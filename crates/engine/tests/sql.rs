@@ -482,15 +482,11 @@ fn unsupported_features_error_rather_than_guess() {
     let (engine, mut session) = engine();
     widgets(&engine, &mut session);
 
-    // The list shrinks as features land; GROUP BY and window functions used to
-    // be here.
-    for sql in [
-        "CREATE TABLE T (a INT, CHECK (a > 0))",
-        "SELECT id FROM Widget INTERSECT SELECT id FROM Widget",
-    ] {
-        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
-        assert_eq!(err.code, 1235, "expected ER_NOT_SUPPORTED_YET for: {sql}");
-    }
+    // The list shrinks as features land; GROUP BY, window functions and CHECK
+    // constraints all used to be here.
+    let sql = "SELECT id FROM Widget INTERSECT SELECT id FROM Widget";
+    let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+    assert_eq!(err.code, 1235, "expected ER_NOT_SUPPORTED_YET for: {sql}");
 }
 
 #[test]
@@ -1929,5 +1925,865 @@ fn an_ordinary_in_list_is_unaffected() {
             "SELECT id FROM Widget WHERE id IN (SELECT id FROM Widget WHERE count > 2)"
         ),
         vec![vec!["a"]]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Generated columns and CHECK constraints. Motte #0025.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_generated_column_is_computed_from_the_row() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (
+            id INT NOT NULL,
+            first VARCHAR(20),
+            last VARCHAR(20),
+            full_name VARCHAR(60) GENERATED ALWAYS AS (CONCAT(first, ' ', last)),
+            PRIMARY KEY (id)
+        )",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO T (id, first, last) VALUES (1, 'Ada', 'Lovelace')",
+    );
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT full_name FROM T"),
+        vec![vec!["Ada Lovelace"]]
+    );
+
+    // It tracks updates to the columns it reads.
+    run(
+        &engine,
+        &mut session,
+        "UPDATE T SET last = 'Byron' WHERE id = 1",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT full_name FROM T"),
+        vec![vec!["Ada Byron"]]
+    );
+}
+
+/// Writing to a generated column is an error, not a silent overwrite.
+#[test]
+fn a_generated_column_cannot_be_written() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (id INT NOT NULL, a INT, g INT GENERATED ALWAYS AS (a + 1), PRIMARY KEY (id))",
+    );
+    run(&engine, &mut session, "INSERT INTO T (id, a) VALUES (1, 1)");
+
+    for sql in [
+        "INSERT INTO T (id, a, g) VALUES (2, 1, 99)",
+        "UPDATE T SET g = 99 WHERE id = 1",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(
+            err.code, 3105,
+            "expected a generated-column error for: {sql}"
+        );
+    }
+}
+
+/// The shape the migrations use: a key that only exists for live rows, so the
+/// uniqueness it enforces is conditional. An unevaluated generated column is
+/// always NULL, and a NULL never conflicts, so the constraint would not exist.
+#[test]
+fn a_generated_column_can_carry_a_conditional_unique_key() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Record (
+            id INT NOT NULL,
+            userId VARCHAR(10) NOT NULL,
+            day VARCHAR(10) NOT NULL,
+            isDeleted BOOLEAN NOT NULL DEFAULT false,
+            activeKey VARCHAR(40) GENERATED ALWAYS AS (
+                CASE WHEN isDeleted = false THEN CONCAT(userId, '-', day) END
+            ),
+            PRIMARY KEY (id),
+            UNIQUE KEY active_unique (activeKey)
+        )",
+    );
+
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Record (id, userId, day) VALUES (1, 'u1', 'mon')",
+    );
+
+    // A second live row for the same user and day collides.
+    let err = engine
+        .execute(
+            &mut session,
+            "INSERT INTO Record (id, userId, day) VALUES (2, 'u1', 'mon')",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1062);
+
+    // A deleted row generates NULL, which never conflicts.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Record (id, userId, day, isDeleted) VALUES (3, 'u1', 'mon', true)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Record (id, userId, day, isDeleted) VALUES (4, 'u1', 'mon', true)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Record"),
+        vec![vec!["3"]]
+    );
+}
+
+#[test]
+fn a_check_constraint_is_enforced() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (id INT NOT NULL, qty INT, PRIMARY KEY (id), CONSTRAINT positive CHECK (qty > 0))",
+    );
+    run(&engine, &mut session, "INSERT INTO T VALUES (1, 5)");
+
+    let err = engine
+        .execute(&mut session, "INSERT INTO T VALUES (2, -1)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 3819, "expected a check violation, got: {err}");
+
+    // UPDATE is held to the same constraint.
+    let err = engine
+        .execute(&mut session, "UPDATE T SET qty = 0 WHERE id = 1", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 3819);
+}
+
+/// A CHECK passes when it is true or unknown; only an outright false violates.
+#[test]
+fn a_check_over_null_passes() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (id INT NOT NULL, qty INT, PRIMARY KEY (id), CHECK (qty > 0))",
+    );
+
+    run(&engine, &mut session, "INSERT INTO T VALUES (1, NULL)");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM T"),
+        vec![vec!["1"]]
+    );
+}
+
+#[test]
+fn information_schema_reports_a_generated_column() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (id INT NOT NULL, a INT, g INT GENERATED ALWAYS AS (a + 1), PRIMARY KEY (id))",
+    );
+
+    let columns = rows(
+        &engine,
+        &mut session,
+        "SELECT column_name FROM information_schema.columns
+         WHERE table_name = 'T' ORDER BY ordinal_position",
+    );
+    assert_eq!(columns, vec![vec!["id"], vec!["a"], vec!["g"]]);
+}
+
+// ---------------------------------------------------------------------------
+// Foreign key enforcement. Motte #0026.
+// ---------------------------------------------------------------------------
+
+/// A parent and a child, with the referential action given by the caller.
+fn related(engine: &Engine, session: &mut Session, on_delete: &str) {
+    run(
+        engine,
+        session,
+        "CREATE TABLE Parent (id VARCHAR(4) NOT NULL, name VARCHAR(10), PRIMARY KEY (id))",
+    );
+    run(
+        engine,
+        session,
+        &format!(
+            "CREATE TABLE Child (
+                id INT NOT NULL,
+                parentId VARCHAR(4) NULL,
+                PRIMARY KEY (id),
+                CONSTRAINT fk_parent FOREIGN KEY (parentId)
+                    REFERENCES Parent (id) ON DELETE {on_delete}
+            )"
+        ),
+    );
+    run(
+        engine,
+        session,
+        "INSERT INTO Parent VALUES ('p1', 'one'), ('p2', 'two')",
+    );
+}
+
+#[test]
+fn a_child_row_must_reference_an_existing_parent() {
+    let (engine, mut session) = engine();
+    related(&engine, &mut session, "RESTRICT");
+
+    run(&engine, &mut session, "INSERT INTO Child VALUES (1, 'p1')");
+
+    let err = engine
+        .execute(&mut session, "INSERT INTO Child VALUES (2, 'nope')", &[])
+        .unwrap_err();
+    assert_eq!(
+        err.code, 1452,
+        "expected a foreign key violation, got: {err}"
+    );
+
+    // UPDATE is held to the same constraint.
+    let err = engine
+        .execute(
+            &mut session,
+            "UPDATE Child SET parentId = 'nope' WHERE id = 1",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1452);
+}
+
+/// A NULL reference points at nothing, so it is exempt.
+#[test]
+fn a_null_reference_is_allowed() {
+    let (engine, mut session) = engine();
+    related(&engine, &mut session, "RESTRICT");
+
+    run(&engine, &mut session, "INSERT INTO Child VALUES (1, NULL)");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Child"),
+        vec![vec!["1"]]
+    );
+}
+
+#[test]
+fn on_delete_restrict_blocks_the_parent() {
+    let (engine, mut session) = engine();
+    related(&engine, &mut session, "RESTRICT");
+    run(&engine, &mut session, "INSERT INTO Child VALUES (1, 'p1')");
+
+    let err = engine
+        .execute(&mut session, "DELETE FROM Parent WHERE id = 'p1'", &[])
+        .unwrap_err();
+    assert_eq!(
+        err.code, 1451,
+        "expected a parent-row violation, got: {err}"
+    );
+
+    // A parent with no children still deletes.
+    run(&engine, &mut session, "DELETE FROM Parent WHERE id = 'p2'");
+}
+
+#[test]
+fn on_delete_cascade_removes_the_children() {
+    let (engine, mut session) = engine();
+    related(&engine, &mut session, "CASCADE");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Child VALUES (1, 'p1'), (2, 'p1'), (3, 'p2')",
+    );
+
+    run(&engine, &mut session, "DELETE FROM Parent WHERE id = 'p1'");
+
+    let left = rows(&engine, &mut session, "SELECT id FROM Child ORDER BY id");
+    assert_eq!(left, vec![vec!["3"]]);
+}
+
+#[test]
+fn on_delete_set_null_clears_the_reference() {
+    let (engine, mut session) = engine();
+    related(&engine, &mut session, "SET NULL");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Child VALUES (1, 'p1'), (2, 'p2')",
+    );
+
+    run(&engine, &mut session, "DELETE FROM Parent WHERE id = 'p1'");
+
+    let refs = rows(
+        &engine,
+        &mut session,
+        "SELECT id, parentId FROM Child ORDER BY id",
+    );
+    assert_eq!(refs, vec![vec!["1", "NULL"], vec!["2", "p2"]]);
+}
+
+/// Cascades chain: deleting a job removes its timesheets, which removes their
+/// records. Handling one level would leave orphans behind.
+#[test]
+fn cascading_deletes_chain_through_several_levels() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE A (id INT NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE B (id INT NOT NULL, aId INT, PRIMARY KEY (id),
+         FOREIGN KEY (aId) REFERENCES A (id) ON DELETE CASCADE)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C (id INT NOT NULL, bId INT, PRIMARY KEY (id),
+         FOREIGN KEY (bId) REFERENCES B (id) ON DELETE CASCADE)",
+    );
+    run(&engine, &mut session, "INSERT INTO A VALUES (1)");
+    run(&engine, &mut session, "INSERT INTO B VALUES (10, 1)");
+    run(&engine, &mut session, "INSERT INTO C VALUES (100, 10)");
+
+    run(&engine, &mut session, "DELETE FROM A WHERE id = 1");
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM B"),
+        vec![vec!["0"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM C"),
+        vec![vec!["0"]],
+        "the grandchild must go too"
+    );
+}
+
+/// A constraint whose parent table does not exist cannot be checked, and must
+/// not fail every write instead.
+#[test]
+fn a_constraint_against_a_missing_parent_is_inert() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Orphan (id INT NOT NULL, ref INT, PRIMARY KEY (id),
+         FOREIGN KEY (ref) REFERENCES NotThere (id))",
+    );
+    run(&engine, &mut session, "INSERT INTO Orphan VALUES (1, 42)");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Orphan"),
+        vec![vec!["1"]]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Transactions. Motte #0027.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rollback_undoes_the_writes_in_a_transaction() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    run(&engine, &mut session, "BEGIN");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Widget (id, name) VALUES ('z', 'zeta')",
+    );
+    run(
+        &engine,
+        &mut session,
+        "UPDATE Widget SET count = 99 WHERE id = 'a'",
+    );
+    run(&engine, &mut session, "DELETE FROM Widget WHERE id = 'b'");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Widget"),
+        vec![vec!["3"]]
+    );
+
+    run(&engine, &mut session, "ROLLBACK");
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Widget"),
+        vec![vec!["3"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT count FROM Widget WHERE id = 'a'"
+        ),
+        vec![vec!["3"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Widget ORDER BY id"),
+        vec![vec!["a"], vec!["b"], vec!["c"]]
+    );
+}
+
+#[test]
+fn commit_keeps_the_writes() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    run(&engine, &mut session, "BEGIN");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Widget (id, name) VALUES ('z', 'zeta')",
+    );
+    run(&engine, &mut session, "COMMIT");
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Widget"),
+        vec![vec!["4"]]
+    );
+
+    // A rollback after the commit has nothing to undo.
+    run(&engine, &mut session, "ROLLBACK");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Widget"),
+        vec![vec!["4"]]
+    );
+}
+
+/// DDL is undone too, because the whole catalog is snapshotted. MySQL commits
+/// implicitly on DDL instead, so this is more forgiving rather than less.
+#[test]
+fn rollback_undoes_schema_changes() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    run(&engine, &mut session, "BEGIN");
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Temp (id INT NOT NULL, PRIMARY KEY (id))",
+    );
+    run(&engine, &mut session, "ROLLBACK");
+
+    assert!(engine
+        .execute(&mut session, "SELECT * FROM Temp", &[])
+        .is_err());
+}
+
+#[test]
+fn a_savepoint_rolls_back_only_the_work_after_it() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    run(&engine, &mut session, "BEGIN");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Widget (id, name) VALUES ('d', 'delta')",
+    );
+    run(&engine, &mut session, "SAVEPOINT here");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Widget (id, name) VALUES ('e', 'epsilon')",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Widget"),
+        vec![vec!["5"]]
+    );
+
+    run(&engine, &mut session, "ROLLBACK TO SAVEPOINT here");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Widget"),
+        vec![vec!["4"]]
+    );
+
+    // The transaction is still open, so the outer rollback still works.
+    run(&engine, &mut session, "ROLLBACK");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Widget"),
+        vec![vec!["3"]]
+    );
+}
+
+#[test]
+fn rolling_back_to_an_unknown_savepoint_is_an_error() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(&engine, &mut session, "BEGIN");
+
+    let err = engine
+        .execute(&mut session, "ROLLBACK TO SAVEPOINT nope", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1305);
+}
+
+#[test]
+fn releasing_a_savepoint_discards_it() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    run(&engine, &mut session, "BEGIN");
+    run(&engine, &mut session, "SAVEPOINT here");
+    run(&engine, &mut session, "RELEASE SAVEPOINT here");
+
+    let err = engine
+        .execute(&mut session, "ROLLBACK TO SAVEPOINT here", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1305);
+}
+
+/// A statement outside a transaction commits as it goes.
+#[test]
+fn autocommit_writes_are_not_undone() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Widget (id, name) VALUES ('z', 'zeta')",
+    );
+    run(&engine, &mut session, "ROLLBACK");
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Widget"),
+        vec![vec!["4"]]
+    );
+}
+
+/// A failed statement inside a transaction leaves its own partial work behind
+/// until the transaction is rolled back, as in MySQL.
+#[test]
+fn a_failed_statement_can_be_rolled_back() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    run(&engine, &mut session, "BEGIN");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Widget (id, name) VALUES ('d', 'delta')",
+    );
+    assert!(engine
+        .execute(
+            &mut session,
+            "INSERT INTO Widget (id, name) VALUES ('a', 'dup')",
+            &[]
+        )
+        .is_err());
+
+    run(&engine, &mut session, "ROLLBACK");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Widget"),
+        vec![vec!["3"]]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the constraints review, 2026-08-18.
+// ---------------------------------------------------------------------------
+
+/// RESTRICT must block the delete, not merely report an error after the parent
+/// row is already gone.
+#[test]
+fn on_delete_restrict_leaves_the_parent_in_place() {
+    let (engine, mut session) = engine();
+    related(&engine, &mut session, "RESTRICT");
+    run(&engine, &mut session, "INSERT INTO Child VALUES (1, 'p1')");
+
+    assert!(engine
+        .execute(&mut session, "DELETE FROM Parent WHERE id = 'p1'", &[])
+        .is_err());
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Parent ORDER BY id"),
+        vec![vec!["p1"], vec!["p2"]],
+        "the parent row must survive a refused delete"
+    );
+}
+
+/// The cascade cap counts generations. A hub table with many referencing
+/// tables is one level deep, however many there are.
+#[test]
+fn many_sibling_children_are_not_mistaken_for_depth() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Hub (id INT NOT NULL, PRIMARY KEY (id))",
+    );
+    for n in 0..20 {
+        run(
+            &engine,
+            &mut session,
+            &format!(
+                "CREATE TABLE Spoke{n} (id INT NOT NULL, hubId INT, PRIMARY KEY (id),
+                 FOREIGN KEY (hubId) REFERENCES Hub (id) ON DELETE CASCADE)"
+            ),
+        );
+    }
+    run(&engine, &mut session, "INSERT INTO Hub VALUES (1)");
+    run(&engine, &mut session, "INSERT INTO Spoke0 VALUES (1, 1)");
+
+    run(&engine, &mut session, "DELETE FROM Hub WHERE id = 1");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Spoke0"),
+        vec![vec!["0"]]
+    );
+}
+
+/// MySQL checks a foreign key row by row, so a self-referencing multi-row
+/// INSERT can point at a row added earlier in the same statement.
+#[test]
+fn a_self_referencing_multi_row_insert_works() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Node (id INT NOT NULL, parent INT NULL, PRIMARY KEY (id),
+         FOREIGN KEY (parent) REFERENCES Node (id))",
+    );
+
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Node VALUES (1, NULL), (2, 1), (3, 2)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Node"),
+        vec![vec!["3"]]
+    );
+}
+
+/// IGNORE downgrades a foreign key violation to a skipped row, as it does a
+/// duplicate key.
+#[test]
+fn insert_ignore_skips_a_foreign_key_violation() {
+    let (engine, mut session) = engine();
+    related(&engine, &mut session, "RESTRICT");
+
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "INSERT IGNORE INTO Child VALUES (1, 'nope')"
+        ),
+        0
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Child"),
+        vec![vec!["0"]]
+    );
+}
+
+/// SET NULL cannot write into a NOT NULL column; storing one would leave a row
+/// the schema says is impossible, which every later UPDATE would then reject.
+#[test]
+fn set_null_into_a_not_null_column_is_refused() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE P (id INT NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C (id INT NOT NULL, pid INT NOT NULL, PRIMARY KEY (id),
+         FOREIGN KEY (pid) REFERENCES P (id) ON DELETE SET NULL)",
+    );
+    run(&engine, &mut session, "INSERT INTO P VALUES (1)");
+    run(&engine, &mut session, "INSERT INTO C VALUES (1, 1)");
+
+    let err = engine
+        .execute(&mut session, "DELETE FROM P WHERE id = 1", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1830);
+}
+
+/// An UPDATE of a parent key must carry the children with it, or leave them
+/// pointing at a value that no longer exists.
+#[test]
+fn on_update_cascade_follows_the_parent_key() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE P (id VARCHAR(4) NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C (id INT NOT NULL, pid VARCHAR(4), PRIMARY KEY (id),
+         FOREIGN KEY (pid) REFERENCES P (id) ON UPDATE CASCADE)",
+    );
+    run(&engine, &mut session, "INSERT INTO P VALUES ('p1')");
+    run(&engine, &mut session, "INSERT INTO C VALUES (1, 'p1')");
+
+    run(
+        &engine,
+        &mut session,
+        "UPDATE P SET id = 'px' WHERE id = 'p1'",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT pid FROM C"),
+        vec![vec!["px"]]
+    );
+}
+
+#[test]
+fn on_update_restrict_blocks_the_parent_key_change() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE P (id VARCHAR(4) NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C (id INT NOT NULL, pid VARCHAR(4), PRIMARY KEY (id),
+         FOREIGN KEY (pid) REFERENCES P (id) ON UPDATE RESTRICT)",
+    );
+    run(&engine, &mut session, "INSERT INTO P VALUES ('p1')");
+    run(&engine, &mut session, "INSERT INTO C VALUES (1, 'p1')");
+
+    let err = engine
+        .execute(&mut session, "UPDATE P SET id = 'px' WHERE id = 'p1'", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1451);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM P"),
+        vec![vec!["p1"]]
+    );
+}
+
+/// An inline CHECK is the same constraint written next to the column.
+#[test]
+fn an_inline_check_is_enforced() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (id INT NOT NULL CHECK (id > 0), PRIMARY KEY (id))",
+    );
+    run(&engine, &mut session, "INSERT INTO T VALUES (1)");
+
+    let err = engine
+        .execute(&mut session, "INSERT INTO T VALUES (-1)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 3819);
+}
+
+/// Whether writing to a generated column is an error must not depend on
+/// whether any row happened to match.
+#[test]
+fn writing_a_generated_column_errors_even_when_no_row_matches() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (id INT NOT NULL, a INT, g INT GENERATED ALWAYS AS (a + 1), PRIMARY KEY (id))",
+    );
+
+    let err = engine
+        .execute(&mut session, "UPDATE T SET g = 1 WHERE id = 999", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 3105);
+}
+
+/// Both INSERT forms must agree: a value in a generated column's position is
+/// an error whether or not a column list was given.
+#[test]
+fn a_positional_insert_cannot_fill_a_generated_column() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (id INT NOT NULL, a INT, g INT GENERATED ALWAYS AS (a + 1), PRIMARY KEY (id))",
+    );
+
+    let err = engine
+        .execute(&mut session, "INSERT INTO T VALUES (1, 5, 999)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 3105);
+
+    // DEFAULT and NULL are accepted in that position.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO T VALUES (2, 5, DEFAULT)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT g FROM T"),
+        vec![vec!["6"]]
+    );
+}
+
+/// A rollback must not discard work another connection already committed. Only
+/// the tables this transaction wrote are restored.
+#[test]
+fn rollback_leaves_other_tables_alone() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Other (id INT NOT NULL, PRIMARY KEY (id))",
+    );
+
+    let mut concurrent = Session::new(ServerConfig::default(), 2);
+    concurrent.current_database = Some("testdb".to_owned());
+
+    run(&engine, &mut session, "BEGIN");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Widget (id, name) VALUES ('z', 'zeta')",
+    );
+
+    // Another connection commits to a different table while the transaction
+    // is open.
+    run(&engine, &mut concurrent, "INSERT INTO Other VALUES (1)");
+
+    run(&engine, &mut session, "ROLLBACK");
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Widget"),
+        vec![vec!["3"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Other"),
+        vec![vec!["1"]],
+        "another connection's committed work must survive"
+    );
+}
+
+/// Under autocommit a stray SAVEPOINT must not open a transaction, or a later
+/// ROLLBACK would undo committed work.
+#[test]
+fn a_savepoint_outside_a_transaction_does_not_open_one() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    run(&engine, &mut session, "SAVEPOINT stray");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Widget (id, name) VALUES ('z', 'zeta')",
+    );
+    run(&engine, &mut session, "ROLLBACK");
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Widget"),
+        vec![vec!["4"]]
     );
 }

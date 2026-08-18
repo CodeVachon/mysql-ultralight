@@ -23,6 +23,13 @@ pub struct Column {
     pub collation: Option<String>,
     /// Ordinal position, 1-based, as `information_schema.columns` reports it.
     pub position: usize,
+    /// The expression a generated column is computed from, as written.
+    ///
+    /// Kept as text so `information_schema` can report it, and re-parsed on
+    /// write. A generated column that is never evaluated is always NULL, and a
+    /// NULL never violates a unique index, so the constraint the schema is
+    /// expressing would silently not exist.
+    pub generated: Option<String>,
 }
 
 impl Column {
@@ -39,8 +46,16 @@ impl Column {
             comment: None,
             collation: None,
             position: 0,
+            generated: None,
         }
     }
+}
+
+/// A CHECK constraint, kept as text and re-parsed on write.
+#[derive(Debug, Clone)]
+pub struct Check {
+    pub name: String,
+    pub expr: String,
 }
 
 /// A named index over one or more columns.
@@ -75,6 +90,7 @@ pub struct Table {
     pub rows: Vec<Vec<Value>>,
     pub indexes: Vec<Index>,
     pub foreign_keys: Vec<ForeignKey>,
+    pub checks: Vec<Check>,
     pub collation: Option<String>,
     pub comment: Option<String>,
     pub next_auto_increment: i64,
@@ -225,7 +241,7 @@ impl Database {
 }
 
 /// Every database in the server.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Catalog {
     databases: BTreeMap<String, Database>,
 }

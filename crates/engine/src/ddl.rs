@@ -23,9 +23,15 @@ pub fn create_table(
 
     let mut table = Table::new(&name);
 
+    let mut inline_checks = Vec::new();
     for (position, def) in create.columns.iter().enumerate() {
-        table.columns.push(build_column(def, position + 1)?);
+        table.columns.push(build_column_with_checks(
+            def,
+            position + 1,
+            &mut inline_checks,
+        )?);
     }
+    table.checks.append(&mut inline_checks);
 
     for constraint in &create.constraints {
         apply_constraint(&mut table, constraint)?;
@@ -86,11 +92,23 @@ pub fn create_table(
         return Err(EngineError::table_exists(&name));
     }
 
-    database.tables.insert(name, table);
+    database.tables.insert(name.clone(), table);
+    drop(catalog);
+    engine.mark_modified_public(session, &db, &name);
     Ok(Outcome::ok())
 }
 
 fn build_column(def: &ColumnDef, position: usize) -> EngineResult<Column> {
+    let mut inline_checks = Vec::new();
+    build_column_with_checks(def, position, &mut inline_checks)
+}
+
+/// Builds a column, collecting any inline CHECK into `inline_checks`.
+fn build_column_with_checks(
+    def: &ColumnDef,
+    position: usize,
+    inline_checks: &mut Vec<crate::catalog::Check>,
+) -> EngineResult<Column> {
     let mut column = Column::new(def.name.value.clone(), SqlType::from_ast(&def.data_type)?);
     column.position = position;
     // MySQL columns are nullable unless declared otherwise, except that a
@@ -113,6 +131,18 @@ fn build_column(def: &ColumnDef, position: usize) -> EngineResult<Column> {
                 // row, so CURRENT_TIMESTAMP differs between inserts.
                 None => column.default_expr = Some(e.to_string()),
             },
+            // An inline CHECK is the same constraint as a table-level one,
+            // just written next to the column.
+            ColumnOption::Check(check) => {
+                inline_checks.push(crate::catalog::Check {
+                    name: check
+                        .name
+                        .as_ref()
+                        .map(|n| n.value.clone())
+                        .unwrap_or_else(|| format!("{}_chk", def.name.value)),
+                    expr: check.expr.to_string(),
+                });
+            }
             ColumnOption::Comment(c) => column.comment = Some(c.clone()),
             ColumnOption::Collation(c) => column.collation = Some(c.to_string()),
             ColumnOption::DialectSpecific(tokens) => {
@@ -126,12 +156,22 @@ fn build_column(def: &ColumnDef, position: usize) -> EngineResult<Column> {
                     column.auto_increment = true;
                 }
             }
-            ColumnOption::Generated { .. } => {
-                return Err(unsupported(format!(
-                    "generated column `{}`",
-                    def.name.value
-                )))
-            }
+            ColumnOption::Generated {
+                generation_expr, ..
+            } => match generation_expr {
+                Some(e) => {
+                    column.generated = Some(e.to_string());
+                    // A generated column has no stored default and cannot be
+                    // written to directly.
+                    column.default = None;
+                }
+                None => {
+                    return Err(unsupported(format!(
+                        "generated column `{}` without an expression",
+                        def.name.value
+                    )))
+                }
+            },
             // Character sets do not change stored values here; every string is
             // held as UTF-8 regardless.
             ColumnOption::CharacterSet(_) => {}
@@ -226,9 +266,16 @@ fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineRe
                     .unwrap_or_else(|| "RESTRICT".into()),
             });
         }
-        // CHECK is recorded as unsupported rather than accepted and ignored:
-        // silently not enforcing a constraint is a wrong answer.
-        TableConstraint::Check(_) => return Err(unsupported("CHECK constraints")),
+        TableConstraint::Check(check) => {
+            table.checks.push(crate::catalog::Check {
+                name: check
+                    .name
+                    .as_ref()
+                    .map(|n| n.value.clone())
+                    .unwrap_or_else(|| format!("{}_chk_{}", table.name, table.checks.len() + 1)),
+                expr: check.expr.to_string(),
+            });
+        }
         other => return Err(unsupported(format!("table constraint `{other}`"))),
     }
     Ok(())
@@ -249,6 +296,7 @@ pub fn alter_table(
     if_exists: bool,
 ) -> EngineResult<Outcome> {
     let (db, table_name) = engine.split_name_public(session, name)?;
+    engine.mark_modified_public(session, &db, &table_name);
     let mut catalog = engine.catalog_mut_public()?;
     let database = catalog
         .database_mut(&db)

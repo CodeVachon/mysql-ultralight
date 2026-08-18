@@ -9,6 +9,7 @@ pub mod dialect;
 pub mod error;
 pub mod exec;
 pub mod expr;
+pub mod foreign_keys;
 pub mod functions;
 pub mod info_schema;
 pub mod params;

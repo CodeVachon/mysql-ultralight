@@ -11,10 +11,11 @@ use sqlparser::ast::{
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::catalog::{Catalog, Table, INFORMATION_SCHEMA};
+use crate::catalog::{Catalog, Database, Table, INFORMATION_SCHEMA};
 use crate::ddl;
 use crate::error::{unsupported, EngineError, EngineResult};
 use crate::expr::{self, ColumnRef, Context, OuterRow, Row};
+use crate::foreign_keys::{self, Action};
 use crate::info_schema;
 use crate::params;
 use crate::relation::Relation;
@@ -60,6 +61,11 @@ impl Engine {
         &self,
     ) -> EngineResult<std::sync::RwLockWriteGuard<'_, Catalog>> {
         self.catalog_mut()
+    }
+
+    /// Lets the DDL module record what it changed, for rollback.
+    pub(crate) fn mark_modified_public(&self, session: &mut Session, database: &str, table: &str) {
+        mark_modified(session, database, std::slice::from_ref(&table.to_owned()));
     }
 
     pub(crate) fn split_name_public(
@@ -347,18 +353,97 @@ impl Engine {
                 self.show_columns(session, &table).map(Outcome::Rows)
             }
 
-            // Transaction control is accepted so client code paths work, but
-            // there is no rollback yet: a test database that discards state at
-            // process exit has nothing to recover.
             Statement::StartTransaction { .. } => {
+                // A nested BEGIN commits the open transaction in MySQL rather
+                // than nesting, so the snapshot is simply replaced.
+                session.transaction = Some(crate::session::Transaction {
+                    opened: self.catalog()?.clone(),
+                    savepoints: Vec::new(),
+                    modified: Vec::new(),
+                });
                 session.in_transaction = true;
                 Ok(Outcome::ok())
             }
-            Statement::Commit { .. } | Statement::Rollback { .. } => {
+            Statement::Commit { .. } => {
+                session.transaction = None;
                 session.in_transaction = false;
                 Ok(Outcome::ok())
             }
-            Statement::Savepoint { .. } | Statement::ReleaseSavepoint { .. } => Ok(Outcome::ok()),
+            Statement::Rollback { savepoint, .. } => {
+                match savepoint {
+                    // ROLLBACK TO SAVEPOINT keeps the transaction open and
+                    // discards only the savepoints taken after the target.
+                    Some(name) => {
+                        let name = name.value.clone();
+                        let Some(transaction) = session.transaction.as_mut() else {
+                            return Err(EngineError::new(
+                                1305,
+                                "42000",
+                                format!("SAVEPOINT {name} does not exist"),
+                            ));
+                        };
+                        let Some(at) = transaction
+                            .savepoints
+                            .iter()
+                            .rposition(|s| s.name.eq_ignore_ascii_case(&name))
+                        else {
+                            return Err(EngineError::new(
+                                1305,
+                                "42000",
+                                format!("SAVEPOINT {name} does not exist"),
+                            ));
+                        };
+                        let restored = transaction.savepoints[at].catalog.clone();
+                        // Every table the transaction has written is restored
+                        // to its state at the savepoint. Restoring only those
+                        // written *since* would leave a table modified both
+                        // before and after it holding the later value.
+                        let undo = transaction.modified.clone();
+                        transaction.savepoints.truncate(at + 1);
+                        restore_tables(&mut *self.catalog_mut()?, &restored, &undo);
+                    }
+                    None => {
+                        if let Some(transaction) = session.transaction.take() {
+                            restore_tables(
+                                &mut *self.catalog_mut()?,
+                                &transaction.opened,
+                                &transaction.modified,
+                            );
+                        }
+                        session.in_transaction = false;
+                    }
+                }
+                Ok(Outcome::ok())
+            }
+            Statement::Savepoint { name } => {
+                let snapshot = self.catalog()?.clone();
+                let name = name.value.clone();
+                // Under autocommit a savepoint is released at the end of the
+                // statement. Opening a transaction here would make every later
+                // write rollback-able, and a stray ROLLBACK would undo
+                // committed work.
+                if let Some(transaction) = session.transaction.as_mut() {
+                    // Re-taking a name replaces the earlier savepoint.
+                    transaction
+                        .savepoints
+                        .retain(|s| !s.name.eq_ignore_ascii_case(&name));
+                    let modified = transaction.modified.clone();
+                    transaction.savepoints.push(crate::session::Savepoint {
+                        name,
+                        catalog: snapshot,
+                        modified,
+                    });
+                }
+                Ok(Outcome::ok())
+            }
+            Statement::ReleaseSavepoint { name } => {
+                if let Some(transaction) = session.transaction.as_mut() {
+                    transaction
+                        .savepoints
+                        .retain(|s| !s.name.eq_ignore_ascii_case(&name.value));
+                }
+                Ok(Outcome::ok())
+            }
 
             other => Err(unsupported(format!(
                 "statement `{}`",
@@ -1533,6 +1618,19 @@ impl Engine {
 
         let session_snapshot = session.clone();
         let mut catalog = self.catalog_mut()?;
+
+        // Captured before the child table is borrowed mutably, so validation
+        // is a pure function of the candidate row.
+        let mut fk_parents = {
+            let database = catalog
+                .database(&db)
+                .ok_or_else(|| EngineError::unknown_database(&db))?;
+            let table = database
+                .table(&table_name)
+                .ok_or_else(|| EngineError::no_such_table(&table_name))?;
+            foreign_keys::snapshot(database, table)
+        };
+
         let database = catalog
             .database_mut(&db)
             .ok_or_else(|| EngineError::unknown_database(&db))?;
@@ -1549,9 +1647,21 @@ impl Engine {
                 .iter()
                 .map(|c| {
                     let name = c.to_string().trim_matches('`').to_owned();
-                    table
+                    let index = table
                         .column_index(&name)
-                        .ok_or_else(|| EngineError::unknown_column(&name, "field list"))
+                        .ok_or_else(|| EngineError::unknown_column(&name, "field list"))?;
+                    if table.columns[index].generated.is_some() {
+                        return Err(EngineError::new(
+                            3105,
+                            "HY000",
+                            format!(
+                                "The value specified for generated column '{name}' in table \
+                                 '{}' is not allowed.",
+                                table.name
+                            ),
+                        ));
+                    }
+                    Ok(index)
                 })
                 .collect::<EngineResult<_>>()?
         };
@@ -1578,6 +1688,26 @@ impl Engine {
             let mut row = default_row(table, &ctx)?;
 
             for (slot, value_expr) in targets.iter().zip(values.content.iter()) {
+                if table.columns[*slot].generated.is_some() {
+                    // DEFAULT and NULL are the only values MySQL accepts in a
+                    // generated column's position.
+                    let permitted = matches!(value_expr, Expr::Identifier(i)
+                        if i.value.eq_ignore_ascii_case("default"))
+                        || matches!(value_expr, Expr::Value(v)
+                            if matches!(v.value, sqlparser::ast::Value::Null));
+                    if !permitted {
+                        return Err(EngineError::new(
+                            3105,
+                            "HY000",
+                            format!(
+                                "The value specified for generated column '{}' in table '{}' \
+                                 is not allowed.",
+                                table.columns[*slot].name, table.name
+                            ),
+                        ));
+                    }
+                    continue;
+                }
                 // DEFAULT in a VALUES list keeps the column's default.
                 if matches!(value_expr, Expr::Identifier(i) if i.value.eq_ignore_ascii_case("default"))
                 {
@@ -1588,35 +1718,53 @@ impl Engine {
                 row[*slot] = column.ty.coerce(value, &column.name)?;
             }
 
-            for (i, column) in table.columns.iter().enumerate() {
-                if column.auto_increment {
-                    if row[i].is_null() {
-                        row[i] = Value::Int(table.next_auto_increment);
-                        last_id = table.next_auto_increment as u64;
-                        table.next_auto_increment += 1;
-                    } else if let Some(explicit) = row[i].as_int() {
-                        // An explicit value moves the counter past it, as
-                        // MySQL does. Without this, a fixture that inserts
-                        // explicit ids collides with generated ones later.
-                        table.next_auto_increment = table.next_auto_increment.max(explicit + 1);
-                    }
-                }
-                if !column.nullable && row[i].is_null() {
-                    return Err(EngineError::null_not_allowed(&column.name));
+            // The counter lives on the table, so the column list and the row
+            // are walked together rather than by index.
+            let auto_increment: Vec<usize> = table
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.auto_increment)
+                .map(|(i, _)| i)
+                .collect();
+            for slot in auto_increment {
+                if row[slot].is_null() {
+                    row[slot] = Value::Int(table.next_auto_increment);
+                    last_id = table.next_auto_increment as u64;
+                    table.next_auto_increment += 1;
+                } else if let Some(explicit) = row[slot].as_int() {
+                    // An explicit value moves the counter past it, as MySQL
+                    // does. Without this, a fixture that inserts explicit ids
+                    // collides with generated ones later.
+                    table.next_auto_increment = table.next_auto_increment.max(explicit + 1);
                 }
             }
 
-            match table.check_unique(&row, None) {
+            // Generated columns, NOT NULL and CHECK are all validated here, on
+            // the same path UPDATE uses.
+            let row = self.finalise_row(table, row, &session_snapshot)?;
+
+            // IGNORE covers a foreign key violation as well as a duplicate
+            // key; MySQL downgrades both to a warning and skips the row.
+            let admissible = foreign_keys::check(&fk_parents, &row, &table_name)
+                .and_then(|()| table.check_unique(&row, None));
+            match admissible {
                 Ok(()) => {}
-                // INSERT IGNORE turns a constraint violation into a skip.
                 Err(_) if ignore => continue,
                 Err(e) => return Err(e),
+            }
+
+            // A self-referencing constraint must see this row when the next
+            // one in the same statement is checked.
+            for parent in &mut fk_parents {
+                parent.note_inserted(&row);
             }
 
             table.rows.push(row);
             inserted += 1;
         }
 
+        mark_modified(session, &db, std::slice::from_ref(&table_name));
         session.last_insert_id = last_id;
         session.affected_rows = inserted;
         Ok(Outcome::Affected {
@@ -1642,10 +1790,25 @@ impl Engine {
 
         let session_snapshot = session.clone();
         let mut catalog = self.catalog_mut()?;
+
+        let fk_parents = {
+            let database = catalog
+                .database(&db)
+                .ok_or_else(|| EngineError::unknown_database(&db))?;
+            let table = database
+                .table(&table_name)
+                .ok_or_else(|| EngineError::no_such_table(&table_name))?;
+            foreign_keys::snapshot(database, table)
+        };
+
         let database = catalog
             .database_mut(&db)
             .ok_or_else(|| EngineError::unknown_database(&db))?;
-        let table = database
+
+        // Applied to a copy and swapped in only on success, so a RESTRICT
+        // found while cascading to children cannot leave the parent updated.
+        let mut working = database.clone();
+        let table = working
             .table_mut(&table_name)
             .ok_or_else(|| EngineError::no_such_table(&table_name))?;
 
@@ -1655,7 +1818,28 @@ impl Engine {
             .map(|c| ColumnRef::new(&table.name, &c.name))
             .collect();
 
+        // Checked once, before any row is considered: whether writing to a
+        // generated column is an error must not depend on the data.
+        for assignment in assignments {
+            let column_name = assignment_column(&assignment.target)?;
+            let slot = table
+                .column_index(&column_name)
+                .ok_or_else(|| EngineError::unknown_column(&column_name, "field list"))?;
+            if table.columns[slot].generated.is_some() {
+                return Err(EngineError::new(
+                    3105,
+                    "HY000",
+                    format!(
+                        "The value specified for generated column '{column_name}' in table \
+                         '{}' is not allowed.",
+                        table.name
+                    ),
+                ));
+            }
+        }
+
         let mut updated = 0u64;
+        let mut changed: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
         let mut rows = table.rows.clone();
 
         for index in 0..rows.len() {
@@ -1681,23 +1865,29 @@ impl Engine {
                 let slot = table
                     .column_index(&column_name)
                     .ok_or_else(|| EngineError::unknown_column(&column_name, "field list"))?;
+
                 // The right-hand side sees the row as it was before this
                 // statement, so `SET a = b, b = a` swaps rather than copies.
                 let value = expr::eval(&assignment.value, &ctx)?;
                 let column = &table.columns[slot];
-                let coerced = column.ty.coerce(value, &column.name)?;
-                if !column.nullable && coerced.is_null() {
-                    return Err(EngineError::null_not_allowed(&column.name));
-                }
-                candidate[slot] = coerced;
+                candidate[slot] = column.ty.coerce(value, &column.name)?;
             }
 
+            let candidate = self.finalise_row(table, candidate, &session_snapshot)?;
+            foreign_keys::check(&fk_parents, &candidate, &table_name)?;
             table.check_unique_against(&rows, &candidate, index)?;
+            // Children follow the key, so both halves of the change are needed.
+            changed.push((rows[index].clone(), candidate.clone()));
             rows[index] = candidate;
             updated += 1;
         }
 
         table.rows = rows;
+        let mut touched = vec![table_name.clone()];
+        cascade_update(&mut working, &table_name, &changed, &mut touched)?;
+        *database = working;
+        mark_modified(session, &db, &touched);
+
         session.affected_rows = updated;
         Ok(Outcome::affected(updated))
     }
@@ -1724,7 +1914,13 @@ impl Engine {
         let database = catalog
             .database_mut(&db)
             .ok_or_else(|| EngineError::unknown_database(&db))?;
-        let table = database
+
+        // The delete and its cascade are applied to a copy and swapped in only
+        // if the whole thing succeeds. A RESTRICT discovered part-way through a
+        // chain would otherwise leave the parent already removed and earlier
+        // children already cascaded.
+        let mut working = database.clone();
+        let table = working
             .table_mut(&table_name)
             .ok_or_else(|| EngineError::no_such_table(&table_name))?;
 
@@ -1736,6 +1932,7 @@ impl Engine {
 
         let before = table.rows.len();
         let mut kept = Vec::with_capacity(before);
+        let mut removed_rows: Vec<Vec<Value>> = Vec::new();
         for row in std::mem::take(&mut table.rows) {
             let ctx = Context {
                 row: Some(Row {
@@ -1749,13 +1946,23 @@ impl Engine {
                 Some(p) => expr::eval(p, &ctx)?.truthy() == Some(true),
                 None => true,
             };
-            if !matched {
+            if matched {
+                removed_rows.push(row);
+            } else {
                 kept.push(row);
             }
         }
 
-        let removed = (before - kept.len()) as u64;
+        let removed = removed_rows.len() as u64;
         table.rows = kept;
+
+        // Children are handled after the parent rows are removed, so a
+        // self-referencing table does not see the rows it is cascading from.
+        let mut touched = vec![table_name.clone()];
+        cascade_delete(&mut working, &table_name, &removed_rows, &mut touched)?;
+        *database = working;
+        mark_modified(session, &db, &touched);
+
         session.affected_rows = removed;
         Ok(Outcome::affected(removed))
     }
@@ -2036,6 +2243,75 @@ impl Engine {
         })
     }
 
+    /// Computes generated columns and validates a candidate row.
+    ///
+    /// Shared by INSERT and UPDATE: a constraint enforced on one path and not
+    /// the other is worse than one enforced on neither, because the gap is
+    /// invisible.
+    fn finalise_row(
+        &self,
+        table: &Table,
+        mut row: Vec<Value>,
+        session: &Session,
+    ) -> EngineResult<Vec<Value>> {
+        let refs: Vec<ColumnRef> = table
+            .columns
+            .iter()
+            .map(|c| ColumnRef::new(&table.name, &c.name))
+            .collect();
+
+        // Generated columns are computed from the row's other values, so they
+        // are evaluated once everything else is in place.
+        for index in 0..table.columns.len() {
+            let Some(expression) = table.columns[index].generated.clone() else {
+                continue;
+            };
+            let parsed = parse_expression(&expression)?;
+            let value = {
+                let ctx = Context {
+                    row: Some(Row {
+                        schema: &refs,
+                        values: &row,
+                    }),
+                    session,
+                    subqueries: Some(self),
+                };
+                expr::eval(&parsed, &ctx)?
+            };
+            let column = &table.columns[index];
+            row[index] = column.ty.coerce(value, &column.name)?;
+        }
+
+        for (index, column) in table.columns.iter().enumerate() {
+            if !column.nullable && row[index].is_null() {
+                return Err(EngineError::null_not_allowed(&column.name));
+            }
+        }
+
+        for check in &table.checks {
+            let parsed = parse_expression(&check.expr)?;
+            let ctx = Context {
+                row: Some(Row {
+                    schema: &refs,
+                    values: &row,
+                }),
+                session,
+                subqueries: Some(self),
+            };
+            // A CHECK passes when it is true or unknown; only an outright
+            // false is a violation, as in MySQL.
+            if expr::eval(&parsed, &ctx)?.truthy() == Some(false) {
+                return Err(EngineError::new(
+                    3819,
+                    "HY000",
+                    format!("Check constraint '{}' is violated.", check.name),
+                ));
+            }
+        }
+
+        Ok(row)
+    }
+
     /// Splits a rendered `db.table` string, for the paths where the AST hands
     /// back a name already stringified.
     fn split_parts(&self, session: &Session, rendered: &str) -> EngineResult<(String, String)> {
@@ -2198,6 +2474,305 @@ impl Table {
         probe.rows = rows.to_vec();
         probe.check_unique(candidate, Some(skip))
     }
+}
+
+/// Records tables a statement wrote, so a rollback knows what to undo.
+///
+/// Only meaningful inside a transaction; outside one there is nothing to undo.
+fn mark_modified(session: &mut Session, database: &str, tables: &[String]) {
+    let Some(transaction) = session.transaction.as_mut() else {
+        return;
+    };
+    for table in tables {
+        let pair = (database.to_owned(), table.clone());
+        if !transaction.modified.contains(&pair) {
+            transaction.modified.push(pair);
+        }
+    }
+}
+
+/// Restores the named tables from a snapshot, leaving everything else alone.
+///
+/// Only the tables a transaction wrote are rolled back. Replacing the whole
+/// catalog would also discard work another connection had already committed,
+/// because the catalog is shared between connections.
+fn restore_tables(catalog: &mut Catalog, snapshot: &Catalog, tables: &[(String, String)]) {
+    for (database_name, table_name) in tables {
+        let original = snapshot
+            .database(database_name)
+            .and_then(|d| d.table(table_name))
+            .cloned();
+        let Some(database) = catalog.database_mut(database_name) else {
+            continue;
+        };
+
+        let key = database
+            .tables
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(table_name))
+            .cloned();
+        match original {
+            // The table existed before; put it back as it was.
+            Some(table) => {
+                let key = key.unwrap_or_else(|| table.name.clone());
+                database.tables.insert(key, table);
+            }
+            // It did not, so the transaction created it.
+            None => {
+                if let Some(key) = key {
+                    database.tables.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+/// Applies each dependent table's ON UPDATE action after a parent key changes.
+///
+/// Without this an UPDATE of a parent key leaves children pointing at a value
+/// that no longer exists — a dangling reference the engine would then reject on
+/// the next INSERT of the same value.
+fn cascade_update(
+    database: &mut Database,
+    parent_table: &str,
+    changed: &[(Vec<Value>, Vec<Value>)],
+    touched: &mut Vec<String>,
+) -> EngineResult<()> {
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let Some(parent) = database.table(parent_table).cloned() else {
+        return Ok(());
+    };
+
+    for dependent in foreign_keys::dependents(database, &parent) {
+        // Only a change to the referenced columns matters; updating an
+        // unrelated column leaves children alone.
+        let moves: Vec<(Vec<String>, Vec<Value>)> = changed
+            .iter()
+            .filter_map(|(before, after)| {
+                let old: Vec<String> = dependent
+                    .parent_positions
+                    .iter()
+                    .map(|p| {
+                        before
+                            .get(*p)
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                            .collation_key()
+                    })
+                    .collect();
+                let new: Vec<Value> = dependent
+                    .parent_positions
+                    .iter()
+                    .map(|p| after.get(*p).cloned().unwrap_or(Value::Null))
+                    .collect();
+                let unchanged = new.iter().map(Value::collation_key).eq(old.iter().cloned());
+                (!unchanged).then_some((old, new))
+            })
+            .collect();
+
+        if moves.is_empty() {
+            continue;
+        }
+
+        let action = Action::parse(&dependent.constraint.on_update);
+        let Some(child) = database.table_mut(&dependent.table) else {
+            continue;
+        };
+        touched.push(dependent.table.clone());
+
+        for row in &mut child.rows {
+            if dependent
+                .child_positions
+                .iter()
+                .any(|p| row.get(*p).is_some_and(Value::is_null))
+            {
+                continue;
+            }
+            let key: Vec<String> = dependent
+                .child_positions
+                .iter()
+                .map(|p| row.get(*p).cloned().unwrap_or(Value::Null).collation_key())
+                .collect();
+            let Some((_, new)) = moves.iter().find(|(old, _)| *old == key) else {
+                continue;
+            };
+
+            match action {
+                Action::Restrict => {
+                    return Err(foreign_keys::restrict_violation(
+                        &dependent.table,
+                        parent_table,
+                        &dependent.constraint,
+                    ))
+                }
+                Action::Cascade => {
+                    for (slot, value) in dependent.child_positions.iter().zip(new) {
+                        row[*slot] = value.clone();
+                    }
+                }
+                Action::SetNull => {
+                    for slot in &dependent.child_positions {
+                        row[*slot] = Value::Null;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Applies each dependent table's ON DELETE action after parent rows are gone.
+///
+/// Cascades chain — deleting a job removes its timesheets, which removes their
+/// records — so this works one generation at a time rather than one level. The
+/// cap counts generations, not tables: a hub with twenty referencing tables is
+/// one level deep, not twenty.
+fn cascade_delete(
+    database: &mut Database,
+    parent_table: &str,
+    removed: &[Vec<Value>],
+    touched: &mut Vec<String>,
+) -> EngineResult<()> {
+    const MAX_GENERATIONS: usize = 16;
+
+    let mut generation: Vec<(String, Vec<Vec<Value>>)> =
+        vec![(parent_table.to_owned(), removed.to_vec())];
+
+    for _ in 0..MAX_GENERATIONS {
+        let mut next: Vec<(String, Vec<Vec<Value>>)> = Vec::new();
+
+        for (parent_name, parent_rows) in generation {
+            if parent_rows.is_empty() {
+                continue;
+            }
+            let Some(parent) = database.table(&parent_name).cloned() else {
+                continue;
+            };
+
+            for dependent in foreign_keys::dependents(database, &parent) {
+                // The set of parent keys that just disappeared.
+                let gone: std::collections::HashSet<Vec<String>> = parent_rows
+                    .iter()
+                    .map(|row| {
+                        dependent
+                            .parent_positions
+                            .iter()
+                            .map(|p| row.get(*p).cloned().unwrap_or(Value::Null).collation_key())
+                            .collect()
+                    })
+                    .collect();
+
+                let action = Action::parse(&dependent.constraint.on_delete);
+
+                // SET NULL cannot write into a NOT NULL column. MySQL rejects
+                // that DDL up front; here the write is refused rather than
+                // storing a row the schema says is impossible.
+                if action == Action::SetNull {
+                    let child = database.table(&dependent.table);
+                    if let Some(child) = child {
+                        if let Some(column) = dependent
+                            .child_positions
+                            .iter()
+                            .filter_map(|p| child.columns.get(*p))
+                            .find(|c| !c.nullable)
+                        {
+                            return Err(EngineError::new(
+                                1830,
+                                "HY000",
+                                format!(
+                                    "Column '{}' cannot be NOT NULL: needed in a foreign key \
+                                     constraint '{}' SET NULL",
+                                    column.name, dependent.constraint.name
+                                ),
+                            ));
+                        }
+                    }
+                }
+
+                let Some(child) = database.table_mut(&dependent.table) else {
+                    continue;
+                };
+                touched.push(dependent.table.clone());
+
+                let matches = |row: &Vec<Value>| -> bool {
+                    // A NULL reference points at nothing, so it is unaffected.
+                    if dependent
+                        .child_positions
+                        .iter()
+                        .any(|p| row.get(*p).is_some_and(Value::is_null))
+                    {
+                        return false;
+                    }
+                    let key: Vec<String> = dependent
+                        .child_positions
+                        .iter()
+                        .map(|p| row.get(*p).cloned().unwrap_or(Value::Null).collation_key())
+                        .collect();
+                    gone.contains(&key)
+                };
+
+                match action {
+                    Action::Restrict => {
+                        if child.rows.iter().any(matches) {
+                            return Err(foreign_keys::restrict_violation(
+                                &dependent.table,
+                                &parent_name,
+                                &dependent.constraint,
+                            ));
+                        }
+                    }
+                    Action::SetNull => {
+                        for row in &mut child.rows {
+                            if matches(row) {
+                                for position in &dependent.child_positions {
+                                    row[*position] = Value::Null;
+                                }
+                            }
+                        }
+                    }
+                    Action::Cascade => {
+                        let mut removed_here = Vec::new();
+                        let mut kept = Vec::with_capacity(child.rows.len());
+                        for row in std::mem::take(&mut child.rows) {
+                            if matches(&row) {
+                                removed_here.push(row);
+                            } else {
+                                kept.push(row);
+                            }
+                        }
+                        child.rows = kept;
+                        // Whatever referenced these rows needs the same
+                        // treatment in the next generation.
+                        if !removed_here.is_empty() {
+                            next.push((dependent.table.clone(), removed_here));
+                        }
+                    }
+                }
+            }
+        }
+
+        if next.is_empty() {
+            return Ok(());
+        }
+        generation = next;
+    }
+
+    Err(EngineError::new(
+        1456,
+        "HY000",
+        "Cascading foreign key actions nest too deeply",
+    ))
+}
+
+/// Parses a stored expression, such as a column default or a CHECK body.
+fn parse_expression(text: &str) -> EngineResult<Expr> {
+    Parser::new(&MySqlDialect {})
+        .try_with_sql(text)
+        .and_then(|mut p| p.parse_expr())
+        .map_err(|e| EngineError::parse(format!("{e}")))
 }
 
 /// Builds a row of column defaults.

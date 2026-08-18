@@ -53,6 +53,11 @@ start plus 26.1s of `prisma migrate deploy`. See [`baseline-mysql.md`](baseline-
   idiom the migrations use for conditional DDL
 - **`sql_mode`** — `ANSI_QUOTES`, `PIPES_AS_CONCAT` and `IGNORE_SPACE` change how a
   statement is parsed and what it means
+- **Constraints** — primary and unique keys, `CHECK`, `NOT NULL`, generated columns
+  computed from the row, and foreign keys enforced on write with `CASCADE`, `SET NULL` and
+  `RESTRICT` on delete, cascading through chains
+- **Transactions** — `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` and `ROLLBACK TO SAVEPOINT`,
+  with writes and schema changes genuinely undone
 - **Sessions** — system variables including the connection preamble every driver reads,
   user variables that outlive the statement that set them, `SET`, `SHOW`
 - **`information_schema`** — `SCHEMATA`, `TABLES`, `COLUMNS`, `STATISTICS`,
@@ -86,10 +91,21 @@ union and stops parsing.
 ## What it does not do yet
 
 Named honestly, because the engine returns an error rather than a wrong answer for each:
-`INTERSECT` and `EXCEPT`, window frames and named windows, `CHECK` constraint enforcement,
-generated columns, foreign key enforcement, real transactions (`BEGIN`/`COMMIT` are
-accepted but nothing rolls back), and the state image that would make startup skip
-migrations entirely.
+`INTERSECT` and `EXCEPT`, window frames and named windows, and the state image that would
+make startup skip migrations entirely.
+
+Two limitations are worth stating rather than implying away.
+
+**Transactions do not isolate concurrent connections.** The catalog is shared, so a second
+connection sees uncommitted writes. Rollback restores only the tables the transaction
+actually wrote, so another connection's work on *other* tables survives — but if both
+wrote the same table, the rollback discards the other's committed rows too. That is
+correct enough for the fresh-process-per-test-file model this engine is built for, and
+wrong for anything else.
+
+**Rollback keeps a catalog snapshot rather than an undo log**, which is the honest trade
+for an in-memory engine holding a test-sized dataset; undo logging would be a great deal of
+machinery for a database that discards everything at process exit.
 
 ## Review hardening (engine)
 
@@ -152,6 +168,29 @@ unexpanded, because the success path jumped past the branches it had just emitte
 The reviewer also caught a third hand-rolled literal-and-comment scanner in a module whose
 own docstring says there is one. There is now genuinely one: `segments()` and the IN-list
 pass are both built on a single `classify` primitive.
+
+## Review hardening (constraints)
+
+Twelve findings on this work, all fixed. Four were serious:
+
+- **`ON DELETE RESTRICT` deleted the parent anyway.** The rows were written before the
+  cascade ran, so the constraint reported an error against a row that was already gone.
+  The existing test only asserted the error code, never that the row survived. DELETE and
+  UPDATE now apply to a copy that is swapped in only if the whole cascade succeeds.
+- **The cascade depth cap counted tables, not levels.** A hub with twenty referencing
+  tables tripped a limit meant for a twenty-deep cycle — and, because of the bug above,
+  did so after deleting the parent.
+- **`ROLLBACK` discarded another connection's committed work**, because it replaced the
+  whole shared catalog. It now restores only the tables the transaction wrote.
+- **`UPDATE` never enforced the parent side of a foreign key**, so changing a parent key
+  left children pointing at a value that no longer existed.
+
+The rest: a self-referencing multi-row `INSERT` could not see its own earlier rows;
+`INSERT IGNORE` turned a foreign key violation into a hard error instead of skipping the
+row; `SET NULL` wrote NULL into `NOT NULL` columns and poisoned the row; inline
+column-level `CHECK` was still refused; the 1451 message printed the constraint name where
+MySQL prints the child table; and a stray `SAVEPOINT` under autocommit opened a
+transaction, so a later `ROLLBACK` undid committed work.
 
 ## Two bugs worth remembering
 

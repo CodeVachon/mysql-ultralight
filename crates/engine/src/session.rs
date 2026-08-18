@@ -46,6 +46,13 @@ pub struct Session {
     /// outlive the statement that created them.
     pub prepared: BTreeMap<String, String>,
     pub in_transaction: bool,
+    /// The catalog as it stood when the transaction opened, plus any named
+    /// savepoints taken since.
+    ///
+    /// A whole-catalog copy is the honest trade for an in-memory test engine:
+    /// the data is small, and undo logging would be a great deal of machinery
+    /// for a database that discards everything at process exit.
+    pub transaction: Option<Transaction>,
     /// How many views deep evaluation currently is, so a self-referential view
     /// is refused rather than exhausting the stack.
     pub view_depth: usize,
@@ -69,6 +76,7 @@ impl Session {
             overrides: BTreeMap::new(),
             prepared: BTreeMap::new(),
             in_transaction: false,
+            transaction: None,
             view_depth: 0,
             parsed_mode,
             parsed_from,
@@ -239,6 +247,31 @@ impl Session {
         out.sort();
         out
     }
+}
+
+/// A transaction's undo state.
+/// A named point a transaction can be rolled back to.
+#[derive(Debug, Clone)]
+pub struct Savepoint {
+    pub name: String,
+    /// The catalog as it stood when the savepoint was taken.
+    pub catalog: crate::catalog::Catalog,
+    /// Tables written before it, so a rollback knows what to restore.
+    pub modified: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Transaction {
+    /// The catalog at BEGIN, restored by ROLLBACK.
+    pub opened: crate::catalog::Catalog,
+    /// Named savepoints, in the order they were taken.
+    pub savepoints: Vec<Savepoint>,
+    /// The `(database, table)` pairs this transaction has written to.
+    ///
+    /// Rollback restores only these. Replacing the whole catalog would discard
+    /// work another connection had already committed, since the catalog is
+    /// shared — turning a rollback into data loss for someone else.
+    pub modified: Vec<(String, String)>,
 }
 
 /// Strips a `GLOBAL.` / `SESSION.` / `LOCAL.` prefix and lowercases the rest.
