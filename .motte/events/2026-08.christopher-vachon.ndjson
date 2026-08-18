@@ -60,3 +60,5 @@
 {"at":"2026-08-18T18:52:38Z","id":24,"by":"Christopher Vachon","as":"user","type":"created","title":"Executor gaps: GROUP BY, UNION, window functions","state":"Todo"}
 {"at":"2026-08-18T19:06:55Z","id":24,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
 {"at":"2026-08-18T19:16:06Z","id":24,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-08-18T19:37:32Z","id":23,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-08-18T19:41:19Z","id":23,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}

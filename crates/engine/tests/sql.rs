@@ -1868,3 +1868,66 @@ fn aggregating_binary_data_preserves_it() {
         "the bytes must survive the fold"
     );
 }
+
+/// MySQL accepts an IN list whose elements are scalar subqueries. It is
+/// rewritten into a UNION ALL, so this checks the result, not just the parse.
+#[test]
+fn in_a_list_of_scalar_subqueries() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Pick (id INT NOT NULL, want VARCHAR(21))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Pick VALUES (1, 'a'), (2, 'c')",
+    );
+
+    let picked = rows(
+        &engine,
+        &mut session,
+        "SELECT id FROM Widget WHERE id IN (
+            (SELECT want FROM Pick WHERE id = 1 LIMIT 1),
+            (SELECT want FROM Pick WHERE id = 2 LIMIT 1)
+         ) ORDER BY id",
+    );
+    assert_eq!(picked, vec![vec!["a"], vec!["c"]]);
+
+    let excluded = rows(
+        &engine,
+        &mut session,
+        "SELECT id FROM Widget WHERE id NOT IN (
+            (SELECT want FROM Pick WHERE id = 1 LIMIT 1),
+            (SELECT want FROM Pick WHERE id = 2 LIMIT 1)
+         )",
+    );
+    assert_eq!(excluded, vec![vec!["b"]]);
+}
+
+/// An ordinary IN list must keep working; the rewrite only applies to a list
+/// whose every element is a parenthesised SELECT.
+#[test]
+fn an_ordinary_in_list_is_unaffected() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM Widget WHERE id IN ('a', 'c') ORDER BY id"
+        ),
+        vec![vec!["a"], vec!["c"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM Widget WHERE id IN (SELECT id FROM Widget WHERE count > 2)"
+        ),
+        vec![vec!["a"]]
+    );
+}

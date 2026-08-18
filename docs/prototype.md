@@ -66,16 +66,22 @@ The conformance extractor can measure the engine's front end as well as sqlparse
 
 | | sqlparser-rs alone | mysql-ultralight front end |
 |---|---|---|
-| Migrations | 94.6% | **100.0%** |
+| Migrations | 94.6% | **100.0%** (3,161 of 3,161) |
 | Provisioning dumps | 100% | 100% |
 | Application raw SQL | 99.0% | 99.0% |
 | **Total** | **96.3%** | **99.9%** |
 
-Four statements remain. Three are artifacts of recovering SQL from `Prisma.sql` templates,
-where an interpolation stands for a whole clause rather than a value, so the complete
-statement never exists in source. The fourth is a genuine gap, tracked as motte #0023: an
-`IN` list whose elements are scalar subqueries, which MySQL accepts and sqlparser-rs reads
-as `IN (subquery)` before failing on the comma.
+Three statements remain, all artifacts of recovering SQL from `Prisma.sql` templates, where
+an interpolation stands for a whole clause rather than a value — the complete statement
+never exists in source, so nothing can parse it. **No statement in the 604 migrations or the
+provisioning dumps is rejected.**
+
+The last genuine gap was an `IN` list whose elements are scalar subqueries, which MySQL
+accepts and sqlparser-rs reads as `IN (subquery)` before failing on the comma. It is
+rewritten into `IN ((SELECT a) UNION ALL (SELECT b))`, which is equivalent and which the
+engine already supports. The branches keep their parentheses deliberately: a branch may end
+in `LIMIT`, and `SELECT ... LIMIT 1 UNION ALL SELECT ...` binds the LIMIT to the whole
+union and stops parsing.
 
 ## What it does not do yet
 
@@ -129,6 +135,23 @@ The rest: views reported every column as text rather than its real type, were mi
 `CREATE TABLE` that would then be permanently unreachable; a correlated subquery with no
 `FROM` lost the outer row; and every `SELECT` deep-copied its row set to support a
 widening only correlated subqueries need.
+
+## Review hardening (IN lists)
+
+Six findings on the rewrite, all fixed. One was a process-killing panic: the check for
+"is this element a parenthesised SELECT" sliced the first six *bytes*, which aborts when a
+multi-byte character straddles the boundary. It needed no `SELECT` at all —
+`WHERE (a,b) IN (('日本', 1), ('x', 2))` was enough, and with `panic = "abort"` in the
+release profile that takes the whole server down rather than one connection.
+
+Two more turned valid SQL invalid: the element test never checked that the leading and
+trailing parentheses were *matched*, so `(SELECT a) + (b)` looked like a subquery, and the
+keyword test had no word boundary, so `(selected)` did too. A third left a nested list
+unexpanded, because the success path jumped past the branches it had just emitted.
+
+The reviewer also caught a third hand-rolled literal-and-comment scanner in a module whose
+own docstring says there is one. There is now genuinely one: `segments()` and the IN-list
+pass are both built on a single `classify` primitive.
 
 ## Two bugs worth remembering
 

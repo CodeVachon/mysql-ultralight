@@ -102,6 +102,10 @@ pub fn normalise(sql: &str, mode: SqlMode) -> String {
         out = replace_outside_literals(&out, ":=", "=");
     }
 
+    // MySQL accepts an IN list whose elements are scalar subqueries; the
+    // parser reads the first as `IN (subquery)` and then fails on the comma.
+    out = expand_in_subquery_lists(&out);
+
     // Under ANSI_QUOTES a double-quoted word is an identifier. Rewriting it to
     // a backtick gives the parser the same meaning without a custom dialect,
     // which sqlparser cannot honour anyway: its MySQL-specific parsing is
@@ -153,71 +157,77 @@ fn segments(sql: &str) -> Vec<(Segment, usize, usize)> {
     let mut code_start = 0usize;
     let mut i = 0usize;
 
-    let flush_code = |out: &mut Vec<(Segment, usize, usize)>, start: usize, end: usize| {
-        if end > start {
-            out.push((Segment::Code, start, end));
-        }
-    };
-
     while i < bytes.len() {
-        match bytes[i] {
-            q @ (b'\'' | b'"' | b'`') => {
-                flush_code(&mut out, code_start, i);
-                let start = i;
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' && q != b'`' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == q {
-                        if bytes.get(i + 1) == Some(&q) {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
+        // One primitive decides where a literal or comment ends; everything
+        // that needs the distinction calls it rather than re-deriving it.
+        match classify(bytes, i) {
+            Some((kind, end)) => {
+                if i > code_start {
+                    out.push((Segment::Code, code_start, i));
                 }
-                i = (i + 1).min(bytes.len());
-                out.push((Segment::Quoted, start, i));
-                code_start = i;
+                out.push((kind, i, end));
+                code_start = end;
+                i = end;
             }
-            b'#' => {
-                flush_code(&mut out, code_start, i);
-                let start = i;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                out.push((Segment::Comment, start, i));
-                code_start = i;
-            }
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                flush_code(&mut out, code_start, i);
-                let start = i;
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                out.push((Segment::Comment, start, i));
-                code_start = i;
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                flush_code(&mut out, code_start, i);
-                let start = i;
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(bytes.len());
-                out.push((Segment::Comment, start, i));
-                code_start = i;
-            }
-            _ => i += 1,
+            None => i += 1,
         }
     }
 
-    flush_code(&mut out, code_start, sql.len());
+    if sql.len() > code_start {
+        out.push((Segment::Code, code_start, sql.len()));
+    }
     out
+}
+
+/// Classifies a literal or comment starting at `i`, and where it ends.
+///
+/// Returns `None` when `i` is ordinary code. This is the single place that
+/// knows MySQL's quoting and comment rules; implementing it per rewriter is
+/// what produced three separate bugs in this module before.
+fn classify(bytes: &[u8], i: usize) -> Option<(Segment, usize)> {
+    match bytes[i] {
+        q @ (b'\'' | b'"' | b'`') => {
+            let mut j = i + 1;
+            while j < bytes.len() {
+                if bytes[j] == b'\\' && q != b'`' {
+                    j += 2;
+                    continue;
+                }
+                if bytes[j] == q {
+                    // A doubled quote is an escaped quote, not a close.
+                    if bytes.get(j + 1) == Some(&q) {
+                        j += 2;
+                        continue;
+                    }
+                    break;
+                }
+                j += 1;
+            }
+            Some((Segment::Quoted, (j + 1).min(bytes.len())))
+        }
+        b'#' => {
+            let mut j = i;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            Some((Segment::Comment, j))
+        }
+        b'-' if bytes.get(i + 1) == Some(&b'-') => {
+            let mut j = i;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            Some((Segment::Comment, j))
+        }
+        b'/' if bytes.get(i + 1) == Some(&b'*') => {
+            let mut j = i + 2;
+            while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                j += 1;
+            }
+            Some((Segment::Comment, (j + 2).min(bytes.len())))
+        }
+        _ => None,
+    }
 }
 
 /// Splits into whitespace-separated words, skipping comments and keeping
@@ -303,6 +313,186 @@ fn double_quotes_to_backticks(sql: &str) -> String {
         }
     }
     out
+}
+
+/// Rewrites `IN ((SELECT a), (SELECT b))` as `IN ((SELECT a) UNION ALL (SELECT b))`.
+///
+/// The two are equivalent for the shapes that appear in practice, and the
+/// second is one both the parser and the executor already handle. Only a list
+/// of two or more parenthesised SELECTs is rewritten, so `IN (SELECT ...)` and
+/// ordinary value lists are untouched.
+///
+/// One divergence worth knowing: MySQL treats each element as a *scalar*
+/// subquery and raises ER_SUBQUERY_NO_1_ROW when one returns several rows. As
+/// a UNION ALL it becomes ordinary set membership, so that error is not
+/// raised. Every occurrence in the target corpus carries `LIMIT 1`, so the
+/// case does not arise there.
+fn expand_in_subquery_lists(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        // Literals and comments are copied verbatim; `IN` inside one is text.
+        if let Some((_, end)) = classify(bytes, i) {
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+
+        let is_in_keyword = bytes.len() - i >= 2
+            && bytes[i..i + 2].eq_ignore_ascii_case(b"IN")
+            && i.checked_sub(1).is_none_or(|p| !is_ident_byte(bytes[p]))
+            && bytes.get(i + 2).is_none_or(|b| !is_ident_byte(*b));
+
+        if !is_in_keyword {
+            let len = utf8_len(bytes[i]);
+            out.push_str(&sql[i..(i + len).min(sql.len())]);
+            i += len;
+            continue;
+        }
+
+        // Whitespace *and comments* may sit between the keyword and the list.
+        let open = skip_trivia(bytes, i + 2);
+        let Some(close) = (bytes.get(open) == Some(&b'('))
+            .then(|| matching_paren(bytes, open))
+            .flatten()
+        else {
+            out.push_str(&sql[i..i + 2]);
+            i += 2;
+            continue;
+        };
+
+        let inner = &sql[open + 1..close];
+        let parts = split_top_level_commas(inner);
+        if parts.len() < 2 || !parts.iter().all(|p| is_parenthesised_select(p)) {
+            out.push_str(&sql[i..i + 2]);
+            i += 2;
+            continue;
+        }
+
+        out.push_str(&sql[i..open]);
+        out.push('(');
+        let branches: Vec<String> = parts
+            .iter()
+            // Each branch keeps its parentheses: one may end in LIMIT, and
+            // `SELECT ... LIMIT 1 UNION ALL SELECT ...` binds the LIMIT to the
+            // whole union and stops parsing. Branches are expanded in turn so a
+            // nested list is not left behind.
+            .map(|p| expand_in_subquery_lists(p.trim()))
+            .collect();
+        out.push_str(&branches.join(" UNION ALL "));
+        out.push(')');
+        i = close + 1;
+    }
+
+    out
+}
+
+/// Whether an IN-list element is a single parenthesised SELECT.
+///
+/// Both halves matter. Without checking that the parentheses match,
+/// `(SELECT a) + (b)` looks like one; without a word boundary after the
+/// keyword, so does `(selected)`. Rewriting either turns valid SQL invalid.
+fn is_parenthesised_select(element: &str) -> bool {
+    let trimmed = element.trim();
+    let bytes = trimmed.as_bytes();
+
+    // A leading comment is common in generated migration SQL, so it is skipped
+    // rather than treated as the element not starting with a parenthesis.
+    let open = skip_trivia(bytes, 0);
+    if bytes.get(open) != Some(&b'(') {
+        return false;
+    }
+    // The opening parenthesis must close at the end, or the element is an
+    // expression that merely begins with one.
+    let Some(close) = matching_paren(bytes, open) else {
+        return false;
+    };
+    if skip_trivia(bytes, close + 1) != trimmed.len() {
+        return false;
+    }
+
+    let inner = trimmed[open + 1..close].trim_start();
+    // `get` rather than a byte slice: an element may hold multi-byte text, and
+    // slicing to a fixed byte length panics when it lands mid-character.
+    inner
+        .get(..6)
+        .is_some_and(|word| word.eq_ignore_ascii_case("SELECT"))
+        && inner.as_bytes().get(6).is_none_or(|b| !is_ident_byte(*b))
+}
+
+/// Advances past whitespace and comments.
+fn skip_trivia(bytes: &[u8], mut i: usize) -> usize {
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        // The end of input is not trivia, and `classify` indexes the byte.
+        if i >= bytes.len() {
+            return i;
+        }
+        match classify(bytes, i) {
+            Some((Segment::Comment, end)) => i = end,
+            _ => return i,
+        }
+    }
+}
+
+/// The index of the parenthesis closing the one at `open`.
+fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        if let Some(end) = classify(bytes, i).map(|(_, end)| end) {
+            i = end;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Splits on commas that are not inside parentheses, literals or comments.
+fn split_top_level_commas(inner: &str) -> Vec<&str> {
+    let bytes = inner.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if let Some(end) = classify(bytes, i).map(|(_, end)| end) {
+            i = end;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                parts.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&inner[start..]);
+    parts
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
 /// Removes whitespace between an identifier and a following `(`, in code only.
@@ -591,5 +781,159 @@ mod review_regressions {
         assert_eq!(unquote(r#""db"."t""#), "db.t");
         assert_eq!(unquote("`db`.`t`"), "db.t");
         assert_eq!(unquote("plain"), "plain");
+    }
+}
+
+#[cfg(test)]
+mod in_list_expansion {
+    use super::*;
+
+    fn expand(sql: &str) -> String {
+        normalise(sql, SqlMode::default())
+    }
+
+    /// MySQL accepts an IN list of scalar subqueries; the parser reads the
+    /// first as `IN (subquery)` and fails on the comma.
+    #[test]
+    fn a_list_of_subqueries_becomes_a_union() {
+        assert_eq!(
+            expand("SELECT a FROM t WHERE b IN ((SELECT x FROM u), (SELECT y FROM v))"),
+            "SELECT a FROM t WHERE b IN ((SELECT x FROM u) UNION ALL (SELECT y FROM v))"
+        );
+    }
+
+    #[test]
+    fn three_or_more_branches_chain() {
+        assert_eq!(
+            expand("WHERE b IN ((SELECT 1), (SELECT 2), (SELECT 3))"),
+            "WHERE b IN ((SELECT 1) UNION ALL (SELECT 2) UNION ALL (SELECT 3))"
+        );
+    }
+
+    /// Shapes the parser already handles must be left exactly as they are.
+    #[test]
+    fn ordinary_in_lists_are_untouched() {
+        for sql in [
+            "WHERE b IN (1, 2, 3)",
+            "WHERE b IN (SELECT x FROM u)",
+            "WHERE b IN ((SELECT x FROM u))",
+            "WHERE b IN ('a', 'b')",
+            "WHERE b IN (f(1), g(2))",
+            "WHERE b NOT IN (1, 2)",
+        ] {
+            assert_eq!(expand(sql), sql, "{sql} should be unchanged");
+        }
+    }
+
+    #[test]
+    fn not_in_is_expanded_too() {
+        assert_eq!(
+            expand("WHERE b NOT IN ((SELECT 1), (SELECT 2))"),
+            "WHERE b NOT IN ((SELECT 1) UNION ALL (SELECT 2))"
+        );
+    }
+
+    /// A branch that ends in LIMIT must keep its parentheses, or the LIMIT
+    /// binds to the whole union and the statement no longer parses.
+    #[test]
+    fn a_branch_with_limit_keeps_its_parentheses() {
+        assert_eq!(
+            expand("WHERE b IN ((SELECT id FROM t LIMIT 1), (SELECT id FROM u LIMIT 1))"),
+            "WHERE b IN ((SELECT id FROM t LIMIT 1) UNION ALL (SELECT id FROM u LIMIT 1))"
+        );
+    }
+
+    /// A comma inside a branch belongs to that branch, not the list.
+    #[test]
+    fn commas_inside_a_branch_do_not_split_it() {
+        assert_eq!(
+            expand("WHERE b IN ((SELECT GREATEST(1, 2)), (SELECT 3))"),
+            "WHERE b IN ((SELECT GREATEST(1, 2)) UNION ALL (SELECT 3))"
+        );
+    }
+
+    /// `IN` inside a literal, an identifier or a comment is text.
+    #[test]
+    fn the_keyword_is_matched_only_as_a_word() {
+        for sql in [
+            "SELECT 'IN ((SELECT 1), (SELECT 2))' FROM t",
+            "SELECT `IN` FROM t",
+            "SELECT a FROM t -- IN ((SELECT 1), (SELECT 2))",
+            "SELECT joined FROM t",
+        ] {
+            assert_eq!(expand(sql), sql, "{sql} should be unchanged");
+        }
+    }
+}
+
+#[cfg(test)]
+mod in_list_review_regressions {
+    use super::*;
+
+    fn expand(sql: &str) -> String {
+        normalise(sql, SqlMode::default())
+    }
+
+    /// Slicing to a fixed byte length panics when it lands mid-character, and
+    /// `panic = "abort"` in the release profile takes the server with it. No
+    /// SELECT is needed to reach it: an ordinary tuple list is enough.
+    #[test]
+    fn a_non_ascii_in_list_does_not_panic() {
+        for sql in [
+            "SELECT * FROM t WHERE (a,b) IN (('日本', 1), ('x', 2))",
+            "WHERE b IN ((SELECT 1), ('日本語'))",
+            "WHERE b IN ((日), (本))",
+            "WHERE b IN ((sé), (x))",
+        ] {
+            // Unchanged is the right answer; not crashing is the point.
+            assert_eq!(expand(sql), sql, "{sql}");
+        }
+    }
+
+    /// An element that merely begins with a parenthesis is not a subquery.
+    /// Rewriting it produces SQL that no longer parses.
+    #[test]
+    fn an_expression_starting_with_a_paren_is_not_rewritten() {
+        for sql in [
+            "WHERE b IN ((SELECT x)+(y), (SELECT z))",
+            "WHERE b IN ((SELECT a FROM t) * (SELECT 2), (SELECT c))",
+        ] {
+            assert_eq!(expand(sql), sql, "{sql} must be left alone");
+        }
+    }
+
+    /// The keyword test needs a word boundary, or `(selected)` looks like a
+    /// subquery.
+    #[test]
+    fn a_word_merely_starting_with_select_is_not_a_subquery() {
+        assert_eq!(
+            expand("WHERE b IN ((selected), (selects))"),
+            "WHERE b IN ((selected), (selects))"
+        );
+    }
+
+    /// The success path used to jump past the branches it emitted, leaving a
+    /// nested list to hit the very error this pass removes.
+    #[test]
+    fn a_nested_list_is_expanded_too() {
+        assert_eq!(
+            expand("WHERE b IN ((SELECT 1), (SELECT x FROM u WHERE y IN ((SELECT 2),(SELECT 3))))"),
+            "WHERE b IN ((SELECT 1) UNION ALL \
+             (SELECT x FROM u WHERE y IN ((SELECT 2) UNION ALL (SELECT 3))))"
+        );
+    }
+
+    /// Machine-generated migration SQL carries comments freely, both before
+    /// the list and inside it.
+    #[test]
+    fn comments_do_not_suppress_the_rewrite() {
+        assert_eq!(
+            expand("WHERE b IN /* x */ ((SELECT 1), (SELECT 2))"),
+            "WHERE b IN /* x */ ((SELECT 1) UNION ALL (SELECT 2))"
+        );
+        assert_eq!(
+            expand("WHERE b IN (/* x */ (SELECT 1), (SELECT 2))"),
+            "WHERE b IN (/* x */ (SELECT 1) UNION ALL (SELECT 2))"
+        );
     }
 }
