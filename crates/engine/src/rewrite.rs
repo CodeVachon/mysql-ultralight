@@ -102,6 +102,13 @@ pub fn normalise(sql: &str, mode: SqlMode) -> String {
         out = replace_outside_literals(&out, ":=", "=");
     }
 
+    // `DELETE a.*, b.* FROM ...` is the canonical multi-table spelling, and
+    // the parser rejects the star. The `.*` carries no meaning MySQL does not
+    // already take from the table name, so it is dropped.
+    if starts_with_keyword(&out, "DELETE") {
+        out = strip_delete_target_stars(&out);
+    }
+
     // MySQL accepts an IN list whose elements are scalar subqueries; the
     // parser reads the first as `IN (subquery)` and then fails on the comma.
     out = expand_in_subquery_lists(&out);
@@ -177,6 +184,59 @@ fn segments(sql: &str) -> Vec<(Segment, usize, usize)> {
         out.push((Segment::Code, code_start, sql.len()));
     }
     out
+}
+
+/// Removes the `.*` from each target of a multi-table DELETE.
+///
+/// Only the text before the first `FROM` is touched, so a `SELECT a.*` inside a
+/// subquery in the WHERE clause keeps its star.
+fn strip_delete_target_stars(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+
+    for (kind, start, end) in segments(sql) {
+        if kind != Segment::Code {
+            out.push_str(&sql[start..end]);
+            continue;
+        }
+
+        let mut i = start;
+        while i < end {
+            if bytes[i] == b'.' && bytes.get(i + 1) == Some(&b'*') {
+                i += 2;
+                continue;
+            }
+            // Everything from the target list's `FROM` onward is left alone.
+            if word_at(bytes, i, b"FROM") {
+                out.push_str(&sql[i..]);
+                return out;
+            }
+            let next = sql[i..end]
+                .char_indices()
+                .nth(1)
+                .map(|(offset, _)| i + offset)
+                .unwrap_or(end);
+            out.push_str(&sql[i..next]);
+            i = next;
+        }
+    }
+
+    out
+}
+
+/// Whether `word` appears at `i` as a whole word, ignoring case.
+fn word_at(bytes: &[u8], i: usize, word: &[u8]) -> bool {
+    let is_word_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    if i > 0 && is_word_byte(bytes[i - 1]) {
+        return false;
+    }
+    if bytes.len() < i + word.len() {
+        return false;
+    }
+    if !bytes[i..i + word.len()].eq_ignore_ascii_case(word) {
+        return false;
+    }
+    bytes.get(i + word.len()).is_none_or(|b| !is_word_byte(*b))
 }
 
 /// Classifies a literal or comment starting at `i`, and where it ends.

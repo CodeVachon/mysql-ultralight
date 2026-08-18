@@ -482,9 +482,9 @@ fn unsupported_features_error_rather_than_guess() {
     let (engine, mut session) = engine();
     widgets(&engine, &mut session);
 
-    // The list shrinks as features land; GROUP BY, window functions and CHECK
-    // constraints all used to be here.
-    let sql = "SELECT id FROM Widget INTERSECT SELECT id FROM Widget";
+    // The list shrinks as features land; GROUP BY, window functions, CHECK
+    // constraints and INTERSECT all used to be here. Named windows remain.
+    let sql = "SELECT id FROM Widget WINDOW w AS (ORDER BY id)";
     let err = engine.execute(&mut session, sql, &[]).unwrap_err();
     assert_eq!(err.code, 1235, "expected ER_NOT_SUPPORTED_YET for: {sql}");
 }
@@ -1665,10 +1665,12 @@ fn an_unsupported_window_function_errors() {
     let (engine, mut session) = engine();
     sales(&engine, &mut session);
 
+    // A window frame is still refused; the function itself is supported now.
     let err = engine
         .execute(
             &mut session,
-            "SELECT LAG(amount) OVER (ORDER BY id) FROM Sale",
+            "SELECT SUM(amount) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+             FROM Sale",
             &[],
         )
         .unwrap_err();
@@ -2786,4 +2788,874 @@ fn a_savepoint_outside_a_transaction_does_not_open_one() {
         rows(&engine, &mut session, "SELECT COUNT(*) FROM Widget"),
         vec![vec!["4"]]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-table DML, set operators and positional windows. Motte #0028.
+// ---------------------------------------------------------------------------
+
+/// The shape the migrations use 57 times: update one table from a join with
+/// another.
+#[test]
+fn a_multi_table_update_writes_through_a_join() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Bump (id VARCHAR(21) NOT NULL, amount INT, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Bump VALUES ('a', 10), ('c', 20)",
+    );
+
+    run(
+        &engine,
+        &mut session,
+        "UPDATE Widget JOIN Bump ON Bump.id = Widget.id SET Widget.count = Bump.amount",
+    );
+
+    let after = rows(
+        &engine,
+        &mut session,
+        "SELECT id, count FROM Widget ORDER BY id",
+    );
+    assert_eq!(
+        after,
+        vec![vec!["a", "10"], vec!["b", "1"], vec!["c", "20"]]
+    );
+}
+
+#[test]
+fn a_multi_table_update_can_write_to_both_sides() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE A (id INT NOT NULL, v INT, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE B (id INT NOT NULL, v INT, PRIMARY KEY (id))",
+    );
+    run(&engine, &mut session, "INSERT INTO A VALUES (1, 0)");
+    run(&engine, &mut session, "INSERT INTO B VALUES (1, 0)");
+
+    run(
+        &engine,
+        &mut session,
+        "UPDATE A JOIN B ON B.id = A.id SET A.v = 7, B.v = 9",
+    );
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT v FROM A"),
+        vec![vec!["7"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT v FROM B"),
+        vec![vec!["9"]]
+    );
+}
+
+/// A WHERE on a joined UPDATE selects which base rows are written.
+#[test]
+fn a_multi_table_update_honours_its_where_clause() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Bump (id VARCHAR(21) NOT NULL, amount INT, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Bump VALUES ('a', 10), ('c', 20)",
+    );
+
+    run(
+        &engine,
+        &mut session,
+        "UPDATE Widget JOIN Bump ON Bump.id = Widget.id SET Widget.count = 0 WHERE Bump.amount > 15",
+    );
+
+    let after = rows(
+        &engine,
+        &mut session,
+        "SELECT id, count FROM Widget ORDER BY id",
+    );
+    assert_eq!(after, vec![vec!["a", "3"], vec!["b", "1"], vec!["c", "0"]]);
+}
+
+#[test]
+fn a_multi_table_delete_removes_from_the_named_table() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Doomed (id VARCHAR(21) NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Doomed VALUES ('a'), ('c')",
+    );
+
+    run(
+        &engine,
+        &mut session,
+        "DELETE Widget FROM Widget JOIN Doomed ON Doomed.id = Widget.id",
+    );
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Widget ORDER BY id"),
+        vec![vec!["b"]]
+    );
+    // The joined-to table is untouched unless it is named.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Doomed"),
+        vec![vec!["2"]]
+    );
+}
+
+#[test]
+fn a_multi_table_delete_can_name_both_tables() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE A (id INT NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE B (id INT NOT NULL, PRIMARY KEY (id))",
+    );
+    run(&engine, &mut session, "INSERT INTO A VALUES (1), (2)");
+    run(&engine, &mut session, "INSERT INTO B VALUES (1)");
+
+    run(
+        &engine,
+        &mut session,
+        "DELETE A, B FROM A JOIN B ON B.id = A.id",
+    );
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM A"),
+        vec![vec!["2"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM B"),
+        vec![vec!["0"]]
+    );
+}
+
+#[test]
+fn intersect_and_except_compare_result_sets() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let both = rows(
+        &engine,
+        &mut session,
+        "SELECT rep FROM Sale WHERE region = 'north'
+         INTERSECT
+         SELECT rep FROM Sale WHERE region = 'south'",
+    );
+    assert_eq!(both, vec![vec!["ann"]]);
+
+    let only_north = rows(
+        &engine,
+        &mut session,
+        "SELECT rep FROM Sale WHERE region = 'north'
+         EXCEPT
+         SELECT rep FROM Sale WHERE region = 'south'",
+    );
+    assert_eq!(only_north, vec![vec!["bob"]]);
+}
+
+#[test]
+fn lag_and_lead_read_neighbouring_rows() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE S (id INT NOT NULL, v INT, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO S VALUES (1, 10), (2, 20), (3, 30)",
+    );
+
+    let shifted = rows(
+        &engine,
+        &mut session,
+        "SELECT id, LAG(v) OVER (ORDER BY id), LEAD(v) OVER (ORDER BY id) FROM S ORDER BY id",
+    );
+    assert_eq!(
+        shifted,
+        vec![
+            vec!["1", "NULL", "20"],
+            vec!["2", "10", "30"],
+            vec!["3", "20", "NULL"],
+        ]
+    );
+}
+
+#[test]
+fn lag_takes_an_offset_and_a_default() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE S (id INT NOT NULL, v INT, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO S VALUES (1, 10), (2, 20), (3, 30)",
+    );
+
+    let shifted = rows(
+        &engine,
+        &mut session,
+        "SELECT LAG(v, 2, 0) OVER (ORDER BY id) FROM S ORDER BY id",
+    );
+    assert_eq!(shifted, vec![vec!["0"], vec!["0"], vec!["10"]]);
+}
+
+/// MySQL's default frame ends at the current row, so LAST_VALUE is the current
+/// row rather than the end of the partition. Reading it as the partition's last
+/// value is a classic trap.
+#[test]
+fn first_value_and_last_value_follow_the_default_frame() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE S (id INT NOT NULL, v INT, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO S VALUES (1, 10), (2, 20), (3, 30)",
+    );
+
+    let framed = rows(
+        &engine,
+        &mut session,
+        "SELECT FIRST_VALUE(v) OVER (ORDER BY id), LAST_VALUE(v) OVER (ORDER BY id)
+         FROM S ORDER BY id",
+    );
+    assert_eq!(
+        framed,
+        vec![vec!["10", "10"], vec!["10", "20"], vec!["10", "30"]]
+    );
+}
+
+// --- Multi-table DML, set operators and positional windows -----------------
+//
+// Every test below is a regression for a review finding where the engine
+// produced a *wrong answer* rather than an error — the one failure mode a
+// test database cannot have.
+
+/// Two tables joined by a foreign key, for the multi-table DML tests.
+fn parent_child(engine: &Engine, session: &mut Session) {
+    run(
+        engine,
+        session,
+        "CREATE TABLE Parent (
+            id INTEGER NOT NULL,
+            label VARCHAR(20) NOT NULL,
+            PRIMARY KEY (id)
+        )",
+    );
+    run(
+        engine,
+        session,
+        "CREATE TABLE Child (
+            id INTEGER NOT NULL,
+            parentId INTEGER NOT NULL,
+            note VARCHAR(20) NULL,
+            PRIMARY KEY (id),
+            CONSTRAINT Child_parent FOREIGN KEY (parentId)
+                REFERENCES Parent(id) ON DELETE CASCADE ON UPDATE CASCADE
+        )",
+    );
+    run(
+        engine,
+        session,
+        "INSERT INTO Parent (id, label) VALUES (1, 'one'), (2, 'two')",
+    );
+    run(
+        engine,
+        session,
+        "INSERT INTO Child (id, parentId, note) VALUES (10, 1, 'a'), (11, 1, 'b'), (12, 2, 'c')",
+    );
+}
+
+#[test]
+fn a_multi_table_delete_without_a_target_is_refused() {
+    // `DELETE FROM a JOIN b` used to empty *both* tables. MySQL rejects the
+    // syntax, so an error is the only safe answer.
+    let (engine, mut session) = engine();
+    parent_child(&engine, &mut session);
+
+    let sql = "DELETE FROM Parent JOIN Child ON Child.parentId = Parent.id";
+    let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+    assert_eq!(err.code, 1064);
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Parent").len(),
+        2
+    );
+    assert_eq!(rows(&engine, &mut session, "SELECT id FROM Child").len(), 3);
+}
+
+#[test]
+fn a_multi_table_delete_removes_only_the_named_table() {
+    let (engine, mut session) = engine();
+    parent_child(&engine, &mut session);
+
+    let removed = affected(
+        &engine,
+        &mut session,
+        "DELETE Child FROM Child JOIN Parent ON Child.parentId = Parent.id \
+         WHERE Parent.label = 'one'",
+    );
+    assert_eq!(removed, 2);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Parent").len(),
+        2
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Child ORDER BY id"),
+        vec![vec!["12"]]
+    );
+}
+
+#[test]
+fn a_multi_table_delete_resolves_aliases_to_their_base_table() {
+    // The target is named by its alias; the rows live in the base table. Using
+    // the alias as a catalog key silently found nothing.
+    let (engine, mut session) = engine();
+    parent_child(&engine, &mut session);
+
+    let removed = affected(
+        &engine,
+        &mut session,
+        "DELETE c FROM Child c JOIN Parent p ON c.parentId = p.id WHERE p.id = 2",
+    );
+    assert_eq!(removed, 1);
+    assert_eq!(rows(&engine, &mut session, "SELECT id FROM Child").len(), 2);
+}
+
+#[test]
+fn a_multi_table_delete_cascades_after_every_named_table_is_cleared() {
+    // Cascading between removals shifted the row indices the remaining
+    // deletions were captured against, destroying the wrong rows.
+    let (engine, mut session) = engine();
+    parent_child(&engine, &mut session);
+
+    // Both tables are named, so a cascade run between the two removals would
+    // shift the indices the second one was captured against.
+    let removed = affected(
+        &engine,
+        &mut session,
+        "DELETE p, c FROM Parent p JOIN Child c ON c.parentId = p.id \
+         WHERE p.id = 2 AND c.id = 12",
+    );
+    assert_eq!(removed, 2);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Parent ORDER BY id"),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Child ORDER BY id"),
+        vec![vec!["10"], vec!["11"]]
+    );
+}
+
+#[test]
+fn a_multi_table_delete_of_one_table_through_two_aliases() {
+    // Two aliases are two join sources over one row vector. Deleting per
+    // source applied the second set's indices to an already-shortened table,
+    // which destroyed rows the statement never selected.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N (id INTEGER NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO N (id) VALUES (1), (2), (3), (4), (5), (6)",
+    );
+
+    let removed = affected(
+        &engine,
+        &mut session,
+        "DELETE x, y FROM N x JOIN N y ON x.id = 1 AND y.id = 3",
+    );
+    assert_eq!(removed, 2);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM N ORDER BY id"),
+        vec![vec!["2"], vec!["4"], vec!["5"], vec!["6"]]
+    );
+}
+
+#[test]
+fn naming_one_table_twice_in_a_multi_table_delete_is_refused() {
+    let (engine, mut session) = engine();
+    parent_child(&engine, &mut session);
+
+    let err = engine
+        .execute(
+            &mut session,
+            "DELETE Child, Child FROM Child JOIN Parent ON Child.parentId = Parent.id",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1066);
+    assert_eq!(rows(&engine, &mut session, "SELECT id FROM Child").len(), 3);
+}
+
+#[test]
+fn a_join_whose_sources_share_a_name_is_refused() {
+    // `source_index` takes the first match, so without this the write lands on
+    // whichever table happens to come first — not the one that was named.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (id INTEGER NOT NULL, v INTEGER NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T2 (id INTEGER NOT NULL, v INTEGER NOT NULL, PRIMARY KEY (id))",
+    );
+    run(&engine, &mut session, "INSERT INTO T VALUES (1, 1), (2, 2)");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO T2 VALUES (1, 1), (2, 2)",
+    );
+
+    let err = engine
+        .execute(
+            &mut session,
+            "DELETE t FROM T2 t JOIN T ON 1 = 1 WHERE t.id = 1",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1066);
+
+    let err = engine
+        .execute(&mut session, "UPDATE T2 t JOIN T ON 1 = 1 SET t.v = 9", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1066);
+
+    // Neither table was touched.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT v FROM T2 ORDER BY id"),
+        vec![vec!["1"], vec!["2"]]
+    );
+}
+
+#[test]
+fn the_canonical_delete_star_spelling_works() {
+    let (engine, mut session) = engine();
+    parent_child(&engine, &mut session);
+
+    let removed = affected(
+        &engine,
+        &mut session,
+        "DELETE c.* FROM Child c JOIN Parent p ON c.parentId = p.id WHERE p.id = 2",
+    );
+    assert_eq!(removed, 1);
+    assert_eq!(rows(&engine, &mut session, "SELECT id FROM Child").len(), 2);
+}
+
+#[test]
+fn a_joined_update_applies_every_assignment_to_the_same_row() {
+    // Each assignment used to be applied against a separately re-read row, so
+    // only the last one survived.
+    let (engine, mut session) = engine();
+    parent_child(&engine, &mut session);
+
+    let updated = affected(
+        &engine,
+        &mut session,
+        "UPDATE Child c JOIN Parent p ON c.parentId = p.id \
+         SET c.note = 'x', c.parentId = 2 WHERE c.id = 10",
+    );
+    assert_eq!(updated, 1);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT note, parentId FROM Child WHERE id = 10"
+        ),
+        vec![vec!["x", "2"]]
+    );
+}
+
+#[test]
+fn a_joined_update_counts_rows_not_assignments() {
+    let (engine, mut session) = engine();
+    parent_child(&engine, &mut session);
+
+    let updated = affected(
+        &engine,
+        &mut session,
+        "UPDATE Child c JOIN Parent p ON c.parentId = p.id \
+         SET c.note = 'y', c.id = c.id WHERE p.id = 1",
+    );
+    assert_eq!(updated, 2, "two rows changed, not four assignments");
+}
+
+#[test]
+fn a_joined_update_enforces_foreign_keys() {
+    let (engine, mut session) = engine();
+    parent_child(&engine, &mut session);
+
+    let err = engine
+        .execute(
+            &mut session,
+            "UPDATE Child c JOIN Parent p ON c.parentId = p.id SET c.parentId = 99",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1452);
+    // The refusal left every row as it was.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT parentId FROM Child ORDER BY id"
+        ),
+        vec![vec!["1"], vec!["1"], vec!["2"]]
+    );
+}
+
+#[test]
+fn a_joined_update_cascades_to_children() {
+    let (engine, mut session) = engine();
+    parent_child(&engine, &mut session);
+
+    let updated = affected(
+        &engine,
+        &mut session,
+        "UPDATE Parent p JOIN Child c ON c.parentId = p.id SET p.id = 7 WHERE p.id = 2",
+    );
+    assert_eq!(updated, 1);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT parentId FROM Child WHERE id = 12"
+        ),
+        vec![vec!["7"]]
+    );
+}
+
+#[test]
+fn an_ambiguous_unqualified_update_target_is_refused() {
+    let (engine, mut session) = engine();
+    parent_child(&engine, &mut session);
+    run(
+        engine.as_ref(),
+        &mut session,
+        "ALTER TABLE Parent ADD COLUMN note VARCHAR(20) NULL",
+    );
+
+    let err = engine
+        .execute(
+            &mut session,
+            "UPDATE Child c JOIN Parent p ON c.parentId = p.id SET note = 'z'",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1052);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT note FROM Child ORDER BY id"),
+        vec![vec!["a"], vec!["b"], vec!["c"]]
+    );
+}
+
+#[test]
+fn a_joined_update_refuses_to_write_a_generated_column() {
+    let (engine, mut session) = engine();
+    parent_child(&engine, &mut session);
+    run(
+        engine.as_ref(),
+        &mut session,
+        "ALTER TABLE Child ADD COLUMN shout VARCHAR(40) \
+         GENERATED ALWAYS AS (UPPER(note)) STORED",
+    );
+
+    for sql in [
+        "UPDATE Child c JOIN Parent p ON c.parentId = p.id SET c.shout = 'NO'",
+        // Second position: the check used to run only for the first
+        // assignment to a table, so this one wrote nothing and said nothing.
+        "UPDATE Child c JOIN Parent p ON c.parentId = p.id SET c.note = 'q', c.shout = 'NO'",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 3105, "expected 3105 for: {sql}");
+    }
+
+    // Nothing was written on the way to either refusal.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT note FROM Child ORDER BY id"),
+        vec![vec!["a"], vec!["b"], vec!["c"]]
+    );
+}
+
+#[test]
+fn intersect_all_and_except_all_are_multiset_operations() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Tally (id INTEGER NOT NULL, name VARCHAR(10) NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Tally (id, name) VALUES (1, 'dup'), (2, 'dup'), (3, 'dup'), (4, 'solo')",
+    );
+
+    // Three 'dup' rows on the left, two on the right: ALL keeps two, not three.
+    let kept = rows(
+        &engine,
+        &mut session,
+        "SELECT name FROM Tally WHERE name = 'dup' \
+         INTERSECT ALL \
+         SELECT name FROM Tally WHERE id IN (1, 2)",
+    );
+    assert_eq!(kept, vec![vec!["dup"], vec!["dup"]]);
+
+    // EXCEPT ALL cancels one occurrence per matching right-hand row.
+    let left = rows(
+        &engine,
+        &mut session,
+        "SELECT name FROM Tally WHERE name = 'dup' \
+         EXCEPT ALL \
+         SELECT name FROM Tally WHERE id = 1",
+    );
+    assert_eq!(left, vec![vec!["dup"], vec!["dup"]]);
+
+    // Without ALL both stay set operations.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT name FROM Tally WHERE name = 'dup' \
+             INTERSECT \
+             SELECT name FROM Tally WHERE id IN (1, 2)"
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT name FROM Tally WHERE name = 'dup' \
+             EXCEPT \
+             SELECT name FROM Tally WHERE id = 1"
+        )
+        .len(),
+        0
+    );
+}
+
+#[test]
+fn a_non_constant_lag_offset_is_refused() {
+    // Defaulting a computed offset to 1 answers a different question than the
+    // one asked, without saying so.
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT LAG(name, count) OVER (ORDER BY id) FROM Widget",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1235);
+
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT LEAD(name, 1, name) OVER (ORDER BY id) FROM Widget",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1235);
+
+    // A constant offset still works.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT LAG(name, 1, 'none') OVER (ORDER BY id) FROM Widget"
+        ),
+        vec![vec!["none"], vec!["alpha"], vec!["beta"]]
+    );
+}
+
+#[test]
+fn dml_clauses_that_are_not_implemented_are_refused() {
+    // Each of these parses and used to be dropped on the floor, which turns a
+    // one-row statement into a whole-table one.
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    for sql in [
+        "UPDATE Widget SET count = 9 LIMIT 1",
+        "UPDATE Widget SET count = 9 ORDER BY id LIMIT 1",
+        "DELETE FROM Widget LIMIT 1",
+        "DELETE FROM Widget ORDER BY id LIMIT 1",
+        "DELETE FROM Widget USING Widget WHERE id = 'a'",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1235, "expected ER_NOT_SUPPORTED_YET for: {sql}");
+    }
+
+    // Every row survived every refusal.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT count FROM Widget ORDER BY id"
+        ),
+        vec![vec!["3"], vec!["1"], vec!["2"]]
+    );
+}
+
+#[test]
+fn an_out_of_scope_qualifier_is_an_unknown_column() {
+    // The evaluator used to fall back to an unqualified lookup, so a wrong
+    // alias bound to another table's same-named column and drove real writes.
+    let (engine, mut session) = engine();
+    parent_child(&engine, &mut session);
+
+    for sql in [
+        "SELECT zz.id FROM Child",
+        "UPDATE Child c JOIN Parent p ON c.parentId = p.id SET c.note = 'x' WHERE zz.id = 10",
+        "DELETE c FROM Child c JOIN Parent p ON c.parentId = p.id WHERE zz.id = 10",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1054, "expected ER_BAD_FIELD_ERROR for: {sql}");
+    }
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT note FROM Child ORDER BY id"),
+        vec![vec!["a"], vec!["b"], vec!["c"]]
+    );
+}
+
+#[test]
+fn a_self_join_update_counts_each_physical_row_once() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE S (id INTEGER NOT NULL, v INTEGER NOT NULL, PRIMARY KEY (id))",
+    );
+    run(&engine, &mut session, "INSERT INTO S VALUES (1, 1), (2, 2)");
+
+    let updated = affected(
+        &engine,
+        &mut session,
+        "UPDATE S x JOIN S y ON y.id = x.id SET x.v = 7",
+    );
+    assert_eq!(updated, 2, "two rows, not one per alias");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT v FROM S ORDER BY id"),
+        vec![vec!["7"], vec!["7"]]
+    );
+}
+
+#[test]
+fn a_windowed_aggregate_with_order_by_runs_to_the_current_row() {
+    // The default frame is RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW.
+    // Folding the whole partition instead reports the final total on every
+    // row, which is a different query than the one asked.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE W (id INTEGER NOT NULL, g INTEGER NOT NULL, v INTEGER NOT NULL,
+         PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO W VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30)",
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT SUM(v) OVER (ORDER BY id) FROM W ORDER BY id"
+        ),
+        vec![vec!["10"], vec!["30"], vec!["60"]]
+    );
+
+    // In RANGE mode the current row means the last of its peer group, so tied
+    // keys share one running total.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) OVER (ORDER BY g) FROM W ORDER BY id"
+        ),
+        vec![vec!["2"], vec!["2"], vec!["3"]]
+    );
+
+    // LAST_VALUE reads the end of that same frame.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT LAST_VALUE(v) OVER (ORDER BY g) FROM W ORDER BY id"
+        ),
+        vec![vec!["20"], vec!["20"], vec!["30"]]
+    );
+
+    // Without ORDER BY the frame is the whole partition.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT SUM(v) OVER (PARTITION BY g) FROM W ORDER BY id"
+        ),
+        vec![vec!["30"], vec!["30"], vec!["30"]]
+    );
+}
+
+#[test]
+fn a_negative_lag_offset_is_refused() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT LAG(name, -1) OVER (ORDER BY id) FROM Widget",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1210);
 }

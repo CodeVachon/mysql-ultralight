@@ -1,5 +1,6 @@
 //! Statement execution.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use mysql_ultralight_protocol::ColumnType;
@@ -222,12 +223,28 @@ impl Engine {
         match statement {
             Statement::Query(query) => self.query(session, query).map(Outcome::Rows),
             Statement::Insert(insert) => self.insert(session, insert),
-            Statement::Update(update) => self.update(
-                session,
-                &update.table,
-                &update.assignments,
-                update.selection.as_ref(),
-            ),
+            Statement::Update(update) => {
+                // Anything not read below would be silently dropped, which for
+                // LIMIT means updating every row instead of one.
+                if update.from.is_some() {
+                    return Err(unsupported("UPDATE ... FROM"));
+                }
+                if !update.order_by.is_empty() {
+                    return Err(unsupported("ORDER BY in an UPDATE"));
+                }
+                if update.limit.is_some() {
+                    return Err(unsupported("LIMIT in an UPDATE"));
+                }
+                if update.returning.is_some() {
+                    return Err(unsupported("RETURNING"));
+                }
+                self.update(
+                    session,
+                    &update.table,
+                    &update.assignments,
+                    update.selection.as_ref(),
+                )
+            }
             Statement::Delete(delete) => self.delete(session, delete),
 
             Statement::CreateTable(create) => ddl::create_table(self, session, create),
@@ -509,14 +526,6 @@ impl Engine {
             } => {
                 use sqlparser::ast::{SetOperator, SetQuantifier};
 
-                // Reject an unsupported operator before running either side,
-                // so the error names the real problem rather than whatever the
-                // branches happen to hit first.
-                match op {
-                    SetOperator::Union => {}
-                    other => return Err(unsupported(format!("{other}"))),
-                }
-
                 let mut left = self.set_expr(session, left, outer)?;
                 let right = self.set_expr(session, right, outer)?;
 
@@ -528,14 +537,47 @@ impl Engine {
                     ));
                 }
 
-                // Column names come from the first branch, as in MySQL.
-                left.rows.extend(right.rows);
-
-                // UNION removes duplicates; only UNION ALL keeps them.
-                if !matches!(
+                // All three operators keep the first branch's column names,
+                // and all three remove duplicates unless ALL is given.
+                let all = matches!(
                     set_quantifier,
                     SetQuantifier::All | SetQuantifier::AllByName
-                ) {
+                );
+
+                // With ALL, INTERSECT and EXCEPT are multiset operations: a row
+                // appearing twice on the right cancels two rows on the left, not
+                // all of them. Plain set membership gets those counts wrong.
+                match op {
+                    SetOperator::Union => left.rows.extend(right.rows),
+                    SetOperator::Intersect => {
+                        let mut available = row_counts(&right.rows);
+                        left.rows
+                            .retain(|row| match available.get_mut(&row_key(row)) {
+                                Some(remaining) if *remaining > 0 => {
+                                    if all {
+                                        *remaining -= 1;
+                                    }
+                                    true
+                                }
+                                _ => false,
+                            });
+                    }
+                    SetOperator::Except | SetOperator::Minus => {
+                        let mut available = row_counts(&right.rows);
+                        left.rows
+                            .retain(|row| match available.get_mut(&row_key(row)) {
+                                Some(remaining) if *remaining > 0 => {
+                                    if all {
+                                        *remaining -= 1;
+                                    }
+                                    false
+                                }
+                                _ => true,
+                            });
+                    }
+                }
+
+                if !all {
                     dedupe(&mut left.rows);
                 }
                 Ok(left)
@@ -606,6 +648,12 @@ impl Engine {
             if keep {
                 matching.push(row);
             }
+        }
+
+        // A WINDOW clause defines names the projection can reference. Ignoring
+        // it would answer a different query than the one that was asked.
+        if !select.named_window.is_empty() {
+            return Err(unsupported("named windows"));
         }
 
         let group_exprs = match &select.group_by {
@@ -735,10 +783,13 @@ impl Engine {
 
         let null_right = vec![Value::Null; right.columns.len()];
         let null_left = vec![Value::Null; left.columns.len()];
+        let unmatched_right: Vec<Option<usize>> = vec![None; right.sources.len()];
+        let unmatched_left: Vec<Option<usize>> = vec![None; left.sources.len()];
         let mut rows = Vec::new();
+        let mut origins: Vec<Vec<Option<usize>>> = Vec::new();
         let mut right_matched = vec![false; right.rows.len()];
 
-        for left_row in &left.rows {
+        for (left_index, left_row) in left.rows.iter().enumerate() {
             let mut matched = false;
             for (i, right_row) in right.rows.iter().enumerate() {
                 let mut combined = left_row.clone();
@@ -763,6 +814,9 @@ impl Engine {
                     matched = true;
                     right_matched[i] = true;
                     rows.push(combined);
+                    let mut origin = left.origins[left_index].clone();
+                    origin.extend(right.origins[i].iter().copied());
+                    origins.push(origin);
                 }
             }
             // A LEFT JOIN keeps the left row even with no match, padded right.
@@ -770,6 +824,9 @@ impl Engine {
                 let mut combined = left_row.clone();
                 combined.extend_from_slice(&null_right);
                 rows.push(combined);
+                let mut origin = left.origins[left_index].clone();
+                origin.extend(unmatched_right.iter().copied());
+                origins.push(origin);
             }
         }
 
@@ -779,11 +836,24 @@ impl Engine {
                     let mut combined = null_left.clone();
                     combined.extend_from_slice(right_row);
                     rows.push(combined);
+                    let mut origin = unmatched_left.clone();
+                    origin.extend(right.origins[i].iter().copied());
+                    origins.push(origin);
                 }
             }
         }
 
-        Ok(Relation { columns, rows })
+        let mut sources = left.sources.clone();
+        sources.extend(right.sources.iter().cloned());
+        let mut base_tables = left.base_tables.clone();
+        base_tables.extend(right.base_tables.iter().cloned());
+        Ok(Relation {
+            columns,
+            rows,
+            sources,
+            base_tables,
+            origins,
+        })
     }
 
     /// Materialises one table factor.
@@ -823,11 +893,16 @@ impl Engine {
                         .cloned()
                         .ok_or_else(|| EngineError::no_such_table(&table_name))?
                 };
-                // An alias replaces the table name for qualified references.
+                // An alias replaces the table name for qualified references,
+                // but a write still has to find the table it came from — and a
+                // self-join is only expressible with aliases, so both are kept.
+                let base_name = table.name.clone();
                 if let Some(alias) = alias {
                     table.name = alias.name.value.clone();
                 }
-                Ok(Relation::from_table(&db, &table))
+                let mut relation = Relation::from_table(&db, &table);
+                relation.base_tables = vec![base_name];
+                Ok(relation)
             }
             TableFactor::Derived {
                 subquery, alias, ..
@@ -849,7 +924,11 @@ impl Engine {
                             nullable: c.nullable,
                         })
                         .collect(),
+                    // A derived table has no base row to write back to.
+                    origins: vec![Vec::new(); inner.rows.len()],
                     rows: inner.rows,
+                    sources: Vec::new(),
+                    base_tables: Vec::new(),
                 })
             }
             other => Err(unsupported(format!("FROM item `{other}`"))),
@@ -1067,6 +1146,31 @@ impl Engine {
             }
             ordered.sort_by(|a, b| compare_keys(&a.0, &b.0, &descending));
 
+            // The default frame is RANGE BETWEEN UNBOUNDED PRECEDING AND
+            // CURRENT ROW, and in RANGE mode "current row" means the last row
+            // of the current row's peer group — every row with an equal ORDER
+            // BY key. Without ORDER BY the frame is the whole partition.
+            let frame_end: Vec<usize> = if spec.order_by.is_empty() {
+                vec![ordered.len().saturating_sub(1); ordered.len()]
+            } else {
+                let mut ends = vec![0usize; ordered.len()];
+                let mut start = 0usize;
+                while start < ordered.len() {
+                    let mut end = start;
+                    while end + 1 < ordered.len()
+                        && compare_keys(&ordered[end + 1].0, &ordered[start].0, &descending)
+                            == std::cmp::Ordering::Equal
+                    {
+                        end += 1;
+                    }
+                    for slot in ends.iter_mut().take(end + 1).skip(start) {
+                        *slot = end;
+                    }
+                    start = end + 1;
+                }
+                ends
+            };
+
             match name.as_str() {
                 "row_number" => {
                     for (position, (_, index)) in ordered.iter().enumerate() {
@@ -1089,20 +1193,83 @@ impl Engine {
                         previous = Some(key.clone());
                     }
                 }
-                // An aggregate with OVER and no frame folds over the whole
-                // partition, so every row in it gets the same value.
+                // Positional functions read another row of the frame rather
+                // than folding it.
+                "lag" | "lead" | "first_value" | "last_value" => {
+                    let args = function_arguments(f);
+                    let Some(subject) = args.first() else {
+                        return Err(unsupported(format!("{name}() without an argument")));
+                    };
+                    // A non-literal offset or default would otherwise fall
+                    // back to 1 / NULL, silently answering a different
+                    // question than the one asked.
+                    let offset = match args.get(1) {
+                        None => 1,
+                        Some(argument) => expr::literal_of(argument)
+                            .and_then(|v| v.as_int())
+                            .ok_or_else(|| {
+                                unsupported(format!("a non-constant offset in {name}()"))
+                            })?,
+                    };
+                    // A negative offset would turn LAG into LEAD and back
+                    // rather than reporting the mistake.
+                    if offset < 0 {
+                        return Err(EngineError::new(
+                            1210,
+                            "HY000",
+                            format!("Incorrect arguments to {name}"),
+                        ));
+                    }
+                    let fallback = match args.get(2) {
+                        None => Value::Null,
+                        Some(argument) => expr::literal_of(argument).ok_or_else(|| {
+                            unsupported(format!("a non-constant default in {name}()"))
+                        })?,
+                    };
+
+                    for (position, (_, index)) in ordered.iter().enumerate() {
+                        let target = match name.as_str() {
+                            "lag" => position as i64 - offset,
+                            "lead" => position as i64 + offset,
+                            "first_value" => 0,
+                            // The default frame ends at the current row, so
+                            // LAST_VALUE reads the end of the frame rather than
+                            // the end of the partition — a classic trap. With
+                            // tied ORDER BY keys that is the last peer, not the
+                            // current row.
+                            _ => frame_end[position] as i64,
+                        };
+                        out[*index] =
+                            match usize::try_from(target).ok().and_then(|t| ordered.get(t)) {
+                                Some((_, source)) => evaluate(subject, matching[*source])?,
+                                None => fallback.clone(),
+                            };
+                    }
+                }
                 other if is_aggregate(other) => {
-                    let group: Vec<&Vec<Value>> = partition.iter().map(|i| matching[*i]).collect();
-                    let value = self.fold(
-                        session,
-                        other,
-                        argument.as_ref(),
-                        refs,
-                        &group,
-                        aggregate_is_distinct(f),
-                    )?;
-                    for index in partition {
-                        out[*index] = value.clone();
+                    // With ORDER BY the aggregate runs to the end of the
+                    // current row's peer group rather than over the whole
+                    // partition, so it accumulates down the ordering. Peers
+                    // share a frame, so each frame is folded once.
+                    let mut position = 0usize;
+                    while position < ordered.len() {
+                        let end = frame_end[position];
+                        let group: Vec<&Vec<Value>> = ordered[..=end]
+                            .iter()
+                            .map(|(_, index)| matching[*index])
+                            .collect();
+                        let value = self.fold(
+                            session,
+                            other,
+                            argument.as_ref(),
+                            refs,
+                            &group,
+                            aggregate_is_distinct(f),
+                        )?;
+                        for (_, index) in &ordered[position..=end] {
+                            out[*index] = value.clone();
+                        }
+                        position = end + 1;
                     }
                 }
                 other => return Err(unsupported(format!("window function `{other}()`"))),
@@ -1128,9 +1295,10 @@ impl Engine {
                 let table = parts
                     .get(parts.len().wrapping_sub(2))
                     .map(|p| p.value.as_str());
-                relation
-                    .index_of(table, name)
-                    .or_else(|| relation.index_of(None, name))
+                // No unqualified fallback: `zz.id` must not quietly resolve
+                // to some other table's `id`. Leaving it unresolved sends it
+                // down the expression path, which reports 1054.
+                relation.index_of(table, name)
             }
             _ => None,
         };
@@ -1781,7 +1949,7 @@ impl Engine {
         selection: Option<&Expr>,
     ) -> EngineResult<Outcome> {
         if !table.joins.is_empty() {
-            return Err(unsupported("multi-table UPDATE"));
+            return self.update_joined(session, table, assignments, selection);
         }
         let TableFactor::Table { name, .. } = &table.relation else {
             return Err(unsupported("this UPDATE target"));
@@ -1892,17 +2060,222 @@ impl Engine {
         Ok(Outcome::affected(updated))
     }
 
+    /// `UPDATE a JOIN b ON ... SET a.x = ..., b.y = ...`.
+    ///
+    /// The join is materialised, so each output row remembers which base row it
+    /// came from; without that there is nothing to write back to.
+    fn update_joined(
+        &self,
+        session: &mut Session,
+        from: &TableWithJoins,
+        assignments: &[Assignment],
+        selection: Option<&Expr>,
+    ) -> EngineResult<Outcome> {
+        let db = session
+            .current_database
+            .clone()
+            .ok_or_else(EngineError::no_database)?;
+        let session_snapshot = session.clone();
+
+        let relation = self.build_relation(&session_snapshot, from)?;
+        reject_duplicate_sources(&relation)?;
+        let refs = relation.refs();
+
+        // Each assignment is resolved to a source table and a column within it.
+        struct Target {
+            source: usize,
+            column: String,
+            value: Expr,
+        }
+        let mut targets: Vec<Target> = Vec::with_capacity(assignments.len());
+        for assignment in assignments {
+            let name = assignment_column(&assignment.target)?;
+            let qualifier = assignment_qualifier(&assignment.target);
+
+            // An unqualified name that matches more than one joined table is
+            // ambiguous; picking the first would write to an arbitrary one.
+            if qualifier.is_none() {
+                let matches = relation
+                    .columns
+                    .iter()
+                    .filter(|c| c.name.eq_ignore_ascii_case(&name))
+                    .count();
+                if matches > 1 {
+                    return Err(EngineError::new(
+                        1052,
+                        "23000",
+                        format!("Column '{name}' in field list is ambiguous"),
+                    ));
+                }
+            }
+
+            let index = relation
+                .index_of(qualifier.as_deref(), &name)
+                .ok_or_else(|| EngineError::unknown_column(&name, "field list"))?;
+            let source = relation
+                .source_index(&relation.columns[index].table)
+                .ok_or_else(|| unsupported("updating a derived table or view"))?;
+            targets.push(Target {
+                source,
+                column: relation.columns[index].name.clone(),
+                value: assignment.value.clone(),
+            });
+        }
+
+        let mut catalog = self.catalog_mut()?;
+
+        // Parent keys are captured per table before anything is written, as in
+        // the single-table path.
+        let mut parents: BTreeMap<usize, Vec<foreign_keys::ParentKeys>> = BTreeMap::new();
+        {
+            let database = catalog
+                .database(&db)
+                .ok_or_else(|| EngineError::unknown_database(&db))?;
+            for target in &targets {
+                let base = &relation.base_tables[target.source];
+                let table = database
+                    .table(base)
+                    .ok_or_else(|| EngineError::no_such_table(base))?;
+
+                // Every target is checked, not just the first per table, and
+                // before any row is examined: whether writing to a generated
+                // column is an error must not depend on whether a row matched.
+                if table
+                    .column(&target.column)
+                    .is_some_and(|c| c.generated.is_some())
+                {
+                    return Err(EngineError::new(
+                        3105,
+                        "HY000",
+                        format!(
+                            "The value specified for generated column '{}' in table '{base}' \
+                             is not allowed.",
+                            target.column
+                        ),
+                    ));
+                }
+
+                parents
+                    .entry(target.source)
+                    .or_insert_with(|| foreign_keys::snapshot(database, table));
+            }
+        }
+
+        let database = catalog
+            .database_mut(&db)
+            .ok_or_else(|| EngineError::unknown_database(&db))?;
+        let mut working = database.clone();
+
+        // MySQL updates each base row at most once however many join rows it
+        // appears in, and every assignment to that table applies to it.
+        let mut seen: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
+        let mut updated = 0u64;
+        let mut changes: BTreeMap<usize, Vec<MovedRow>> = BTreeMap::new();
+
+        for (row_index, row) in relation.rows.iter().enumerate() {
+            let ctx = Context {
+                row: Some(Row {
+                    schema: &refs,
+                    values: row,
+                }),
+                session: &session_snapshot,
+                subqueries: Some(self),
+            };
+            let matched = match selection {
+                Some(p) => expr::eval(p, &ctx)?.truthy() == Some(true),
+                None => true,
+            };
+            if !matched {
+                continue;
+            }
+
+            for source in 0..relation.sources.len() {
+                if !targets.iter().any(|t| t.source == source) {
+                    continue;
+                }
+                let Some(Some(origin)) = relation.origins[row_index].get(source).copied() else {
+                    continue;
+                };
+                let base = relation.base_tables[source].clone();
+                // Keyed by the base table, not the join position: a self-join
+                // reaches one physical row through two aliases, and MySQL
+                // updates — and counts — it once.
+                if !seen.insert((base.to_ascii_lowercase(), origin)) {
+                    continue;
+                }
+
+                let table = working
+                    .table_mut(&base)
+                    .ok_or_else(|| EngineError::no_such_table(&base))?;
+
+                let before = table.rows[origin].clone();
+                let mut candidate = before.clone();
+                for target in targets.iter().filter(|t| t.source == source) {
+                    let slot = table
+                        .column_index(&target.column)
+                        .ok_or_else(|| EngineError::unknown_column(&target.column, "field list"))?;
+                    let value = expr::eval(&target.value, &ctx)?;
+                    candidate[slot] = table.columns[slot].ty.coerce(value, &target.column)?;
+                }
+
+                let candidate = self.finalise_row(table, candidate, &session_snapshot)?;
+                if let Some(snapshot) = parents.get(&source) {
+                    foreign_keys::check(snapshot, &candidate, &base)?;
+                }
+                let rows = table.rows.clone();
+                table.check_unique_against(&rows, &candidate, origin)?;
+
+                table.rows[origin] = candidate.clone();
+                changes.entry(source).or_default().push((before, candidate));
+                // Counted per row, not per assignment.
+                updated += 1;
+            }
+        }
+
+        // Children follow a changed parent key here too.
+        let mut touched: Vec<String> = relation.base_tables.clone();
+        for (source, moved) in &changes {
+            let base = relation.base_tables[*source].clone();
+            cascade_update(&mut working, &base, moved, &mut touched)?;
+        }
+
+        *database = working;
+        mark_modified(session, &db, &touched);
+
+        session.affected_rows = updated;
+        Ok(Outcome::affected(updated))
+    }
+
     fn delete(
         &self,
         session: &mut Session,
         delete: &sqlparser::ast::Delete,
     ) -> EngineResult<Outcome> {
+        // As with UPDATE, a clause that is parsed but never read turns a
+        // precise statement into a broad one: `DELETE ... LIMIT 1` would empty
+        // the table.
+        if delete.using.is_some() {
+            return Err(unsupported("USING in a DELETE"));
+        }
+        if !delete.order_by.is_empty() {
+            return Err(unsupported("ORDER BY in a DELETE"));
+        }
+        if delete.limit.is_some() {
+            return Err(unsupported("LIMIT in a DELETE"));
+        }
+        if delete.returning.is_some() {
+            return Err(unsupported("RETURNING"));
+        }
+
         let from = match &delete.from {
             sqlparser::ast::FromTable::WithFromKeyword(t)
             | sqlparser::ast::FromTable::WithoutKeyword(t) => t,
         };
-        if from.len() != 1 || !from[0].joins.is_empty() {
-            return Err(unsupported("multi-table DELETE"));
+        if from.len() != 1 {
+            return Err(unsupported("comma-separated DELETE targets"));
+        }
+        if !from[0].joins.is_empty() || !delete.tables.is_empty() {
+            return self.delete_joined(session, delete, &from[0]);
         }
         let TableFactor::Table { name, .. } = &from[0].relation else {
             return Err(unsupported("this DELETE target"));
@@ -1960,6 +2333,148 @@ impl Engine {
         // self-referencing table does not see the rows it is cascading from.
         let mut touched = vec![table_name.clone()];
         cascade_delete(&mut working, &table_name, &removed_rows, &mut touched)?;
+        *database = working;
+        mark_modified(session, &db, &touched);
+
+        session.affected_rows = removed;
+        Ok(Outcome::affected(removed))
+    }
+
+    /// `DELETE a FROM a JOIN b ON ...`, where the named tables are the ones
+    /// rows are removed from and the join only decides which.
+    fn delete_joined(
+        &self,
+        session: &mut Session,
+        delete: &sqlparser::ast::Delete,
+        from: &TableWithJoins,
+    ) -> EngineResult<Outcome> {
+        let db = session
+            .current_database
+            .clone()
+            .ok_or_else(EngineError::no_database)?;
+        let session_snapshot = session.clone();
+
+        let relation = self.build_relation(&session_snapshot, from)?;
+        let refs = relation.refs();
+
+        // MySQL rejects `DELETE FROM a JOIN b` outright: with a join, the
+        // target has to be named. Defaulting to every table in the join would
+        // empty tables nobody asked to touch.
+        if delete.tables.is_empty() {
+            return Err(EngineError::parse(
+                "a multi-table DELETE must name the tables to delete from, \
+                 as in `DELETE a FROM a JOIN b ON ...`",
+            ));
+        }
+        reject_duplicate_sources(&relation)?;
+
+        let named: Vec<String> = delete
+            .tables
+            .iter()
+            .map(|t| {
+                t.0.last()
+                    .map(|p| p.to_string().trim_matches('`').to_owned())
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        let mut sources: Vec<usize> = Vec::with_capacity(named.len());
+        for name in &named {
+            let source = relation
+                .source_index(name)
+                .ok_or_else(|| EngineError::no_such_table(name))?;
+            // `DELETE t, t FROM ...` names one table twice; MySQL refuses it
+            // rather than deleting from it twice.
+            if sources.contains(&source) {
+                return Err(EngineError::new(
+                    1066,
+                    "42000",
+                    format!("Not unique table/alias: '{name}'"),
+                ));
+            }
+            sources.push(source);
+        }
+
+        // Collect first, delete after: removing as we go would shift the
+        // indices the remaining join rows point at.
+        let mut doomed: Vec<std::collections::HashSet<usize>> =
+            vec![std::collections::HashSet::new(); relation.sources.len()];
+
+        for (row_index, row) in relation.rows.iter().enumerate() {
+            let ctx = Context {
+                row: Some(Row {
+                    schema: &refs,
+                    values: row,
+                }),
+                session: &session_snapshot,
+                subqueries: Some(self),
+            };
+            let matched = match &delete.selection {
+                Some(p) => expr::eval(p, &ctx)?.truthy() == Some(true),
+                None => true,
+            };
+            if !matched {
+                continue;
+            }
+            for source in &sources {
+                if let Some(Some(origin)) = relation.origins[row_index].get(*source).copied() {
+                    doomed[*source].insert(origin);
+                }
+            }
+        }
+
+        let mut catalog = self.catalog_mut()?;
+        let database = catalog
+            .database_mut(&db)
+            .ok_or_else(|| EngineError::unknown_database(&db))?;
+        let mut working = database.clone();
+
+        let mut removed = 0u64;
+        let mut touched: Vec<String> = Vec::new();
+        let mut cascades: Vec<(String, Vec<Vec<Value>>)> = Vec::new();
+
+        // Two aliases of one table are two sources over a single row vector, so
+        // the sets are merged by base table. Deleting per source would apply
+        // the second set's pre-deletion indices to an already-shortened table.
+        let mut by_table: BTreeMap<String, std::collections::HashSet<usize>> = BTreeMap::new();
+        for source in &sources {
+            let indices = std::mem::take(&mut doomed[*source]);
+            by_table
+                .entry(relation.base_tables[*source].clone())
+                .or_default()
+                .extend(indices);
+        }
+
+        // Every named table's own rows go first. Cascading in between would
+        // shift the row indices the remaining sets were captured against.
+        for (table_name, indices) in by_table {
+            if indices.is_empty() {
+                continue;
+            }
+
+            let table = working
+                .table_mut(&table_name)
+                .ok_or_else(|| EngineError::no_such_table(&table_name))?;
+            let mut removed_rows = Vec::new();
+            let mut kept = Vec::with_capacity(table.rows.len());
+            for (index, row) in std::mem::take(&mut table.rows).into_iter().enumerate() {
+                if indices.contains(&index) {
+                    removed_rows.push(row);
+                } else {
+                    kept.push(row);
+                }
+            }
+            table.rows = kept;
+            removed += removed_rows.len() as u64;
+
+            touched.push(table_name.clone());
+            cascades.push((table_name, removed_rows));
+        }
+
+        for (table_name, removed_rows) in cascades {
+            cascade_delete(&mut working, &table_name, &removed_rows, &mut touched)?;
+        }
+
         *database = working;
         mark_modified(session, &db, &touched);
 
@@ -2238,8 +2753,12 @@ impl Engine {
             .collect();
 
         Ok(Relation {
+            // A view is materialised, so it has no base row to write back to.
+            origins: vec![Vec::new(); rows.rows.len()],
             columns,
             rows: rows.rows,
+            sources: Vec::new(),
+            base_tables: Vec::new(),
         })
     }
 
@@ -2527,6 +3046,30 @@ fn restore_tables(catalog: &mut Catalog, snapshot: &Catalog, tables: &[(String, 
     }
 }
 
+/// MySQL refuses a join in which two sources answer to the same name, because
+/// a qualified reference could not say which one it meant. Without this check
+/// `source_index` silently resolves to the first, so a write can land on a
+/// table the statement never named.
+fn reject_duplicate_sources(relation: &Relation) -> EngineResult<()> {
+    for (i, name) in relation.sources.iter().enumerate() {
+        if relation.sources[..i]
+            .iter()
+            .any(|earlier| earlier.eq_ignore_ascii_case(name))
+        {
+            return Err(EngineError::new(
+                1066,
+                "42000",
+                format!("Not unique table/alias: '{name}'"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A row before and after an UPDATE, which is what a cascade needs to match
+/// children against the old key and rewrite them with the new one.
+type MovedRow = (Vec<Value>, Vec<Value>);
+
 /// Applies each dependent table's ON UPDATE action after a parent key changes.
 ///
 /// Without this an UPDATE of a parent key leaves children pointing at a value
@@ -2535,7 +3078,7 @@ fn restore_tables(catalog: &mut Catalog, snapshot: &Catalog, tables: &[(String, 
 fn cascade_update(
     database: &mut Database,
     parent_table: &str,
-    changed: &[(Vec<Value>, Vec<Value>)],
+    changed: &[MovedRow],
     touched: &mut Vec<String>,
 ) -> EngineResult<()> {
     if changed.is_empty() {
@@ -2829,6 +3372,31 @@ fn apply_limit(result: &mut ResultSet, session: &Session, query: &Query) -> Engi
     Ok(())
 }
 
+/// The comparison key for a whole row, under the server's collation.
+fn row_key(row: &[Value]) -> Vec<String> {
+    row.iter()
+        .map(|v| {
+            if v.is_null() {
+                // NULL is its own value and must not collide with the empty
+                // string.
+                "\u{0}NULL".to_owned()
+            } else {
+                v.collation_key()
+            }
+        })
+        .collect()
+}
+
+/// How many times each row appears, for the multiset behaviour of
+/// INTERSECT ALL and EXCEPT ALL.
+fn row_counts(rows: &[Vec<Value>]) -> HashMap<Vec<String>, usize> {
+    let mut counts: HashMap<Vec<String>, usize> = HashMap::new();
+    for row in rows {
+        *counts.entry(row_key(row)).or_insert(0) += 1;
+    }
+    counts
+}
+
 /// Removes duplicate rows in place, preserving first-seen order.
 ///
 /// The key uses the same collation as comparison, so what DISTINCT and UNION
@@ -2839,18 +3407,7 @@ fn dedupe(rows: &mut Vec<Vec<Value>>) {
     let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
     let mut kept = Vec::with_capacity(rows.len());
     for row in std::mem::take(rows) {
-        // NULL is its own distinct value and must not collide with the empty
-        // string.
-        let key: Vec<String> = row
-            .iter()
-            .map(|v| {
-                if v.is_null() {
-                    "\u{0}NULL".to_owned()
-                } else {
-                    v.collation_key()
-                }
-            })
-            .collect();
+        let key = row_key(&row);
         if seen.insert(key) {
             kept.push(row);
         }
@@ -3171,6 +3728,19 @@ fn aggregate_argument(f: &sqlparser::ast::Function) -> Option<Expr> {
     list.args.iter().find_map(|arg| match arg {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.clone()),
         _ => None,
+    })
+}
+
+/// The table an assignment target names, if it was qualified.
+fn assignment_qualifier(target: &AssignmentTarget) -> Option<String> {
+    let AssignmentTarget::ColumnName(name) = target else {
+        return None;
+    };
+    (name.0.len() >= 2).then(|| {
+        name.0[name.0.len() - 2]
+            .to_string()
+            .trim_matches('`')
+            .to_owned()
     })
 }
 

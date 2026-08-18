@@ -25,6 +25,18 @@ pub struct RelColumn {
 pub struct Relation {
     pub columns: Vec<RelColumn>,
     pub rows: Vec<Vec<Value>>,
+    /// The names rows are addressed by in join order — an alias where one was
+    /// given, which is what a qualified column reference uses.
+    pub sources: Vec<String>,
+    /// The catalog tables behind those names, in the same order. A self-join is
+    /// only expressible with aliases, so writing back needs both.
+    pub base_tables: Vec<String>,
+    /// For each row, where it came from in each source table.
+    ///
+    /// A multi-table UPDATE has to write back to the row a join produced, and
+    /// a materialised copy cannot be traced without this. `None` marks the
+    /// padding an outer join adds for an unmatched side.
+    pub origins: Vec<Vec<Option<usize>>>,
 }
 
 impl Relation {
@@ -43,7 +55,17 @@ impl Relation {
                 })
                 .collect(),
             rows: table.rows.clone(),
+            sources: vec![table.name.clone()],
+            base_tables: vec![table.name.clone()],
+            origins: (0..table.rows.len()).map(|i| vec![Some(i)]).collect(),
         }
+    }
+
+    /// The ordinal of a source table, for writing a joined row back.
+    pub fn source_index(&self, table: &str) -> Option<usize> {
+        self.sources
+            .iter()
+            .position(|s| s.eq_ignore_ascii_case(table))
     }
 
     /// Column references in the shape the expression evaluator wants.

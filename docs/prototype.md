@@ -42,9 +42,11 @@ start plus 26.1s of `prisma migrate deploy`. See [`baseline-mysql.md`](baseline-
   functions
 - **Grouping** — `GROUP BY` over several columns, `HAVING`, aggregates folded inside larger
   expressions such as `SUM(a) / COUNT(*)`, `COUNT(DISTINCT x)`, and NULLs grouped together
-- **`UNION` and `UNION ALL`**
-- **Window functions** — `ROW_NUMBER`, `RANK`, `DENSE_RANK` and aggregates over
-  `OVER (PARTITION BY ... ORDER BY ...)`
+- **Set operators** — `UNION`, `INTERSECT` and `EXCEPT`, each with `ALL`
+- **Multi-table DML** — `UPDATE a JOIN b SET ...` and `DELETE a FROM a JOIN b`, writing back
+  through the join to the rows it came from
+- **Window functions** — `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `FIRST_VALUE`,
+  `LAST_VALUE` and aggregates over `OVER (PARTITION BY ... ORDER BY ...)`
 - **Subqueries** — scalar, `EXISTS`, `IN (SELECT ...)`, and correlated forms that reference
   the enclosing query's columns
 - **Views** — `CREATE`, `CREATE OR REPLACE`, `DROP`, materialised on read so they reflect
@@ -91,8 +93,10 @@ union and stops parsing.
 ## What it does not do yet
 
 Named honestly, because the engine returns an error rather than a wrong answer for each:
-`INTERSECT` and `EXCEPT`, window frames and named windows, and the state image that would
-make startup skip migrations entirely.
+explicit window frames (`ROWS`/`RANGE BETWEEN`), named `WINDOW` clauses, `NTH_VALUE`, a
+computed (non-constant) offset or default in `LAG`/`LEAD`, `ORDER BY` and `LIMIT` on an
+`UPDATE` or `DELETE`, `DELETE ... USING`, and the state image that would make startup skip
+migrations entirely.
 
 Two limitations are worth stating rather than implying away.
 
@@ -191,6 +195,65 @@ row; `SET NULL` wrote NULL into `NOT NULL` columns and poisoned the row; inline
 column-level `CHECK` was still refused; the 1451 message printed the constraint name where
 MySQL prints the child table; and a stray `SAVEPOINT` under autocommit opened a
 transaction, so a later `ROLLBACK` undid committed work.
+
+## Review hardening (multi-table DML)
+
+Twelve findings on this work, all fixed. The worst was unrecoverable data loss on a
+statement the real server refuses: **`DELETE FROM a JOIN b` emptied both tables.** With no
+explicit target list the code fell back to "every table in the join", reported two rows
+affected and destroyed the lot. MySQL rejects that syntax outright, so it is an error here
+now.
+
+Three more came from the same root cause — the relation recorded only the *alias* each row
+was addressed by, and a write needs the *base table* it came from:
+
+- **A joined UPDATE or DELETE through an alias found nothing**, because the alias was used
+  as a catalog key. `DELETE c FROM Child c JOIN Parent p ...` reported "table 'c' doesn't
+  exist". The relation now carries `sources` (what the SQL names a row by) and
+  `base_tables` (where the row lives) side by side; a self-join is only expressible with
+  aliases, so both are needed.
+- **A joined DELETE cascaded between removals**, so the row indices captured for the
+  remaining tables had already shifted and the wrong rows were destroyed. Every named
+  table's own rows are removed first, and only then do the cascades run.
+- **A joined UPDATE applied each assignment to a separately re-read row**, so of
+  `SET a = 1, b = 2` only the last one survived. All assignments now build one candidate
+  row, which is validated and written once.
+
+The rest: a joined UPDATE enforced no foreign keys and ran no `ON UPDATE` cascade at all;
+it counted affected rows per *assignment* rather than per row; an ambiguous unqualified
+`SET` target picked an arbitrary table instead of reporting 1052; a write to a generated
+column was only caught if some row happened to match; `INTERSECT ALL` and `EXCEPT ALL` used
+set membership where MySQL uses multiset arithmetic, so duplicate counts came out wrong;
+and a computed `LAG`/`LEAD` offset silently became 1, answering a different question than
+the one asked.
+
+A second review of the fixes found ten more, all fixed. The worst repeated the first
+pass's mistake one level down: **two aliases of one table are two join sources over a
+single row vector**, so deleting per source applied the second set's pre-deletion indices
+to an already-shortened table. `DELETE x, y FROM t x JOIN t y ON x.id = 1 AND y.id = 3`
+deleted ids 1 and *4*. The sets are merged by base table now. The same confusion let a
+join whose sources share a name — `DELETE t FROM t2 t JOIN t` — resolve to the first
+match and delete from `t2`; MySQL's 1066 covers that, and both joined paths raise it.
+
+Two were wrong answers this work made reachable rather than introduced:
+
+- **An out-of-scope qualifier fell back to an unqualified lookup.** `WHERE zz.v = 100`
+  bound to some other table's `v` and returned rows. Harmless-ish while only reads used
+  it; with joined UPDATE and DELETE it drives writes. Both the evaluator and the
+  projection planner now report 1054, as MySQL does.
+- **A windowed aggregate with `ORDER BY` folded the whole partition.**
+  `SUM(v) OVER (ORDER BY id)` returned the grand total on every row where MySQL returns a
+  running one. The default frame is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`,
+  and in RANGE mode "current row" means the last row of the peer group — so tied keys
+  share a total, and `LAST_VALUE` reads the last peer rather than the current row.
+
+The rest: `LIMIT`, `ORDER BY` and `USING` on an `UPDATE` or `DELETE` parsed and were
+dropped, so `DELETE ... LIMIT 1` emptied the table — all four are refused now; the
+generated-column check ran only for the first assignment to a table, so
+`SET note = 'q', shout = 'NO'` wrote nothing and said nothing; a self-join `UPDATE`
+counted one physical row once per alias; a negative `LAG` offset quietly behaved as
+`LEAD`; and `DELETE a.* FROM a JOIN b`, the canonical MySQL spelling, failed at the
+parser — the `.*` is now stripped before parsing.
 
 ## Two bugs worth remembering
 

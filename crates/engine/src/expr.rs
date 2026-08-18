@@ -151,7 +151,17 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             let table = parts
                 .get(parts.len().wrapping_sub(2))
                 .map(|i| i.value.as_str());
-            ctx.lookup(table, name).or_else(|_| ctx.lookup(None, name))
+            // No fallback to an unqualified lookup: an out-of-scope qualifier
+            // would otherwise bind to another table's same-named column and
+            // silently drive a write against the wrong rows.
+            ctx.lookup(table, name).map_err(|_| {
+                let shown = parts
+                    .iter()
+                    .map(|p| p.value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                EngineError::unknown_column(&shown, "field list")
+            })
         }
 
         Expr::Value(v) => literal(&v.value),
