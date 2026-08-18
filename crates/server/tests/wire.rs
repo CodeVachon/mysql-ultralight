@@ -92,7 +92,7 @@ async fn start_server(password: Option<String>) -> String {
         ..Default::default()
     };
     let server = Arc::new(Server::new(config));
-    tokio::spawn(async move { server.serve_tcp(listener, || TestHandler).await });
+    tokio::spawn(async move { server.serve_tcp(listener, |_| TestHandler).await });
 
     addr
 }
@@ -505,7 +505,7 @@ async fn start_rogue_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let server = Arc::new(Server::new(Config::default()));
-    tokio::spawn(async move { server.serve_tcp(listener, || RogueIdHandler).await });
+    tokio::spawn(async move { server.serve_tcp(listener, |_| RogueIdHandler).await });
     addr
 }
 

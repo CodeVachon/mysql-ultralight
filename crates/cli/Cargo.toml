@@ -14,4 +14,5 @@ path = "src/main.rs"
 [dependencies]
 mysql-ultralight-protocol = { workspace = true }
 mysql-ultralight-server = { workspace = true }
+mysql-ultralight-engine = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "signal", "io-util"] }

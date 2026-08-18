@@ -45,3 +45,9 @@
 {"at":"2026-08-18T15:51:57Z","id":20,"by":"Christopher Vachon","as":"user","type":"created","title":"Dynamic SQL: user variables, PREPARE, EXECUTE, DEALLOCATE","state":"Todo"}
 {"at":"2026-08-18T15:51:57Z","id":21,"by":"Christopher Vachon","as":"user","type":"created","title":"ALTER TABLE RENAME INDEX, and DROP EVENT","state":"Todo"}
 {"at":"2026-08-18T15:51:58Z","id":14,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-08-18T17:45:38Z","id":15,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-08-18T17:45:39Z","id":15,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-08-18T17:45:39Z","id":17,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-08-18T18:13:29Z","id":16,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-18T18:13:29Z","id":17,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-08-18T18:13:30Z","id":22,"by":"Christopher Vachon","as":"user","type":"created","title":"Working prototype: Prisma db push and Client CRUD","state":"Done"}

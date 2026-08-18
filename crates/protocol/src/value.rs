@@ -101,7 +101,16 @@ impl Value {
             ColumnType::Double => {
                 w.f64(self.as_f64().unwrap_or(0.0));
             }
-            // Everything else — strings, decimals, dates, JSON, blobs — is
+            // Temporal types have a packed binary form. Sending the text
+            // form instead makes a client read the string's length byte as a
+            // year: MySQL's own drivers panic rather than error on that.
+            ColumnType::Date | ColumnType::DateTime | ColumnType::Timestamp => {
+                encode_binary_datetime(w, &self.rendered());
+            }
+            ColumnType::Time => {
+                encode_binary_time(w, &self.rendered());
+            }
+            // Everything else — strings, decimals, JSON, blobs — is
             // length-encoded in the binary protocol just as in the text one.
             _ => match self {
                 Value::Bytes(v) => {
@@ -116,6 +125,21 @@ impl Value {
                     w.bytes(text.as_slice());
                 }
             },
+        }
+    }
+
+    /// The value's text form, used where a type needs re-parsing.
+    fn rendered(&self) -> String {
+        match self {
+            Value::Str(v) => v.clone(),
+            Value::Bytes(v) => String::from_utf8_lossy(v).into_owned(),
+            other => {
+                let mut w = BufWriter::new();
+                other.encode_text(&mut w);
+                // encode_text writes a length-encoded string; the digits start
+                // after the single-byte length for anything this short.
+                String::from_utf8_lossy(&w.into_inner()[1..]).into_owned()
+            }
         }
     }
 
@@ -328,4 +352,127 @@ pub fn bitmap_is_null(bitmap: &[u8], index: usize) -> bool {
     bitmap
         .get(index / 8)
         .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
+}
+
+/// Parses a fractional-seconds field into whole microseconds.
+///
+/// The digits are counted in characters, not bytes: taking six `chars` and then
+/// measuring `len()` overflows the scale subtraction the moment the fraction
+/// contains a multi-byte character, which a client can put there by storing
+/// junk in a DATETIME column.
+fn parse_fraction(fraction: &str) -> u32 {
+    let digits: String = fraction
+        .chars()
+        .filter(char::is_ascii_digit)
+        .take(6)
+        .collect();
+    if digits.is_empty() {
+        return 0;
+    }
+    // A shorter fraction is scaled up rather than truncated: `.5` is 500000µs.
+    let scale = 10u32.pow(6 - digits.chars().count() as u32);
+    digits.parse::<u32>().unwrap_or(0) * scale
+}
+
+/// Splits a `YYYY-MM-DD[ HH:MM:SS[.ffffff]]` string into its parts.
+fn datetime_parts(text: &str) -> Option<(u16, u8, u8, u8, u8, u8, u32)> {
+    let text = text.trim();
+    let (date, time) = match text.split_once([' ', 'T']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (text, None),
+    };
+
+    let mut date_parts = date.split('-');
+    let year: u16 = date_parts.next()?.parse().ok()?;
+    let month: u8 = date_parts.next().unwrap_or("1").parse().unwrap_or(1);
+    let day: u8 = date_parts.next().unwrap_or("1").parse().unwrap_or(1);
+
+    let (mut hour, mut minute, mut second, mut micros) = (0u8, 0u8, 0u8, 0u32);
+    if let Some(time) = time {
+        let time = time.trim_end_matches('Z');
+        let (clock, fraction) = match time.split_once('.') {
+            Some((c, f)) => (c, Some(f)),
+            None => (time, None),
+        };
+        let mut clock_parts = clock.split(':');
+        hour = clock_parts.next().unwrap_or("0").parse().unwrap_or(0);
+        minute = clock_parts.next().unwrap_or("0").parse().unwrap_or(0);
+        second = clock_parts.next().unwrap_or("0").parse().unwrap_or(0);
+        if let Some(fraction) = fraction {
+            micros = parse_fraction(fraction);
+        }
+    }
+
+    Some((year, month, day, hour, minute, second, micros))
+}
+
+/// Writes the packed binary DATE/DATETIME form.
+fn encode_binary_datetime(w: &mut BufWriter, text: &str) {
+    let Some((year, month, day, hour, minute, second, micros)) = datetime_parts(text) else {
+        // A value that cannot be parsed is sent as the zero date rather than a
+        // malformed packet that would desynchronise the connection.
+        w.u8(0);
+        return;
+    };
+
+    if micros > 0 {
+        w.u8(11)
+            .u16(year)
+            .u8(month)
+            .u8(day)
+            .u8(hour)
+            .u8(minute)
+            .u8(second)
+            .u32(micros);
+    } else if hour != 0 || minute != 0 || second != 0 {
+        w.u8(7)
+            .u16(year)
+            .u8(month)
+            .u8(day)
+            .u8(hour)
+            .u8(minute)
+            .u8(second);
+    } else {
+        w.u8(4).u16(year).u8(month).u8(day);
+    }
+}
+
+/// Writes the packed binary TIME form.
+fn encode_binary_time(w: &mut BufWriter, text: &str) {
+    let text = text.trim();
+    let negative = text.starts_with('-');
+    let body = text.trim_start_matches('-');
+
+    let (clock, fraction) = match body.split_once('.') {
+        Some((c, f)) => (c, Some(f)),
+        None => (body, None),
+    };
+    let mut parts = clock.split(':');
+    let total_hours: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    let minutes: u8 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    let seconds: u8 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    let micros: u32 = fraction.map(parse_fraction).unwrap_or(0);
+
+    // MySQL splits the hour count into whole days plus a remainder.
+    let days = total_hours / 24;
+    let hours = (total_hours % 24) as u8;
+
+    if micros > 0 {
+        w.u8(12)
+            .u8(u8::from(negative))
+            .u32(days)
+            .u8(hours)
+            .u8(minutes)
+            .u8(seconds)
+            .u32(micros);
+    } else if days == 0 && hours == 0 && minutes == 0 && seconds == 0 {
+        w.u8(0);
+    } else {
+        w.u8(8)
+            .u8(u8::from(negative))
+            .u32(days)
+            .u8(hours)
+            .u8(minutes)
+            .u8(seconds);
+    }
 }

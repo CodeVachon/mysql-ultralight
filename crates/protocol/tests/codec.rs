@@ -437,3 +437,37 @@ fn multi_statement_capabilities_are_not_advertised() {
     assert!(caps.contains(Capabilities::PLUGIN_AUTH));
     assert!(caps.contains(Capabilities::DEPRECATE_EOF));
 }
+
+/// A client can store arbitrary text in a DATETIME column, so the binary
+/// encoder must survive a fraction that is not digits. Counting characters and
+/// then measuring bytes overflowed the scale subtraction and panicked.
+#[test]
+fn a_datetime_with_a_multibyte_fraction_does_not_panic() {
+    use mysql_ultralight_protocol::ColumnType;
+
+    for (text, ty) in [
+        ("2024-01-01 00:00:00.ééééé", ColumnType::DateTime),
+        ("10:00:00.ééééé", ColumnType::Time),
+        ("not a date at all", ColumnType::DateTime),
+        ("", ColumnType::DateTime),
+    ] {
+        let mut w = BufWriter::new();
+        Value::Str(text.to_owned()).encode_binary(&mut w, ty);
+        assert!(!w.into_inner().is_empty(), "{text} produced no bytes");
+    }
+}
+
+#[test]
+fn a_short_fraction_scales_up_rather_than_truncating() {
+    use mysql_ultralight_protocol::ColumnType;
+
+    let mut w = BufWriter::new();
+    Value::Str("2024-01-01 00:00:00.5".to_owned()).encode_binary(&mut w, ColumnType::DateTime);
+    let bytes = w.into_inner();
+    assert_eq!(bytes[0], 11, "a fractional datetime uses the 11 byte form");
+    // .5 seconds is 500000 microseconds, not 5.
+    assert_eq!(
+        u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+        500_000
+    );
+}

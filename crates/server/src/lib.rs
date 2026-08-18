@@ -51,7 +51,8 @@ impl Server {
     /// Serves TCP connections until the listener fails.
     ///
     /// `make_handler` is called once per accepted connection, so each session
-    /// gets independent state.
+    /// gets independent state. It receives the connection id the handshake
+    /// carries, so a handler cannot report an id the client was never told.
     pub async fn serve_tcp<H, F>(
         self: Arc<Self>,
         listener: TcpListener,
@@ -59,7 +60,7 @@ impl Server {
     ) -> std::io::Result<()>
     where
         H: Handler + 'static,
-        F: Fn() -> H + Send + Sync + 'static,
+        F: Fn(u32) -> H + Send + Sync + 'static,
     {
         let make_handler = Arc::new(make_handler);
         loop {
@@ -73,7 +74,7 @@ impl Server {
             let connection_id = self.next_id();
 
             tokio::spawn(async move {
-                let handler = make_handler();
+                let handler = make_handler(connection_id);
                 let connection =
                     Connection::new(stream, handler, Arc::clone(&server.config), connection_id)
                         .with_trace(Arc::clone(&server.trace));
@@ -98,7 +99,7 @@ impl Server {
     ) -> std::io::Result<()>
     where
         H: Handler + 'static,
-        F: Fn() -> H + Send + Sync + 'static,
+        F: Fn(u32) -> H + Send + Sync + 'static,
     {
         let make_handler = Arc::new(make_handler);
         loop {
@@ -108,7 +109,7 @@ impl Server {
             let connection_id = self.next_id();
 
             tokio::spawn(async move {
-                let handler = make_handler();
+                let handler = make_handler(connection_id);
                 let connection =
                     Connection::new(stream, handler, Arc::clone(&server.config), connection_id)
                         .with_trace(Arc::clone(&server.trace));

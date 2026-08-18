@@ -1,17 +1,19 @@
 //! The `mysql-ultralight` server binary.
 
-mod spike;
+mod handler;
 
 use std::sync::Arc;
 use std::time::Instant;
 
+use handler::EngineHandler;
+use mysql_ultralight_engine::{Engine, ServerConfig};
 use mysql_ultralight_server::{Config, Server, StderrTrace, Trace};
-use spike::{SpikeHandler, Unhandled};
 
 const DEFAULT_VERSION: &str = "8.3.0-mysql-ultralight";
 
 struct Options {
     port: u16,
+    database: Option<String>,
     socket: Option<String>,
     version: String,
     password: Option<String>,
@@ -24,6 +26,7 @@ impl Default for Options {
             // Port 0 asks the OS for a free port, which is what a test harness
             // spawning many servers wants.
             port: 0,
+            database: Some("test".to_owned()),
             socket: None,
             version: DEFAULT_VERSION.to_owned(),
             password: None,
@@ -42,6 +45,7 @@ USAGE:
 OPTIONS:
     --port <PORT>        TCP port to listen on; 0 picks a free one (default: 0)
     --socket <PATH>      Also listen on a unix socket at PATH
+    --database <NAME>    Database to create at startup (default: test)
     --password <PASS>    Require this password; omit to accept any credentials
     --server-version <V> Version string reported to clients (default: {DEFAULT_VERSION})
     --trace              Log every connection, command, and result to stderr
@@ -65,6 +69,7 @@ fn parse_args() -> Options {
                 options.port = value().parse().unwrap_or_else(|_| usage());
             }
             "--socket" => options.socket = Some(value()),
+            "--database" => options.database = Some(value()),
             "--password" => options.password = Some(value()),
             "--server-version" => options.version = value(),
             "--trace" => options.trace = true,
@@ -137,7 +142,22 @@ async fn main() -> std::io::Result<()> {
         Arc::new(mysql_ultralight_server::NoTrace)
     };
 
-    let unhandled = Arc::new(Unhandled::default());
+    let engine_config = ServerConfig {
+        version: options.version.clone(),
+        port,
+        socket: options.socket.clone(),
+        ..Default::default()
+    };
+    let engine = Engine::new(engine_config.clone());
+    // A server with no database is unusable, and every client expects the one
+    // named in its connection string to exist.
+    if let Some(name) = &options.database {
+        if let Err(e) = engine.bootstrap_database(name) {
+            eprintln!("could not create database {name}: {e}");
+            std::process::exit(1);
+        }
+    }
+
     let server = Arc::new(Server::new(config).with_trace(trace));
 
     println!(
@@ -148,17 +168,17 @@ async fn main() -> std::io::Result<()> {
     use std::io::Write;
     let _ = std::io::stdout().flush();
 
-    let version = options.version.clone();
-    let tcp_unhandled = Arc::clone(&unhandled);
-    let tcp_socket = options.socket.clone();
     let tcp = tokio::spawn({
         let server = Arc::clone(&server);
-        let version = version.clone();
+        let engine = Arc::clone(&engine);
+        let engine_config = engine_config.clone();
+
         async move {
             server
-                .serve_tcp(listener, move || {
-                    SpikeHandler::new(version.clone(), Arc::clone(&tcp_unhandled))
-                        .with_endpoint(tcp_socket.clone(), port)
+                // The id comes from the server, so the engine session and
+                // the handshake packet cannot disagree about it.
+                .serve_tcp(listener, move |id| {
+                    EngineHandler::new(Arc::clone(&engine), engine_config.clone(), id)
                 })
                 .await
         }
@@ -167,14 +187,13 @@ async fn main() -> std::io::Result<()> {
     #[cfg(unix)]
     let unix = unix_listener.map(|listener| {
         let server = Arc::clone(&server);
-        let version = version.clone();
-        let unhandled = Arc::clone(&unhandled);
-        let unix_socket = options.socket.clone();
+        let engine = Arc::clone(&engine);
+        let engine_config = engine_config.clone();
+
         tokio::spawn(async move {
             server
-                .serve_unix(listener, move || {
-                    SpikeHandler::new(version.clone(), Arc::clone(&unhandled))
-                        .with_endpoint(unix_socket.clone(), port)
+                .serve_unix(listener, move |id| {
+                    EngineHandler::new(Arc::clone(&engine), engine_config.clone(), id)
                 })
                 .await
         })
@@ -192,19 +211,6 @@ async fn main() -> std::io::Result<()> {
     #[cfg(unix)]
     if let Some(path) = &options.socket {
         let _ = std::fs::remove_file(path);
-    }
-
-    // The list of statements the spike could not answer is its main output.
-    let report = unhandled.report();
-    if !report.is_empty() {
-        eprintln!(
-            "\n{} unhandled statement(s), {} occurrence(s):",
-            report.len(),
-            unhandled.total()
-        );
-        for sql in report {
-            eprintln!("  {sql}");
-        }
     }
 
     Ok(())

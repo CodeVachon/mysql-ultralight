@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/server", "crates/cli", "crates/conformance"]
+members = ["crates/protocol", "crates/server", "crates/engine", "crates/cli", "crates/conformance"]
 
 [workspace.package]
 version = "0.0.1"
@@ -12,6 +12,7 @@ repository = "https://github.com/CodeVachon/mysql-ultralight"
 [workspace.dependencies]
 mysql-ultralight-protocol = { path = "crates/protocol" }
 mysql-ultralight-server = { path = "crates/server" }
+mysql-ultralight-engine = { path = "crates/engine" }
 tokio = { version = "1", default-features = false }
 sha1 = { version = "0.10", default-features = false }
 

@@ -1,0 +1,12 @@
+[package]
+name = "mysql-ultralight-engine"
+description = "In-memory MySQL-compatible catalog, storage, and executor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mysql-ultralight-protocol = { workspace = true }
+sqlparser = "0.62"
