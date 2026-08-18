@@ -54,6 +54,17 @@ impl Response {
 
 pub type HandlerResult = Result<Response, ErrPacket>;
 
+/// What one `COM_QUERY` produced.
+///
+/// A multi-statement command can partly succeed: the statements before a
+/// failure have already been applied. Reporting only the error would tell the
+/// client nothing ran, which for a migration is a materially different claim.
+#[derive(Debug, Default)]
+pub struct Answered {
+    pub responses: Vec<Response>,
+    pub error: Option<ErrPacket>,
+}
+
 /// A statement that has been prepared but not yet executed.
 #[derive(Debug, Clone)]
 pub struct Prepared {
@@ -74,6 +85,27 @@ pub struct Prepared {
 pub trait Handler: Send {
     /// Executes a statement arriving via `COM_QUERY`.
     fn query(&mut self, sql: &str) -> HandlerResult;
+
+    /// Executes a `COM_QUERY` that may carry several statements.
+    ///
+    /// One response per statement, in order, plus the error that stopped the
+    /// rest. `allow_multi` is whether the client negotiated `MULTI_STATEMENTS`;
+    /// when it did not, a command with more than one statement must be refused
+    /// rather than run, because the client has no way to read past the first
+    /// result.
+    fn query_multi(&mut self, sql: &str, allow_multi: bool) -> Answered {
+        let _ = allow_multi;
+        match self.query(sql) {
+            Ok(response) => Answered {
+                responses: vec![response],
+                error: None,
+            },
+            Err(e) => Answered {
+                responses: Vec::new(),
+                error: Some(e),
+            },
+        }
+    }
 
     /// Prepares a statement. `id` is assigned by the connection.
     fn prepare(&mut self, id: u32, sql: &str) -> Result<Prepared, ErrPacket>;

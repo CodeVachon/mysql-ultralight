@@ -421,15 +421,16 @@ fn a_handshake_response_without_protocol_41_is_refused() {
     assert!(HandshakeResponse::decode(&w.into_inner()).is_err());
 }
 
-/// The command loop answers each command exactly once and never sets
-/// MORE_RESULTS_EXISTS, so advertising multi-statement support would let a
-/// client silently lose every result after the first.
+/// Multi-statement commands are advertised because Prisma's migration engine
+/// sends a whole migration file as one command. PS_MULTI_RESULTS is not: a
+/// prepared statement here is always one statement, so a client must never be
+/// told to look for a second result from `COM_STMT_EXECUTE`.
 #[test]
-fn multi_statement_capabilities_are_not_advertised() {
+fn multi_statement_capabilities_match_what_the_command_loop_does() {
     let caps = Capabilities::server_default();
 
-    assert!(!caps.contains(Capabilities::MULTI_STATEMENTS));
-    assert!(!caps.contains(Capabilities::MULTI_RESULTS));
+    assert!(caps.contains(Capabilities::MULTI_STATEMENTS));
+    assert!(caps.contains(Capabilities::MULTI_RESULTS));
     assert!(!caps.contains(Capabilities::PS_MULTI_RESULTS));
 
     // The capabilities the protocol genuinely depends on are still there.

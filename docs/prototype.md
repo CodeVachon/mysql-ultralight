@@ -90,13 +90,61 @@ engine already supports. The branches keep their parentheses deliberately: a bra
 in `LIMIT`, and `SELECT ... LIMIT 1 UNION ALL SELECT ...` binds the LIMIT to the whole
 union and stops parsing.
 
+## Running the real migrations, not just parsing them
+
+Parsing every statement and *running* every statement are different claims, and only the
+second one matters. Pointing `prisma migrate deploy` at the engine with the real
+604-migration history applies **453 of 604** today, stopping at `JSON_TABLE`.
+
+Everything between the two numbers was found this way, one migration at a time. Some of it
+was missing features — multi-statement commands (Prisma sends a whole migration file as one
+command), CTEs, `INSERT ... SELECT`, named locks, `UUID`, `RAND`, `MD5`, the `REGEXP`
+family, `DROP INDEX`, `VALUES ROW(...)`, `CAST AS SIGNED`, `ON UPDATE CURRENT_TIMESTAMP`.
+The rest were bugs no unit test had reason to write:
+
+- **Every writer deadlocked on a subquery.** `INSERT`, `UPDATE` and `DELETE` held the
+  catalog's write lock while evaluating, and a subquery in `VALUES`, `SET` or `WHERE`
+  reaches the executor, which takes a read lock to answer it. `RwLock` is not reentrant, so
+  the connection waited on a lock it held itself, forever. Writers now compute against a
+  copy with no lock held and swap it in at the end.
+- **A foreign key created no index.** MySQL indexes every foreign key and names the index
+  after the constraint; Prisma renames that index in a later migration, which had nothing
+  to find.
+- **An inline `UNIQUE INDEX name (...)` lost its name**, because the parser puts it in a
+  different field from `CONSTRAINT name UNIQUE (...)`. Every one was stored under an
+  invented name, so `information_schema` reported the wrong thing and `DROP INDEX` failed.
+- **`UPDATE Board b ... WHERE b.x` did not resolve the alias** in the single-table path.
+- **`ONLY_FULL_GROUP_BY` rejected valid queries**: MySQL permits a column that the grouping
+  functionally determines, which a join equality can establish.
+- **The first deterministic `UUID()` put its counter last**, so every value shared a
+  24-character prefix — and the migrations derive ids with
+  `SUBSTRING(REPLACE(UUID(), '-', ''), 1, 21)`. Every one collided. The counter is in the
+  leading field now, where MySQL's time-low is.
+
+The review of that work found twelve more, all fixed. The worst was introduced by the
+deadlock fix itself: **writers computed against a copy with no lock held, so two
+connections discarded each other's rows and both reported success.** Four threads inserting
+200 rows each left 325 of 800 present, with no error anywhere. Writers now hold a gate
+across the whole copy-compute-commit cycle — the catalog's write lock still cannot be held
+while evaluating, but only one writer runs at a time. Two regression tests reproduce the
+original loss.
+
+Three others were wrong answers rather than gaps: `ONLY_FULL_GROUP_BY` propagated
+functional dependency in *both* directions through an outer join, so
+`a LEFT JOIN b ON a.id = b.id GROUP BY b.id` permitted `a.id` and returned an arbitrary row
+from the unmatched group; `RAND()` ran a bare counter through one xorshift round and
+returned values that agreed to nine decimal places, so `ORDER BY RAND()` did not shuffle
+and `WHERE RAND() < 0.5` matched every row or none; and `CAST('12abc' AS SIGNED)` returned
+NULL where MySQL returns 12.
+
 ## What it does not do yet
 
 Named honestly, because the engine returns an error rather than a wrong answer for each:
 explicit window frames (`ROWS`/`RANGE BETWEEN`), named `WINDOW` clauses, `NTH_VALUE`, a
 computed (non-constant) offset or default in `LAG`/`LEAD`, `ORDER BY` and `LIMIT` on an
-`UPDATE` or `DELETE`, `DELETE ... USING`, and the state image that would make startup skip
-migrations entirely.
+`UPDATE` or `DELETE`, `DELETE ... USING`, `WITH RECURSIVE`, `JSON_TABLE` and the JSON
+function library, the date and spatial functions, and the state image that would make
+startup skip migrations entirely.
 
 Two limitations are worth stating rather than implying away.
 

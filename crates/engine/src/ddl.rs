@@ -145,6 +145,16 @@ fn build_column_with_checks(
             }
             ColumnOption::Comment(c) => column.comment = Some(c.clone()),
             ColumnOption::Collation(c) => column.collation = Some(c.to_string()),
+            ColumnOption::OnUpdate(e) => {
+                // Only CURRENT_TIMESTAMP is meaningful here; anything else
+                // would be a value this engine would have to invent.
+                let rendered = e.to_string().to_ascii_lowercase();
+                if rendered.starts_with("current_timestamp") || rendered.starts_with("now") {
+                    column.on_update_now = true;
+                } else {
+                    return Err(unsupported(format!("ON UPDATE `{e}`")));
+                }
+            }
             ColumnOption::DialectSpecific(tokens) => {
                 let rendered = tokens
                     .iter()
@@ -216,9 +226,15 @@ fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineRe
                     c.unique = true;
                 }
             }
+            // `CONSTRAINT c UNIQUE (...)` puts the name in `name`, while
+            // `UNIQUE INDEX c (...)` — the spelling Prisma generates — puts it
+            // in `index_name`. Reading only the first left every inline unique
+            // index stored under an invented name, which DROP INDEX and
+            // information_schema then could not find.
             table.indexes.push(Index {
                 name: name
                     .as_ref()
+                    .or(unique.index_name.as_ref())
                     .map(|n| n.value.clone())
                     .unwrap_or_else(|| names.join("_")),
                 columns: names,
@@ -248,12 +264,36 @@ fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineRe
                 &fk.on_delete,
                 &fk.on_update,
             );
+            // MySQL numbers unnamed foreign keys `<table>_ibfk_1`, `_2`, and
+            // so on. A single `<table>_fk` for all of them collides, and since
+            // the implicit index takes the same name, dropping one index would
+            // drop every one of them.
+            let constraint_name = name
+                .as_ref()
+                .map(|n| n.value.clone())
+                .unwrap_or_else(|| format!("{}_ibfk_{}", table.name, table.foreign_keys.len() + 1));
+            let key_columns: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+
+            // MySQL creates an index for a foreign key unless one already
+            // covers its columns, and names it after the constraint. Prisma
+            // then renames that index in a later migration, which has nothing
+            // to find if the index was never created.
+            let covered = table
+                .indexes
+                .iter()
+                .any(|i| i.columns.starts_with(key_columns.as_slice()));
+            if !covered {
+                table.indexes.push(Index {
+                    name: constraint_name.clone(),
+                    columns: key_columns.clone(),
+                    unique: false,
+                    primary: false,
+                });
+            }
+
             table.foreign_keys.push(ForeignKey {
-                name: name
-                    .as_ref()
-                    .map(|n| n.value.clone())
-                    .unwrap_or_else(|| format!("{}_fk", table.name)),
-                columns: columns.iter().map(|c| c.value.clone()).collect(),
+                name: constraint_name,
+                columns: key_columns,
                 referenced_table: object_name(foreign_table),
                 referenced_columns: referred_columns.iter().map(|c| c.value.clone()).collect(),
                 on_delete: on_delete
@@ -333,7 +373,7 @@ pub fn alter_table(
                 let filler = match (&column.default, column.nullable) {
                     (Some(v), _) => v.clone(),
                     (None, true) => Value::Null,
-                    (None, false) => implicit_default(&column.ty),
+                    (None, false) => column.ty.implicit_default(),
                 };
                 table.columns.push(column);
                 // Existing rows need a value in the new position.
@@ -542,27 +582,6 @@ pub fn create_index(
 
     table.indexes.push(index);
     Ok(Outcome::ok())
-}
-
-/// The value MySQL stores in a NOT NULL column with no declared default.
-fn implicit_default(ty: &SqlType) -> Value {
-    use crate::types::TypeKind;
-    match ty.kind {
-        TypeKind::Bool | TypeKind::Int | TypeKind::Year => Value::Int(0),
-        TypeKind::Float => Value::Float(0.0),
-        TypeKind::Decimal => Value::text("0"),
-        TypeKind::Date => Value::text("1970-01-01"),
-        TypeKind::DateTime => Value::text("1970-01-01 00:00:00"),
-        TypeKind::Time => Value::text("00:00:00"),
-        TypeKind::Json => Value::text("null"),
-        // ENUM defaults to its first permitted value.
-        TypeKind::Enum => ty
-            .variants
-            .first()
-            .map(Value::text)
-            .unwrap_or_else(|| Value::text("")),
-        _ => Value::text(""),
-    }
 }
 
 fn object_name(name: &ObjectName) -> String {

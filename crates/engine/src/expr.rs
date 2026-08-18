@@ -35,10 +35,13 @@ pub struct Row<'a> {
 
 /// Runs a subquery on the evaluator's behalf.
 ///
+/// What the evaluator needs from the executor but cannot reach directly.
+///
 /// The evaluator cannot execute a query itself without depending on the
 /// executor, which depends on it. This trait is the seam that keeps the cycle
-/// out of the type graph.
-pub trait Subqueries {
+/// out of the type graph. Named locks are here for the same reason: they live
+/// on the engine because they are shared between connections.
+pub trait Executor {
     /// Runs a query and returns its rows.
     ///
     /// `outer` carries the row the subquery is being evaluated against, so a
@@ -49,6 +52,41 @@ pub trait Subqueries {
         session: &Session,
         outer: Option<OuterRow>,
     ) -> EngineResult<Vec<Vec<Value>>>;
+
+    /// Applies a named-lock operation on behalf of one connection.
+    fn named_lock(&self, op: LockOp, name: &str, connection_id: u32) -> Value;
+
+    /// The next value for `RAND()`, in [0, 1).
+    ///
+    /// Deterministic, like [`Executor::next_uuid`]: a test that shuffles or
+    /// samples should do the same thing every run, and nothing here needs
+    /// unpredictability.
+    fn next_random(&self, seed: Option<i64>) -> f64;
+
+    /// The next value for `UUID()`.
+    ///
+    /// On the engine rather than the session because uniqueness has to hold
+    /// across connections, and because a test that asserts on generated ids
+    /// wants the same sequence every run.
+    fn next_uuid(&self) -> String;
+}
+
+/// The named-lock operations MySQL exposes as functions.
+///
+/// Prisma's migration engine takes `GET_LOCK('prisma_migrate', ...)` before it
+/// applies anything, so without these it stops before the first migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockOp {
+    /// GET_LOCK: 1 if acquired, 0 if another connection holds it.
+    Acquire,
+    /// RELEASE_LOCK: 1 if released, 0 if held by another, NULL if unheld.
+    Release,
+    /// IS_FREE_LOCK: 1 when nobody holds the lock.
+    IsFree,
+    /// IS_USED_LOCK: the holder's connection id, or NULL.
+    UsedBy,
+    /// RELEASE_ALL_LOCKS: how many this connection was holding.
+    ReleaseAll,
 }
 
 /// An owned copy of the row a correlated subquery can see.
@@ -65,8 +103,8 @@ pub struct OuterRow {
 pub struct Context<'a> {
     pub row: Option<Row<'a>>,
     pub session: &'a Session,
-    /// Absent where subqueries cannot appear, such as a column default.
-    pub subqueries: Option<&'a dyn Subqueries>,
+    /// Absent where a subquery cannot appear, such as a column default.
+    pub executor: Option<&'a dyn Executor>,
 }
 
 impl<'a> Context<'a> {
@@ -74,18 +112,18 @@ impl<'a> Context<'a> {
         Self {
             row: None,
             session,
-            subqueries: None,
+            executor: None,
         }
     }
 
-    pub fn with_subqueries(mut self, runner: &'a dyn Subqueries) -> Self {
-        self.subqueries = Some(runner);
+    pub fn with_executor(mut self, runner: &'a dyn Executor) -> Self {
+        self.executor = Some(runner);
         self
     }
 
     /// Runs a subquery, or explains that one cannot appear here.
     fn run(&self, query: &Query) -> EngineResult<Vec<Vec<Value>>> {
-        match self.subqueries {
+        match self.executor {
             Some(runner) => runner.rows(query, self.session, self.outer_row()),
             None => Err(unsupported("a subquery in this position")),
         }
@@ -351,9 +389,145 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             Ok(bool_value(*negated))
         }
 
+        // sqlparser models these as their own nodes rather than as function
+        // calls, because SQL gives them keyword argument syntax. They are the
+        // same functions, so they are routed to the same table rather than
+        // reimplemented.
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            let mut args = vec![eval(expr, ctx)?];
+            args.push(match substring_from {
+                Some(e) => eval(e, ctx)?,
+                None => Value::Int(1),
+            });
+            if let Some(e) = substring_for {
+                args.push(eval(e, ctx)?);
+            }
+            functions::call("substring", args, ctx.session)
+        }
+
+        Expr::Trim {
+            expr,
+            trim_where,
+            trim_what,
+            trim_characters,
+        } => {
+            if trim_characters.is_some() {
+                return Err(unsupported("TRIM with a character list"));
+            }
+            let subject = eval(expr, ctx)?;
+            if subject.is_null() {
+                return Ok(Value::Null);
+            }
+            let what = match trim_what {
+                Some(w) => {
+                    let value = eval(w, ctx)?;
+                    if value.is_null() {
+                        return Ok(Value::Null);
+                    }
+                    value.as_text()
+                }
+                None => " ".to_owned(),
+            };
+            // MySQL strips whole repetitions of the string, not any character
+            // in it, and an empty one would loop forever.
+            let mut text = subject.as_text();
+            if !what.is_empty() {
+                use sqlparser::ast::TrimWhereField as Side;
+                let lead = matches!(trim_where, None | Some(Side::Both) | Some(Side::Leading));
+                let trail = matches!(trim_where, None | Some(Side::Both) | Some(Side::Trailing));
+                if lead {
+                    while let Some(rest) = text.strip_prefix(&what) {
+                        text = rest.to_owned();
+                    }
+                }
+                if trail {
+                    while let Some(rest) = text.strip_suffix(&what) {
+                        text = rest.to_owned();
+                    }
+                }
+            }
+            Ok(Value::text(text))
+        }
+
+        Expr::Position { expr, r#in } => {
+            let args = vec![eval(expr, ctx)?, eval(r#in, ctx)?];
+            functions::call("position", args, ctx.session)
+        }
+
+        // `x REGEXP y` and `x RLIKE y`, which are the same operator.
+        Expr::RLike {
+            negated,
+            expr,
+            pattern,
+            ..
+        } => {
+            // `x REGEXP BINARY y` asks for a case-sensitive match, which is
+            // not what this evaluates, so it is refused rather than answered
+            // with the wrong comparison. The parser reads the operator as a
+            // cast, which is where it has to be recognised.
+            if matches!(
+                pattern.as_ref(),
+                Expr::Cast { data_type, .. }
+                    if matches!(
+                        data_type,
+                        sqlparser::ast::DataType::Binary(_)
+                            | sqlparser::ast::DataType::Varbinary(_)
+                            | sqlparser::ast::DataType::Blob(_)
+                    )
+            ) {
+                return Err(unsupported("REGEXP against a BINARY pattern"));
+            }
+            let subject = eval(expr, ctx)?;
+            let pattern = eval(pattern, ctx)?;
+            if subject.is_null() || pattern.is_null() {
+                return Ok(Value::Null);
+            }
+            let matched = functions::call("regexp_like", vec![subject, pattern], ctx.session)?;
+            Ok(bool_value((matched.truthy() == Some(true)) != *negated))
+        }
+
         Expr::Function(f) => {
             let name = f.name.to_string().to_ascii_lowercase();
             let args = function_args(f, ctx)?;
+
+            // Named locks need engine state rather than session state, so they
+            // go through the executor seam instead of the function table.
+            let op = match name.as_str() {
+                "get_lock" => Some(LockOp::Acquire),
+                "release_lock" => Some(LockOp::Release),
+                "is_free_lock" => Some(LockOp::IsFree),
+                "is_used_lock" => Some(LockOp::UsedBy),
+                "release_all_locks" => Some(LockOp::ReleaseAll),
+                _ => None,
+            };
+            if name == "rand" {
+                let Some(engine) = ctx.executor else {
+                    return Err(unsupported("rand() here"));
+                };
+                let seed = args.first().and_then(|v| v.as_int());
+                return Ok(Value::Float(engine.next_random(seed)));
+            }
+
+            if name == "uuid" {
+                let Some(engine) = ctx.executor else {
+                    return Err(unsupported("uuid() here"));
+                };
+                return Ok(Value::text(engine.next_uuid()));
+            }
+
+            if let Some(op) = op {
+                let Some(engine) = ctx.executor else {
+                    return Err(unsupported(format!("{name}() here")));
+                };
+                let lock_name = args.first().map(|v| v.as_text()).unwrap_or_default();
+                return Ok(engine.named_lock(op, &lock_name, ctx.session.connection_id));
+            }
+
             functions::call(&name, args, ctx.session)
         }
 

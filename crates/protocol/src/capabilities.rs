@@ -69,12 +69,14 @@ impl Capabilities {
     /// Compression and TLS are deliberately absent: this engine is for local
     /// test processes, where both cost startup time and buy nothing.
     ///
-    /// MULTI_STATEMENTS, MULTI_RESULTS and PS_MULTI_RESULTS are also absent,
-    /// because the command loop sends exactly one response per command and
-    /// never sets `status::MORE_RESULTS_EXISTS`. Advertising them would let a
-    /// client send `A; B` and silently lose every result after the first —
-    /// a wrong answer rather than a clear error. Add them back together with
-    /// the multi-result terminator, not before.
+    /// MULTI_STATEMENTS and MULTI_RESULTS are advertised: Prisma's migration
+    /// engine sends each migration file as one command, so without them it
+    /// cannot apply anything. The command loop sets
+    /// `status::MORE_RESULTS_EXISTS` on every response but the last, which is
+    /// what makes the extra results readable rather than silently lost.
+    ///
+    /// PS_MULTI_RESULTS stays absent: a prepared statement here is always one
+    /// statement, so there is never a second result to announce.
     pub fn server_default() -> Self {
         Self::LONG_PASSWORD
             | Self::FOUND_ROWS
@@ -93,6 +95,8 @@ impl Capabilities {
             | Self::CAN_HANDLE_EXPIRED_PASSWORDS
             | Self::SESSION_TRACK
             | Self::DEPRECATE_EOF
+            | Self::MULTI_STATEMENTS
+            | Self::MULTI_RESULTS
     }
 
     pub fn contains(self, other: Capabilities) -> bool {

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use mysql_ultralight_engine::value::Value as EngineValue;
 use mysql_ultralight_engine::{Engine, Outcome, ServerConfig, Session};
 use mysql_ultralight_protocol::{ErrPacket, OkPacket, Value as WireValue};
-use mysql_ultralight_server::{Handler, HandlerResult, Prepared, Response, ResultSet};
+use mysql_ultralight_server::{Answered, Handler, HandlerResult, Prepared, Response, ResultSet};
 
 pub struct EngineHandler {
     engine: Arc<Engine>,
@@ -25,23 +25,29 @@ impl EngineHandler {
 
     /// Runs one statement and shapes the outcome for the wire.
     fn run(&mut self, sql: &str, parameters: &[EngineValue]) -> HandlerResult {
-        match self.engine.execute(&mut self.session, sql, parameters) {
-            Ok(Outcome::Rows(rows)) => {
+        let outcome = self
+            .engine
+            .execute(&mut self.session, sql, parameters)
+            .map_err(ErrPacket::from)?;
+        Ok(Self::shape(outcome))
+    }
+
+    /// Turns one engine outcome into the response the wire carries.
+    fn shape(outcome: Outcome) -> Response {
+        match outcome {
+            Outcome::Rows(rows) => {
                 let columns = rows.columns.iter().map(|c| c.to_wire()).collect();
                 let wire_rows = rows
                     .rows
                     .into_iter()
                     .map(|row| row.iter().map(EngineValue::to_wire).collect())
                     .collect();
-                Ok(Response::ResultSet(ResultSet::with_rows(
-                    columns, wire_rows,
-                )))
+                Response::ResultSet(ResultSet::with_rows(columns, wire_rows))
             }
-            Ok(Outcome::Affected {
+            Outcome::Affected {
                 rows,
                 last_insert_id,
-            }) => Ok(Response::Ok(OkPacket::new(rows, last_insert_id))),
-            Err(e) => Err(ErrPacket::from(e)),
+            } => Response::Ok(OkPacket::new(rows, last_insert_id)),
         }
     }
 }
@@ -49,6 +55,28 @@ impl EngineHandler {
 impl Handler for EngineHandler {
     fn query(&mut self, sql: &str) -> HandlerResult {
         self.run(sql, &[])
+    }
+
+    fn query_multi(&mut self, sql: &str, allow_multi: bool) -> Answered {
+        if !allow_multi {
+            // The client cannot read past the first result, so running the
+            // rest would apply changes it never learns about.
+            return match self.run(sql, &[]) {
+                Ok(response) => Answered {
+                    responses: vec![response],
+                    error: None,
+                },
+                Err(e) => Answered {
+                    responses: Vec::new(),
+                    error: Some(e),
+                },
+            };
+        }
+        let executed = self.engine.execute_many(&mut self.session, sql, &[]);
+        Answered {
+            responses: executed.outcomes.into_iter().map(Self::shape).collect(),
+            error: executed.error.map(ErrPacket::from),
+        }
     }
 
     fn prepare(&mut self, id: u32, sql: &str) -> Result<Prepared, ErrPacket> {

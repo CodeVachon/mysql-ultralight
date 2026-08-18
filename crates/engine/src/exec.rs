@@ -30,11 +30,30 @@ use crate::value::Value;
 pub struct Engine {
     catalog: RwLock<Catalog>,
     config: ServerConfig,
+    /// Named advisory locks, by lock name to the connection holding it.
+    /// Separate from the catalog because they survive a ROLLBACK and are not
+    /// part of any database.
+    locks: std::sync::Mutex<HashMap<String, u32>>,
+    /// Counter behind `UUID()`. Deterministic on purpose: a test that asserts
+    /// on a generated id should see the same one every run.
+    uuids: std::sync::atomic::AtomicU64,
+    /// State behind `RAND()`, deterministic for the same reason.
+    randoms: std::sync::atomic::AtomicU64,
+    /// Held by one writer at a time, across its copy-compute-commit cycle.
+    ///
+    /// Writers cannot hold the catalog's write lock while they compute — a
+    /// subquery would deadlock on it — so this is what stops two of them
+    /// computing against the same copy and each discarding the other's work.
+    writes: std::sync::Mutex<()>,
 }
 
 impl Engine {
     pub fn new(config: ServerConfig) -> Arc<Self> {
         Arc::new(Self {
+            locks: std::sync::Mutex::new(HashMap::new()),
+            uuids: std::sync::atomic::AtomicU64::new(1),
+            randoms: std::sync::atomic::AtomicU64::new(0x2545_f491_4f6c_dd1d),
+            writes: std::sync::Mutex::new(()),
             catalog: RwLock::new(Catalog::new()),
             config,
         })
@@ -55,6 +74,46 @@ impl Engine {
 
     fn catalog_mut(&self) -> EngineResult<std::sync::RwLockWriteGuard<'_, Catalog>> {
         self.catalog.write().map_err(|_| poisoned())
+    }
+
+    /// Serialises writers, held from before [`Engine::database_copy`] until
+    /// after [`Engine::commit_database`].
+    ///
+    /// Without it a writer's copy can go stale between the two: another
+    /// connection commits in the gap and the swap silently discards its rows,
+    /// while both statements report success. Reads are unaffected — they take
+    /// the catalog's read lock and never this.
+    fn begin_write(&self) -> EngineResult<std::sync::MutexGuard<'_, ()>> {
+        // A poisoned gate means a writer panicked mid-statement. The catalog
+        // is untouched in that case, because a writer only swaps in at the
+        // end, so taking the gate anyway is safe.
+        Ok(self.writes.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// A private copy of one database, to compute a write against.
+    ///
+    /// Every writer works on a copy and swaps it in at the end, and the reason
+    /// is not only atomicity. Anything that can run a subquery — a scalar
+    /// subquery in a VALUES list, a correlated one in SET or WHERE — reaches
+    /// the executor, which takes a read lock to answer it. `RwLock` is not
+    /// reentrant, so evaluating any of that while holding the write lock is a
+    /// deadlock: the thread waits for a lock it holds itself, forever. Holding
+    /// no lock while evaluating is what makes those statements possible.
+    fn database_copy(&self, db: &str) -> EngineResult<Database> {
+        self.catalog()?
+            .database(db)
+            .cloned()
+            .ok_or_else(|| EngineError::unknown_database(db))
+    }
+
+    /// Puts a computed database back, replacing what was there.
+    fn commit_database(&self, db: &str, working: Database) -> EngineResult<()> {
+        let mut catalog = self.catalog_mut()?;
+        let database = catalog
+            .database_mut(db)
+            .ok_or_else(|| EngineError::unknown_database(db))?;
+        *database = working;
+        Ok(())
     }
 
     /// Write access for the DDL module, which lives outside this impl.
@@ -90,6 +149,48 @@ impl Engine {
         self.execute_at_depth(session, sql, parameters, 0)
     }
 
+    /// Runs a command that may hold several statements, one outcome each.
+    ///
+    /// Prisma's migration engine sends a whole migration file as one command,
+    /// so this is what makes `prisma migrate deploy` possible. Execution stops
+    /// at the first error: the statements after it were written expecting the
+    /// earlier ones to have succeeded.
+    pub fn execute_many(&self, session: &mut Session, sql: &str, parameters: &[Value]) -> Executed {
+        let statements = rewrite::split_statements(sql);
+        if statements.len() <= 1 {
+            // One statement is the overwhelmingly common case, and routing it
+            // through the splitter's output would re-render text the single
+            // path already handles verbatim.
+            return match self.execute(session, sql, parameters) {
+                Ok(outcome) => Executed::of(vec![outcome]),
+                Err(e) => Executed::failed(Vec::new(), e),
+            };
+        }
+
+        // Parameters belong to a prepared statement, which is always one
+        // statement; a multi-statement command carrying them is malformed.
+        if !parameters.is_empty() {
+            return Executed::failed(
+                Vec::new(),
+                unsupported("parameters with a multi-statement command"),
+            );
+        }
+
+        let mut outcomes = Vec::with_capacity(statements.len());
+        for statement in statements {
+            match self.execute(session, &statement, &[]) {
+                Ok(outcome) => outcomes.push(outcome),
+                // The statements before the failure have already been applied,
+                // and there is no rollback here. Returning them with the error
+                // is what lets a caller see how far the command got, which for
+                // a migration is the difference between "did nothing" and
+                // "half applied".
+                Err(e) => return Executed::failed(outcomes, e),
+            }
+        }
+        Executed::of(outcomes)
+    }
+
     /// `depth` bounds recursion through `EXECUTE`, which can otherwise run a
     /// prepared statement that prepares and executes itself.
     fn execute_at_depth(
@@ -123,10 +224,12 @@ impl Engine {
         match statements.len() {
             0 => Ok(Outcome::ok()),
             1 => self.run(session, &statements[0]),
-            // Multi-statement requires MORE_RESULTS_EXISTS on the wire, which
-            // the server does not advertise. Erroring beats returning only the
-            // first result and letting the caller believe it ran everything.
-            _ => Err(unsupported("multiple statements in one command")),
+            // Reached only when a caller uses `execute` directly on several
+            // statements. It can return one outcome, so anything past the
+            // first would be run and then silently discarded.
+            _ => Err(unsupported(
+                "several statements here; use a multi-statement command",
+            )),
         }
     }
 
@@ -221,7 +324,22 @@ impl Engine {
 
     fn run(&self, session: &mut Session, statement: &Statement) -> EngineResult<Outcome> {
         match statement {
-            Statement::Query(query) => self.query(session, query).map(Outcome::Rows),
+            // A statement can be a query with a WITH clause whose body is a
+            // write: `WITH x AS (...) UPDATE t JOIN x ...`. The CTEs are
+            // materialised first either way, so the body sees them by name.
+            Statement::Query(query) => match query.body.as_ref() {
+                SetExpr::Update(inner) | SetExpr::Insert(inner) | SetExpr::Delete(inner) => {
+                    let mut scoped = session.clone();
+                    self.materialise_ctes(&mut scoped, query)?;
+                    let outcome = self.run(&mut scoped, inner)?;
+                    // The CTEs go out of scope with the statement; nothing else
+                    // the body changed should be discarded with them.
+                    scoped.ctes.clear();
+                    *session = scoped;
+                    Ok(outcome)
+                }
+                _ => self.query(session, query).map(Outcome::Rows),
+            },
             Statement::Insert(insert) => self.insert(session, insert),
             Statement::Update(update) => {
                 // Anything not read below would be silently dropped, which for
@@ -320,8 +438,9 @@ impl Engine {
                 object_type,
                 names,
                 if_exists,
+                table,
                 ..
-            } => self.drop(session, *object_type, names, *if_exists),
+            } => self.drop(session, *object_type, names, *if_exists, table.as_ref()),
             Statement::Truncate(truncate) => {
                 for name in &truncate.table_names {
                     let (db, table) = self.split_name(session, &name.name)?;
@@ -475,6 +594,44 @@ impl Engine {
         self.query_with_outer(session, query, None)
     }
 
+    /// Runs each CTE of a query and puts its rows in scope under its name.
+    ///
+    /// Each is evaluated once, and can see the ones declared before it, which
+    /// is what MySQL does for a non-recursive WITH.
+    fn materialise_ctes(&self, session: &mut Session, query: &Query) -> EngineResult<()> {
+        let Some(with) = &query.with else {
+            return Ok(());
+        };
+        if with.recursive {
+            return Err(unsupported("WITH RECURSIVE"));
+        }
+
+        for cte in &with.cte_tables {
+            let name = cte.alias.name.value.clone();
+            let mut relation = self.relation_of_query(session, &cte.query, &name)?;
+
+            // `WITH x (a, b) AS ...` renames the columns of the result.
+            if !cte.alias.columns.is_empty() {
+                if cte.alias.columns.len() != relation.columns.len() {
+                    return Err(EngineError::new(
+                        1353,
+                        "HY000",
+                        format!(
+                            "In definition of view, derived table or common table expression, \
+                             SELECT and column names list have different column counts: '{name}'"
+                        ),
+                    ));
+                }
+                for (column, alias) in relation.columns.iter_mut().zip(&cte.alias.columns) {
+                    column.name = alias.name.value.clone();
+                }
+            }
+
+            session.ctes.push((name, relation));
+        }
+        Ok(())
+    }
+
     /// Runs a query, optionally against an enclosing row so a correlated
     /// subquery can reference the outer query's columns.
     fn query_with_outer(
@@ -483,11 +640,25 @@ impl Engine {
         query: &Query,
         outer: Option<&OuterRow>,
     ) -> EngineResult<ResultSet> {
+        // A WITH clause is materialised here rather than at any one caller,
+        // because every path that runs a query — a subquery, a view body, a
+        // derived table, the top level — comes through this function. Doing it
+        // in `query` alone left a CTE inside a subquery reported as a missing
+        // table.
+        if query.with.is_some() {
+            let mut scoped = session.clone();
+            self.materialise_ctes(&mut scoped, query)?;
+            let mut without = query.clone();
+            // Cleared so the recursive call does not run them a second time.
+            without.with = None;
+            return self.query_with_outer(&scoped, &without, outer);
+        }
+
         let select = match query.body.as_ref() {
             SetExpr::Select(select) => select,
             // A set operation runs both sides and combines them, so it is
             // handled before the single-SELECT path.
-            SetExpr::SetOperation { .. } | SetExpr::Query(_) => {
+            SetExpr::SetOperation { .. } | SetExpr::Query(_) | SetExpr::Values(_) => {
                 let mut combined = self.set_expr(session, query.body.as_ref(), outer)?;
                 self.order_projected(&mut combined, session, query.order_by.as_ref())?;
                 apply_limit(&mut combined, session, query)?;
@@ -508,6 +679,50 @@ impl Engine {
         Ok(rows)
     }
 
+    /// A `VALUES ROW(...), ROW(...)` constructor as a result set.
+    ///
+    /// MySQL names the columns `column_0`, `column_1`, and so on, which is what
+    /// anything selecting from it has to reference.
+    fn values_result(
+        &self,
+        session: &Session,
+        values: &sqlparser::ast::Values,
+    ) -> EngineResult<ResultSet> {
+        let ctx = Context::rowless(session).with_executor(self);
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(values.rows.len());
+        for row in &values.rows {
+            let mut out = Vec::with_capacity(row.content.len());
+            for e in &row.content {
+                out.push(expr::eval(e, &ctx)?);
+            }
+            rows.push(out);
+        }
+
+        let width = rows.first().map(|r| r.len()).unwrap_or(0);
+        // A ragged constructor would produce rows the wire cannot frame, and
+        // MySQL refuses it outright.
+        if rows.iter().any(|r| r.len() != width) {
+            return Err(EngineError::new(
+                1136,
+                "21S01",
+                "Column count doesn't match value count",
+            ));
+        }
+
+        let columns = (0..width)
+            .map(|i| {
+                let ty = rows
+                    .first()
+                    .and_then(|r| r.get(i))
+                    .map(wire_type)
+                    .unwrap_or(ColumnType::VarString);
+                OutColumn::new(format!("column_{i}"), ty)
+            })
+            .collect();
+
+        Ok(ResultSet { columns, rows })
+    }
+
     /// Evaluates a set operation, or a nested query body.
     fn set_expr(
         &self,
@@ -518,6 +733,9 @@ impl Engine {
         match body {
             SetExpr::Select(select) => Ok(self.select(session, select, None, outer)?.result),
             SetExpr::Query(query) => self.query_with_outer(session, query, outer),
+            // MySQL 8's table value constructor: `VALUES ROW(1), ROW(2)` is a
+            // result in its own right, usable anywhere a SELECT is.
+            SetExpr::Values(values) => self.values_result(session, values),
             SetExpr::SetOperation {
                 left,
                 op,
@@ -639,7 +857,7 @@ impl Engine {
                     values: row,
                 }),
                 session,
-                subqueries: Some(self),
+                executor: Some(self),
             };
             let keep = match &select.selection {
                 Some(predicate) => expr::eval(predicate, &ctx)?.truthy() == Some(true),
@@ -715,7 +933,7 @@ impl Engine {
                     values: row,
                 }),
                 session,
-                subqueries: Some(self),
+                executor: Some(self),
             };
             let mut key = Vec::with_capacity(items.len());
             for item in items {
@@ -803,7 +1021,7 @@ impl Engine {
                                 values: &combined,
                             }),
                             session,
-                            subqueries: Some(self),
+                            executor: Some(self),
                         };
                         expr::eval(e, &ctx)?.truthy() == Some(true)
                     }
@@ -860,6 +1078,29 @@ impl Engine {
     fn relation_of(&self, session: &Session, factor: &TableFactor) -> EngineResult<Relation> {
         match factor {
             TableFactor::Table { name, alias, .. } => {
+                // A CTE shadows a table of the same name, and is looked up
+                // before the catalog for exactly that reason. Innermost wins.
+                let unqualified = name.0.len() == 1;
+                let plain = object_name(name);
+                if unqualified {
+                    if let Some((_, cte)) = session
+                        .ctes
+                        .iter()
+                        .rev()
+                        .find(|(n, _)| n.eq_ignore_ascii_case(&plain))
+                    {
+                        let shown = alias
+                            .as_ref()
+                            .map(|a| a.name.value.clone())
+                            .unwrap_or_else(|| plain.clone());
+                        let mut relation = cte.clone();
+                        for column in &mut relation.columns {
+                            column.table = shown.clone();
+                        }
+                        return Ok(relation);
+                    }
+                }
+
                 let (db, table_name) = self.split_name(session, name)?;
 
                 // A view is a named query, so it is run and its rows stand in
@@ -951,10 +1192,10 @@ impl Engine {
                     values: &outer.values,
                 }),
                 session,
-                subqueries: None,
+                executor: None,
             },
         }
-        .with_subqueries(self);
+        .with_executor(self);
         let mut columns = Vec::new();
         let mut row = Vec::new();
 
@@ -1049,7 +1290,7 @@ impl Engine {
                     values: row,
                 }),
                 session,
-                subqueries: Some(self),
+                executor: Some(self),
             };
             let mut out = Vec::with_capacity(plan.len());
             for step in &plan {
@@ -1098,7 +1339,7 @@ impl Engine {
                     values: row,
                 }),
                 session,
-                subqueries: Some(self),
+                executor: Some(self),
             };
             expr::eval(e, &ctx)
         };
@@ -1357,7 +1598,7 @@ impl Engine {
                         values: row,
                     }),
                     session,
-                    subqueries: Some(self),
+                    executor: Some(self),
                 };
                 let mut key = Vec::with_capacity(group_exprs.len());
                 for e in &group_exprs {
@@ -1386,8 +1627,9 @@ impl Engine {
         // aggregated. Silently evaluating it against the group's first row
         // returns an arbitrary value where MySQL raises an error.
         if session.sql_mode().only_full_group_by {
+            let determined = determined_columns(select, refs, &group_exprs);
             for (_, e) in &items {
-                check_full_group_by(e, &group_exprs)?;
+                check_full_group_by(e, &group_exprs, refs, &determined)?;
             }
         }
 
@@ -1498,7 +1740,7 @@ impl Engine {
                 values: &values,
             }),
             session,
-            subqueries: Some(self),
+            executor: Some(self),
         };
         expr::eval(&rewritten, &ctx)
     }
@@ -1645,7 +1887,7 @@ impl Engine {
                         values: row,
                     }),
                     session,
-                    subqueries: Some(self),
+                    executor: Some(self),
                 };
                 values.push(expr::eval(arg, &ctx)?);
             }
@@ -1746,7 +1988,7 @@ impl Engine {
                     values: row,
                 }),
                 session,
-                subqueries: Some(self),
+                executor: Some(self),
             };
             let mut key = Vec::with_capacity(items.len());
             for item in items {
@@ -1776,33 +2018,47 @@ impl Engine {
         let (db, table_name) = self.split_parts(session, &rendered)?;
         let ignore = insert.ignore;
 
-        let source_rows = match &insert.source {
+        // `INSERT ... SELECT` runs its query first and to completion. MySQL
+        // reads the whole source before writing, so a statement whose SELECT
+        // reads the table it inserts into sees the table as it was.
+        let source_rows: Vec<Vec<SourceValue>> = match &insert.source {
             Some(query) => match query.body.as_ref() {
-                SetExpr::Values(values) => values.rows.clone(),
-                _ => return Err(unsupported("INSERT ... SELECT")),
+                SetExpr::Values(values) => values
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .cloned()
+                            .map(|e| SourceValue::Expr(Box::new(e)))
+                            .collect()
+                    })
+                    .collect(),
+                _ => {
+                    let selected = self.query(session, query)?;
+                    selected
+                        .rows
+                        .into_iter()
+                        .map(|row| row.into_iter().map(SourceValue::Value).collect())
+                        .collect()
+                }
             },
             None => return Err(unsupported("INSERT without VALUES")),
         };
 
         let session_snapshot = session.clone();
-        let mut catalog = self.catalog_mut()?;
+        let _writing = self.begin_write()?;
+        let mut working = self.database_copy(&db)?;
 
         // Captured before the child table is borrowed mutably, so validation
         // is a pure function of the candidate row.
         let mut fk_parents = {
-            let database = catalog
-                .database(&db)
-                .ok_or_else(|| EngineError::unknown_database(&db))?;
-            let table = database
+            let table = working
                 .table(&table_name)
                 .ok_or_else(|| EngineError::no_such_table(&table_name))?;
-            foreign_keys::snapshot(database, table)
+            foreign_keys::snapshot(&working, table)
         };
 
-        let database = catalog
-            .database_mut(&db)
-            .ok_or_else(|| EngineError::unknown_database(&db))?;
-        let table = database
+        let table = working
             .table_mut(&table_name)
             .ok_or_else(|| EngineError::no_such_table(&table_name))?;
 
@@ -1841,7 +2097,7 @@ impl Engine {
             // MySQL rejects a row whose value count does not match the column
             // list. Truncating instead stores corrupt data for a client bug
             // that would have failed loudly against the real server.
-            if values.content.len() != targets.len() {
+            if values.len() != targets.len() {
                 return Err(EngineError::new(
                     1136,
                     "21S01",
@@ -1852,17 +2108,21 @@ impl Engine {
                 ));
             }
 
-            let ctx = Context::rowless(&session_snapshot).with_subqueries(self);
+            let ctx = Context::rowless(&session_snapshot).with_executor(self);
             let mut row = default_row(table, &ctx)?;
 
-            for (slot, value_expr) in targets.iter().zip(values.content.iter()) {
+            for (slot, source) in targets.iter().zip(values.iter()) {
                 if table.columns[*slot].generated.is_some() {
                     // DEFAULT and NULL are the only values MySQL accepts in a
                     // generated column's position.
-                    let permitted = matches!(value_expr, Expr::Identifier(i)
-                        if i.value.eq_ignore_ascii_case("default"))
-                        || matches!(value_expr, Expr::Value(v)
-                            if matches!(v.value, sqlparser::ast::Value::Null));
+                    let permitted = match source {
+                        SourceValue::Expr(e) => match e.as_ref() {
+                            Expr::Identifier(i) => i.value.eq_ignore_ascii_case("default"),
+                            Expr::Value(v) => matches!(v.value, sqlparser::ast::Value::Null),
+                            _ => false,
+                        },
+                        SourceValue::Value(v) => v.is_null(),
+                    };
                     if !permitted {
                         return Err(EngineError::new(
                             3105,
@@ -1877,11 +2137,16 @@ impl Engine {
                     continue;
                 }
                 // DEFAULT in a VALUES list keeps the column's default.
-                if matches!(value_expr, Expr::Identifier(i) if i.value.eq_ignore_ascii_case("default"))
+                if matches!(source, SourceValue::Expr(e)
+                    if matches!(e.as_ref(), Expr::Identifier(i)
+                        if i.value.eq_ignore_ascii_case("default")))
                 {
                     continue;
                 }
-                let value = expr::eval(value_expr, &ctx)?;
+                let value = match source {
+                    SourceValue::Expr(e) => expr::eval(e, &ctx)?,
+                    SourceValue::Value(v) => v.clone(),
+                };
                 let column = &table.columns[*slot];
                 row[*slot] = column.ty.coerce(value, &column.name)?;
             }
@@ -1905,6 +2170,18 @@ impl Engine {
                     // does. Without this, a fixture that inserts explicit ids
                     // collides with generated ones later.
                     table.next_auto_increment = table.next_auto_increment.max(explicit + 1);
+                }
+            }
+
+            // IGNORE downgrades a strict-mode error to a warning, so a NOT
+            // NULL column left out of the statement takes its type's implicit
+            // default rather than failing. The real migrations rely on this:
+            // they omit `NOT NULL` columns that have no DEFAULT.
+            if ignore {
+                for (slot, column) in table.columns.iter().enumerate() {
+                    if !column.nullable && row[slot].is_null() && column.generated.is_none() {
+                        row[slot] = column.ty.implicit_default();
+                    }
                 }
             }
 
@@ -1932,6 +2209,7 @@ impl Engine {
             inserted += 1;
         }
 
+        self.commit_database(&db, working)?;
         mark_modified(session, &db, std::slice::from_ref(&table_name));
         session.last_insert_id = last_id;
         session.affected_rows = inserted;
@@ -1951,31 +2229,31 @@ impl Engine {
         if !table.joins.is_empty() {
             return self.update_joined(session, table, assignments, selection);
         }
-        let TableFactor::Table { name, .. } = &table.relation else {
+        let TableFactor::Table { name, alias, .. } = &table.relation else {
             return Err(unsupported("this UPDATE target"));
         };
         let (db, table_name) = self.split_name(session, name)?;
+        // `UPDATE Board b ... WHERE b.x` qualifies by the alias, so that is
+        // the name the row's columns have to answer to.
+        let addressed_as = alias
+            .as_ref()
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| table_name.clone());
 
         let session_snapshot = session.clone();
-        let mut catalog = self.catalog_mut()?;
-
-        let fk_parents = {
-            let database = catalog
-                .database(&db)
-                .ok_or_else(|| EngineError::unknown_database(&db))?;
-            let table = database
-                .table(&table_name)
-                .ok_or_else(|| EngineError::no_such_table(&table_name))?;
-            foreign_keys::snapshot(database, table)
-        };
-
-        let database = catalog
-            .database_mut(&db)
-            .ok_or_else(|| EngineError::unknown_database(&db))?;
 
         // Applied to a copy and swapped in only on success, so a RESTRICT
         // found while cascading to children cannot leave the parent updated.
-        let mut working = database.clone();
+        let _writing = self.begin_write()?;
+        let mut working = self.database_copy(&db)?;
+
+        let fk_parents = {
+            let table = working
+                .table(&table_name)
+                .ok_or_else(|| EngineError::no_such_table(&table_name))?;
+            foreign_keys::snapshot(&working, table)
+        };
+
         let table = working
             .table_mut(&table_name)
             .ok_or_else(|| EngineError::no_such_table(&table_name))?;
@@ -1983,7 +2261,7 @@ impl Engine {
         let refs: Vec<ColumnRef> = table
             .columns
             .iter()
-            .map(|c| ColumnRef::new(&table.name, &c.name))
+            .map(|c| ColumnRef::new(&addressed_as, &c.name))
             .collect();
 
         // Checked once, before any row is considered: whether writing to a
@@ -2017,7 +2295,7 @@ impl Engine {
                     values: &rows[index],
                 }),
                 session: &session_snapshot,
-                subqueries: Some(self),
+                executor: Some(self),
             };
             let matched = match selection {
                 Some(p) => expr::eval(p, &ctx)?.truthy() == Some(true),
@@ -2028,6 +2306,7 @@ impl Engine {
             }
 
             let mut candidate = rows[index].clone();
+            let mut assigned: Vec<usize> = Vec::with_capacity(assignments.len());
             for assignment in assignments {
                 let column_name = assignment_column(&assignment.target)?;
                 let slot = table
@@ -2039,7 +2318,15 @@ impl Engine {
                 let value = expr::eval(&assignment.value, &ctx)?;
                 let column = &table.columns[slot];
                 candidate[slot] = column.ty.coerce(value, &column.name)?;
+                assigned.push(slot);
             }
+            Self::restamp_on_update(
+                table,
+                &rows[index],
+                &mut candidate,
+                &assigned,
+                &session_snapshot,
+            )?;
 
             let candidate = self.finalise_row(table, candidate, &session_snapshot)?;
             foreign_keys::check(&fk_parents, &candidate, &table_name)?;
@@ -2053,7 +2340,7 @@ impl Engine {
         table.rows = rows;
         let mut touched = vec![table_name.clone()];
         cascade_update(&mut working, &table_name, &changed, &mut touched)?;
-        *database = working;
+        self.commit_database(&db, working)?;
         mark_modified(session, &db, &touched);
 
         session.affected_rows = updated;
@@ -2122,15 +2409,14 @@ impl Engine {
             });
         }
 
-        let mut catalog = self.catalog_mut()?;
+        let _writing = self.begin_write()?;
+        let mut working = self.database_copy(&db)?;
 
         // Parent keys are captured per table before anything is written, as in
         // the single-table path.
         let mut parents: BTreeMap<usize, Vec<foreign_keys::ParentKeys>> = BTreeMap::new();
         {
-            let database = catalog
-                .database(&db)
-                .ok_or_else(|| EngineError::unknown_database(&db))?;
+            let database = &working;
             for target in &targets {
                 let base = &relation.base_tables[target.source];
                 let table = database
@@ -2161,11 +2447,6 @@ impl Engine {
             }
         }
 
-        let database = catalog
-            .database_mut(&db)
-            .ok_or_else(|| EngineError::unknown_database(&db))?;
-        let mut working = database.clone();
-
         // MySQL updates each base row at most once however many join rows it
         // appears in, and every assignment to that table applies to it.
         let mut seen: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
@@ -2179,7 +2460,7 @@ impl Engine {
                     values: row,
                 }),
                 session: &session_snapshot,
-                subqueries: Some(self),
+                executor: Some(self),
             };
             let matched = match selection {
                 Some(p) => expr::eval(p, &ctx)?.truthy() == Some(true),
@@ -2210,13 +2491,22 @@ impl Engine {
 
                 let before = table.rows[origin].clone();
                 let mut candidate = before.clone();
+                let mut assigned: Vec<usize> = Vec::new();
                 for target in targets.iter().filter(|t| t.source == source) {
                     let slot = table
                         .column_index(&target.column)
                         .ok_or_else(|| EngineError::unknown_column(&target.column, "field list"))?;
                     let value = expr::eval(&target.value, &ctx)?;
                     candidate[slot] = table.columns[slot].ty.coerce(value, &target.column)?;
+                    assigned.push(slot);
                 }
+                Self::restamp_on_update(
+                    table,
+                    &before,
+                    &mut candidate,
+                    &assigned,
+                    &session_snapshot,
+                )?;
 
                 let candidate = self.finalise_row(table, candidate, &session_snapshot)?;
                 if let Some(snapshot) = parents.get(&source) {
@@ -2239,7 +2529,7 @@ impl Engine {
             cascade_update(&mut working, &base, moved, &mut touched)?;
         }
 
-        *database = working;
+        self.commit_database(&db, working)?;
         mark_modified(session, &db, &touched);
 
         session.affected_rows = updated;
@@ -2277,22 +2567,24 @@ impl Engine {
         if !from[0].joins.is_empty() || !delete.tables.is_empty() {
             return self.delete_joined(session, delete, &from[0]);
         }
-        let TableFactor::Table { name, .. } = &from[0].relation else {
+        let TableFactor::Table { name, alias, .. } = &from[0].relation else {
             return Err(unsupported("this DELETE target"));
         };
         let (db, table_name) = self.split_name(session, name)?;
+        // As in UPDATE, an alias is what a qualified reference names.
+        let addressed_as = alias
+            .as_ref()
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| table_name.clone());
 
         let session_snapshot = session.clone();
-        let mut catalog = self.catalog_mut()?;
-        let database = catalog
-            .database_mut(&db)
-            .ok_or_else(|| EngineError::unknown_database(&db))?;
 
         // The delete and its cascade are applied to a copy and swapped in only
         // if the whole thing succeeds. A RESTRICT discovered part-way through a
         // chain would otherwise leave the parent already removed and earlier
         // children already cascaded.
-        let mut working = database.clone();
+        let _writing = self.begin_write()?;
+        let mut working = self.database_copy(&db)?;
         let table = working
             .table_mut(&table_name)
             .ok_or_else(|| EngineError::no_such_table(&table_name))?;
@@ -2300,7 +2592,7 @@ impl Engine {
         let refs: Vec<ColumnRef> = table
             .columns
             .iter()
-            .map(|c| ColumnRef::new(&table.name, &c.name))
+            .map(|c| ColumnRef::new(&addressed_as, &c.name))
             .collect();
 
         let before = table.rows.len();
@@ -2313,7 +2605,7 @@ impl Engine {
                     values: &row,
                 }),
                 session: &session_snapshot,
-                subqueries: Some(self),
+                executor: Some(self),
             };
             let matched = match &delete.selection {
                 Some(p) => expr::eval(p, &ctx)?.truthy() == Some(true),
@@ -2333,7 +2625,7 @@ impl Engine {
         // self-referencing table does not see the rows it is cascading from.
         let mut touched = vec![table_name.clone()];
         cascade_delete(&mut working, &table_name, &removed_rows, &mut touched)?;
-        *database = working;
+        self.commit_database(&db, working)?;
         mark_modified(session, &db, &touched);
 
         session.affected_rows = removed;
@@ -2407,7 +2699,7 @@ impl Engine {
                     values: row,
                 }),
                 session: &session_snapshot,
-                subqueries: Some(self),
+                executor: Some(self),
             };
             let matched = match &delete.selection {
                 Some(p) => expr::eval(p, &ctx)?.truthy() == Some(true),
@@ -2423,11 +2715,8 @@ impl Engine {
             }
         }
 
-        let mut catalog = self.catalog_mut()?;
-        let database = catalog
-            .database_mut(&db)
-            .ok_or_else(|| EngineError::unknown_database(&db))?;
-        let mut working = database.clone();
+        let _writing = self.begin_write()?;
+        let mut working = self.database_copy(&db)?;
 
         let mut removed = 0u64;
         let mut touched: Vec<String> = Vec::new();
@@ -2475,7 +2764,7 @@ impl Engine {
             cascade_delete(&mut working, &table_name, &removed_rows, &mut touched)?;
         }
 
-        *database = working;
+        self.commit_database(&db, working)?;
         mark_modified(session, &db, &touched);
 
         session.affected_rows = removed;
@@ -2488,6 +2777,8 @@ impl Engine {
         object_type: ObjectType,
         names: &[ObjectName],
         if_exists: bool,
+        // `DROP INDEX x ON t` carries the table separately from the index name.
+        on_table: Option<&ObjectName>,
     ) -> EngineResult<Outcome> {
         match object_type {
             ObjectType::Database | ObjectType::Schema => {
@@ -2544,9 +2835,40 @@ impl Engine {
                     }
                 }
             }
-            // DROP EVENT IF EXISTS appears in the migrations against an event
-            // that no longer exists; accepting it as a no-op is enough.
-            ObjectType::Index if if_exists => {}
+            ObjectType::Index => {
+                // Without the table there is nothing to look the index up in.
+                // `DROP EVENT IF EXISTS` also lands here, against an event that
+                // no longer exists, and accepting it as a no-op is enough.
+                let Some(on_table) = on_table else {
+                    if if_exists {
+                        return Ok(Outcome::ok());
+                    }
+                    return Err(unsupported("DROP INDEX without ON <table>"));
+                };
+                let (db, table_name) = self.split_name(session, on_table)?;
+                let mut catalog = self.catalog_mut()?;
+                let table = catalog
+                    .database_mut(&db)
+                    .ok_or_else(|| EngineError::unknown_database(&db))?
+                    .table_mut(&table_name)
+                    .ok_or_else(|| EngineError::no_such_table(&table_name))?;
+
+                for name in names {
+                    let index = object_name(name);
+                    let before = table.indexes.len();
+                    table
+                        .indexes
+                        .retain(|i| !i.name.eq_ignore_ascii_case(&index));
+                    if table.indexes.len() == before && !if_exists {
+                        return Err(EngineError::new(
+                            1091,
+                            "42000",
+                            format!("Can't DROP '{index}'; check that it exists"),
+                        ));
+                    }
+                }
+                mark_modified(session, &db, std::slice::from_ref(&table_name));
+            }
             other => return Err(unsupported(format!("DROP {other}"))),
         }
         Ok(Outcome::ok())
@@ -2559,7 +2881,7 @@ impl Engine {
                 variable, values, ..
             } => {
                 let name = object_name(variable);
-                let ctx = Context::rowless(session).with_subqueries(self);
+                let ctx = Context::rowless(session).with_executor(self);
                 // An expression that cannot be evaluated must not become a
                 // silent NULL: the variable would then carry a wrong answer
                 // into whatever reads it next.
@@ -2573,7 +2895,7 @@ impl Engine {
             S::MultipleAssignments { assignments } => {
                 for assignment in assignments {
                     let name = object_name(&assignment.name);
-                    let ctx = Context::rowless(session).with_subqueries(self);
+                    let ctx = Context::rowless(session).with_executor(self);
                     let value = expr::eval(&assignment.value, &ctx)?;
                     self.assign(session, &name, value);
                 }
@@ -2697,6 +3019,40 @@ impl Engine {
 
     // ------------------------------------------------------------- internals
 
+    /// Runs a query and presents its rows as a named relation.
+    ///
+    /// A CTE is addressed like a table, so its result needs the same shape a
+    /// table has: named columns carrying their real types, and no base rows,
+    /// because there is nothing to write back to.
+    fn relation_of_query(
+        &self,
+        session: &Session,
+        query: &Query,
+        name: &str,
+    ) -> EngineResult<Relation> {
+        let rows = self.query(session, query)?;
+        let schema = session.current_database.clone().unwrap_or_default();
+        let columns = rows
+            .columns
+            .iter()
+            .map(|c| crate::relation::RelColumn {
+                schema: schema.clone(),
+                table: name.to_owned(),
+                name: c.name.clone(),
+                ty: crate::types::SqlType::from_column_type(c.ty),
+                nullable: c.nullable,
+            })
+            .collect();
+
+        Ok(Relation {
+            origins: vec![Vec::new(); rows.rows.len()],
+            columns,
+            rows: rows.rows,
+            sources: Vec::new(),
+            base_tables: Vec::new(),
+        })
+    }
+
     /// Runs a view's definition and presents the result as a relation.
     ///
     /// The view's own database is made current for the duration, so an
@@ -2762,6 +3118,30 @@ impl Engine {
         })
     }
 
+    /// Restamps `ON UPDATE CURRENT_TIMESTAMP` columns that the statement did
+    /// not set itself.
+    ///
+    /// MySQL only restamps when the row actually changes, so an UPDATE that
+    /// writes the same values leaves the timestamp alone.
+    fn restamp_on_update(
+        table: &Table,
+        before: &[Value],
+        candidate: &mut [Value],
+        assigned: &[usize],
+        session: &Session,
+    ) -> EngineResult<()> {
+        if before == candidate {
+            return Ok(());
+        }
+        for (slot, column) in table.columns.iter().enumerate() {
+            if column.on_update_now && !assigned.contains(&slot) {
+                let now = crate::functions::call("now", Vec::new(), session)?;
+                candidate[slot] = column.ty.coerce(now, &column.name)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Computes generated columns and validates a candidate row.
     ///
     /// Shared by INSERT and UPDATE: a constraint enforced on one path and not
@@ -2793,7 +3173,7 @@ impl Engine {
                         values: &row,
                     }),
                     session,
-                    subqueries: Some(self),
+                    executor: Some(self),
                 };
                 expr::eval(&parsed, &ctx)?
             };
@@ -2815,7 +3195,7 @@ impl Engine {
                     values: &row,
                 }),
                 session,
-                subqueries: Some(self),
+                executor: Some(self),
             };
             // A CHECK passes when it is true or unknown; only an outright
             // false is a violation, as in MySQL.
@@ -2913,7 +3293,7 @@ fn using_condition(
     condition.ok_or_else(|| EngineError::parse("USING clause names no columns"))
 }
 
-impl crate::expr::Subqueries for Engine {
+impl crate::expr::Executor for Engine {
     fn rows(
         &self,
         query: &sqlparser::ast::Query,
@@ -2921,6 +3301,111 @@ impl crate::expr::Subqueries for Engine {
         outer: Option<crate::expr::OuterRow>,
     ) -> EngineResult<Vec<Vec<Value>>> {
         Ok(self.query_with_outer(session, query, outer.as_ref())?.rows)
+    }
+
+    fn next_random(&self, seed: Option<i64>) -> f64 {
+        // A seed restarts the sequence, as MySQL's RAND(N) does; without one
+        // the counter simply advances. xorshift64* keeps this to a few lines
+        // and needs no dependency — the numbers only have to be spread out,
+        // not unpredictable.
+        if let Some(n) = seed {
+            self.randoms
+                .store(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        let counter = self
+            .randoms
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // splitmix64. The counter advances by one, so the mixer has to spread
+        // adjacent inputs across the whole range: a bare xorshift left them
+        // nearly equal, and `ORDER BY RAND()` then returned rows in scan order
+        // while `WHERE RAND() < 0.5` matched every row or none.
+        let mut z = counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+
+        // 53 bits is what an f64 holds exactly, so the division is lossless.
+        (z >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn next_uuid(&self) -> String {
+        let n = self
+            .uuids
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Shaped like a version-4 UUID so anything that validates the format
+        // accepts it, but the body is a counter rather than randomness.
+        //
+        // The counter goes in the *leading* field, as MySQL's time-low does.
+        // With it at the end every value shared a 24-character prefix, and the
+        // migrations derive ids with `SUBSTRING(REPLACE(UUID(), '-', ''), 1, 21)`
+        // — every one of which collided.
+        let low = n as u32;
+        let high = (n >> 32) as u16;
+        format!("{low:08x}-{high:04x}-4000-8000-{n:012x}")
+    }
+
+    fn named_lock(&self, op: crate::expr::LockOp, name: &str, connection_id: u32) -> Value {
+        use crate::expr::LockOp;
+
+        // A poisoned lock table would only happen if a panic unwound while it
+        // was held, and there is nothing to recover — take it either way.
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        let holder = locks.get(name).copied();
+
+        match op {
+            LockOp::Acquire => {
+                // MySQL lets a connection re-take a lock it already holds. A
+                // lock held elsewhere returns 0 rather than blocking: this
+                // engine is a single test process, so waiting for a holder
+                // that will never release is worse than saying no.
+                match holder {
+                    Some(id) if id != connection_id => Value::Int(0),
+                    _ => {
+                        locks.insert(name.to_owned(), connection_id);
+                        Value::Int(1)
+                    }
+                }
+            }
+            LockOp::Release => match holder {
+                Some(id) if id == connection_id => {
+                    locks.remove(name);
+                    Value::Int(1)
+                }
+                Some(_) => Value::Int(0),
+                None => Value::Null,
+            },
+            LockOp::IsFree => Value::Int(i64::from(holder.is_none())),
+            LockOp::UsedBy => holder.map_or(Value::Null, |id| Value::Int(i64::from(id))),
+            LockOp::ReleaseAll => {
+                let before = locks.len();
+                locks.retain(|_, id| *id != connection_id);
+                Value::Int((before - locks.len()) as i64)
+            }
+        }
+    }
+}
+
+/// What a multi-statement command produced: one outcome per statement that
+/// ran, and the error that stopped the rest.
+pub struct Executed {
+    pub outcomes: Vec<Outcome>,
+    pub error: Option<EngineError>,
+}
+
+impl Executed {
+    fn of(outcomes: Vec<Outcome>) -> Self {
+        Self {
+            outcomes,
+            error: None,
+        }
+    }
+
+    fn failed(outcomes: Vec<Outcome>, error: EngineError) -> Self {
+        Self {
+            outcomes,
+            error: Some(error),
+        }
     }
 }
 
@@ -3064,6 +3549,15 @@ fn reject_duplicate_sources(relation: &Relation) -> EngineResult<()> {
         }
     }
     Ok(())
+}
+
+/// One value of an inserted row: still an expression from a VALUES list, or
+/// already computed by the SELECT of an `INSERT ... SELECT`.
+enum SourceValue {
+    // Boxed because an `Expr` is an order of magnitude larger than a `Value`,
+    // and every value of every inserted row is one of these.
+    Expr(Box<Expr>),
+    Value(Value),
 }
 
 /// A row before and after an UPDATE, which is what a cascade needs to match
@@ -3559,11 +4053,193 @@ fn computed_column_type(e: &Expr) -> ColumnType {
     }
 }
 
+/// The column positions a GROUP BY determines, which is more than the columns
+/// it names.
+///
+/// MySQL's ONLY_FULL_GROUP_BY permits a column that is *functionally
+/// dependent* on the grouping. `GROUP BY esa.sectionId` with
+/// `JOIN es ON es.id = esa.sectionId` fixes `es.id` for the whole group, so
+/// selecting it is not ambiguous and MySQL accepts it — the migrations rely on
+/// exactly that. Equality conditions in ON and WHERE are followed to build the
+/// set; anything they do not reach is still an error.
+fn determined_columns(select: &Select, refs: &[ColumnRef], group_exprs: &[Expr]) -> Vec<usize> {
+    let mut determined: Vec<usize> = group_exprs
+        .iter()
+        .filter_map(|e| column_slot(refs, e))
+        .collect();
+
+    // Directed: `(from, to)` means a value of `from` fixes `to`.
+    let mut equalities: Vec<(usize, usize)> = Vec::new();
+
+    // A WHERE equality holds for every row in the result, so it determines in
+    // both directions.
+    if let Some(where_clause) = &select.selection {
+        for (left, right) in equality_conjuncts(where_clause) {
+            if let (Some(l), Some(r)) = (column_slot(refs, &left), column_slot(refs, &right)) {
+                equalities.push((l, r));
+                equalities.push((r, l));
+            }
+        }
+    }
+
+    for from in &select.from {
+        for join in &from.joins {
+            let Some(sqlparser::ast::JoinConstraint::On(on)) = join_constraint(&join.join_operator)
+            else {
+                continue;
+            };
+            let side = preserved_side(&join.join_operator);
+            let joined = factor_name(&join.relation);
+            let in_joined = |slot: usize| {
+                joined
+                    .as_deref()
+                    .is_some_and(|name| refs[slot].table.eq_ignore_ascii_case(name))
+            };
+
+            for (left, right) in equality_conjuncts(on) {
+                let (Some(l), Some(r)) = (column_slot(refs, &left), column_slot(refs, &right))
+                else {
+                    continue;
+                };
+                // An outer join's ON does not hold on its NULL-extended rows,
+                // so the preserved side is *not* determined by the other one:
+                // `a LEFT JOIN b ON a.id = b.id GROUP BY b.id` collects every
+                // unmatched `a` into one group. The null-supplying side is
+                // determined, because there it is NULL — a single value.
+                for (from, to) in [(l, r), (r, l)] {
+                    let permitted = match side {
+                        PreservedSide::Both => true,
+                        PreservedSide::Left => !in_joined(from) && in_joined(to),
+                        PreservedSide::Right => in_joined(from) && !in_joined(to),
+                        PreservedSide::Neither => false,
+                    };
+                    if permitted {
+                        equalities.push((from, to));
+                    }
+                }
+            }
+        }
+    }
+
+    // Determination is transitive, so the set is closed rather than walked
+    // once. These pairs are directed, so the closure follows them one way.
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for (from, to) in &equalities {
+            if determined.contains(from) && !determined.contains(to) {
+                determined.push(*to);
+                grew = true;
+            }
+        }
+    }
+    determined
+}
+
+/// Which side of a join keeps its rows when the other side has no match.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreservedSide {
+    Both,
+    Left,
+    Right,
+    Neither,
+}
+
+fn preserved_side(op: &sqlparser::ast::JoinOperator) -> PreservedSide {
+    use sqlparser::ast::JoinOperator as J;
+    match op {
+        J::Join(_) | J::Inner(_) => PreservedSide::Both,
+        J::Left(_) | J::LeftOuter(_) => PreservedSide::Left,
+        J::Right(_) | J::RightOuter(_) => PreservedSide::Right,
+        // A full outer join preserves both sides, so neither determines the
+        // other; a semi or anti join contributes no columns at all.
+        _ => PreservedSide::Neither,
+    }
+}
+
+/// The name a joined table is addressed by, which is its alias where it has one.
+fn factor_name(factor: &TableFactor) -> Option<String> {
+    match factor {
+        TableFactor::Table { name, alias, .. } => Some(
+            alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .unwrap_or_else(|| object_name(name)),
+        ),
+        TableFactor::Derived { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
+        _ => None,
+    }
+}
+
+/// The `ON` clause of a join, where it has one.
+fn join_constraint(op: &sqlparser::ast::JoinOperator) -> Option<&sqlparser::ast::JoinConstraint> {
+    use sqlparser::ast::JoinOperator as J;
+    match op {
+        J::Join(c)
+        | J::Inner(c)
+        | J::Left(c)
+        | J::LeftOuter(c)
+        | J::Right(c)
+        | J::RightOuter(c)
+        | J::FullOuter(c)
+        | J::Semi(c)
+        | J::LeftSemi(c)
+        | J::RightSemi(c)
+        | J::Anti(c)
+        | J::LeftAnti(c)
+        | J::RightAnti(c) => Some(c),
+        _ => None,
+    }
+}
+
+/// Every `a = b` reachable through AND, which is where an equality has to hold
+/// for the row to be in the result at all. An OR branch proves nothing.
+fn equality_conjuncts(e: &Expr) -> Vec<(Expr, Expr)> {
+    use sqlparser::ast::BinaryOperator as Op;
+    match e {
+        Expr::BinaryOp { left, op, right } => match op {
+            Op::Eq => vec![(left.as_ref().clone(), right.as_ref().clone())],
+            Op::And => {
+                let mut out = equality_conjuncts(left);
+                out.extend(equality_conjuncts(right));
+                out
+            }
+            _ => Vec::new(),
+        },
+        Expr::Nested(inner) => equality_conjuncts(inner),
+        _ => Vec::new(),
+    }
+}
+
+/// Where a column reference lands in the relation, so `sectionId` and
+/// `esa.sectionId` are recognised as the same column.
+fn column_slot(refs: &[ColumnRef], e: &Expr) -> Option<usize> {
+    let (table, name) = match e {
+        Expr::Identifier(i) => (None, i.value.as_str()),
+        Expr::CompoundIdentifier(parts) => (
+            parts
+                .get(parts.len().wrapping_sub(2))
+                .map(|p| p.value.as_str()),
+            parts.last()?.value.as_str(),
+        ),
+        Expr::Nested(inner) => return column_slot(refs, inner),
+        _ => return None,
+    };
+    refs.iter().position(|c| {
+        c.name.eq_ignore_ascii_case(name) && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+    })
+}
+
 /// Rejects a selected expression that is neither aggregated nor grouped by.
 ///
 /// Without this the engine evaluates it against the group's first row and
 /// returns an arbitrary value, where MySQL under ONLY_FULL_GROUP_BY errors.
-fn check_full_group_by(e: &Expr, group_exprs: &[Expr]) -> EngineResult<()> {
+fn check_full_group_by(
+    e: &Expr,
+    group_exprs: &[Expr],
+    refs: &[ColumnRef],
+    determined: &[usize],
+) -> EngineResult<()> {
     // An expression built only from aggregates and constants is always fine.
     if !references_column(e) {
         return Ok(());
@@ -3573,16 +4249,21 @@ fn check_full_group_by(e: &Expr, group_exprs: &[Expr]) -> EngineResult<()> {
     if group_exprs.iter().any(|g| g.to_string() == rendered) {
         return Ok(());
     }
+    // A column the grouping determines, whether or not it was named the same
+    // way in the GROUP BY.
+    if column_slot(refs, e).is_some_and(|slot| determined.contains(&slot)) {
+        return Ok(());
+    }
 
     match e {
         Expr::Function(f) if f.over.is_some() => return Ok(()),
         Expr::Function(f) if is_aggregate(&f.name.to_string()) => return Ok(()),
         Expr::BinaryOp { left, right, .. } => {
-            check_full_group_by(left, group_exprs)?;
-            return check_full_group_by(right, group_exprs);
+            check_full_group_by(left, group_exprs, refs, determined)?;
+            return check_full_group_by(right, group_exprs, refs, determined);
         }
         Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
-            return check_full_group_by(expr, group_exprs)
+            return check_full_group_by(expr, group_exprs, refs, determined)
         }
         _ => {}
     }

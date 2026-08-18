@@ -56,6 +56,13 @@ pub struct Session {
     /// How many views deep evaluation currently is, so a self-referential view
     /// is refused rather than exhausting the stack.
     pub view_depth: usize,
+    /// Common table expressions in scope, innermost last.
+    ///
+    /// A CTE is named like a table but exists only for the statement that
+    /// declares it, so it lives here rather than in the catalog. Kept as
+    /// already-materialised rows because MySQL evaluates a non-recursive CTE
+    /// once however many times the body names it.
+    pub ctes: Vec<(String, crate::relation::Relation)>,
     /// The parsed form of `config.sql_mode`, with the string it came from so a
     /// direct mutation of `config` cannot leave it stale.
     parsed_mode: crate::dialect::SqlMode,
@@ -78,6 +85,7 @@ impl Session {
             in_transaction: false,
             transaction: None,
             view_depth: 0,
+            ctes: Vec::new(),
             parsed_mode,
             parsed_from,
             last_insert_id: 0,

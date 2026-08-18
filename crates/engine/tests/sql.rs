@@ -3,6 +3,13 @@
 use mysql_ultralight_engine::{Engine, Outcome, ServerConfig, Session, Value};
 
 /// A fresh engine with one database selected.
+///
+/// Aliased so a test that needs a *second* engine can still reach it after
+/// binding a local named `engine`.
+fn fresh_engine() -> (std::sync::Arc<Engine>, Session) {
+    engine()
+}
+
 fn engine() -> (std::sync::Arc<Engine>, Session) {
     let engine = Engine::new(ServerConfig::default());
     engine.bootstrap_database("testdb").unwrap();
@@ -1064,7 +1071,7 @@ fn ignore_space_allows_a_gap_before_a_call() {
     );
 }
 
-/// Scalar subqueries, which the migrations reach for constantly to test
+/// Scalar executor, which the migrations reach for constantly to test
 /// information_schema before altering anything.
 #[test]
 fn a_scalar_subquery_evaluates_to_one_value() {
@@ -1103,7 +1110,7 @@ fn a_scalar_subquery_returning_many_rows_is_an_error() {
 }
 
 #[test]
-fn exists_and_in_subqueries_filter() {
+fn exists_and_in_executor_filter() {
     let (engine, mut session) = engine();
     widgets(&engine, &mut session);
     run(
@@ -1867,10 +1874,10 @@ fn aggregating_binary_data_preserves_it() {
     );
 }
 
-/// MySQL accepts an IN list whose elements are scalar subqueries. It is
+/// MySQL accepts an IN list whose elements are scalar executor. It is
 /// rewritten into a UNION ALL, so this checks the result, not just the parse.
 #[test]
-fn in_a_list_of_scalar_subqueries() {
+fn in_a_list_of_scalar_executor() {
     let (engine, mut session) = engine();
     widgets(&engine, &mut session);
     run(
@@ -3658,4 +3665,809 @@ fn a_negative_lag_offset_is_refused() {
         )
         .unwrap_err();
     assert_eq!(err.code, 1210);
+}
+
+// --- Running the real migrations -------------------------------------------
+//
+// Everything below was found by pointing `prisma migrate deploy` at the engine
+// and fixing whatever it hit next. Each is a feature the real 604-migration
+// history needs, or a bug that history exposed.
+
+#[test]
+fn a_subquery_in_values_does_not_deadlock() {
+    // The writer held the catalog's write lock while evaluating, and the
+    // subquery needed a read lock to answer. `RwLock` is not reentrant, so the
+    // statement hung forever rather than failing.
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Pick (id VARCHAR(21) NOT NULL, chosen VARCHAR(120) NULL, PRIMARY KEY (id))",
+    );
+
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Pick (id, chosen) VALUES ('p1', (SELECT name FROM Widget WHERE id = 'a'))",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT chosen FROM Pick"),
+        vec![vec!["alpha"]]
+    );
+
+    // The same hazard on the UPDATE and DELETE paths.
+    run(
+        &engine,
+        &mut session,
+        "UPDATE Pick SET chosen = (SELECT name FROM Widget WHERE id = 'b')",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT chosen FROM Pick"),
+        vec![vec!["beta"]]
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "DELETE FROM Pick WHERE chosen = (SELECT name FROM Widget WHERE id = 'b')"
+        ),
+        1
+    );
+}
+
+#[test]
+fn insert_select_copies_rows() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Copy (id VARCHAR(21) NOT NULL, name VARCHAR(120) NOT NULL, PRIMARY KEY (id))",
+    );
+
+    let inserted = affected(
+        &engine,
+        &mut session,
+        "INSERT INTO Copy (id, name) SELECT id, name FROM Widget WHERE count > 1",
+    );
+    assert_eq!(inserted, 2);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Copy ORDER BY id"),
+        vec![vec!["a"], vec!["c"]]
+    );
+
+    // IGNORE still skips a duplicate rather than failing the statement.
+    let again = affected(
+        &engine,
+        &mut session,
+        "INSERT IGNORE INTO Copy (id, name) SELECT id, name FROM Widget",
+    );
+    assert_eq!(again, 1);
+}
+
+#[test]
+fn a_multi_statement_command_runs_every_statement() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    let executed = engine.execute_many(
+        &mut session,
+        "UPDATE Widget SET count = 10 WHERE id = 'a'; \
+         SELECT count FROM Widget WHERE id = 'a'; \
+         DELETE FROM Widget WHERE id = 'b';",
+        &[],
+    );
+    assert!(executed.error.is_none());
+    assert_eq!(executed.outcomes.len(), 3);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Widget ORDER BY id"),
+        vec![vec!["a"], vec!["c"]]
+    );
+}
+
+#[test]
+fn a_semicolon_inside_a_literal_is_not_a_separator() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    let executed = engine.execute_many(
+        &mut session,
+        "UPDATE Widget SET note = 'a;b' WHERE id = 'a'; -- and a; comment\n\
+         SELECT note FROM Widget WHERE id = 'a'",
+        &[],
+    );
+    assert!(executed.error.is_none());
+    assert_eq!(executed.outcomes.len(), 2);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT note FROM Widget WHERE id = 'a'"
+        ),
+        vec![vec!["a;b"]]
+    );
+}
+
+#[test]
+fn a_multi_statement_command_stops_at_the_first_error() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    let executed = engine.execute_many(
+        &mut session,
+        "UPDATE Widget SET count = 5 WHERE id = 'a'; \
+         SELECT * FROM Nope; \
+         DELETE FROM Widget",
+        &[],
+    );
+    assert!(executed.error.is_some());
+
+    // The statement before the error stands; the one after it never ran.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT count FROM Widget WHERE id = 'a'"
+        ),
+        vec![vec!["5"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Widget").len(),
+        3
+    );
+}
+
+#[test]
+fn a_cte_can_be_selected_from_and_joined_to() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH big AS (SELECT id, count FROM Widget WHERE count > 1) \
+             SELECT id FROM big ORDER BY id"
+        ),
+        vec![vec!["a"], vec!["c"]]
+    );
+
+    // Named columns, and a join back to the base table.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH totals (wid, n) AS (SELECT id, count FROM Widget) \
+             SELECT w.name, t.n FROM Widget w JOIN totals t ON t.wid = w.id \
+             WHERE t.n = 3"
+        ),
+        vec![vec!["alpha", "3"]]
+    );
+}
+
+#[test]
+fn a_cte_can_feed_an_update() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    let updated = affected(
+        &engine,
+        &mut session,
+        "WITH ranked AS (SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM Widget) \
+         UPDATE Widget w JOIN ranked r ON r.id = w.id SET w.count = r.rn",
+    );
+    assert_eq!(updated, 3);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT count FROM Widget ORDER BY id"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["3"]]
+    );
+}
+
+#[test]
+fn a_recursive_cte_is_refused() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    let err = engine
+        .execute(
+            &mut session,
+            "WITH RECURSIVE n AS (SELECT 1 AS x) SELECT x FROM n",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1235);
+}
+
+#[test]
+fn named_locks_are_held_per_connection() {
+    // Prisma's migration engine takes GET_LOCK before it applies anything.
+    let (engine, mut first) = engine();
+    let mut second = Session::new(ServerConfig::default(), 2);
+    second.current_database = Some("testdb".to_owned());
+
+    assert_eq!(
+        rows(&engine, &mut first, "SELECT GET_LOCK('m', 1)"),
+        vec![vec!["1"]]
+    );
+    // Re-taking a lock this connection already holds succeeds; another
+    // connection is told no rather than waiting for a holder in the same
+    // process that cannot release while it waits.
+    assert_eq!(
+        rows(&engine, &mut first, "SELECT GET_LOCK('m', 1)"),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut second, "SELECT GET_LOCK('m', 1)"),
+        vec![vec!["0"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut second, "SELECT IS_USED_LOCK('m')"),
+        vec![vec!["1"]]
+    );
+
+    // Releasing someone else's lock reports 0 and does not release it.
+    assert_eq!(
+        rows(&engine, &mut second, "SELECT RELEASE_LOCK('m')"),
+        vec![vec!["0"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut first, "SELECT RELEASE_LOCK('m')"),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut second, "SELECT IS_FREE_LOCK('m')"),
+        vec![vec!["1"]]
+    );
+    // An unheld lock releases to NULL, not 0.
+    assert_eq!(
+        rows(&engine, &mut first, "SELECT RELEASE_LOCK('m')"),
+        vec![vec!["NULL"]]
+    );
+}
+
+#[test]
+fn generated_values_are_unique_and_deterministic() {
+    let (first_engine, mut second_session) = engine();
+    let (engine, session) = (&first_engine, &mut second_session);
+
+    let first = rows(engine, session, "SELECT UUID(), UUID(), MD5('abc')");
+    // Two calls in one statement must not collide, and neither must their
+    // prefixes: the migrations derive ids with SUBSTRING(REPLACE(UUID(), ...)).
+    assert_ne!(first[0][0], first[0][1]);
+    assert_ne!(first[0][0][..8], first[0][1][..8]);
+    assert_eq!(first[0][2], "900150983cd24fb0d6963f7d28e17f72");
+
+    // A fresh engine repeats the sequence, so a test can assert on an id.
+    let (other, mut other_session) = fresh_engine();
+    assert_eq!(
+        rows(&other, &mut other_session, "SELECT UUID()")[0][0],
+        first[0][0]
+    );
+
+    // RAND stays inside [0, 1) and moves.
+    let r = rows(engine, session, "SELECT RAND(), RAND()");
+    let (a, b): (f64, f64) = (r[0][0].parse().unwrap(), r[0][1].parse().unwrap());
+    assert!((0.0..1.0).contains(&a) && (0.0..1.0).contains(&b));
+    assert_ne!(a, b);
+}
+
+#[test]
+fn regular_expressions_match_and_replace() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT REGEXP_REPLACE('Hello World', '[^a-zA-Z]+', '-')"
+        ),
+        vec![vec!["Hello-World"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM Widget WHERE name REGEXP '^(al|ga)' ORDER BY id"
+        ),
+        vec![vec!["a"], vec!["c"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM Widget WHERE name NOT REGEXP '^(al|ga)'"
+        ),
+        vec![vec!["b"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT REGEXP_SUBSTR('a1b22c', '[0-9]+')"
+        ),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT REGEXP_INSTR('a1b22c', '[0-9]{2}')"
+        ),
+        vec![vec!["4"]]
+    );
+
+    // A pattern the engine cannot compile is an error, never a silent no-match
+    // that would rewrite or skip the wrong rows.
+    let err = engine
+        .execute(&mut session, "SELECT REGEXP_LIKE('a', '[')", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 3692);
+}
+
+#[test]
+fn a_values_constructor_is_a_result_in_its_own_right() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(&engine, &mut session, "VALUES ROW('a'), ROW('b')"),
+        vec![vec!["a"], vec!["b"]]
+    );
+}
+
+#[test]
+fn on_update_current_timestamp_restamps_a_changed_row() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Stamped (
+            id INTEGER NOT NULL,
+            v INTEGER NOT NULL,
+            updatedAt DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+                ON UPDATE CURRENT_TIMESTAMP(3),
+            PRIMARY KEY (id)
+        )",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Stamped (id, v, updatedAt) VALUES (1, 1, '2000-01-01 00:00:00.000')",
+    );
+
+    // A statement that changes nothing leaves the stamp alone, as MySQL does.
+    run(&engine, &mut session, "UPDATE Stamped SET v = 1");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT updatedAt FROM Stamped")[0][0],
+        "2000-01-01 00:00:00.000"
+    );
+
+    run(&engine, &mut session, "UPDATE Stamped SET v = 2");
+    assert_ne!(
+        rows(&engine, &mut session, "SELECT updatedAt FROM Stamped")[0][0],
+        "2000-01-01 00:00:00.000"
+    );
+
+    // An explicit value wins over the restamp.
+    run(
+        &engine,
+        &mut session,
+        "UPDATE Stamped SET v = 3, updatedAt = '2001-01-01 00:00:00.000'",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT updatedAt FROM Stamped")[0][0],
+        "2001-01-01 00:00:00.000"
+    );
+}
+
+#[test]
+fn an_alias_qualifies_a_single_table_update_or_delete() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE Widget w SET w.count = 9 WHERE w.id = 'a'"
+        ),
+        1
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT count FROM Widget WHERE id = 'a'"
+        ),
+        vec![vec!["9"]]
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "DELETE FROM Widget w WHERE w.id = 'b'"
+        ),
+        1
+    );
+}
+
+#[test]
+fn a_foreign_key_creates_the_index_mysql_would() {
+    // MySQL indexes every foreign key, and Prisma renames that index in a
+    // later migration — which fails outright if it was never created.
+    let (engine, mut session) = engine();
+    parent_child(&engine, &mut session);
+
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE Child RENAME INDEX Child_parent TO Child_parent_index",
+    );
+    run(
+        &engine,
+        &mut session,
+        "DROP INDEX Child_parent_index ON Child",
+    );
+
+    let err = engine
+        .execute(&mut session, "DROP INDEX Child_parent_index ON Child", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1091);
+}
+
+#[test]
+fn an_inline_unique_index_keeps_the_name_it_was_given() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Named (
+            id INTEGER NOT NULL,
+            a VARCHAR(20) NOT NULL,
+            b VARCHAR(20) NOT NULL,
+            UNIQUE INDEX Named_a_b_key (a, b),
+            PRIMARY KEY (id)
+        )",
+    );
+    // Stored under an invented name, this could not be found again.
+    run(&engine, &mut session, "DROP INDEX Named_a_b_key ON Named");
+}
+
+#[test]
+fn insert_ignore_fills_a_not_null_column_that_has_no_default() {
+    // Strict mode makes the plain statement an error; IGNORE downgrades it to
+    // a warning and writes the type's implicit default, which is what the real
+    // seed migrations depend on.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Ordered (id INTEGER NOT NULL, orderNo INTEGER NOT NULL, PRIMARY KEY (id))",
+    );
+
+    engine
+        .execute(&mut session, "INSERT INTO Ordered (id) VALUES (1)", &[])
+        .unwrap_err();
+    run(
+        &engine,
+        &mut session,
+        "INSERT IGNORE INTO Ordered (id) VALUES (1)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT orderNo FROM Ordered"),
+        vec![vec!["0"]]
+    );
+}
+
+#[test]
+fn only_full_group_by_allows_a_column_the_grouping_determines() {
+    // MySQL permits a column that a join equality fixes for the whole group.
+    let (engine, mut session) = engine();
+    parent_child(&engine, &mut session);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT p.id, COUNT(*) FROM Child c \
+             LEFT JOIN Parent p ON p.id = c.parentId \
+             GROUP BY parentId ORDER BY p.id"
+        ),
+        vec![vec!["1", "2"], vec!["2", "1"]]
+    );
+
+    // A column nothing determines is still an error.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT c.note, COUNT(*) FROM Child c \
+             LEFT JOIN Parent p ON p.id = c.parentId GROUP BY parentId",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1055);
+}
+
+#[test]
+fn cast_accepts_the_mysql_integer_spellings() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('42' AS SIGNED), CAST('7' AS UNSIGNED)"
+        ),
+        vec![vec!["42", "7"]]
+    );
+}
+
+#[test]
+fn substring_trim_and_position_work_in_keyword_form() {
+    // sqlparser models these as their own nodes, so the keyword spellings used
+    // to miss the function table entirely.
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT SUBSTRING('abcdef' FROM 2 FOR 3), \
+                    TRIM(BOTH ' ' FROM '  hi  '), \
+                    TRIM(LEADING ' ' FROM '  hi'), \
+                    POSITION('c' IN 'abc')"
+        ),
+        vec![vec!["bcd", "hi", "hi", "3"]]
+    );
+}
+
+#[test]
+fn only_full_group_by_still_rejects_the_preserved_side_of_an_outer_join() {
+    // A LEFT JOIN's ON does not hold on the NULL-extended rows, so the
+    // preserved side is not determined by the null-supplying one: every
+    // unmatched row lands in the same group and the engine would pick one of
+    // them arbitrarily.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE L (id INTEGER NOT NULL, name VARCHAR(10) NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE R (id INTEGER NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO L VALUES (1,'one'),(2,'two'),(3,'three')",
+    );
+    run(&engine, &mut session, "INSERT INTO R VALUES (1)");
+
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT R.id, L.id, COUNT(*) FROM L LEFT JOIN R ON L.id = R.id GROUP BY R.id",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1055);
+
+    // The other direction is fine: grouping by the preserved side determines
+    // the null-supplying one, because there it is NULL — a single value.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT L.id, R.id FROM L LEFT JOIN R ON L.id = R.id GROUP BY L.id ORDER BY L.id"
+        ),
+        vec![vec!["1", "1"], vec!["2", "NULL"], vec!["3", "NULL"]]
+    );
+}
+
+#[test]
+fn rand_spreads_across_the_range() {
+    // A counter run through a weak mixer produced nearly equal values, so
+    // `ORDER BY RAND()` returned scan order and `WHERE RAND() < 0.5` matched
+    // every row or none.
+    let (engine, mut session) = engine();
+    let values: Vec<f64> = rows(
+        &engine,
+        &mut session,
+        "SELECT RAND(), RAND(), RAND(), RAND(), RAND(), RAND(), RAND(), RAND()",
+    )[0]
+    .iter()
+    .map(|v| v.parse().unwrap())
+    .collect();
+
+    assert!(values.iter().all(|v| (0.0..1.0).contains(v)));
+    let below = values.iter().filter(|v| **v < 0.5).count();
+    assert!(
+        (1..values.len()).contains(&below),
+        "all on one side of 0.5: {values:?}"
+    );
+
+    // A seed restarts the sequence rather than repeating one value.
+    let seeded = rows(&engine, &mut session, "SELECT RAND(7), RAND()");
+    assert_ne!(seeded[0][0], seeded[0][1]);
+    let again = rows(&engine, &mut session, "SELECT RAND(7)");
+    assert_eq!(again[0][0], seeded[0][0]);
+}
+
+#[test]
+fn the_optional_regexp_arguments_change_the_answer() {
+    // Accepting and ignoring these answered a different question: 'c' asks for
+    // a case-sensitive match, and an occurrence of 2 rewrites only the second.
+    let (engine, mut session) = engine();
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT REGEXP_INSTR('abcabc', 'a', 4), \
+                    REGEXP_REPLACE('aaa', 'a', 'b', 1, 2), \
+                    REGEXP_LIKE('ABC', 'abc', 'c'), \
+                    REGEXP_LIKE('ABC', 'abc', 'i'), \
+                    REGEXP_SUBSTR('a1b22c', '[0-9]+', 1, 2), \
+                    REGEXP_REPLACE('a-b', '[^a-z]', '_', 1, 0, 'c')"
+        ),
+        vec![vec!["4", "aba", "0", "1", "22", "a_b"]]
+    );
+
+    // A match type that would change semantics this does not implement, and a
+    // start position MySQL rejects, are errors rather than quiet answers.
+    for (sql, code) in [
+        ("SELECT REGEXP_LIKE('a', 'a', 'm')", 1235),
+        ("SELECT REGEXP_SUBSTR('a', 'a', 0)", 1582),
+        ("SELECT 'ABC' REGEXP BINARY 'abc'", 1235),
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, code, "for: {sql}");
+    }
+}
+
+#[test]
+fn a_cte_inside_a_subquery_is_in_scope() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM Widget WHERE id IN (WITH d AS (SELECT 'a' AS k) SELECT k FROM d)"
+        ),
+        vec![vec!["a"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT (WITH d AS (SELECT 7 AS n) SELECT n FROM d)"
+        ),
+        vec![vec!["7"]]
+    );
+}
+
+#[test]
+fn a_cte_is_evaluated_once_per_statement() {
+    // Materialising it at two levels ran it twice, which is visible through
+    // any function that advances state.
+    let (engine, mut session) = engine();
+    let first = rows(
+        &engine,
+        &mut session,
+        "WITH c AS (SELECT UUID() AS u) SELECT u FROM c",
+    );
+    let (other, mut other_session) = fresh_engine();
+    let bare = rows(&other, &mut other_session, "SELECT UUID()");
+    assert_eq!(first[0][0], bare[0][0]);
+}
+
+#[test]
+fn a_multi_statement_command_reports_what_already_ran() {
+    // The statements before a failure have been applied and there is no
+    // rollback, so reporting only the error would claim nothing happened.
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    let executed = engine.execute_many(
+        &mut session,
+        "UPDATE Widget SET count = 7 WHERE id = 'a'; SELECT * FROM Nope; DELETE FROM Widget",
+        &[],
+    );
+    assert_eq!(executed.outcomes.len(), 1);
+    assert_eq!(executed.error.map(|e| e.code), Some(1146));
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Widget").len(),
+        3
+    );
+}
+
+#[test]
+fn the_implicit_default_is_the_same_however_the_column_is_filled() {
+    // Two implementations disagreed, so a column back-filled by ALTER TABLE
+    // did not compare equal to one filled by INSERT IGNORE.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Defaults (id INTEGER NOT NULL, d DATE NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT IGNORE INTO Defaults (id) VALUES (1)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE Defaults ADD COLUMN d2 DATE NOT NULL",
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM Defaults WHERE d = d2"
+        ),
+        vec![vec!["1"]]
+    );
+}
+
+#[test]
+fn cast_to_an_integer_reads_the_leading_number() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('12abc' AS SIGNED), CAST('abc' AS SIGNED), CAST('-5x' AS SIGNED)"
+        ),
+        vec![vec!["12", "0", "-5"]]
+    );
+
+    // An unsigned cast of a negative value cannot be represented, so it is
+    // refused rather than reported as a negative number.
+    let err = engine
+        .execute(&mut session, "SELECT CAST(-1 AS UNSIGNED)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1235);
+}
+
+#[test]
+fn unnamed_foreign_keys_get_distinct_names() {
+    // One name for all of them meant the implicit indexes collided, and
+    // dropping one would have dropped every one.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE P2 (id INTEGER NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C2 (
+            id INTEGER NOT NULL,
+            pid INTEGER NOT NULL,
+            qid INTEGER NOT NULL,
+            PRIMARY KEY (id),
+            FOREIGN KEY (pid) REFERENCES P2(id),
+            FOREIGN KEY (qid) REFERENCES P2(id)
+        )",
+    );
+
+    let names = rows(
+        &engine,
+        &mut session,
+        "SELECT DISTINCT INDEX_NAME FROM information_schema.statistics \
+         WHERE TABLE_NAME = 'C2' ORDER BY INDEX_NAME",
+    );
+    assert_eq!(
+        names,
+        vec![vec!["C2_ibfk_1"], vec!["C2_ibfk_2"], vec!["PRIMARY"]]
+    );
 }

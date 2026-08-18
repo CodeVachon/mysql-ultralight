@@ -1,0 +1,27 @@
+---
+id: 31
+title: Run the real 604-migration history end to end
+state: Todo
+parent: 8
+labels: [compat, prisma, milestone]
+created: 2026-08-18T22:40:24Z
+updated: 2026-08-18T23:01:22Z
+---
+
+## Description
+
+Pointing `prisma migrate deploy` at the engine with the real Appello history is the only test that proves the engine works, as opposed to parses. 453 of 604 migrations apply today.
+
+Everything it found so far is fixed: multi-statement commands, CTEs, INSERT ... SELECT, named locks, UUID/RAND/MD5/REGEXP, DROP INDEX, the implicit index MySQL creates for a foreign key, inline UNIQUE INDEX names, table aliases in single-table UPDATE and DELETE, ON UPDATE CURRENT_TIMESTAMP, VALUES ROW(), CAST AS SIGNED, functional dependency under ONLY_FULL_GROUP_BY, and INSERT IGNORE filling a NOT NULL column that has no default. A deadlock was also found and fixed: every writer held the catalog's write lock while evaluating, so any subquery in VALUES, SET or WHERE hung the connection forever.
+
+Next blocker at migration 453: JSON_TABLE, which needs JSON path support — see #0029.
+
+This should become an automated check once it passes, because it is the difference between a parser and a database.
+
+## Notes
+
+### 2026-08-18T23:01:22Z — Christopher Vachon (user)
+
+Reviewed. Twelve findings, all fixed with regression tests. The worst was introduced by the deadlock fix: writers computed against a copy with no lock held, so two connections discarded each other's rows and both reported success — four threads inserting 200 rows each left 325 of 800. Writers now hold a gate across the whole copy-compute-commit cycle, and crates/engine/tests/concurrency.rs reproduces the loss.
+
+Also fixed: ONLY_FULL_GROUP_BY propagated functional dependency both ways through an outer join, permitting a genuinely ambiguous column; RAND() was effectively constant; CAST('12abc' AS SIGNED) returned NULL instead of 12; a CTE inside a subquery was out of scope; CTEs were materialised twice; COM_SET_OPTION was ignored, so a client that turned multi-statements off still got them; and a multi-statement command that failed part way reported that nothing had run.

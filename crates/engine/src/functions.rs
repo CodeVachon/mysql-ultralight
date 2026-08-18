@@ -15,6 +15,115 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
     let text = |i: usize| arg(i).as_text();
 
     Ok(match name {
+        // -- regular expressions ---------------------------------------------
+        //
+        // MySQL 8 uses ICU regex syntax and the `regex` crate uses Rust's;
+        // they agree on everything the migrations use. A pattern one accepts
+        // and the other does not is reported rather than quietly matching
+        // nothing, which would silently rewrite the wrong rows.
+        "regexp_replace" | "regexp_like" | "regexp_substr" | "regexp_instr" => {
+            // MySQL's optional arguments sit at different positions per
+            // function: a start position, which occurrence to act on, and a
+            // match type. The migrations pass all three.
+            let (pos_at, occurrence_at, return_at, match_at) = match name {
+                "regexp_like" => (None, None, None, Some(2)),
+                "regexp_replace" => (Some(3), Some(4), None, Some(5)),
+                "regexp_substr" => (Some(2), Some(3), None, Some(4)),
+                _ => (Some(2), Some(3), Some(4), Some(5)),
+            };
+            let fixed = if name == "regexp_replace" { 3 } else { 2 };
+            if args.iter().take(fixed).any(|v| v.is_null()) {
+                return Ok(Value::Null);
+            }
+
+            let subject = text(0);
+            let at = |i: Option<usize>| i.and_then(|i| args.get(i)).cloned();
+            let match_type = at(match_at).map(|v| v.as_text()).unwrap_or_default();
+            let re = compile_regex(&text(1), &match_type)?;
+
+            // Positions and offsets are in characters, as everything else in
+            // MySQL's string functions is.
+            let position = at(pos_at).and_then(|v| v.as_int()).unwrap_or(1);
+            if position < 1 {
+                return Err(crate::EngineError::new(
+                    1582,
+                    "42000",
+                    format!("Incorrect parameters in the call to native function '{name}'"),
+                ));
+            }
+            let skipped: usize = subject
+                .chars()
+                .take(position as usize - 1)
+                .map(char::len_utf8)
+                .sum();
+            let (prefix, hay) = subject.split_at(skipped.min(subject.len()));
+
+            // 0 means every occurrence for REGEXP_REPLACE and the first for the
+            // others, which is how MySQL reads the same default differently.
+            let occurrence = at(occurrence_at)
+                .and_then(|v| v.as_int())
+                .unwrap_or(0)
+                .max(0);
+            let nth = |n: i64| -> Option<regex::Match<'_>> {
+                re.find_iter(hay).nth(n.max(1) as usize - 1)
+            };
+
+            match name {
+                "regexp_like" => Value::Int(i64::from(re.is_match(hay))),
+                "regexp_replace" => {
+                    let replaced = if occurrence == 0 {
+                        re.replace_all(hay, text(2).as_str()).into_owned()
+                    } else {
+                        // Only the one occurrence is rewritten, so the match
+                        // is replaced in place and the rest kept verbatim.
+                        match re.captures_iter(hay).nth(occurrence.max(1) as usize - 1) {
+                            Some(caps) => {
+                                let whole = caps.get(0).expect("group 0 always matches");
+                                let mut out = String::from(&hay[..whole.start()]);
+                                caps.expand(text(2).as_str(), &mut out);
+                                out.push_str(&hay[whole.end()..]);
+                                out
+                            }
+                            None => hay.to_owned(),
+                        }
+                    };
+                    Value::text(format!("{prefix}{replaced}"))
+                }
+                "regexp_substr" => match nth(occurrence) {
+                    Some(m) => Value::text(m.as_str()),
+                    None => Value::Null,
+                },
+                // REGEXP_INSTR reports a 1-based character position, 0 for no
+                // match. A return option of 1 asks for the position after the
+                // match rather than its start.
+                _ => {
+                    let after = at(return_at).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+                    Value::Int(nth(occurrence).map_or(0, |m| {
+                        let edge = if after { m.end() } else { m.start() };
+                        (prefix.chars().count() + hay[..edge].chars().count()) as i64 + 1
+                    }))
+                }
+            }
+        }
+
+        // -- hashing --------------------------------------------------------
+        //
+        // The migrations use MD5 to derive stable ids from a seed value, so it
+        // has to produce the same digest MySQL does, not merely some digest.
+        "md5" => {
+            use md5::Digest;
+            if arg(0).is_null() {
+                return Ok(Value::Null);
+            }
+            let digest = md5::Md5::digest(text(0).as_bytes());
+            Value::text(
+                digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+            )
+        }
+
         // -- null handling ------------------------------------------------
         "coalesce" => args
             .into_iter()
@@ -101,7 +210,13 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
             } else {
                 (text(1), text(0))
             };
-            Value::Int(haystack.find(&needle).map_or(0, |i| i as i64 + 1))
+            // MySQL counts characters, not bytes: with any multi-byte text a
+            // byte offset is a different, wrong position.
+            Value::Int(
+                haystack
+                    .find(&needle)
+                    .map_or(0, |byte| haystack[..byte].chars().count() as i64 + 1),
+            )
         }
         "lpad" | "rpad" => {
             let s = text(0);
@@ -279,7 +394,21 @@ pub fn cast(value: Value, ty: &DataType) -> EngineResult<Value> {
         | D::Int(_)
         | D::Integer(_)
         | D::BigInt(_)
-        | D::MediumInt(_) => value.as_int().map(Value::Int).unwrap_or(Value::Null),
+        | D::MediumInt(_)
+        // MySQL spells the integer cast `SIGNED`, and it is by far the most
+        // common one written by hand.
+        | D::Signed
+        | D::SignedInteger => Value::Int(int_prefix(&value)),
+        // UNSIGNED reinterprets a negative value as a 64-bit unsigned one,
+        // which does not fit the engine's integer. Refusing beats reporting a
+        // negative number for a cast whose entire point is that it is not.
+        D::Unsigned | D::UnsignedInteger => {
+            let n = int_prefix(&value);
+            if n < 0 {
+                return Err(unsupported("CAST of a negative value AS UNSIGNED"));
+            }
+            Value::Int(n)
+        }
         D::Float(_) | D::Double(_) | D::DoublePrecision | D::Real => {
             value.as_float().map(Value::Float).unwrap_or(Value::Null)
         }
@@ -350,6 +479,61 @@ fn like_at(t: &[char], mut ti: usize, p: &[char], mut pi: usize, escape: Option<
         }
     }
     ti == t.len()
+}
+
+/// The integer MySQL reads out of a value being cast.
+///
+/// MySQL takes the leading numeric part and warns about the rest, so
+/// `CAST('12abc' AS SIGNED)` is 12 and `CAST('abc' AS SIGNED)` is 0. Returning
+/// NULL for either would be a value the real server never produces.
+fn int_prefix(value: &Value) -> i64 {
+    if let Some(n) = value.as_int() {
+        return n;
+    }
+    let text = value.as_text();
+    let text = text.trim_start();
+    let mut end = 0;
+    for (i, c) in text.char_indices() {
+        if c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+')) {
+            end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    text[..end].parse().unwrap_or(0)
+}
+
+/// Compiles a pattern, reporting a bad one rather than treating it as literal
+/// text.
+///
+/// MySQL matches case-insensitively for the usual collations, which is what a
+/// `REGEXP` against a `utf8mb4_0900_ai_ci` column does, so that is the default
+/// here. A match type of `c` or `i` overrides it; the others change semantics
+/// this does not implement and are refused rather than ignored.
+fn compile_regex(pattern: &str, match_type: &str) -> EngineResult<regex::Regex> {
+    let mut case_insensitive = true;
+    for flag in match_type.chars() {
+        match flag {
+            'c' => case_insensitive = false,
+            'i' => case_insensitive = true,
+            other => {
+                return Err(unsupported(format!(
+                    "the `{other}` match type of a regular expression"
+                )))
+            }
+        }
+    }
+
+    regex::RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .build()
+        .map_err(|e| {
+            crate::EngineError::new(
+                3692,
+                "HY000",
+                format!("Illegal argument to a regular expression: {e}"),
+            )
+        })
 }
 
 #[cfg(test)]

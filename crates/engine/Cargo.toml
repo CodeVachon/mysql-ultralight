@@ -8,5 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+md5 = { package = "md-5", version = "0.10" }
 mysql-ultralight-protocol = { workspace = true }
+regex = "1.13.1"
 sqlparser = "0.62"

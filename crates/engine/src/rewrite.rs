@@ -186,6 +186,39 @@ fn segments(sql: &str) -> Vec<(Segment, usize, usize)> {
     out
 }
 
+/// Splits a command into its statements at top-level semicolons.
+///
+/// A semicolon inside a string, an identifier or a comment is not a separator,
+/// which is why this is built on `segments` rather than `split(';')`. Empty
+/// statements are dropped: MySQL accepts a trailing `;` and a `;;` between
+/// statements, and both are common in generated migration files.
+pub fn split_statements(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut start = 0usize;
+
+    for (kind, from, to) in segments(sql) {
+        if kind != Segment::Code {
+            continue;
+        }
+        for i in from..to {
+            if bytes[i] == b';' {
+                let statement = sql[start..i].trim();
+                if !statement.is_empty() {
+                    out.push(statement.to_owned());
+                }
+                start = i + 1;
+            }
+        }
+    }
+
+    let tail = sql[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail.to_owned());
+    }
+    out
+}
+
 /// Removes the `.*` from each target of a multi-table DELETE.
 ///
 /// Only the text before the first `FROM` is touched, so a `SELECT a.*` inside a

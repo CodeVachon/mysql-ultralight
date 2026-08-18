@@ -214,6 +214,34 @@ impl SqlType {
     ///
     /// Rejecting rather than silently storing the wrong shape is the point:
     /// a test suite cannot notice a value that was quietly coerced.
+    /// The value MySQL stores when a NOT NULL column with no default is left
+    /// out of an `INSERT IGNORE`.
+    ///
+    /// Under a strict `sql_mode` the plain statement is an error, but IGNORE
+    /// downgrades it to a warning and writes this instead — which is how the
+    /// real migrations get away with omitting `NOT NULL` columns.
+    pub fn implicit_default(&self) -> Value {
+        match self.kind {
+            TypeKind::Bool | TypeKind::Int | TypeKind::Year => Value::Int(0),
+            TypeKind::Float => Value::Float(0.0),
+            // Kept as text: a DECIMAL carries a scale that a float would lose.
+            TypeKind::Decimal => Value::text("0"),
+            // The epoch rather than MySQL's `0000-00-00`, because the mode this
+            // engine targets sets NO_ZERO_DATE and would reject that value.
+            TypeKind::Date => Value::text("1970-01-01"),
+            TypeKind::DateTime => Value::text("1970-01-01 00:00:00"),
+            TypeKind::Time => Value::text("00:00:00"),
+            TypeKind::Json => Value::text("null"),
+            // An ENUM's implicit default is its first member, not an empty
+            // string, which would not be a legal value at all.
+            TypeKind::Enum => match self.variants.first() {
+                Some(first) => Value::text(first),
+                None => Value::text(""),
+            },
+            TypeKind::Text | TypeKind::Blob | TypeKind::Set => Value::text(""),
+        }
+    }
+
     pub fn coerce(&self, value: Value, column: &str) -> EngineResult<Value> {
         if value.is_null() {
             return Ok(Value::Null);

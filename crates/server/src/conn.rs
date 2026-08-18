@@ -60,6 +60,12 @@ pub struct Connection<S, H> {
     caps: Capabilities,
     statements: HashMap<u32, Prepared>,
     next_statement_id: u32,
+    /// Whether multi-statement commands are currently accepted.
+    ///
+    /// Negotiated at handshake and then switchable with `COM_SET_OPTION`. A
+    /// client that turns it off reads one result and leaves the rest in the
+    /// socket, so running them anyway desynchronises the connection.
+    multi_statements: bool,
     /// Parameter types from the last `COM_STMT_EXECUTE` that carried them.
     /// Clients re-executing a statement may omit the types and expect the
     /// server to have remembered them.
@@ -88,6 +94,7 @@ where
             caps: Capabilities::EMPTY,
             statements: HashMap::new(),
             next_statement_id: 1,
+            multi_statements: true,
             statement_param_types: HashMap::new(),
             long_data: HashMap::new(),
             long_data_bytes: 0,
@@ -245,8 +252,21 @@ where
                     self.send_response(Response::ok(), started).await?;
                 }
                 // Deprecated, but the mysql CLI still sends it for completion.
-                Command::FieldList => self.write_eof_or_ok().await?,
-                Command::SetOption => self.send_response(Response::ok(), started).await?,
+                Command::FieldList => self.write_eof_or_ok(false).await?,
+                Command::SetOption => {
+                    // The payload is a two-byte little-endian option: 0 turns
+                    // multi-statement commands on, 1 turns them off.
+                    match detail.as_bytes() {
+                        [0, 0] => self.multi_statements = true,
+                        [1, 0] => self.multi_statements = false,
+                        _ => {
+                            self.send_error(&ErrPacket::unsupported("this COM_SET_OPTION option"))
+                                .await?;
+                            continue;
+                        }
+                    }
+                    self.send_response(Response::ok(), started).await?;
+                }
                 Command::Statistics => {
                     let stats = self.handler.statistics();
                     self.write(stats.as_bytes()).await?;
@@ -266,9 +286,30 @@ where
     }
 
     async fn handle_query(&mut self, sql: &str, started: Instant) -> std::io::Result<()> {
-        match self.handler.query(sql) {
-            Ok(response) => self.send_response(response, started).await,
-            Err(err) => self.send_error(&err).await,
+        // A client that did not negotiate MULTI_STATEMENTS cannot read a
+        // second result, so the handler must refuse rather than run one.
+        let allow_multi =
+            self.multi_statements && self.caps.contains(Capabilities::MULTI_STATEMENTS);
+        let answered = self.handler.query_multi(sql, allow_multi);
+
+        // An empty command is still a command: MySQL answers a bare `;` with
+        // one OK rather than nothing, and a client waiting on a reply that
+        // never comes hangs.
+        if answered.responses.is_empty() && answered.error.is_none() {
+            return self.send_response(Response::ok(), started).await;
+        }
+
+        // Each result announces the next one. An error is itself the last
+        // packet, so everything before it announces too.
+        let last = answered.responses.len().saturating_sub(1);
+        let failed = answered.error.is_some();
+        for (index, response) in answered.responses.into_iter().enumerate() {
+            self.send_response_with(response, started, false, failed || index != last)
+                .await?;
+        }
+        match answered.error {
+            Some(err) => self.send_error(&err).await,
+            None => Ok(()),
         }
     }
 
@@ -372,7 +413,10 @@ where
         self.forget_long_data(stmt_id);
 
         match self.handler.execute(&stmt, &params) {
-            Ok(response) => self.send_response_with(response, started, true).await,
+            Ok(response) => {
+                self.send_response_with(response, started, true, false)
+                    .await
+            }
             Err(err) => self.send_error(&err).await,
         }
     }
@@ -514,14 +558,19 @@ where
     }
 
     async fn send_response(&mut self, response: Response, started: Instant) -> std::io::Result<()> {
-        self.send_response_with(response, started, false).await
+        self.send_response_with(response, started, false, false)
+            .await
     }
 
+    /// Writes one response. `more` sets `MORE_RESULTS_EXISTS`, which is how a
+    /// client knows to read another result rather than treating this as the
+    /// end of the command.
     async fn send_response_with(
         &mut self,
         response: Response,
         started: Instant,
         binary: bool,
+        more: bool,
     ) -> std::io::Result<()> {
         let summary = match &response {
             Response::ResultSet(rs) => {
@@ -531,8 +580,13 @@ where
         };
 
         match response {
-            Response::Ok(ok) => self.write(&ok.encode(self.caps)).await?,
-            Response::ResultSet(rs) => self.write_result_set(&rs, binary).await?,
+            Response::Ok(mut ok) => {
+                if more {
+                    ok.status_flags |= status::MORE_RESULTS_EXISTS;
+                }
+                self.write(&ok.encode(self.caps)).await?
+            }
+            Response::ResultSet(rs) => self.write_result_set(&rs, binary, more).await?,
         }
 
         self.trace.event(Event::Completed {
@@ -543,7 +597,12 @@ where
         Ok(())
     }
 
-    async fn write_result_set(&mut self, rs: &ResultSet, binary: bool) -> std::io::Result<()> {
+    async fn write_result_set(
+        &mut self,
+        rs: &ResultSet,
+        binary: bool,
+        more: bool,
+    ) -> std::io::Result<()> {
         let mut count = BufWriter::with_capacity(9);
         count.lenenc_int(rs.columns.len() as u64);
         self.write(&count.into_inner()).await?;
@@ -588,15 +647,26 @@ where
             self.write(&w.into_inner()).await?;
         }
 
-        self.write_eof_or_ok().await
+        self.write_eof_or_ok(more).await
     }
 
     /// Terminates a result set the way the negotiated capabilities require.
-    async fn write_eof_or_ok(&mut self) -> std::io::Result<()> {
+    ///
+    /// The terminator carries the status flags, so a result set followed by
+    /// another announces it here rather than in its header.
+    async fn write_eof_or_ok(&mut self, more: bool) -> std::io::Result<()> {
+        let mut flags = status::AUTOCOMMIT;
+        if more {
+            flags |= status::MORE_RESULTS_EXISTS;
+        }
         let packet = if self.caps.contains(Capabilities::DEPRECATE_EOF) {
-            OkPacket::default().encode_as_eof(self.caps)
+            let ok = OkPacket {
+                status_flags: flags,
+                ..OkPacket::default()
+            };
+            ok.encode_as_eof(self.caps)
         } else {
-            encode_eof(self.caps, 0, status::AUTOCOMMIT)
+            encode_eof(self.caps, 0, flags)
         };
         self.write(&packet).await
     }

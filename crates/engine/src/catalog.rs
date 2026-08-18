@@ -30,6 +30,9 @@ pub struct Column {
     /// NULL never violates a unique index, so the constraint the schema is
     /// expressing would silently not exist.
     pub generated: Option<String>,
+    /// `ON UPDATE CURRENT_TIMESTAMP`: the column restamps itself whenever the
+    /// row changes, which is how Prisma's `@updatedAt` columns are declared.
+    pub on_update_now: bool,
 }
 
 impl Column {
@@ -47,6 +50,7 @@ impl Column {
             collation: None,
             position: 0,
             generated: None,
+            on_update_now: false,
         }
     }
 }

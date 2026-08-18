@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 pub use conn::{Config, Connection};
-pub use handler::{Handler, HandlerResult, Prepared, Response, ResultSet};
+pub use handler::{Answered, Handler, HandlerResult, Prepared, Response, ResultSet};
 pub use trace::{Event, NoTrace, StderrTrace, Trace};
 
 use tokio::net::TcpListener;
