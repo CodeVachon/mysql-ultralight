@@ -69,3 +69,5 @@
 {"at":"2026-08-18T20:01:39Z","id":25,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-08-18T20:01:39Z","id":26,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-18T20:01:39Z","id":27,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-18T20:17:13Z","id":4,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-18T20:17:13Z","id":28,"by":"Christopher Vachon","as":"user","type":"created","title":"Remaining SQL surface: INTERSECT, EXCEPT, window frames","state":"Todo"}
