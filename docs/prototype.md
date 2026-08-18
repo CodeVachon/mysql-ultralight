@@ -40,6 +40,11 @@ start plus 26.1s of `prisma migrate deploy`. See [`baseline-mysql.md`](baseline-
 - **Expressions** — comparison with correct three-valued NULL logic, `AND`/`OR`, arithmetic,
   `BETWEEN`, `IN`, `LIKE` with escapes, `CASE`, `CAST`, `IS NULL`, and about 50 scalar
   functions
+- **Grouping** — `GROUP BY` over several columns, `HAVING`, aggregates folded inside larger
+  expressions such as `SUM(a) / COUNT(*)`, `COUNT(DISTINCT x)`, and NULLs grouped together
+- **`UNION` and `UNION ALL`**
+- **Window functions** — `ROW_NUMBER`, `RANK`, `DENSE_RANK` and aggregates over
+  `OVER (PARTITION BY ... ORDER BY ...)`
 - **Subqueries** — scalar, `EXISTS`, `IN (SELECT ...)`, and correlated forms that reference
   the enclosing query's columns
 - **Views** — `CREATE`, `CREATE OR REPLACE`, `DROP`, materialised on read so they reflect
@@ -75,9 +80,10 @@ as `IN (subquery)` before failing on the comma.
 ## What it does not do yet
 
 Named honestly, because the engine returns an error rather than a wrong answer for each:
-`GROUP BY`, `UNION`, window functions, `CHECK` constraint enforcement, generated columns,
-foreign key enforcement, real transactions (`BEGIN`/`COMMIT` are accepted but nothing rolls
-back), and the state image that would make startup skip migrations entirely.
+`INTERSECT` and `EXCEPT`, window frames and named windows, `CHECK` constraint enforcement,
+generated columns, foreign key enforcement, real transactions (`BEGIN`/`COMMIT` are
+accepted but nothing rolls back), and the state image that would make startup skip
+migrations entirely.
 
 ## Review hardening (engine)
 

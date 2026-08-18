@@ -529,6 +529,7 @@ mod review_regressions {
         ignore_space: true,
         real_as_float: false,
         strict: true,
+        only_full_group_by: true,
     };
 
     /// A lone double quote in a comment used to open an identifier run that

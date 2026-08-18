@@ -482,9 +482,11 @@ fn unsupported_features_error_rather_than_guess() {
     let (engine, mut session) = engine();
     widgets(&engine, &mut session);
 
+    // The list shrinks as features land; GROUP BY and window functions used to
+    // be here.
     for sql in [
-        "SELECT count FROM Widget GROUP BY count",
         "CREATE TABLE T (a INT, CHECK (a > 0))",
+        "SELECT id FROM Widget INTERSECT SELECT id FROM Widget",
     ] {
         let err = engine.execute(&mut session, sql, &[]).unwrap_err();
         assert_eq!(err.code, 1235, "expected ER_NOT_SUPPORTED_YET for: {sql}");
@@ -1317,4 +1319,552 @@ fn a_multi_action_alter_is_not_partially_applied() {
         }
         Err(e) => assert_ne!(e.code, 0),
     }
+}
+
+// ---------------------------------------------------------------------------
+// GROUP BY, UNION and window functions. Motte #0024.
+// ---------------------------------------------------------------------------
+
+fn sales(engine: &Engine, session: &mut Session) {
+    run(
+        engine,
+        session,
+        "CREATE TABLE Sale (
+            id INT NOT NULL,
+            region VARCHAR(10) NOT NULL,
+            rep VARCHAR(10) NOT NULL,
+            amount INT NOT NULL,
+            note VARCHAR(10) NULL,
+            PRIMARY KEY (id)
+        )",
+    );
+    run(
+        engine,
+        session,
+        "INSERT INTO Sale (id, region, rep, amount, note) VALUES
+            (1, 'north', 'ann', 100, 'x'),
+            (2, 'north', 'bob', 200, NULL),
+            (3, 'south', 'ann', 50,  'y'),
+            (4, 'south', 'cid', 75,  NULL),
+            (5, 'south', 'cid', 25,  'z')",
+    );
+}
+
+#[test]
+fn group_by_aggregates_per_group() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let by_region = rows(
+        &engine,
+        &mut session,
+        "SELECT region, COUNT(*), SUM(amount) FROM Sale GROUP BY region ORDER BY region",
+    );
+    assert_eq!(
+        by_region,
+        vec![vec!["north", "2", "300"], vec!["south", "3", "150"]]
+    );
+}
+
+#[test]
+fn group_by_several_columns() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let grouped = rows(
+        &engine,
+        &mut session,
+        "SELECT region, rep, SUM(amount) FROM Sale GROUP BY region, rep ORDER BY region, rep",
+    );
+    assert_eq!(
+        grouped,
+        vec![
+            vec!["north", "ann", "100"],
+            vec!["north", "bob", "200"],
+            vec!["south", "ann", "50"],
+            vec!["south", "cid", "100"],
+        ]
+    );
+}
+
+/// HAVING filters groups after aggregation, unlike WHERE.
+#[test]
+fn having_filters_groups() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let big = rows(
+        &engine,
+        &mut session,
+        "SELECT region FROM Sale GROUP BY region HAVING SUM(amount) > 200",
+    );
+    assert_eq!(big, vec![vec!["north"]]);
+
+    let many = rows(
+        &engine,
+        &mut session,
+        "SELECT region FROM Sale GROUP BY region HAVING COUNT(*) >= 3",
+    );
+    assert_eq!(many, vec![vec!["south"]]);
+}
+
+/// An aggregate inside a larger expression must fold before the surrounding
+/// arithmetic runs.
+#[test]
+fn an_aggregate_can_appear_inside_an_expression() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let averaged = rows(
+        &engine,
+        &mut session,
+        "SELECT region, SUM(amount) / COUNT(*) FROM Sale GROUP BY region ORDER BY region",
+    );
+    assert_eq!(averaged, vec![vec!["north", "150"], vec!["south", "50"]]);
+}
+
+/// Grouping treats NULLs as one group, unlike comparison, which treats them as
+/// unknown and never equal.
+#[test]
+fn nulls_group_together() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let counted = rows(
+        &engine,
+        &mut session,
+        "SELECT COUNT(*) FROM Sale GROUP BY note ORDER BY COUNT(*) DESC",
+    );
+    assert_eq!(counted, vec![vec!["2"], vec!["1"], vec!["1"], vec!["1"]]);
+}
+
+/// An aggregate with no GROUP BY is one group over every row, and still
+/// produces a row when there are none.
+#[test]
+fn an_ungrouped_aggregate_over_no_rows_returns_one_row() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*), SUM(amount) FROM Sale WHERE amount > 9999"
+        ),
+        vec![vec!["0", "NULL"]]
+    );
+    // With GROUP BY, no rows means no groups and therefore no output.
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT region FROM Sale WHERE amount > 9999 GROUP BY region"
+    )
+    .is_empty());
+}
+
+#[test]
+fn count_distinct_counts_unique_values() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(DISTINCT rep) FROM Sale"
+        ),
+        vec![vec!["3"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(rep) FROM Sale"),
+        vec![vec!["5"]]
+    );
+}
+
+#[test]
+fn group_concat_joins_a_group() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let joined = rows(
+        &engine,
+        &mut session,
+        "SELECT region, GROUP_CONCAT(rep) FROM Sale GROUP BY region ORDER BY region",
+    );
+    assert_eq!(
+        joined,
+        vec![vec!["north", "ann,bob"], vec!["south", "ann,cid,cid"]]
+    );
+}
+
+#[test]
+fn union_combines_and_deduplicates() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let deduped = rows(
+        &engine,
+        &mut session,
+        "SELECT rep FROM Sale WHERE region = 'north'
+         UNION
+         SELECT rep FROM Sale WHERE region = 'south'
+         ORDER BY rep",
+    );
+    assert_eq!(deduped, vec![vec!["ann"], vec!["bob"], vec!["cid"]]);
+}
+
+#[test]
+fn union_all_keeps_duplicates() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let all = rows(
+        &engine,
+        &mut session,
+        "SELECT rep FROM Sale WHERE region = 'north'
+         UNION ALL
+         SELECT rep FROM Sale WHERE region = 'south'
+         ORDER BY rep",
+    );
+    assert_eq!(all.len(), 5);
+}
+
+#[test]
+fn a_union_with_mismatched_column_counts_is_rejected() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT rep FROM Sale UNION SELECT rep, amount FROM Sale",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1222);
+}
+
+/// ROW_NUMBER over a partition, which is what the migrations use to
+/// deduplicate.
+#[test]
+fn row_number_numbers_within_a_partition() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let numbered = rows(
+        &engine,
+        &mut session,
+        "SELECT region, amount, ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rn
+         FROM Sale ORDER BY region, rn",
+    );
+    assert_eq!(
+        numbered,
+        vec![
+            vec!["north", "200", "1"],
+            vec!["north", "100", "2"],
+            vec!["south", "75", "1"],
+            vec!["south", "50", "2"],
+            vec!["south", "25", "3"],
+        ]
+    );
+}
+
+/// A window function keeps every row, unlike an aggregate.
+#[test]
+fn a_window_function_does_not_collapse_the_result() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let windowed = rows(
+        &engine,
+        &mut session,
+        "SELECT id, SUM(amount) OVER (PARTITION BY region) AS region_total
+         FROM Sale ORDER BY id",
+    );
+    assert_eq!(
+        windowed,
+        vec![
+            vec!["1", "300"],
+            vec!["2", "300"],
+            vec!["3", "150"],
+            vec!["4", "150"],
+            vec!["5", "150"],
+        ]
+    );
+}
+
+/// RANK leaves a gap after a tie; DENSE_RANK does not.
+#[test]
+fn rank_and_dense_rank_differ_on_ties() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE S (id INT NOT NULL, v INT, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO S VALUES (1, 10), (2, 10), (3, 20)",
+    );
+
+    let ranked = rows(
+        &engine,
+        &mut session,
+        "SELECT id, RANK() OVER (ORDER BY v), DENSE_RANK() OVER (ORDER BY v) FROM S ORDER BY id",
+    );
+    assert_eq!(
+        ranked,
+        vec![
+            vec!["1", "1", "1"],
+            vec!["2", "1", "1"],
+            vec!["3", "3", "2"]
+        ]
+    );
+}
+
+/// A window with no PARTITION BY spans the whole result.
+#[test]
+fn a_window_without_partition_covers_everything() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let numbered = rows(
+        &engine,
+        &mut session,
+        "SELECT ROW_NUMBER() OVER (ORDER BY amount) FROM Sale",
+    );
+    assert_eq!(numbered.len(), 5);
+    let mut seen: Vec<String> = numbered.into_iter().map(|r| r[0].clone()).collect();
+    seen.sort();
+    assert_eq!(seen, vec!["1", "2", "3", "4", "5"]);
+}
+
+/// The deduplication shape the migrations actually use: number the rows in each
+/// partition, then keep the first.
+#[test]
+fn the_deduplication_idiom_from_the_migrations() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let first_per_region = rows(
+        &engine,
+        &mut session,
+        "SELECT region, rep FROM (
+            SELECT region, rep,
+                   ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rn
+            FROM Sale
+         ) ranked
+         WHERE rn = 1
+         ORDER BY region",
+    );
+    assert_eq!(
+        first_per_region,
+        vec![vec!["north", "bob"], vec!["south", "cid"]]
+    );
+}
+
+#[test]
+fn an_unsupported_window_function_errors() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT LAG(amount) OVER (ORDER BY id) FROM Sale",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1235);
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the grouping review, 2026-08-18.
+// ---------------------------------------------------------------------------
+
+/// An aggregate nested in an expression is still an aggregate query. Matching
+/// only a bare `COUNT(*)` sent these down the per-row path.
+#[test]
+fn an_aggregate_nested_in_an_expression_still_groups() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) + 0 FROM Sale"),
+        vec![vec!["5"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT SUM(amount) / COUNT(*) FROM Sale"
+        ),
+        vec![vec!["90"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROUND(AVG(amount), 1) FROM Sale"
+        ),
+        vec![vec!["90"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CASE WHEN COUNT(*) > 1 THEN 'many' ELSE 'one' END FROM Sale"
+        ),
+        vec![vec!["many"]]
+    );
+}
+
+/// The silent version of the same bug: an aggregate over no matching rows
+/// returned zero rows instead of one row holding the default.
+#[test]
+fn a_wrapped_aggregate_over_no_rows_still_returns_one_row() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT IFNULL(SUM(amount), 0) FROM Sale WHERE id > 99"
+        ),
+        vec![vec!["0"]]
+    );
+}
+
+/// `GROUP BY 1` means the first select column. Read as a literal it gives every
+/// row the same key and collapses the table into one group.
+#[test]
+fn group_by_an_ordinal_names_a_column() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let by_ordinal = rows(
+        &engine,
+        &mut session,
+        "SELECT region, COUNT(*) FROM Sale GROUP BY 1 ORDER BY region",
+    );
+    assert_eq!(by_ordinal, vec![vec!["north", "2"], vec!["south", "3"]]);
+}
+
+/// `ORDER BY 2` names the second output column, in both the grouped and the
+/// set-operation paths.
+#[test]
+fn order_by_an_ordinal_sorts_by_that_column() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let grouped = rows(
+        &engine,
+        &mut session,
+        "SELECT region, SUM(amount) FROM Sale GROUP BY region ORDER BY 2 DESC",
+    );
+    assert_eq!(grouped, vec![vec!["north", "300"], vec!["south", "150"]]);
+
+    let unioned = rows(
+        &engine,
+        &mut session,
+        "SELECT region FROM Sale WHERE amount > 90
+         UNION SELECT region FROM Sale WHERE amount < 60
+         ORDER BY 1 DESC",
+    );
+    assert_eq!(unioned, vec![vec!["south"], vec!["north"]]);
+}
+
+/// HAVING may name a select-list alias, which reporting queries rely on.
+#[test]
+fn having_can_reference_an_alias() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let filtered = rows(
+        &engine,
+        &mut session,
+        "SELECT region, COUNT(*) AS n FROM Sale GROUP BY region HAVING n > 2",
+    );
+    assert_eq!(filtered, vec![vec!["south", "3"]]);
+}
+
+/// A HAVING with no aggregate must still be applied, not silently dropped.
+#[test]
+fn a_having_without_an_aggregate_is_applied() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+
+    let filtered = rows(
+        &engine,
+        &mut session,
+        "SELECT region FROM Sale GROUP BY region HAVING region = 'north'",
+    );
+    assert_eq!(filtered, vec![vec!["north"]]);
+}
+
+/// Under ONLY_FULL_GROUP_BY, selecting a column that is neither grouped nor
+/// aggregated is an error. Evaluating it against the group's first row returns
+/// an arbitrary value instead.
+#[test]
+fn only_full_group_by_rejects_an_ungrouped_column() {
+    let (engine, mut session) = engine();
+    sales(&engine, &mut session);
+    assert!(session.sql_mode().only_full_group_by);
+
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT id, COUNT(*) FROM Sale GROUP BY region",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.code, 1055,
+        "expected ER_WRONG_FIELD_WITH_GROUP, got: {err}"
+    );
+
+    // The grouped column itself is fine.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT region, COUNT(*) FROM Sale GROUP BY region ORDER BY region"
+        )
+        .len(),
+        2
+    );
+}
+
+/// Folding an aggregate must preserve the value, not round-trip it through a
+/// string literal: that loses binary data and changes the reported type.
+#[test]
+fn aggregating_binary_data_preserves_it() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE B (id INT NOT NULL, d VARBINARY(8), PRIMARY KEY (id))",
+    );
+
+    engine
+        .execute(
+            &mut session,
+            "INSERT INTO B VALUES (1, ?)",
+            &[Value::Bytes(vec![0xc3, 0xff, 0x01])],
+        )
+        .unwrap();
+
+    let Outcome::Rows(result) = engine
+        .execute(&mut session, "SELECT MAX(d) FROM B", &[])
+        .unwrap()
+    else {
+        panic!("expected rows")
+    };
+    assert_eq!(
+        result.rows[0][0],
+        Value::Bytes(vec![0xc3, 0xff, 0x01]),
+        "the bytes must survive the fold"
+    );
 }

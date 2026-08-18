@@ -381,8 +381,17 @@ impl Engine {
         query: &Query,
         outer: Option<&OuterRow>,
     ) -> EngineResult<ResultSet> {
-        let SetExpr::Select(select) = query.body.as_ref() else {
-            return Err(unsupported("this query form"));
+        let select = match query.body.as_ref() {
+            SetExpr::Select(select) => select,
+            // A set operation runs both sides and combines them, so it is
+            // handled before the single-SELECT path.
+            SetExpr::SetOperation { .. } | SetExpr::Query(_) => {
+                let mut combined = self.set_expr(session, query.body.as_ref(), outer)?;
+                self.order_projected(&mut combined, session, query.order_by.as_ref())?;
+                apply_limit(&mut combined, session, query)?;
+                return Ok(combined);
+            }
+            other => return Err(unsupported(format!("query body `{other}`"))),
         };
 
         let result = self.select(session, select, query.order_by.as_ref(), outer)?;
@@ -395,6 +404,59 @@ impl Engine {
         }
         apply_limit(&mut rows, session, query)?;
         Ok(rows)
+    }
+
+    /// Evaluates a set operation, or a nested query body.
+    fn set_expr(
+        &self,
+        session: &Session,
+        body: &SetExpr,
+        outer: Option<&OuterRow>,
+    ) -> EngineResult<ResultSet> {
+        match body {
+            SetExpr::Select(select) => Ok(self.select(session, select, None, outer)?.result),
+            SetExpr::Query(query) => self.query_with_outer(session, query, outer),
+            SetExpr::SetOperation {
+                left,
+                op,
+                set_quantifier,
+                right,
+            } => {
+                use sqlparser::ast::{SetOperator, SetQuantifier};
+
+                // Reject an unsupported operator before running either side,
+                // so the error names the real problem rather than whatever the
+                // branches happen to hit first.
+                match op {
+                    SetOperator::Union => {}
+                    other => return Err(unsupported(format!("{other}"))),
+                }
+
+                let mut left = self.set_expr(session, left, outer)?;
+                let right = self.set_expr(session, right, outer)?;
+
+                if left.columns.len() != right.columns.len() {
+                    return Err(EngineError::new(
+                        1222,
+                        "21000",
+                        "The used SELECT statements have a different number of columns",
+                    ));
+                }
+
+                // Column names come from the first branch, as in MySQL.
+                left.rows.extend(right.rows);
+
+                // UNION removes duplicates; only UNION ALL keeps them.
+                if !matches!(
+                    set_quantifier,
+                    SetQuantifier::All | SetQuantifier::AllByName
+                ) {
+                    dedupe(&mut left.rows);
+                }
+                Ok(left)
+            }
+            other => Err(unsupported(format!("query body `{other}`"))),
+        }
     }
 
     fn select(
@@ -461,19 +523,26 @@ impl Engine {
             }
         }
 
-        let grouped = match &select.group_by {
-            GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
-            GroupByExpr::All(_) => true,
+        let group_exprs = match &select.group_by {
+            GroupByExpr::Expressions(exprs, _) => exprs.clone(),
+            GroupByExpr::All(_) => return Err(unsupported("GROUP BY ALL")),
         };
-        if grouped {
-            return Err(unsupported("GROUP BY"));
-        }
 
-        if projection_is_aggregate(&select.projection) {
-            // An aggregate collapses to one row, so ordering is meaningless.
-            return Ok(Ordered::sorted(
-                self.aggregate(session, select, &refs, &matching)?,
-            ));
+        // A query is grouped if it says so, or if it aggregates: an aggregate
+        // with no GROUP BY is one group covering every row.
+        // An aggregate anywhere in a select item groups the query, not just a
+        // bare one: `SELECT SUM(a) / COUNT(*)` and `SELECT IFNULL(SUM(v), 0)`
+        // are aggregate queries. HAVING alone groups it too, since MySQL
+        // treats the whole result as one group in that case.
+        let aggregating = !group_exprs.is_empty()
+            || select.having.is_some()
+            || select.projection.iter().any(select_item_aggregates);
+
+        if aggregating {
+            let mut grouped =
+                self.grouped(session, select, &refs, &matching, &group_exprs, order)?;
+            apply_distinct(&mut grouped, select.distinct.as_ref())?;
+            return Ok(Ordered::sorted(grouped));
         }
 
         // Sorting happens before projection so ORDER BY can reference a column
@@ -752,6 +821,9 @@ impl Engine {
     ) -> EngineResult<ResultSet> {
         let mut columns: Vec<OutColumn> = Vec::new();
         let mut plan: Vec<Projection> = Vec::new();
+        // A window function sees the whole result rather than one row, so its
+        // values are computed up front and read back by row index.
+        let mut windows: Vec<Vec<Value>> = Vec::new();
 
         let push_all =
             |columns: &mut Vec<OutColumn>, plan: &mut Vec<Projection>, table: Option<&str>| {
@@ -775,14 +847,29 @@ impl Engine {
                     let table = name.trim_end_matches(".*").rsplit('.').next().unwrap_or("");
                     push_all(&mut columns, &mut plan, Some(table));
                 }
-                SelectItem::UnnamedExpr(e) => {
-                    let (column, projection) = self.plan_expr(e, None, relation)?;
-                    columns.push(column);
-                    plan.push(projection);
-                }
-                SelectItem::ExprWithAlias { expr: e, alias } => {
-                    let (column, projection) =
-                        self.plan_expr(e, Some(alias.value.clone()), relation)?;
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                    let alias = match item {
+                        SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+                        _ => None,
+                    };
+
+                    if let Expr::Function(f) = e {
+                        if f.over.is_some() {
+                            let values = self.compute_window(f, refs, matching, session)?;
+                            // Typed from the function, not the first value: a
+                            // later row may differ, and the binary protocol
+                            // encodes by the declared type.
+                            columns.push(OutColumn::new(
+                                alias.unwrap_or_else(|| render_expr(e)),
+                                computed_column_type(e),
+                            ));
+                            plan.push(Projection::Window(windows.len()));
+                            windows.push(values);
+                            continue;
+                        }
+                    }
+
+                    let (column, projection) = self.plan_expr(e, alias, relation)?;
                     columns.push(column);
                     plan.push(projection);
                 }
@@ -791,7 +878,7 @@ impl Engine {
         }
 
         let mut rows = Vec::with_capacity(matching.len());
-        for row in matching {
+        for (index, row) in matching.iter().enumerate() {
             let ctx = Context {
                 row: Some(Row {
                     schema: refs,
@@ -804,6 +891,7 @@ impl Engine {
             for step in &plan {
                 out.push(match step {
                     Projection::Column(i) => row.get(*i).cloned().unwrap_or(Value::Null),
+                    Projection::Window(i) => windows[*i].get(index).cloned().unwrap_or(Value::Null),
                     Projection::Expr(e) => expr::eval(e, &ctx)?,
                 });
             }
@@ -811,6 +899,132 @@ impl Engine {
         }
 
         Ok(ResultSet { columns, rows })
+    }
+
+    /// Computes a window function's value for every matching row.
+    ///
+    /// Rows are partitioned, each partition ordered, and the result written
+    /// back against the row's original position so the projection reads it by
+    /// index.
+    fn compute_window(
+        &self,
+        f: &sqlparser::ast::Function,
+        refs: &[ColumnRef],
+        matching: &[&Vec<Value>],
+        session: &Session,
+    ) -> EngineResult<Vec<Value>> {
+        use sqlparser::ast::WindowType;
+
+        let spec = match f.over.as_ref() {
+            Some(WindowType::WindowSpec(spec)) => spec,
+            Some(WindowType::NamedWindow(_)) => return Err(unsupported("named windows")),
+            None => return Err(unsupported("a window function without OVER")),
+        };
+        if spec.window_frame.is_some() {
+            return Err(unsupported("window frames"));
+        }
+
+        let name = f.name.to_string().to_ascii_lowercase();
+        let argument = aggregate_argument(f);
+
+        let evaluate = |e: &Expr, row: &Vec<Value>| -> EngineResult<Value> {
+            let ctx = Context {
+                row: Some(Row {
+                    schema: refs,
+                    values: row,
+                }),
+                session,
+                subqueries: Some(self),
+            };
+            expr::eval(e, &ctx)
+        };
+
+        // Partition, keeping each row's original index so results land back
+        // where the projection will look for them.
+        let mut partition_keys: Vec<Vec<String>> = Vec::new();
+        let mut partitions: Vec<Vec<usize>> = Vec::new();
+        for (index, row) in matching.iter().enumerate() {
+            let mut key = Vec::with_capacity(spec.partition_by.len());
+            for e in &spec.partition_by {
+                let value = evaluate(e, row)?;
+                key.push(if value.is_null() {
+                    "\u{0}NULL".to_owned()
+                } else {
+                    value.collation_key()
+                });
+            }
+            match partition_keys.iter().position(|k| *k == key) {
+                Some(at) => partitions[at].push(index),
+                None => {
+                    partition_keys.push(key);
+                    partitions.push(vec![index]);
+                }
+            }
+        }
+
+        let descending: Vec<bool> = spec
+            .order_by
+            .iter()
+            .map(|i| i.options.asc == Some(false))
+            .collect();
+
+        let mut out = vec![Value::Null; matching.len()];
+
+        for partition in &partitions {
+            // Without ORDER BY the input order stands, as in MySQL.
+            let mut ordered: Vec<(Vec<Value>, usize)> = Vec::with_capacity(partition.len());
+            for index in partition {
+                let mut key = Vec::with_capacity(spec.order_by.len());
+                for item in &spec.order_by {
+                    key.push(evaluate(&item.expr, matching[*index])?);
+                }
+                ordered.push((key, *index));
+            }
+            ordered.sort_by(|a, b| compare_keys(&a.0, &b.0, &descending));
+
+            match name.as_str() {
+                "row_number" => {
+                    for (position, (_, index)) in ordered.iter().enumerate() {
+                        out[*index] = Value::Int(position as i64 + 1);
+                    }
+                }
+                "rank" | "dense_rank" => {
+                    let dense = name == "dense_rank";
+                    let mut rank = 0i64;
+                    let mut previous: Option<Vec<Value>> = None;
+                    for (position, (key, index)) in ordered.iter().enumerate() {
+                        let tied = previous.as_ref().is_some_and(|p| {
+                            compare_keys(p, key, &descending) == std::cmp::Ordering::Equal
+                        });
+                        if !tied {
+                            // RANK leaves a gap after a tie; DENSE_RANK does not.
+                            rank = if dense { rank + 1 } else { position as i64 + 1 };
+                        }
+                        out[*index] = Value::Int(rank);
+                        previous = Some(key.clone());
+                    }
+                }
+                // An aggregate with OVER and no frame folds over the whole
+                // partition, so every row in it gets the same value.
+                other if is_aggregate(other) => {
+                    let group: Vec<&Vec<Value>> = partition.iter().map(|i| matching[*i]).collect();
+                    let value = self.fold(
+                        session,
+                        other,
+                        argument.as_ref(),
+                        refs,
+                        &group,
+                        aggregate_is_distinct(f),
+                    )?;
+                    for index in partition {
+                        out[*index] = value.clone();
+                    }
+                }
+                other => return Err(unsupported(format!("window function `{other}()`"))),
+            }
+        }
+
+        Ok(out)
     }
 
     /// Decides how one projected item is produced, and what its metadata is.
@@ -854,43 +1068,308 @@ impl Engine {
         ))
     }
 
-    fn aggregate(
+    /// Evaluates a grouped query: GROUP BY, HAVING, and aggregates.
+    ///
+    /// An aggregate with no GROUP BY is one group covering every row, which is
+    /// why both go through here.
+    fn grouped(
         &self,
         session: &Session,
         select: &Select,
         refs: &[ColumnRef],
         matching: &[&Vec<Value>],
+        group_exprs: &[Expr],
+        order: Option<&OrderBy>,
     ) -> EngineResult<ResultSet> {
-        let mut columns = Vec::new();
-        let mut row = Vec::new();
+        // `GROUP BY 1` means the first select column, not the literal 1.
+        // Treating it as a literal gives every row the same key and collapses
+        // the whole table into one group.
+        let group_exprs: Vec<Expr> = group_exprs
+            .iter()
+            .map(|e| resolve_ordinal(e, &select.projection).unwrap_or_else(|| e.clone()))
+            .collect();
 
-        for item in &select.projection {
-            let (alias, e) = match item {
-                SelectItem::UnnamedExpr(e) => (render_expr(e), e),
-                SelectItem::ExprWithAlias { expr, alias } => (alias.value.clone(), expr),
-                other => {
-                    return Err(unsupported(format!(
-                        "select item `{other}` with aggregates"
-                    )))
+        let mut keys: Vec<Vec<String>> = Vec::new();
+        let mut groups: Vec<Vec<&Vec<Value>>> = Vec::new();
+
+        if group_exprs.is_empty() {
+            // Ungrouped aggregation always produces exactly one row, even over
+            // no rows at all: `SELECT COUNT(*)` on an empty table returns 0.
+            groups.push(matching.to_vec());
+        } else {
+            for row in matching {
+                let ctx = Context {
+                    row: Some(Row {
+                        schema: refs,
+                        values: row,
+                    }),
+                    session,
+                    subqueries: Some(self),
+                };
+                let mut key = Vec::with_capacity(group_exprs.len());
+                for e in &group_exprs {
+                    let value = expr::eval(e, &ctx)?;
+                    // Grouping treats NULLs as equal to one another, unlike
+                    // comparison, so they need a key of their own.
+                    key.push(if value.is_null() {
+                        "\u{0}NULL".to_owned()
+                    } else {
+                        value.collation_key()
+                    });
                 }
-            };
-
-            let Expr::Function(f) = e else {
-                // Mixing bare columns with aggregates needs GROUP BY semantics
-                // that are not implemented; ONLY_FULL_GROUP_BY rejects it too.
-                return Err(unsupported("non-aggregate columns alongside aggregates"));
-            };
-
-            let name = f.name.to_string().to_ascii_lowercase();
-            let argument = aggregate_argument(f);
-            let value = self.fold(session, &name, argument.as_ref(), refs, matching)?;
-            columns.push(OutColumn::new(alias, wire_type(&value)));
-            row.push(value);
+                match keys.iter().position(|k| *k == key) {
+                    Some(index) => groups[index].push(row),
+                    None => {
+                        keys.push(key);
+                        groups.push(vec![*row]);
+                    }
+                }
+            }
         }
 
-        Ok(ResultSet {
-            columns,
-            rows: vec![row],
+        let items = projected_items(&select.projection)?;
+
+        // Under ONLY_FULL_GROUP_BY a selected column must be grouped by or
+        // aggregated. Silently evaluating it against the group's first row
+        // returns an arbitrary value where MySQL raises an error.
+        if session.sql_mode().only_full_group_by {
+            for (_, e) in &items {
+                check_full_group_by(e, &group_exprs)?;
+            }
+        }
+
+        let order_items = match order.map(|o| &o.kind) {
+            Some(OrderByKind::Expressions(o)) => o.clone(),
+            Some(_) => return Err(unsupported("this ORDER BY form")),
+            None => Vec::new(),
+        };
+        let descending: Vec<bool> = order_items
+            .iter()
+            .map(|i| i.options.asc == Some(false))
+            .collect();
+
+        // Column types cannot be inferred from the first group: a later group
+        // may produce a different type, and the binary protocol encodes by the
+        // declared type, so a client would silently decode the wrong thing.
+        // Computed columns are reported as strings, as the ungrouped path does.
+        let columns: Vec<OutColumn> = items
+            .iter()
+            .map(|(alias, e)| OutColumn::new(alias.clone(), computed_column_type(e)))
+            .collect();
+
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        let mut sort_keys: Vec<Vec<Value>> = Vec::new();
+
+        for group in &groups {
+            let mut out = Vec::with_capacity(items.len());
+            for (_, e) in &items {
+                out.push(self.eval_over_group(e, group, refs, session)?);
+            }
+
+            // HAVING is evaluated after the projection so it can reference an
+            // output alias, which MySQL allows and reporting queries rely on.
+            if let Some(having) = &select.having {
+                let resolved = substitute_aliases(having, &items, &out);
+                if self
+                    .eval_over_group(&resolved, group, refs, session)?
+                    .truthy()
+                    != Some(true)
+                {
+                    continue;
+                }
+            }
+
+            if !order_items.is_empty() {
+                let mut key = Vec::with_capacity(order_items.len());
+                for item in &order_items {
+                    // ORDER BY may name an ordinal or an output alias; both
+                    // resolve against the projection before evaluation.
+                    let by_position = ordinal_of(&item.expr).and_then(|n| out.get(n - 1).cloned());
+                    key.push(match by_position {
+                        Some(value) => value,
+                        None => {
+                            let resolved = substitute_aliases(&item.expr, &items, &out);
+                            self.eval_over_group(&resolved, group, refs, session)?
+                        }
+                    });
+                }
+                sort_keys.push(key);
+            }
+
+            rows.push(out);
+        }
+
+        if !order_items.is_empty() {
+            let mut paired: Vec<(Vec<Value>, Vec<Value>)> =
+                sort_keys.into_iter().zip(rows).collect();
+            paired.sort_by(|a, b| compare_keys(&a.0, &b.0, &descending));
+            rows = paired.into_iter().map(|(_, row)| row).collect();
+        }
+
+        Ok(ResultSet { columns, rows })
+    }
+
+    /// Evaluates an expression over one group, folding any aggregates first.
+    ///
+    /// Folded values are bound to hidden columns rather than spliced back into
+    /// the syntax tree: rendering a value as a literal loses binary data and
+    /// changes its type, so `MAX(blob_column)` would come back as text.
+    fn eval_over_group(
+        &self,
+        e: &Expr,
+        group: &[&Vec<Value>],
+        refs: &[ColumnRef],
+        session: &Session,
+    ) -> EngineResult<Value> {
+        let mut folded: Vec<Value> = Vec::new();
+        let rewritten = self.fold_aggregates(e, group, refs, session, &mut folded)?;
+
+        // Hidden columns carry the folded values, so the rest of the
+        // expression evaluates by the ordinary rules.
+        let mut schema: Vec<ColumnRef> = refs.to_vec();
+        let mut values: Vec<Value> = match group.first() {
+            Some(row) => row.to_vec(),
+            // An empty group still has to line up with the schema, or the
+            // hidden columns land at the wrong index and cannot be resolved.
+            None => vec![Value::Null; refs.len()],
+        };
+        values.resize(refs.len(), Value::Null);
+        for (index, value) in folded.into_iter().enumerate() {
+            schema.push(ColumnRef::new("", folded_name(index)));
+            values.push(value);
+        }
+
+        let ctx = Context {
+            row: Some(Row {
+                schema: &schema,
+                values: &values,
+            }),
+            session,
+            subqueries: Some(self),
+        };
+        expr::eval(&rewritten, &ctx)
+    }
+
+    /// Rewrites every aggregate call into a reference to a hidden column, and
+    /// appends the folded value for it to `folded`.
+    fn fold_aggregates(
+        &self,
+        e: &Expr,
+        group: &[&Vec<Value>],
+        refs: &[ColumnRef],
+        session: &Session,
+        folded: &mut Vec<Value>,
+    ) -> EngineResult<Expr> {
+        use sqlparser::ast::Ident;
+
+        // A window function is not an aggregate over the group, so it is left
+        // for the projection to handle.
+        if let Expr::Function(f) = e {
+            if f.over.is_none() && is_aggregate(&f.name.to_string()) {
+                let name = f.name.to_string().to_ascii_lowercase();
+                let argument = aggregate_argument(f);
+                let value = self.fold(
+                    session,
+                    &name,
+                    argument.as_ref(),
+                    refs,
+                    group,
+                    aggregate_is_distinct(f),
+                )?;
+                let slot = folded.len();
+                folded.push(value);
+                return Ok(Expr::Identifier(Ident::new(folded_name(slot))));
+            }
+        }
+
+        let recur = |inner: &Expr, folded: &mut Vec<Value>| {
+            self.fold_aggregates(inner, group, refs, session, folded)
+        };
+
+        Ok(match e {
+            Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+                left: Box::new(recur(left, folded)?),
+                op: op.clone(),
+                right: Box::new(recur(right, folded)?),
+            },
+            Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+                op: *op,
+                expr: Box::new(recur(expr, folded)?),
+            },
+            Expr::Nested(inner) => Expr::Nested(Box::new(recur(inner, folded)?)),
+            Expr::IsNull(inner) => Expr::IsNull(Box::new(recur(inner, folded)?)),
+            Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(recur(inner, folded)?)),
+            Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => Expr::Between {
+                expr: Box::new(recur(expr, folded)?),
+                negated: *negated,
+                low: Box::new(recur(low, folded)?),
+                high: Box::new(recur(high, folded)?),
+            },
+            Expr::Cast {
+                kind,
+                expr,
+                data_type,
+                format,
+                array,
+            } => Expr::Cast {
+                kind: kind.clone(),
+                expr: Box::new(recur(expr, folded)?),
+                data_type: data_type.clone(),
+                format: format.clone(),
+                array: *array,
+            },
+            Expr::Case {
+                case_token,
+                end_token,
+                operand,
+                conditions,
+                else_result,
+            } => Expr::Case {
+                case_token: case_token.clone(),
+                end_token: end_token.clone(),
+                operand: match operand {
+                    Some(o) => Some(Box::new(recur(o, folded)?)),
+                    None => None,
+                },
+                conditions: {
+                    let mut out = Vec::with_capacity(conditions.len());
+                    for w in conditions {
+                        out.push(sqlparser::ast::CaseWhen {
+                            condition: recur(&w.condition, folded)?,
+                            result: recur(&w.result, folded)?,
+                        });
+                    }
+                    out
+                },
+                else_result: match else_result {
+                    Some(r) => Some(Box::new(recur(r, folded)?)),
+                    None => None,
+                },
+            },
+            Expr::Function(f) => {
+                use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+                let mut f = f.clone();
+                if let FunctionArguments::List(list) = &mut f.args {
+                    for arg in &mut list.args {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(inner))
+                        | FunctionArg::Named {
+                            arg: FunctionArgExpr::Expr(inner),
+                            ..
+                        } = arg
+                        {
+                            *inner = recur(inner, folded)?;
+                        }
+                    }
+                }
+                Expr::Function(f)
+            }
+            // Anything without a nested expression to rewrite passes through.
+            other => other.clone(),
         })
     }
 
@@ -902,6 +1381,7 @@ impl Engine {
         argument: Option<&Expr>,
         refs: &[ColumnRef],
         matching: &[&Vec<Value>],
+        distinct: bool,
     ) -> EngineResult<Value> {
         let mut values = Vec::new();
         if let Some(arg) = argument {
@@ -919,7 +1399,13 @@ impl Engine {
         }
 
         // Aggregates ignore NULL, except COUNT(*) which counts rows.
-        let present: Vec<&Value> = values.iter().filter(|v| !v.is_null()).collect();
+        let mut present: Vec<&Value> = values.iter().filter(|v| !v.is_null()).collect();
+
+        // COUNT(DISTINCT x) and the like fold over unique values only.
+        if distinct {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            present.retain(|v| seen.insert(v.collation_key()));
+        }
 
         Ok(match name {
             "count" => match argument {
@@ -1011,7 +1497,13 @@ impl Engine {
             };
             let mut key = Vec::with_capacity(items.len());
             for item in items {
-                key.push(expr::eval(&item.expr, &ctx)?);
+                // `ORDER BY 2` names the second output column. Evaluated as an
+                // expression it is the constant 2, which gives every row the
+                // same sort key and leaves the result unordered.
+                key.push(match ordinal_of(&item.expr).and_then(|n| row.get(n - 1)) {
+                    Some(value) => value.clone(),
+                    None => expr::eval(&item.expr, &ctx)?,
+                });
             }
             keyed.push((key, row.clone()));
         }
@@ -1686,6 +2178,8 @@ fn compare_keys(a: &[Value], b: &[Value], descending: &[bool]) -> std::cmp::Orde
 enum Projection {
     /// Copied straight from the stored row.
     Column(usize),
+    /// Precomputed per row by a window function.
+    Window(usize),
     /// Boxed: an Expr is far larger than an index, and a projection list is
     /// mostly plain columns.
     Expr(Box<Expr>),
@@ -1760,6 +2254,35 @@ fn apply_limit(result: &mut ResultSet, session: &Session, query: &Query) -> Engi
     Ok(())
 }
 
+/// Removes duplicate rows in place, preserving first-seen order.
+///
+/// The key uses the same collation as comparison, so what DISTINCT and UNION
+/// treat as duplicate matches what `WHERE` treats as equal.
+fn dedupe(rows: &mut Vec<Vec<Value>>) {
+    // A set, not a Vec: UNION dedupes the concatenation of both branches by
+    // default, and a linear probe there is quadratic in the row count.
+    let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+    let mut kept = Vec::with_capacity(rows.len());
+    for row in std::mem::take(rows) {
+        // NULL is its own distinct value and must not collide with the empty
+        // string.
+        let key: Vec<String> = row
+            .iter()
+            .map(|v| {
+                if v.is_null() {
+                    "\u{0}NULL".to_owned()
+                } else {
+                    v.collation_key()
+                }
+            })
+            .collect();
+        if seen.insert(key) {
+            kept.push(row);
+        }
+    }
+    *rows = kept;
+}
+
 /// Removes duplicate rows for SELECT DISTINCT.
 ///
 /// Silently ignoring DISTINCT returns a plausible-looking result with the wrong
@@ -1772,41 +2295,289 @@ fn apply_distinct(
         None => Ok(()),
         Some(sqlparser::ast::Distinct::Distinct) => {
             // Order is preserved, so a preceding ORDER BY still holds.
-            let mut seen: Vec<Vec<String>> = Vec::new();
-            let mut kept = Vec::with_capacity(result.rows.len());
-            for row in std::mem::take(&mut result.rows) {
-                // NULL is its own distinct value, and must not collide with
-                // the empty string.
-                let key: Vec<String> = row
-                    .iter()
-                    .map(|v| {
-                        if v.is_null() {
-                            "\u{0}NULL".to_owned()
-                        } else {
-                            v.as_text()
-                        }
-                    })
-                    .collect();
-                if !seen.contains(&key) {
-                    seen.push(key);
-                    kept.push(row);
-                }
-            }
-            result.rows = kept;
+            dedupe(&mut result.rows);
             Ok(())
         }
         Some(other) => Err(unsupported(format!("`{other}`"))),
     }
 }
 
-fn projection_is_aggregate(projection: &[SelectItem]) -> bool {
-    projection.iter().any(|item| {
-        let e = match item {
-            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
-            _ => return false,
-        };
-        matches!(e, Expr::Function(f) if is_aggregate(&f.name.to_string()))
-    })
+/// The name of the hidden column a folded aggregate is bound to.
+///
+/// A NUL prefix keeps it out of any namespace a query could reference.
+fn folded_name(index: usize) -> String {
+    format!("\u{0}agg{index}")
+}
+
+/// The alias and expression of each projected item.
+fn projected_items(projection: &[SelectItem]) -> EngineResult<Vec<(String, Expr)>> {
+    projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(e) => Ok((render_expr(e), e.clone())),
+            SelectItem::ExprWithAlias { expr, alias } => Ok((alias.value.clone(), expr.clone())),
+            other => Err(unsupported(format!(
+                "select item `{other}` in a grouped query"
+            ))),
+        })
+        .collect()
+}
+
+/// The 1-based position an expression names, if it is a bare integer.
+fn ordinal_of(e: &Expr) -> Option<usize> {
+    match e {
+        Expr::Value(v) => match &v.value {
+            sqlparser::ast::Value::Number(n, _) => n.parse::<usize>().ok().filter(|n| *n > 0),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Resolves `GROUP BY 1` to the first select item's expression.
+fn resolve_ordinal(e: &Expr, projection: &[SelectItem]) -> Option<Expr> {
+    let position = ordinal_of(e)?;
+    match projection.get(position - 1)? {
+        SelectItem::UnnamedExpr(inner) => Some(inner.clone()),
+        SelectItem::ExprWithAlias { expr, .. } => Some(expr.clone()),
+        _ => None,
+    }
+}
+
+/// Replaces references to a select-list alias with the value already computed
+/// for it, so HAVING and ORDER BY can name one.
+fn substitute_aliases(e: &Expr, items: &[(String, Expr)], values: &[Value]) -> Expr {
+    if let Expr::Identifier(ident) = e {
+        if let Some(position) = items
+            .iter()
+            .position(|(alias, _)| alias.eq_ignore_ascii_case(&ident.value))
+        {
+            if let Some(value) = values.get(position) {
+                return literal_expr(value);
+            }
+        }
+    }
+
+    let recur = |inner: &Expr| Box::new(substitute_aliases(inner, items, values));
+    match e {
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: recur(left),
+            op: op.clone(),
+            right: recur(right),
+        },
+        Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+            op: *op,
+            expr: recur(expr),
+        },
+        Expr::Nested(inner) => Expr::Nested(recur(inner)),
+        Expr::IsNull(inner) => Expr::IsNull(recur(inner)),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(recur(inner)),
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => Expr::Between {
+            expr: recur(expr),
+            negated: *negated,
+            low: recur(low),
+            high: recur(high),
+        },
+        other => other.clone(),
+    }
+}
+
+/// Renders a value as a literal expression.
+///
+/// Only used for alias substitution, where the values involved are the ones a
+/// comparison in HAVING or ORDER BY will act on.
+fn literal_expr(value: &Value) -> Expr {
+    use sqlparser::ast::{Value as AstValue, ValueWithSpan};
+    let span = sqlparser::tokenizer::Span::empty();
+    let wrap = |v: AstValue| Expr::Value(ValueWithSpan { value: v, span });
+
+    match value {
+        Value::Null => wrap(AstValue::Null),
+        Value::Int(v) => wrap(AstValue::Number(v.to_string(), false)),
+        Value::Float(v) if v.is_finite() => wrap(AstValue::Number(format!("{v:?}"), false)),
+        Value::Float(_) => wrap(AstValue::Null),
+        Value::Text(v) => wrap(AstValue::SingleQuotedString(v.clone())),
+        Value::Bytes(v) => wrap(AstValue::SingleQuotedString(
+            String::from_utf8_lossy(v).into_owned(),
+        )),
+    }
+}
+
+/// The declared type of a computed column.
+///
+/// A grouped projection cannot be typed from the first group's value: a later
+/// group may produce a different type, and the binary protocol encodes by the
+/// declared type, so the client would decode the wrong thing. Only the shapes
+/// that are always integral are claimed as such.
+fn computed_column_type(e: &Expr) -> ColumnType {
+    match e {
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_ascii_lowercase();
+            match name.as_str() {
+                "count" | "row_number" | "rank" | "dense_rank" => ColumnType::LongLong,
+                _ => ColumnType::VarString,
+            }
+        }
+        _ => ColumnType::VarString,
+    }
+}
+
+/// Rejects a selected expression that is neither aggregated nor grouped by.
+///
+/// Without this the engine evaluates it against the group's first row and
+/// returns an arbitrary value, where MySQL under ONLY_FULL_GROUP_BY errors.
+fn check_full_group_by(e: &Expr, group_exprs: &[Expr]) -> EngineResult<()> {
+    // An expression built only from aggregates and constants is always fine.
+    if !references_column(e) {
+        return Ok(());
+    }
+    // So is one the query grouped by, compared as written.
+    let rendered = e.to_string();
+    if group_exprs.iter().any(|g| g.to_string() == rendered) {
+        return Ok(());
+    }
+
+    match e {
+        Expr::Function(f) if f.over.is_some() => return Ok(()),
+        Expr::Function(f) if is_aggregate(&f.name.to_string()) => return Ok(()),
+        Expr::BinaryOp { left, right, .. } => {
+            check_full_group_by(left, group_exprs)?;
+            return check_full_group_by(right, group_exprs);
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
+            return check_full_group_by(expr, group_exprs)
+        }
+        _ => {}
+    }
+
+    Err(EngineError::new(
+        1055,
+        "42000",
+        format!(
+            "Expression '{rendered}' is not in GROUP BY clause and contains a nonaggregated \
+             column; this is incompatible with sql_mode=only_full_group_by"
+        ),
+    ))
+}
+
+/// Whether an expression reads any column outside an aggregate.
+fn references_column(e: &Expr) -> bool {
+    match e {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+        // An aggregate consumes its columns, so they are not loose references.
+        Expr::Function(f) if f.over.is_none() && is_aggregate(&f.name.to_string()) => false,
+        Expr::Function(f) => function_arguments(f).iter().any(references_column),
+        Expr::BinaryOp { left, right, .. } => references_column(left) || references_column(right),
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::Cast { expr, .. } => references_column(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => references_column(expr) || references_column(low) || references_column(high),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(references_column)
+                || conditions
+                    .iter()
+                    .any(|w| references_column(&w.condition) || references_column(&w.result))
+                || else_result.as_deref().is_some_and(references_column)
+        }
+        _ => false,
+    }
+}
+
+/// True when a select item contains an aggregate anywhere inside it.
+///
+/// Matching only a bare `COUNT(*)` misses `SUM(a) / COUNT(*)` and
+/// `IFNULL(SUM(v), 0)`, which then take the per-row path and either fail
+/// outright or return no rows at all.
+fn select_item_aggregates(item: &SelectItem) -> bool {
+    match item {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+            contains_aggregate(e)
+        }
+        _ => false,
+    }
+}
+
+/// True when an expression contains an aggregate call anywhere inside it.
+fn contains_aggregate(e: &Expr) -> bool {
+    match e {
+        Expr::Function(f) => {
+            f.over.is_none() && is_aggregate(&f.name.to_string())
+                || function_arguments(f).iter().any(contains_aggregate)
+        }
+        Expr::BinaryOp { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
+        Expr::UnaryOp { expr, .. } => contains_aggregate(expr),
+        Expr::Nested(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            contains_aggregate(inner)
+        }
+        Expr::Cast { expr, .. } => contains_aggregate(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
+        Expr::InList { expr, list, .. } => {
+            contains_aggregate(expr) || list.iter().any(contains_aggregate)
+        }
+        Expr::InSubquery { expr, .. } => contains_aggregate(expr),
+        Expr::Like { expr, pattern, .. } => contains_aggregate(expr) || contains_aggregate(pattern),
+        Expr::IsTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsNotFalse(inner) => contains_aggregate(inner),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(contains_aggregate)
+                || conditions
+                    .iter()
+                    .any(|w| contains_aggregate(&w.condition) || contains_aggregate(&w.result))
+                || else_result.as_deref().is_some_and(contains_aggregate)
+        }
+        _ => false,
+    }
+}
+
+/// The expression arguments of a function call.
+fn function_arguments(f: &sqlparser::ast::Function) -> Vec<Expr> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    let FunctionArguments::List(list) = &f.args else {
+        return Vec::new();
+    };
+    list.args
+        .iter()
+        .filter_map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+            | FunctionArg::Named {
+                arg: FunctionArgExpr::Expr(e),
+                ..
+            } => Some(e.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether an aggregate was written with DISTINCT.
+fn aggregate_is_distinct(f: &sqlparser::ast::Function) -> bool {
+    use sqlparser::ast::{DuplicateTreatment, FunctionArguments};
+    matches!(
+        &f.args,
+        FunctionArguments::List(list) if list.duplicate_treatment == Some(DuplicateTreatment::Distinct)
+    )
 }
 
 fn is_aggregate(name: &str) -> bool {

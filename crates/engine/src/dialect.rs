@@ -29,6 +29,8 @@ pub struct SqlMode {
     pub real_as_float: bool,
     /// Writes that would truncate or lose data are errors, not warnings.
     pub strict: bool,
+    /// A grouped query may only select columns it grouped by, or aggregates.
+    pub only_full_group_by: bool,
 }
 
 impl SqlMode {
@@ -42,6 +44,7 @@ impl SqlMode {
                 "IGNORE_SPACE" => out.ignore_space = true,
                 "REAL_AS_FLOAT" => out.real_as_float = true,
                 "STRICT_ALL_TABLES" | "STRICT_TRANS_TABLES" => out.strict = true,
+                "ONLY_FULL_GROUP_BY" => out.only_full_group_by = true,
                 // ANSI is a compound mode that implies ANSI_QUOTES and
                 // PIPES_AS_CONCAT, among others.
                 "ANSI" => {
@@ -68,6 +71,7 @@ mod tests {
     #[test]
     fn parses_the_deployments_mode() {
         let mode = SqlMode::parse(APPELLO);
+        assert!(mode.only_full_group_by);
         assert!(mode.ansi_quotes);
         assert!(mode.pipes_as_concat);
         assert!(mode.ignore_space);
