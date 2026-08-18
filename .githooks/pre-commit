@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+#
+# Refuses a commit that does not pass scripts/check.sh.
+#
+# Lives in .githooks rather than .git/hooks so it is version controlled and
+# every clone gets it. Activated by:
+#     git config core.hooksPath .githooks
+#
+# Bypass with `git commit --no-verify` when you genuinely need to.
+
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT" || exit 1
+
+# Nothing Rust in this commit means nothing for this gate to say.
+if ! git diff --cached --name-only --diff-filter=ACMR \
+    | grep -qE '\.rs$|Cargo\.(toml|lock)$|scripts/check\.sh$'; then
+    exit 0
+fi
+
+# The checks run against the working tree, not the index. If those differ, the
+# result does not describe what is about to be committed, so say so rather than
+# implying a guarantee the gate cannot make.
+if ! git diff --quiet; then
+    printf '\033[33mNote:\033[0m unstaged changes present — checks cover the working tree, not just the index.\n'
+fi
+
+if ! ./scripts/check.sh; then
+    printf '\n\033[31mCommit refused.\033[0m Fix the above, or bypass with: git commit --no-verify\n'
+    exit 1
+fi

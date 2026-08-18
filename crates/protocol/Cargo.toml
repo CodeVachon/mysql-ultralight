@@ -1,0 +1,15 @@
+[package]
+name = "mysql-ultralight-protocol"
+description = "MySQL 8 client/server wire protocol codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["io-util"] }
+sha1 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }

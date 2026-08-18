@@ -1,0 +1,17 @@
+[package]
+name = "mysql-ultralight-cli"
+description = "The mysql-ultralight command line server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mysql-ultralight"
+path = "src/main.rs"
+
+[dependencies]
+mysql-ultralight-protocol = { workspace = true }
+mysql-ultralight-server = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "signal", "io-util"] }

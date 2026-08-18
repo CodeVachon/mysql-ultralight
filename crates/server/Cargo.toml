@@ -1,0 +1,15 @@
+[package]
+name = "mysql-ultralight-server"
+description = "Connection handling and command dispatch for mysql-ultralight"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mysql-ultralight-protocol = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "macros", "time"] }
