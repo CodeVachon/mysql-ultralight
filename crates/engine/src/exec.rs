@@ -14,11 +14,12 @@ use sqlparser::parser::Parser;
 use crate::catalog::{Catalog, Table, INFORMATION_SCHEMA};
 use crate::ddl;
 use crate::error::{unsupported, EngineError, EngineResult};
-use crate::expr::{self, ColumnRef, Context, Row};
+use crate::expr::{self, ColumnRef, Context, OuterRow, Row};
 use crate::info_schema;
 use crate::params;
 use crate::relation::Relation;
 use crate::result::{OutColumn, Outcome, ResultSet};
+use crate::rewrite::{self, Intercepted};
 use crate::session::{ServerConfig, Session};
 use crate::value::Value;
 
@@ -79,11 +80,38 @@ impl Engine {
         sql: &str,
         parameters: &[Value],
     ) -> EngineResult<Outcome> {
-        let bound = params::bind(sql, parameters);
-        let dialect = MySqlDialect {};
+        self.execute_at_depth(session, sql, parameters, 0)
+    }
 
-        let statements =
-            Parser::parse_sql(&dialect, &bound).map_err(|e| EngineError::parse(format!("{e}")))?;
+    /// `depth` bounds recursion through `EXECUTE`, which can otherwise run a
+    /// prepared statement that prepares and executes itself.
+    fn execute_at_depth(
+        &self,
+        session: &mut Session,
+        sql: &str,
+        parameters: &[Value],
+        depth: usize,
+    ) -> EngineResult<Outcome> {
+        const MAX_DEPTH: usize = 8;
+        if depth > MAX_DEPTH {
+            return Err(EngineError::new(
+                1456,
+                "HY000",
+                "Recursive limit exceeded for prepared statements",
+            ));
+        }
+
+        let bound = params::bind(sql, parameters);
+        let mode = session.sql_mode();
+
+        // Statements the parser cannot take are recognised before it sees them.
+        if let Some(intercepted) = rewrite::intercept(&bound) {
+            return self.run_intercepted(session, intercepted, depth);
+        }
+
+        let normalised = rewrite::normalise(&bound, mode);
+        let statements = Parser::parse_sql(&MySqlDialect {}, &normalised)
+            .map_err(|e| EngineError::parse(format!("{e}")))?;
 
         match statements.len() {
             0 => Ok(Outcome::ok()),
@@ -92,6 +120,95 @@ impl Engine {
             // the server does not advertise. Erroring beats returning only the
             // first result and letting the caller believe it ran everything.
             _ => Err(unsupported("multiple statements in one command")),
+        }
+    }
+
+    /// Runs a statement recognised outside the general parser.
+    fn run_intercepted(
+        &self,
+        session: &mut Session,
+        intercepted: Intercepted,
+        depth: usize,
+    ) -> EngineResult<Outcome> {
+        match intercepted {
+            Intercepted::Prepare { name, source } => {
+                // The source is either a literal or a user variable holding
+                // one. The migrations build it with IF(), so the variable form
+                // is the one that matters.
+                let text = match source.strip_prefix('@') {
+                    Some(variable) => {
+                        let value = session.user_variable(variable);
+                        if value.is_null() {
+                            return Err(EngineError::new(
+                                1064,
+                                "42000",
+                                format!("Prepared statement source @{variable} is NULL"),
+                            ));
+                        }
+                        value.as_text()
+                    }
+                    None => source.trim_matches('\'').to_owned(),
+                };
+                session.prepared.insert(name.to_ascii_lowercase(), text);
+                Ok(Outcome::ok())
+            }
+
+            Intercepted::Execute { name, using } => {
+                let sql = session
+                    .prepared
+                    .get(&name.to_ascii_lowercase())
+                    .cloned()
+                    .ok_or_else(|| {
+                        EngineError::new(
+                            1243,
+                            "HY000",
+                            format!("Unknown prepared statement handler ({name}) given to EXECUTE"),
+                        )
+                    })?;
+
+                let parameters: Vec<Value> = using
+                    .iter()
+                    .map(|v| session.user_variable(v.trim_start_matches('@')))
+                    .collect();
+
+                self.execute_at_depth(session, &sql, &parameters, depth + 1)
+            }
+
+            Intercepted::Deallocate { name } => {
+                session.prepared.remove(&name.to_ascii_lowercase());
+                Ok(Outcome::ok())
+            }
+
+            Intercepted::RenameIndex { table, old, new } => {
+                let (db, table_name) = self.split_parts(session, &table)?;
+                let mut catalog = self.catalog_mut()?;
+                let database = catalog
+                    .database_mut(&db)
+                    .ok_or_else(|| EngineError::unknown_database(&db))?;
+                let table = database
+                    .table_mut(&table_name)
+                    .ok_or_else(|| EngineError::no_such_table(&table_name))?;
+
+                match table
+                    .indexes
+                    .iter_mut()
+                    .find(|i| i.name.eq_ignore_ascii_case(&old))
+                {
+                    Some(index) => index.name = new,
+                    None => {
+                        return Err(EngineError::new(
+                            1176,
+                            "42000",
+                            format!("Key '{old}' doesn't exist in table '{table_name}'"),
+                        ))
+                    }
+                }
+                Ok(Outcome::ok())
+            }
+
+            // No CREATE EVENT exists anywhere in the target codebase; the one
+            // DROP is against a legacy event, so accepting it is enough.
+            Intercepted::DropEvent { .. } => Ok(Outcome::ok()),
         }
     }
 
@@ -108,6 +225,57 @@ impl Engine {
             Statement::Delete(delete) => self.delete(session, delete),
 
             Statement::CreateTable(create) => ddl::create_table(self, session, create),
+            Statement::CreateView(create) => {
+                let (db, name) = self.split_name(session, &create.name)?;
+                let explicit: Vec<String> = create
+                    .columns
+                    .iter()
+                    .map(|c| c.name.value.clone())
+                    .collect();
+
+                // Running the definition now both validates it and fixes the
+                // view's shape, which information_schema needs later without a
+                // session to run anything against.
+                let mut scoped = session.clone();
+                scoped.current_database = Some(db.clone());
+                let resolved = self.query(&scoped, &create.query)?;
+                let shape: Vec<crate::catalog::Column> = resolved
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let mut column = crate::catalog::Column::new(
+                            explicit.get(i).cloned().unwrap_or_else(|| c.name.clone()),
+                            crate::types::SqlType::from_column_type(c.ty),
+                        );
+                        column.position = i + 1;
+                        column.nullable = c.nullable;
+                        column
+                    })
+                    .collect();
+
+                let view = crate::catalog::View {
+                    name: name.clone(),
+                    definition: create.query.to_string(),
+                    columns: explicit,
+                    shape,
+                };
+
+                let mut catalog = self.catalog_mut()?;
+                let database = catalog
+                    .database_mut(&db)
+                    .ok_or_else(|| EngineError::unknown_database(&db))?;
+
+                if !create.or_replace && database.view(&name).is_some() {
+                    return Err(EngineError::table_exists(&name));
+                }
+                // A view and a table cannot share a name.
+                if database.table(&name).is_some() {
+                    return Err(EngineError::table_exists(&name));
+                }
+                database.views.insert(name, view);
+                Ok(Outcome::ok())
+            }
             Statement::AlterTable(alter) => ddl::alter_table(
                 self,
                 session,
@@ -202,11 +370,22 @@ impl Engine {
     // ---------------------------------------------------------------- SELECT
 
     fn query(&self, session: &Session, query: &Query) -> EngineResult<ResultSet> {
+        self.query_with_outer(session, query, None)
+    }
+
+    /// Runs a query, optionally against an enclosing row so a correlated
+    /// subquery can reference the outer query's columns.
+    fn query_with_outer(
+        &self,
+        session: &Session,
+        query: &Query,
+        outer: Option<&OuterRow>,
+    ) -> EngineResult<ResultSet> {
         let SetExpr::Select(select) = query.body.as_ref() else {
             return Err(unsupported("this query form"));
         };
 
-        let result = self.select(session, select, query.order_by.as_ref())?;
+        let result = self.select(session, select, query.order_by.as_ref(), outer)?;
         // Ordering by an output alias rather than a source column is legal and
         // could not be resolved against the table, so it is retried here.
         let pending = result.pending_order;
@@ -223,28 +402,55 @@ impl Engine {
         session: &Session,
         select: &Select,
         order: Option<&OrderBy>,
+        outer: Option<&OuterRow>,
     ) -> EngineResult<Ordered> {
         // A SELECT with no FROM evaluates its projection once, which is the
         // shape of `SELECT 1` and every driver's preamble query.
         if select.from.is_empty() {
-            return Ok(Ordered::sorted(self.select_without_table(session, select)?));
+            return Ok(Ordered::sorted(
+                self.select_without_table(session, select, outer)?,
+            ));
         }
         if select.from.len() > 1 {
             return Err(unsupported("comma-separated FROM items"));
         }
 
         let relation = self.build_relation(session, &select.from[0])?;
-        let refs = relation.refs();
+        // The outer row's columns are appended, so an unqualified name resolves
+        // against this query's columns first and the enclosing one only if it
+        // is not found here, which is MySQL's scoping rule.
+        let mut refs = relation.refs();
+        if let Some(outer) = outer {
+            refs.extend(outer.schema.iter().cloned());
+        }
 
         // Filter first so projections and aggregates see only matching rows.
+        // Each candidate row is widened with the outer row's values so both
+        // are visible to the predicate.
+        // Only a correlated subquery needs widened rows; an ordinary query
+        // borrows the relation's rows rather than copying the whole set.
+        let widened: Option<Vec<Vec<Value>>> = outer.map(|outer| {
+            relation
+                .rows
+                .iter()
+                .map(|row| {
+                    let mut combined = row.clone();
+                    combined.extend(outer.values.iter().cloned());
+                    combined
+                })
+                .collect()
+        });
+        let source: &Vec<Vec<Value>> = widened.as_ref().unwrap_or(&relation.rows);
+
         let mut matching: Vec<&Vec<Value>> = Vec::new();
-        for row in &relation.rows {
+        for row in source {
             let ctx = Context {
                 row: Some(Row {
                     schema: &refs,
                     values: row,
                 }),
                 session,
+                subqueries: Some(self),
             };
             let keep = match &select.selection {
                 Some(predicate) => expr::eval(predicate, &ctx)?.truthy() == Some(true),
@@ -307,6 +513,7 @@ impl Engine {
                     values: row,
                 }),
                 session,
+                subqueries: Some(self),
             };
             let mut key = Vec::with_capacity(items.len());
             for item in items {
@@ -391,6 +598,7 @@ impl Engine {
                                 values: &combined,
                             }),
                             session,
+                            subqueries: Some(self),
                         };
                         expr::eval(e, &ctx)?.truthy() == Some(true)
                     }
@@ -429,6 +637,26 @@ impl Engine {
         match factor {
             TableFactor::Table { name, alias, .. } => {
                 let (db, table_name) = self.split_name(session, name)?;
+
+                // A view is a named query, so it is run and its rows stand in
+                // for a table's.
+                let view = if db.eq_ignore_ascii_case(INFORMATION_SCHEMA) {
+                    None
+                } else {
+                    let catalog = self.catalog()?;
+                    catalog
+                        .database(&db)
+                        .and_then(|d| d.view(&table_name))
+                        .cloned()
+                };
+                if let Some(view) = view {
+                    let shown = alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| view.name.clone());
+                    return self.materialise_view(session, &view, &db, &shown);
+                }
+
                 let mut table = if db.eq_ignore_ascii_case(INFORMATION_SCHEMA) {
                     let catalog = self.catalog()?;
                     info_schema::table(&catalog, session, &table_name)?
@@ -463,15 +691,8 @@ impl Engine {
                             schema: String::new(),
                             table: name.clone(),
                             name: c.name.clone(),
-                            ty: crate::types::SqlType {
-                                kind: crate::types::TypeKind::Text,
-                                declared: "varchar(512)".to_owned(),
-                                length: None,
-                                scale: None,
-                                unsigned: false,
-                                variants: Vec::new(),
-                            },
-                            nullable: true,
+                            ty: crate::types::SqlType::from_column_type(c.ty),
+                            nullable: c.nullable,
                         })
                         .collect(),
                     rows: inner.rows,
@@ -481,8 +702,26 @@ impl Engine {
         }
     }
 
-    fn select_without_table(&self, session: &Session, select: &Select) -> EngineResult<ResultSet> {
-        let ctx = Context::rowless(session);
+    fn select_without_table(
+        &self,
+        session: &Session,
+        select: &Select,
+        outer: Option<&OuterRow>,
+    ) -> EngineResult<ResultSet> {
+        // `SELECT (SELECT a) FROM t` has no FROM of its own but must still see
+        // the enclosing row.
+        let ctx = match outer {
+            None => Context::rowless(session),
+            Some(outer) => Context {
+                row: Some(Row {
+                    schema: &outer.schema,
+                    values: &outer.values,
+                }),
+                session,
+                subqueries: None,
+            },
+        }
+        .with_subqueries(self);
         let mut columns = Vec::new();
         let mut row = Vec::new();
 
@@ -492,7 +731,7 @@ impl Engine {
                 SelectItem::ExprWithAlias { expr, alias } => (alias.value.clone(), expr),
                 other => return Err(unsupported(format!("select item `{other}`"))),
             };
-            let value = self.eval_scalar(session, e, &ctx)?;
+            let value = expr::eval(e, &ctx)?;
             columns.push(OutColumn::new(alias, wire_type(&value)));
             row.push(value);
         }
@@ -501,52 +740,6 @@ impl Engine {
             columns,
             rows: vec![row],
         })
-    }
-
-    /// Evaluates an expression that may reference a system or user variable.
-    ///
-    /// sqlparser models `@@x` and `@x` as identifiers with the sigil retained,
-    /// so they are resolved here rather than inside the evaluator, which has
-    /// no session-variable concept.
-    fn eval_scalar(&self, session: &Session, e: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
-        if let Some(value) = self.session_variable(session, e)? {
-            return Ok(value);
-        }
-        expr::eval(e, ctx)
-    }
-
-    fn session_variable(&self, session: &Session, e: &Expr) -> EngineResult<Option<Value>> {
-        let name = match e {
-            Expr::Identifier(ident) => ident.value.clone(),
-            // `@@GLOBAL.version` parses as a compound identifier.
-            Expr::CompoundIdentifier(parts)
-                if parts.first().is_some_and(|p| p.value.starts_with('@')) =>
-            {
-                parts
-                    .iter()
-                    .map(|p| p.value.as_str())
-                    .collect::<Vec<_>>()
-                    .join(".")
-            }
-            _ => return Ok(None),
-        };
-
-        if let Some(rest) = name.strip_prefix("@@") {
-            return match session.system_variable(rest) {
-                Some(v) => Ok(Some(v)),
-                // An unknown system variable is an error in MySQL too, and
-                // guessing would hide a real incompatibility.
-                None => Err(EngineError::new(
-                    1193,
-                    "HY000",
-                    format!("Unknown system variable '{rest}'"),
-                )),
-            };
-        }
-        if let Some(rest) = name.strip_prefix('@') {
-            return Ok(Some(session.user_variable(rest)));
-        }
-        Ok(None)
     }
 
     fn project(
@@ -605,12 +798,13 @@ impl Engine {
                     values: row,
                 }),
                 session,
+                subqueries: Some(self),
             };
             let mut out = Vec::with_capacity(plan.len());
             for step in &plan {
                 out.push(match step {
                     Projection::Column(i) => row.get(*i).cloned().unwrap_or(Value::Null),
-                    Projection::Expr(e) => self.eval_scalar(session, e, &ctx)?,
+                    Projection::Expr(e) => expr::eval(e, &ctx)?,
                 });
             }
             rows.push(out);
@@ -718,6 +912,7 @@ impl Engine {
                         values: row,
                     }),
                     session,
+                    subqueries: Some(self),
                 };
                 values.push(expr::eval(arg, &ctx)?);
             }
@@ -812,6 +1007,7 @@ impl Engine {
                     values: row,
                 }),
                 session,
+                subqueries: Some(self),
             };
             let mut key = Vec::with_capacity(items.len());
             for item in items {
@@ -886,7 +1082,7 @@ impl Engine {
                 ));
             }
 
-            let ctx = Context::rowless(&session_snapshot);
+            let ctx = Context::rowless(&session_snapshot).with_subqueries(self);
             let mut row = default_row(table, &ctx)?;
 
             for (slot, value_expr) in targets.iter().zip(values.content.iter()) {
@@ -977,6 +1173,7 @@ impl Engine {
                     values: &rows[index],
                 }),
                 session: &session_snapshot,
+                subqueries: Some(self),
             };
             let matched = match selection {
                 Some(p) => expr::eval(p, &ctx)?.truthy() == Some(true),
@@ -1054,6 +1251,7 @@ impl Engine {
                     values: &row,
                 }),
                 session: &session_snapshot,
+                subqueries: Some(self),
             };
             let matched = match &delete.selection {
                 Some(p) => expr::eval(p, &ctx)?.truthy() == Some(true),
@@ -1082,6 +1280,30 @@ impl Engine {
                 for name in names {
                     self.catalog_mut()?
                         .drop_database(&object_name(name), if_exists)?;
+                }
+            }
+            ObjectType::View => {
+                for name in names {
+                    let (db, view) = self.split_name(session, name)?;
+                    let mut catalog = self.catalog_mut()?;
+                    let Some(database) = catalog.database_mut(&db) else {
+                        if if_exists {
+                            continue;
+                        }
+                        return Err(EngineError::unknown_database(&db));
+                    };
+                    let key = database
+                        .views
+                        .keys()
+                        .find(|k| k.eq_ignore_ascii_case(&view))
+                        .cloned();
+                    match key {
+                        Some(k) => {
+                            database.views.remove(&k);
+                        }
+                        None if if_exists => {}
+                        None => return Err(EngineError::no_such_table(&view)),
+                    }
                 }
             }
             ObjectType::Table => {
@@ -1123,9 +1345,12 @@ impl Engine {
                 variable, values, ..
             } => {
                 let name = object_name(variable);
-                let ctx = Context::rowless(session);
+                let ctx = Context::rowless(session).with_subqueries(self);
+                // An expression that cannot be evaluated must not become a
+                // silent NULL: the variable would then carry a wrong answer
+                // into whatever reads it next.
                 let value = match values.first() {
-                    Some(e) => expr::eval(e, &ctx).unwrap_or(Value::Null),
+                    Some(e) => expr::eval(e, &ctx)?,
                     None => Value::Null,
                 };
                 self.assign(session, &name, value);
@@ -1134,8 +1359,8 @@ impl Engine {
             S::MultipleAssignments { assignments } => {
                 for assignment in assignments {
                     let name = object_name(&assignment.name);
-                    let ctx = Context::rowless(session);
-                    let value = expr::eval(&assignment.value, &ctx).unwrap_or(Value::Null);
+                    let ctx = Context::rowless(session).with_subqueries(self);
+                    let value = expr::eval(&assignment.value, &ctx)?;
                     self.assign(session, &name, value);
                 }
                 Ok(Outcome::ok())
@@ -1187,7 +1412,15 @@ impl Engine {
             format!("Tables_in_{}", database.name),
             ColumnType::VarString,
         )]);
-        for name in database.tables.keys() {
+        // MySQL lists views here too, and information_schema.TABLES already
+        // reports them, so omitting them contradicts the same connection.
+        let mut names: Vec<&String> = database
+            .tables
+            .keys()
+            .chain(database.views.keys())
+            .collect();
+        names.sort();
+        for name in names {
             result.rows.push(vec![Value::Text(name.clone())]);
         }
         Ok(result)
@@ -1196,10 +1429,6 @@ impl Engine {
     fn show_columns(&self, session: &Session, table: &str) -> EngineResult<ResultSet> {
         let catalog = self.catalog()?;
         let database = catalog.resolve(None, session.current_database.as_deref())?;
-        let table = database
-            .table(table)
-            .ok_or_else(|| EngineError::no_such_table(table))?;
-
         let mut result = ResultSet::new(vec![
             OutColumn::new("Field", ColumnType::VarString),
             OutColumn::new("Type", ColumnType::VarString),
@@ -1208,6 +1437,26 @@ impl Engine {
             OutColumn::new("Default", ColumnType::VarString),
             OutColumn::new("Extra", ColumnType::VarString),
         ]);
+
+        // A view is described by the shape resolved when it was created, which
+        // is also what information_schema reports for it.
+        if let Some(view) = database.view(table) {
+            for column in &view.shape {
+                result.rows.push(vec![
+                    Value::Text(column.name.clone()),
+                    Value::Text(column.ty.declared.clone()),
+                    Value::text(if column.nullable { "YES" } else { "NO" }),
+                    Value::text(""),
+                    Value::Null,
+                    Value::text(""),
+                ]);
+            }
+            return Ok(result);
+        }
+
+        let table = database
+            .table(table)
+            .ok_or_else(|| EngineError::no_such_table(table))?;
 
         for column in &table.columns {
             result.rows.push(vec![
@@ -1234,12 +1483,75 @@ impl Engine {
 
     // ------------------------------------------------------------- internals
 
+    /// Runs a view's definition and presents the result as a relation.
+    ///
+    /// The view's own database is made current for the duration, so an
+    /// unqualified table reference inside the definition resolves where the
+    /// view lives rather than wherever the caller happens to be.
+    fn materialise_view(
+        &self,
+        session: &Session,
+        view: &crate::catalog::View,
+        database: &str,
+        alias: &str,
+    ) -> EngineResult<Relation> {
+        let mut scoped = session.clone();
+        scoped.current_database = Some(database.to_owned());
+        // Views nest; without a guard a view defined in terms of itself would
+        // recurse until the stack ran out.
+        scoped.view_depth += 1;
+        if scoped.view_depth > 16 {
+            return Err(EngineError::new(
+                1462,
+                "HY000",
+                format!("`{}` contains a recursive view reference", view.name),
+            ));
+        }
+
+        let outcome = self.execute(&mut scoped, &view.definition, &[])?;
+        let Outcome::Rows(rows) = outcome else {
+            return Err(EngineError::new(
+                1064,
+                "42000",
+                format!("View `{}` does not return rows", view.name),
+            ));
+        };
+
+        // Explicit column names from `CREATE VIEW v (a, b)` rename the output.
+        let columns = rows
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| crate::relation::RelColumn {
+                schema: database.to_owned(),
+                table: alias.to_owned(),
+                name: view
+                    .columns
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| c.name.clone()),
+                // The inner query already worked out each column's type;
+                // discarding it reports every view column as text, and a typed
+                // client then decodes a number as a string.
+                ty: crate::types::SqlType::from_column_type(c.ty),
+                nullable: c.nullable,
+            })
+            .collect();
+
+        Ok(Relation {
+            columns,
+            rows: rows.rows,
+        })
+    }
+
     /// Splits a rendered `db.table` string, for the paths where the AST hands
     /// back a name already stringified.
     fn split_parts(&self, session: &Session, rendered: &str) -> EngineResult<(String, String)> {
         let parts: Vec<String> = rendered
             .split('.')
-            .map(|p| p.trim_matches('`').to_owned())
+            // Under ANSI_QUOTES the parts arrive double-quoted, so trimming
+            // only backticks leaves a database named `testdb"`.
+            .map(|p| p.trim_matches(|c| c == '`' || c == '"').to_owned())
             .collect();
         match parts.len() {
             1 => {
@@ -1312,6 +1624,17 @@ fn using_condition(
         });
     }
     condition.ok_or_else(|| EngineError::parse("USING clause names no columns"))
+}
+
+impl crate::expr::Subqueries for Engine {
+    fn rows(
+        &self,
+        query: &sqlparser::ast::Query,
+        session: &Session,
+        outer: Option<crate::expr::OuterRow>,
+    ) -> EngineResult<Vec<Vec<Value>>> {
+        Ok(self.query_with_outer(session, query, outer.as_ref())?.rows)
+    }
 }
 
 /// A result together with whether its ORDER BY still needs applying.
@@ -1406,6 +1729,7 @@ fn default_row(table: &Table, ctx: &Context<'_>) -> EngineResult<Vec<Value>> {
 }
 
 fn apply_limit(result: &mut ResultSet, session: &Session, query: &Query) -> EngineResult<()> {
+    // LIMIT and OFFSET are constants or parameters, never subqueries.
     let ctx = Context::rowless(session);
 
     if let Some(clause) = &query.limit_clause {

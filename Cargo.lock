@@ -146,6 +146,7 @@ dependencies = [
 name = "mysql-ultralight-conformance"
 version = "0.0.1"
 dependencies = [
+ "mysql-ultralight-engine",
  "serde_json",
  "sqlparser",
 ]

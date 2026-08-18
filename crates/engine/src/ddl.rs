@@ -77,7 +77,9 @@ pub fn create_table(
         .database_mut(&db)
         .ok_or_else(|| EngineError::unknown_database(&db))?;
 
-    if database.table(&name).is_some() {
+    // A view occupies the same namespace; without this check the new table
+    // would be permanently unreachable, since a view resolves first.
+    if database.table(&name).is_some() || database.view(&name).is_some() {
         if create.if_not_exists {
             return Ok(Outcome::ok());
         }

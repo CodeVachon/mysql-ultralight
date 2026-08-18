@@ -1,11 +1,11 @@
 ---
 id: 18
 title: Parser must be sql_mode aware (ANSI_QUOTES, PIPES_AS_CONCAT)
-state: Todo
+state: Done
 parent: 4
 labels: [compat, parser, blocker]
 created: 2026-08-18T15:29:25Z
-updated: 2026-08-18T15:51:57Z
+updated: 2026-08-18T18:52:11Z
 ---
 
 ## Description
@@ -37,3 +37,9 @@ Confirmed empirically on 2026-08-18 by querying a container built from the repo'
 ### 2026-08-18T15:51:57Z — Christopher Vachon (user)
 
 Confirmed by the conformance extraction with concrete failures. Four rejected statements trace to IGNORE_SPACE: LEFT (MD5 (UUID ()), 21) writes the LEFT() function with a space, and sqlparser-rs reads LEFT as the start of a LEFT JOIN. Errors surface as 'Expected: ), found: ,' and 'Expected: joined table, found: .'. This is the sql_mode dependency showing up in the parser exactly as predicted, and it is not theoretical.
+
+### 2026-08-18T18:52:11Z — Christopher Vachon (user)
+
+Implemented 2026-08-18. sql_mode is parsed into a SqlMode struct and applied by rewriting statement text before parsing: ANSI_QUOTES converts double-quoted words to backtick identifiers, IGNORE_SPACE closes the gap between a function name and its opening parenthesis, and PIPES_AS_CONCAT is honoured at evaluation time because the tokenizer always emits StringConcat for ||.
+
+Note the approach: a custom sqlparser Dialect does not work. sqlparser gates its MySQL-specific parsing on the concrete dialect type via dialect_of!(self is MySqlDialect | ...) at 94 sites, so a wrapper implementing the trait silently loses AUTO_INCREMENT and much else. That was found by a test regression, not by reading the source.

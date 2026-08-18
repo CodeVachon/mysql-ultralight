@@ -154,11 +154,30 @@ impl Table {
     }
 }
 
+/// A view: a named query, materialised on read.
+///
+/// The definition is kept as text rather than as an AST so it can be reported
+/// verbatim by `information_schema.VIEWS`, which is where introspection tools
+/// read it from.
+#[derive(Debug, Clone)]
+pub struct View {
+    pub name: String,
+    pub definition: String,
+    /// Explicit column names from `CREATE VIEW v (a, b) AS ...`, if given.
+    pub columns: Vec<String>,
+    /// The columns the definition returns, resolved once when the view is
+    /// created. A view's data changes with the tables under it but its shape
+    /// does not, and `information_schema.COLUMNS` is read without a session to
+    /// run the query against.
+    pub shape: Vec<Column>,
+}
+
 /// A database, also called a schema.
 #[derive(Debug, Clone, Default)]
 pub struct Database {
     pub name: String,
     pub tables: BTreeMap<String, Table>,
+    pub views: BTreeMap<String, View>,
     pub charset: String,
     pub collation: String,
 }
@@ -168,6 +187,7 @@ impl Database {
         Self {
             name: name.into(),
             tables: BTreeMap::new(),
+            views: BTreeMap::new(),
             charset: "utf8mb4".to_owned(),
             collation: "utf8mb4_0900_ai_ci".to_owned(),
         }
@@ -178,6 +198,16 @@ impl Database {
     pub fn table(&self, name: &str) -> Option<&Table> {
         self.tables.get(name).or_else(|| {
             self.tables
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v)
+        })
+    }
+
+    /// View lookup, case-insensitive like table lookup.
+    pub fn view(&self, name: &str) -> Option<&View> {
+        self.views.get(name).or_else(|| {
+            self.views
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v)

@@ -25,21 +25,7 @@ pub fn table(catalog: &Catalog, session: &Session, name: &str) -> EngineResult<T
         // Views, routines, events, triggers and check constraints are all
         // empty rather than absent. Prisma reads each one and treats a missing
         // table as an error, but an empty result as "none defined".
-        "views" => empty(
-            "VIEWS",
-            &[
-                "TABLE_CATALOG",
-                "TABLE_SCHEMA",
-                "TABLE_NAME",
-                "VIEW_DEFINITION",
-                "CHECK_OPTION",
-                "IS_UPDATABLE",
-                "DEFINER",
-                "SECURITY_TYPE",
-                "CHARACTER_SET_CLIENT",
-                "COLLATION_CONNECTION",
-            ],
-        ),
+        "views" => views(catalog),
         "routines" => empty(
             "ROUTINES",
             &[
@@ -190,6 +176,28 @@ fn tables(catalog: &Catalog) -> Table {
             ]);
         }
     }
+    // A view appears here too, with TABLE_TYPE = VIEW.
+    for name in catalog.database_names() {
+        let Some(db) = catalog.database(&name) else {
+            continue;
+        };
+        for view in db.views.values() {
+            rows.push(vec![
+                text("def"),
+                text(&name),
+                text(&view.name),
+                text("VIEW"),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                text("VIEW"),
+                text(""),
+            ]);
+        }
+    }
+
     build(
         "TABLES",
         &[
@@ -288,6 +296,38 @@ fn columns(catalog: &Catalog) -> Table {
             }
         }
     }
+    // A view's columns come from the shape resolved when it was created.
+    // Prisma finds a view in TABLES and then reads COLUMNS for it, so omitting
+    // these presents a zero-column object.
+    for name in catalog.database_names() {
+        let Some(db) = catalog.database(&name) else {
+            continue;
+        };
+        for view in db.views.values() {
+            for column in &view.shape {
+                rows.push(vec![
+                    text("def"),
+                    text(&name),
+                    text(&view.name),
+                    text(&column.name),
+                    Value::Int(column.position as i64),
+                    Value::Null,
+                    text(if column.nullable { "YES" } else { "NO" }),
+                    text(column.ty.base_name()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    text(&column.ty.declared),
+                    text(""),
+                    text(""),
+                    text(&db.collation),
+                    text(""),
+                ]);
+            }
+        }
+    }
+
     build(
         "COLUMNS",
         &[
@@ -518,6 +558,46 @@ fn referential_constraints(catalog: &Catalog) -> Table {
             "DELETE_RULE",
             "TABLE_NAME",
             "REFERENCED_TABLE_NAME",
+        ],
+        rows,
+    )
+}
+
+fn views(catalog: &Catalog) -> Table {
+    let mut rows = Vec::new();
+    for name in catalog.database_names() {
+        let Some(db) = catalog.database(&name) else {
+            continue;
+        };
+        for view in db.views.values() {
+            rows.push(vec![
+                text("def"),
+                text(&name),
+                text(&view.name),
+                text(&view.definition),
+                text("NONE"),
+                // Nothing here is updatable: a view is materialised on read.
+                text("NO"),
+                text("root@localhost"),
+                text("DEFINER"),
+                text("utf8mb4"),
+                text("utf8mb4_0900_ai_ci"),
+            ]);
+        }
+    }
+    build(
+        "VIEWS",
+        &[
+            "TABLE_CATALOG",
+            "TABLE_SCHEMA",
+            "TABLE_NAME",
+            "VIEW_DEFINITION",
+            "CHECK_OPTION",
+            "IS_UPDATABLE",
+            "DEFINER",
+            "SECURITY_TYPE",
+            "CHARACTER_SET_CLIENT",
+            "COLLATION_CONNECTION",
         ],
         rows,
     )

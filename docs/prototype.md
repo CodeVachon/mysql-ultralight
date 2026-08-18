@@ -40,21 +40,46 @@ start plus 26.1s of `prisma migrate deploy`. See [`baseline-mysql.md`](baseline-
 - **Expressions** — comparison with correct three-valued NULL logic, `AND`/`OR`, arithmetic,
   `BETWEEN`, `IN`, `LIKE` with escapes, `CASE`, `CAST`, `IS NULL`, and about 50 scalar
   functions
+- **Subqueries** — scalar, `EXISTS`, `IN (SELECT ...)`, and correlated forms that reference
+  the enclosing query's columns
+- **Views** — `CREATE`, `CREATE OR REPLACE`, `DROP`, materialised on read so they reflect
+  later writes, queryable and joinable like tables
+- **Dynamic SQL** — `SET @x := ...`, `PREPARE`, `EXECUTE ... USING`, `DEALLOCATE`: the
+  idiom the migrations use for conditional DDL
+- **`sql_mode`** — `ANSI_QUOTES`, `PIPES_AS_CONCAT` and `IGNORE_SPACE` change how a
+  statement is parsed and what it means
 - **Sessions** — system variables including the connection preamble every driver reads,
   user variables that outlive the statement that set them, `SET`, `SHOW`
 - **`information_schema`** — `SCHEMATA`, `TABLES`, `COLUMNS`, `STATISTICS`,
   `TABLE_CONSTRAINTS`, `KEY_COLUMN_USAGE`, `REFERENTIAL_CONSTRAINTS`, and the empty tables
   Prisma expects to exist, all queryable and joinable as ordinary tables
 
+## Parser coverage against the real corpus
+
+The conformance extractor can measure the engine's front end as well as sqlparser-rs alone
+(`--engine`). Against the same 4,661 statements:
+
+| | sqlparser-rs alone | mysql-ultralight front end |
+|---|---|---|
+| Migrations | 94.6% | **100.0%** |
+| Provisioning dumps | 100% | 100% |
+| Application raw SQL | 99.0% | 99.0% |
+| **Total** | **96.3%** | **99.9%** |
+
+Four statements remain. Three are artifacts of recovering SQL from `Prisma.sql` templates,
+where an interpolation stands for a whole clause rather than a value, so the complete
+statement never exists in source. The fourth is a genuine gap, tracked as motte #0023: an
+`IN` list whose elements are scalar subqueries, which MySQL accepts and sqlparser-rs reads
+as `IN (subquery)` before failing on the comma.
+
 ## What it does not do yet
 
 Named honestly, because the engine returns an error rather than a wrong answer for each:
-`GROUP BY`, `CHECK` constraint enforcement, generated columns, views, subqueries in
-expressions, `UNION`, window functions, `PREPARE`/`EXECUTE` dynamic SQL, real transactions
-(`BEGIN`/`COMMIT` are accepted but nothing rolls back), foreign key enforcement, and the
-state image that would make startup skip migrations entirely.
+`GROUP BY`, `UNION`, window functions, `CHECK` constraint enforcement, generated columns,
+foreign key enforcement, real transactions (`BEGIN`/`COMMIT` are accepted but nothing rolls
+back), and the state image that would make startup skip migrations entirely.
 
-## Review hardening
+## Review hardening (engine)
 
 A high-effort review of the engine found thirteen issues, all fixed with regression tests.
 Three were reproduced as outright defects a client could trigger:
@@ -78,6 +103,26 @@ honouring MySQL's default backslash escape, `COM_RESET_CONNECTION` discarding th
 schema, `USE information_schema` failing on a schema the server advertises, the connection
 id being assigned twice and able to disagree, and string comparison being byte-exact while
 the server advertised a case-insensitive collation.
+
+## Review hardening (blockers)
+
+A second high-effort review of the blocker work found thirteen more, all fixed with
+regression tests. Three shared one cause worth naming: `rewrite.rs` had three separate
+scanners that understood quotes but not comments, and each grew its own bug from it — a
+stray `"` in a comment swallowed the rest of the statement under ANSI_QUOTES, a `--`
+comment absorbed the following line when IGNORE_SPACE closed up the newline, and an
+apostrophe in a comment suppressed the `:=` rewrite. There is one scanner now.
+
+The worst in isolation: `ALTER TABLE t RENAME INDEX a TO b, ADD COLUMN c INT` was
+intercepted, renamed the index, reported success, and silently dropped the ADD COLUMN.
+Silent schema divergence is the worst outcome a migration can have. The intercept now
+requires exactly the eight-word form and otherwise falls through to the real parser.
+
+The rest: views reported every column as text rather than its real type, were missing from
+`information_schema.COLUMNS` and `SHOW TABLES`, and could have their name taken by a later
+`CREATE TABLE` that would then be permanently unreachable; a correlated subquery with no
+`FROM` lost the outer row; and every `SELECT` deep-copied its row set to support a
+widening only correlated subqueries need.
 
 ## Two bugs worth remembering
 

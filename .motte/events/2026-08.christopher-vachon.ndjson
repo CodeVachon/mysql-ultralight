@@ -51,3 +51,10 @@
 {"at":"2026-08-18T18:13:29Z","id":16,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-18T18:13:29Z","id":17,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-08-18T18:13:30Z","id":22,"by":"Christopher Vachon","as":"user","type":"created","title":"Working prototype: Prisma db push and Client CRUD","state":"Done"}
+{"at":"2026-08-18T18:52:11Z","id":23,"by":"Christopher Vachon","as":"user","type":"created","title":"IN list of scalar subqueries","state":"Todo"}
+{"at":"2026-08-18T18:52:11Z","id":18,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-18T18:52:11Z","id":19,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-18T18:52:11Z","id":20,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-18T18:52:11Z","id":21,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-18T18:52:38Z","id":1,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-18T18:52:38Z","id":24,"by":"Christopher Vachon","as":"user","type":"created","title":"Executor gaps: GROUP BY, UNION, window functions","state":"Todo"}

@@ -107,19 +107,29 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         eprintln!(
-            "conformance <target-repo-root> [--json <path>] [--md <path>]\n\n\
+            "conformance <target-repo-root> [--engine] [--json <path>] [--md <path>]\n\n\
              Scans <root>/apps/api/prisma/migrations, <root>/provisions, and the raw SQL\n\
-             embedded in TypeScript under <root>/apps and <root>/packages."
+             embedded in TypeScript under <root>/apps and <root>/packages.\n\n\
+             --engine  measure what mysql-ultralight's front end accepts, rather than\n\
+                       what sqlparser-rs accepts unaided."
         );
         std::process::exit(2);
     }
 
     let root = PathBuf::from(&args[0]);
     let mut json_out = None;
+    // Measures the engine's front end rather than sqlparser alone: the engine
+    // recognises statements the parser rejects and rewrites others according
+    // to sql_mode, so the two rates answer different questions.
+    let mut through_engine = false;
     let mut md_out = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--engine" => {
+                through_engine = true;
+                i += 1;
+            }
             "--json" => {
                 json_out = Some(require_value(&args, i));
                 i += 2;
@@ -154,6 +164,13 @@ fn main() {
     }
 
     let dialect = MySqlDialect {};
+    // The mode the target deployment runs, which changes what some statements
+    // even mean.
+    let mode = mysql_ultralight_engine::SqlMode::parse(
+        "REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,\
+         STRICT_ALL_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,\
+         NO_ENGINE_SUBSTITUTION",
+    );
     let mut per_origin: BTreeMap<Origin, Totals> = BTreeMap::new();
     let mut failures: Vec<Failure> = Vec::new();
     let mut seen_files: BTreeMap<Origin, std::collections::BTreeSet<PathBuf>> = BTreeMap::new();
@@ -219,6 +236,28 @@ fn main() {
                 continue;
             }
 
+            if through_engine {
+                match engine_accepts(&statement.sql, &mode) {
+                    Ok(()) => totals.parsed += 1,
+                    Err(error) => {
+                        if source.origin == Origin::ApplicationCode && error.contains("found: ?") {
+                            totals.unrecoverable += 1;
+                            totals.statements -= 1;
+                            continue;
+                        }
+                        totals.failed += 1;
+                        failures.push(Failure {
+                            origin: source.origin,
+                            path: source.path.clone(),
+                            line: statement.line + source.line_offset - 1,
+                            error,
+                            excerpt: excerpt(&normalized),
+                        });
+                    }
+                }
+                continue;
+            }
+
             match Parser::parse_sql(&dialect, &statement.sql) {
                 Ok(parsed) => {
                     totals.parsed += 1;
@@ -267,6 +306,22 @@ fn main() {
         json_out.as_deref(),
         md_out.as_deref(),
     );
+}
+
+/// Whether the engine's front end accepts a statement.
+///
+/// Mirrors what `Engine::execute` does before execution: recognise statements
+/// the parser cannot take, rewrite for `sql_mode`, then parse.
+fn engine_accepts(sql: &str, mode: &mysql_ultralight_engine::SqlMode) -> Result<(), String> {
+    use mysql_ultralight_engine::rewrite;
+
+    if rewrite::intercept(sql).is_some() {
+        return Ok(());
+    }
+    let normalised = rewrite::normalise(sql, *mode);
+    Parser::parse_sql(&MySqlDialect {}, &normalised)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// The AST variant name, used as a coarse statement classification.

@@ -1,8 +1,8 @@
 //! Expression evaluation.
 
 use sqlparser::ast::{
-    BinaryOperator, CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator,
-    Value as AstValue,
+    BinaryOperator, CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query,
+    UnaryOperator, Value as AstValue,
 };
 
 use crate::error::{unsupported, EngineError, EngineResult};
@@ -33,15 +33,71 @@ pub struct Row<'a> {
     pub values: &'a [Value],
 }
 
+/// Runs a subquery on the evaluator's behalf.
+///
+/// The evaluator cannot execute a query itself without depending on the
+/// executor, which depends on it. This trait is the seam that keeps the cycle
+/// out of the type graph.
+pub trait Subqueries {
+    /// Runs a query and returns its rows.
+    ///
+    /// `outer` carries the row the subquery is being evaluated against, so a
+    /// correlated subquery can reference the enclosing query's columns.
+    fn rows(
+        &self,
+        query: &Query,
+        session: &Session,
+        outer: Option<OuterRow>,
+    ) -> EngineResult<Vec<Vec<Value>>>;
+}
+
+/// An owned copy of the row a correlated subquery can see.
+///
+/// Owned rather than borrowed because it outlives the borrow of the row being
+/// filtered, and because a subquery may itself contain one.
+#[derive(Debug, Clone, Default)]
+pub struct OuterRow {
+    pub schema: Vec<ColumnRef>,
+    pub values: Vec<Value>,
+}
+
 /// Everything an expression may read.
 pub struct Context<'a> {
     pub row: Option<Row<'a>>,
     pub session: &'a Session,
+    /// Absent where subqueries cannot appear, such as a column default.
+    pub subqueries: Option<&'a dyn Subqueries>,
 }
 
 impl<'a> Context<'a> {
     pub fn rowless(session: &'a Session) -> Self {
-        Self { row: None, session }
+        Self {
+            row: None,
+            session,
+            subqueries: None,
+        }
+    }
+
+    pub fn with_subqueries(mut self, runner: &'a dyn Subqueries) -> Self {
+        self.subqueries = Some(runner);
+        self
+    }
+
+    /// Runs a subquery, or explains that one cannot appear here.
+    fn run(&self, query: &Query) -> EngineResult<Vec<Vec<Value>>> {
+        match self.subqueries {
+            Some(runner) => runner.rows(query, self.session, self.outer_row()),
+            None => Err(unsupported("a subquery in this position")),
+        }
+    }
+
+    /// The current row, in the form a correlated subquery can carry.
+    fn outer_row(&self) -> Option<OuterRow> {
+        let row = self.row.as_ref()?;
+        Some(OuterRow {
+            schema: row.schema.to_vec(),
+            values: row.values.to_vec(),
+        })
     }
 
     /// Resolves a column reference, optionally qualified by table.
@@ -76,7 +132,17 @@ impl<'a> Context<'a> {
 /// Evaluates an expression to a single value.
 pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
     match expr {
+        Expr::Identifier(ident) if ident.value.starts_with('@') => variable(&ident.value, ctx),
+
         Expr::Identifier(ident) => ctx.lookup(None, &ident.value),
+
+        // `@@GLOBAL.version` parses as a compound identifier.
+        Expr::CompoundIdentifier(parts)
+            if parts.first().is_some_and(|p| p.value.starts_with('@')) =>
+        {
+            let name: Vec<&str> = parts.iter().map(|p| p.value.as_str()).collect();
+            variable(&name.join("."), ctx)
+        }
 
         Expr::CompoundIdentifier(parts) => {
             let name = parts.last().map(|i| i.value.as_str()).unwrap_or_default();
@@ -119,7 +185,7 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             }
         }
 
-        Expr::BinaryOp { left, op, right } => binary(op, eval(left, ctx)?, eval(right, ctx)?),
+        Expr::BinaryOp { left, op, right } => binary(op, eval(left, ctx)?, eval(right, ctx)?, ctx),
 
         Expr::Between {
             expr,
@@ -222,6 +288,59 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             functions::cast(value, data_type)
         }
 
+        // A scalar subquery: one row, one column.
+        Expr::Subquery(query) => {
+            let rows = ctx.run(query)?;
+            if rows.len() > 1 {
+                return Err(EngineError::new(
+                    1242,
+                    "21000",
+                    "Subquery returns more than 1 row",
+                ));
+            }
+            Ok(rows
+                .into_iter()
+                .next()
+                .and_then(|row| row.into_iter().next())
+                .unwrap_or(Value::Null))
+        }
+
+        Expr::Exists { subquery, negated } => {
+            let rows = ctx.run(subquery)?;
+            Ok(bool_value(!rows.is_empty() != *negated))
+        }
+
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let needle = eval(expr, ctx)?;
+            if needle.is_null() {
+                return Ok(Value::Null);
+            }
+            let rows = ctx.run(subquery)?;
+            let mut saw_null = false;
+            for row in rows {
+                let Some(candidate) = row.into_iter().next() else {
+                    continue;
+                };
+                if candidate.is_null() {
+                    saw_null = true;
+                    continue;
+                }
+                if needle.compare(&candidate) == Some(std::cmp::Ordering::Equal) {
+                    return Ok(bool_value(!*negated));
+                }
+            }
+            // As with an IN list, a miss against a set containing NULL is
+            // unknown rather than false.
+            if saw_null {
+                return Ok(Value::Null);
+            }
+            Ok(bool_value(*negated))
+        }
+
         Expr::Function(f) => {
             let name = f.name.to_string().to_ascii_lowercase();
             let args = function_args(f, ctx)?;
@@ -293,6 +412,23 @@ pub fn literal(value: &AstValue) -> EngineResult<Value> {
     })
 }
 
+/// Resolves `@user` and `@@system` variables.
+///
+/// An unset user variable reads as NULL, as in MySQL. An unknown system
+/// variable is an error there too, and guessing a value would hide a real
+/// incompatibility from whatever asked for it.
+fn variable(name: &str, ctx: &Context<'_>) -> EngineResult<Value> {
+    if let Some(rest) = name.strip_prefix("@@") {
+        return ctx.session.system_variable(rest).ok_or_else(|| {
+            EngineError::new(1193, "HY000", format!("Unknown system variable '{rest}'"))
+        });
+    }
+    match name.strip_prefix('@') {
+        Some(rest) => Ok(ctx.session.user_variable(rest)),
+        None => Err(EngineError::unknown_column(name, "field list")),
+    }
+}
+
 /// A constant literal, if the expression is one.
 ///
 /// Used to tell a column default that can be stored once from one that must be
@@ -318,7 +454,12 @@ pub fn bool_value(b: bool) -> Value {
     Value::Int(i64::from(b))
 }
 
-fn binary(op: &BinaryOperator, left: Value, right: Value) -> EngineResult<Value> {
+fn binary(
+    op: &BinaryOperator,
+    left: Value,
+    right: Value,
+    ctx: &Context<'_>,
+) -> EngineResult<Value> {
     use std::cmp::Ordering;
     use BinaryOperator as B;
 
@@ -361,13 +502,23 @@ fn binary(op: &BinaryOperator, left: Value, right: Value) -> EngineResult<Value>
 
         B::Plus | B::Minus | B::Multiply | B::Divide | B::Modulo => arithmetic(op, &left, &right)?,
 
-        // Under PIPES_AS_CONCAT this is string concatenation, which is the
-        // mode the target runs in. Without it MySQL reads `||` as OR.
+        // The tokenizer always produces StringConcat for `||`, but what it
+        // means depends on sql_mode: concatenation under PIPES_AS_CONCAT, and
+        // logical OR otherwise. Picking one unconditionally makes half of all
+        // deployments silently compute the wrong answer.
         B::StringConcat => {
-            if left.is_null() || right.is_null() {
-                Value::Null
+            if ctx.session.sql_mode().pipes_as_concat {
+                if left.is_null() || right.is_null() {
+                    Value::Null
+                } else {
+                    Value::Text(format!("{}{}", left.as_text(), right.as_text()))
+                }
             } else {
-                Value::Text(format!("{}{}", left.as_text(), right.as_text()))
+                match (left.truthy(), right.truthy()) {
+                    (Some(true), _) | (_, Some(true)) => bool_value(true),
+                    (Some(false), Some(false)) => bool_value(false),
+                    _ => Value::Null,
+                }
             }
         }
 

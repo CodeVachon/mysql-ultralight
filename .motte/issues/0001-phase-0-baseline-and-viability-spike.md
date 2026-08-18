@@ -1,10 +1,10 @@
 ---
 id: 1
 title: Phase 0 — Baseline and viability spike
-state: Todo
+state: Done
 labels: [epic, phase-0]
 created: 2026-08-18T14:10:54Z
-updated: 2026-08-18T14:20:37Z
+updated: 2026-08-18T18:52:38Z
 ---
 
 ## Description
@@ -20,3 +20,9 @@ Plus extraction of the machine-readable conformance surface from the target code
 Track B (go-mysql-server evaluation) was cancelled on 2026-08-18 — see #0012.
 
 Exit criteria: the architecture decision record at #0015.
+
+## Notes
+
+### 2026-08-18T18:52:38Z — Christopher Vachon (user)
+
+Phase 0 complete 2026-08-18. Track A baselined real MySQL at 4.5-8.9s container start plus 26.1s migrate deploy; Track B was cancelled once Rust was committed to; Track C proved the wire protocol at 1.85ms cold start; the conformance surface was extracted and the ADR written.

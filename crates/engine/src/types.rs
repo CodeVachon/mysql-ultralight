@@ -149,6 +149,41 @@ impl SqlType {
         Ok(out)
     }
 
+    /// Recovers a type from a wire type code.
+    ///
+    /// Used where a result set is fed back in as a relation, such as a view or
+    /// a derived table: without it every column would be reported as text and
+    /// a typed client would decode a number as a string.
+    pub fn from_column_type(ty: ColumnType) -> Self {
+        let simple = |kind, declared: &str| SqlType {
+            kind,
+            declared: declared.to_owned(),
+            length: None,
+            scale: None,
+            unsigned: false,
+            variants: Vec::new(),
+        };
+        match ty {
+            ColumnType::Tiny => simple(TypeKind::Bool, "tinyint(1)"),
+            ColumnType::Short => simple(TypeKind::Int, "smallint"),
+            ColumnType::Long | ColumnType::Int24 => simple(TypeKind::Int, "int"),
+            ColumnType::LongLong => simple(TypeKind::Int, "bigint"),
+            ColumnType::Float => simple(TypeKind::Float, "float"),
+            ColumnType::Double => simple(TypeKind::Float, "double"),
+            ColumnType::Decimal | ColumnType::NewDecimal => simple(TypeKind::Decimal, "decimal"),
+            ColumnType::Date => simple(TypeKind::Date, "date"),
+            ColumnType::DateTime | ColumnType::Timestamp => simple(TypeKind::DateTime, "datetime"),
+            ColumnType::Time => simple(TypeKind::Time, "time"),
+            ColumnType::Year => simple(TypeKind::Year, "year"),
+            ColumnType::Json => simple(TypeKind::Json, "json"),
+            ColumnType::Blob
+            | ColumnType::LongBlob
+            | ColumnType::MediumBlob
+            | ColumnType::TinyBlob => simple(TypeKind::Blob, "blob"),
+            _ => simple(TypeKind::Text, "varchar(512)"),
+        }
+    }
+
     /// The MySQL type code reported in result set metadata.
     pub fn column_type(&self) -> ColumnType {
         match self.kind {

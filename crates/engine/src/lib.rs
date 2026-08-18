@@ -5,6 +5,7 @@
 
 pub mod catalog;
 pub mod ddl;
+pub mod dialect;
 pub mod error;
 pub mod exec;
 pub mod expr;
@@ -13,11 +14,13 @@ pub mod info_schema;
 pub mod params;
 pub mod relation;
 pub mod result;
+pub mod rewrite;
 pub mod session;
 pub mod types;
 pub mod value;
 
 pub use catalog::{Catalog, Column, Database, Table};
+pub use dialect::SqlMode;
 pub use error::{EngineError, EngineResult};
 pub use exec::Engine;
 pub use result::{OutColumn, Outcome, ResultSet};

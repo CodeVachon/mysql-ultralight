@@ -780,3 +780,541 @@ fn a_hash_comment_does_not_shift_parameters() {
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0][0].as_text(), "a");
 }
+
+// ---------------------------------------------------------------------------
+// Views, dynamic SQL, and sql_mode. Motte #0018 through #0021.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_view_is_queryable_like_a_table() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW BusyWidget AS SELECT id, count FROM Widget WHERE count > 1",
+    );
+
+    let through_view = rows(
+        &engine,
+        &mut session,
+        "SELECT id FROM BusyWidget ORDER BY id",
+    );
+    assert_eq!(through_view, vec![vec!["a"], vec!["c"]]);
+
+    // A view reflects later writes, because it is a query and not a copy.
+    run(
+        &engine,
+        &mut session,
+        "UPDATE Widget SET count = 0 WHERE id = 'a'",
+    );
+    let after = rows(
+        &engine,
+        &mut session,
+        "SELECT id FROM BusyWidget ORDER BY id",
+    );
+    assert_eq!(after, vec![vec!["c"]]);
+}
+
+#[test]
+fn a_view_can_be_filtered_and_joined() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW W AS SELECT id, name, count FROM Widget",
+    );
+
+    let filtered = rows(&engine, &mut session, "SELECT name FROM W WHERE count = 1");
+    assert_eq!(filtered, vec![vec!["beta"]]);
+
+    let joined = rows(
+        &engine,
+        &mut session,
+        "SELECT W.name FROM W JOIN Widget ON Widget.id = W.id WHERE W.id = 'c'",
+    );
+    assert_eq!(joined, vec![vec!["gamma"]]);
+}
+
+#[test]
+fn create_or_replace_view_redefines_it() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW V AS SELECT id FROM Widget WHERE id = 'a'",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM V"),
+        vec![vec!["1"]]
+    );
+
+    run(
+        &engine,
+        &mut session,
+        "CREATE OR REPLACE VIEW V AS SELECT id FROM Widget",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM V"),
+        vec![vec!["3"]]
+    );
+
+    // Without OR REPLACE, redefining is an error.
+    assert!(engine
+        .execute(&mut session, "CREATE VIEW V AS SELECT id FROM Widget", &[])
+        .is_err());
+
+    run(&engine, &mut session, "DROP VIEW V");
+    assert!(engine
+        .execute(&mut session, "SELECT * FROM V", &[])
+        .is_err());
+}
+
+#[test]
+fn information_schema_reports_views() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW V AS SELECT id FROM Widget",
+    );
+
+    let listed = rows(
+        &engine,
+        &mut session,
+        "SELECT table_name FROM information_schema.views WHERE table_schema = 'testdb'",
+    );
+    assert_eq!(listed, vec![vec!["V"]]);
+
+    // Prisma's first introspection step filters tables by type, so a view must
+    // appear there as a VIEW rather than a BASE TABLE.
+    let base = rows(
+        &engine,
+        &mut session,
+        "SELECT table_name FROM information_schema.tables
+         WHERE table_schema = 'testdb' AND table_type = 'BASE TABLE'",
+    );
+    assert_eq!(base, vec![vec!["Widget"]]);
+}
+
+/// The idiom the migrations use for conditional DDL: read a count into a user
+/// variable, branch with IF(), then prepare and execute the built statement.
+#[test]
+fn the_prepare_execute_idiom_runs() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    run(
+        &engine,
+        &mut session,
+        "SET @exists := (SELECT COUNT(*) FROM Widget WHERE id = 'z')",
+    );
+    // A quote inside a MySQL string literal is doubled, so the built statement
+    // survives being carried through a variable as text.
+    run(
+        &engine,
+        &mut session,
+        "SET @sql = IF(@exists = 0,          'INSERT INTO Widget (id, name) VALUES (''z'', ''zeta'')', 'SELECT 1')",
+    );
+    run(&engine, &mut session, "PREPARE stmt FROM @sql");
+    run(&engine, &mut session, "EXECUTE stmt");
+    run(&engine, &mut session, "DEALLOCATE PREPARE stmt");
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT name FROM Widget WHERE id = 'z'"
+        ),
+        vec![vec!["zeta"]]
+    );
+}
+
+#[test]
+fn execute_binds_its_using_list() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    run(
+        &engine,
+        &mut session,
+        "SET @q = 'SELECT id FROM Widget WHERE count = ?'",
+    );
+    run(&engine, &mut session, "PREPARE find FROM @q");
+    run(&engine, &mut session, "SET @wanted = 2");
+
+    assert_eq!(
+        rows(&engine, &mut session, "EXECUTE find USING @wanted"),
+        vec![vec!["c"]]
+    );
+}
+
+#[test]
+fn executing_an_unknown_statement_is_an_error() {
+    let (engine, mut session) = engine();
+    let err = engine
+        .execute(&mut session, "EXECUTE nope", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1243);
+}
+
+#[test]
+fn colon_equals_assigns_a_user_variable() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "SET @x := 7");
+    assert_eq!(rows(&engine, &mut session, "SELECT @x"), vec![vec!["7"]]);
+}
+
+#[test]
+fn rename_index_and_drop_event_are_accepted() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (a INT NOT NULL, b INT, PRIMARY KEY (a))",
+    );
+    run(&engine, &mut session, "CREATE INDEX old_name ON T (b)");
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE T RENAME INDEX old_name TO new_name",
+    );
+
+    let indexes = rows(
+        &engine,
+        &mut session,
+        "SELECT DISTINCT index_name FROM information_schema.statistics
+         WHERE table_schema = 'testdb' ORDER BY index_name",
+    );
+    // Ordering follows the case-insensitive collation the server advertises,
+    // so "new_name" sorts before "PRIMARY".
+    assert_eq!(indexes, vec![vec!["new_name"], vec!["PRIMARY"]]);
+
+    // No CREATE EVENT exists in the target codebase, so the drop is a no-op.
+    run(&engine, &mut session, "DROP EVENT IF EXISTS `Legacy`");
+}
+
+#[test]
+fn renaming_an_index_that_does_not_exist_is_an_error() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    let err = engine
+        .execute(
+            &mut session,
+            "ALTER TABLE Widget RENAME INDEX nope TO other",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1176);
+}
+
+/// `||` means OR by default and concatenation under PIPES_AS_CONCAT. The same
+/// text has to produce different answers depending on the mode.
+#[test]
+fn pipes_follow_sql_mode() {
+    let (engine, mut session) = engine();
+
+    let as_or = rows(&engine, &mut session, "SELECT 1 || 0");
+    assert_eq!(as_or, vec![vec!["1"]], "by default `||` is logical OR");
+
+    session.config.sql_mode.push_str(",PIPES_AS_CONCAT");
+    let as_concat = rows(&engine, &mut session, "SELECT 'a' || 'b'");
+    assert_eq!(as_concat, vec![vec!["ab"]]);
+}
+
+/// Under ANSI_QUOTES a double-quoted word is a column reference.
+#[test]
+fn ansi_quotes_changes_what_a_quoted_word_means() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    // Without the mode it is a string literal, so every row returns it.
+    let literal = rows(
+        &engine,
+        &mut session,
+        r#"SELECT "name" FROM Widget LIMIT 1"#,
+    );
+    assert_eq!(literal, vec![vec!["name"]]);
+
+    session.config.sql_mode.push_str(",ANSI_QUOTES");
+    let column = rows(
+        &engine,
+        &mut session,
+        r#"SELECT "name" FROM Widget WHERE id = 'a'"#,
+    );
+    assert_eq!(
+        column,
+        vec![vec!["alpha"]],
+        "with ANSI_QUOTES it is the column"
+    );
+}
+
+/// `LEFT (` is the LEFT() function under IGNORE_SPACE, not a join.
+#[test]
+fn ignore_space_allows_a_gap_before_a_call() {
+    let (engine, mut session) = engine();
+    session.config.sql_mode.push_str(",IGNORE_SPACE");
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LEFT ('abcdef', 3)"),
+        vec![vec!["abc"]]
+    );
+}
+
+/// Scalar subqueries, which the migrations reach for constantly to test
+/// information_schema before altering anything.
+#[test]
+fn a_scalar_subquery_evaluates_to_one_value() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT (SELECT COUNT(*) FROM Widget)"
+        ),
+        vec![vec!["3"]]
+    );
+    // No rows means NULL, not an error.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT (SELECT id FROM Widget WHERE id = 'zz')"
+        ),
+        vec![vec!["NULL"]]
+    );
+}
+
+/// A scalar subquery returning several rows is an error, not a silent pick.
+#[test]
+fn a_scalar_subquery_returning_many_rows_is_an_error() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    let err = engine
+        .execute(&mut session, "SELECT (SELECT id FROM Widget)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1242);
+}
+
+#[test]
+fn exists_and_in_subqueries_filter() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Tag (widgetId VARCHAR(21) NOT NULL)",
+    );
+    run(&engine, &mut session, "INSERT INTO Tag VALUES ('a'), ('c')");
+
+    let in_sub = rows(
+        &engine,
+        &mut session,
+        "SELECT id FROM Widget WHERE id IN (SELECT widgetId FROM Tag) ORDER BY id",
+    );
+    assert_eq!(in_sub, vec![vec!["a"], vec!["c"]]);
+
+    let not_in = rows(
+        &engine,
+        &mut session,
+        "SELECT id FROM Widget WHERE id NOT IN (SELECT widgetId FROM Tag)",
+    );
+    assert_eq!(not_in, vec![vec!["b"]]);
+
+    let exists = rows(
+        &engine,
+        &mut session,
+        "SELECT id FROM Widget WHERE EXISTS (SELECT 1 FROM Tag WHERE Tag.widgetId = Widget.id) ORDER BY id",
+    );
+    assert_eq!(exists, vec![vec!["a"], vec!["c"]]);
+}
+
+/// A subquery that cannot be evaluated must surface, not become NULL. SET was
+/// swallowing the error, so `@x` silently held NULL and every later branch on
+/// it took the wrong path.
+#[test]
+fn set_reports_an_evaluation_error_instead_of_storing_null() {
+    let (engine, mut session) = engine();
+    let err = engine
+        .execute(&mut session, "SET @x = (SELECT id FROM NoSuchTable)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1146);
+    assert_eq!(
+        session.user_variable("x"),
+        Value::Null,
+        "nothing was stored"
+    );
+}
+
+/// The conditional-DDL shape the migrations use: branch on a count read from
+/// information_schema, then build and run the statement.
+#[test]
+fn conditional_ddl_against_information_schema() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    run(
+        &engine,
+        &mut session,
+        "SET @has_column := (SELECT COUNT(*) FROM information_schema.columns
+                             WHERE table_schema = 'testdb' AND table_name = 'Widget'
+                               AND column_name = 'extra')",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @has_column"),
+        vec![vec!["0"]]
+    );
+
+    run(
+        &engine,
+        &mut session,
+        "SET @sql = IF(@has_column = 0, 'ALTER TABLE Widget ADD COLUMN extra INT NULL', 'SELECT 1')",
+    );
+    run(&engine, &mut session, "PREPARE stmt FROM @sql");
+    run(&engine, &mut session, "EXECUTE stmt");
+    run(&engine, &mut session, "DEALLOCATE PREPARE stmt");
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT extra FROM Widget WHERE id = 'a'"
+        ),
+        vec![vec!["NULL"]]
+    );
+}
+
+/// A view's columns must carry the types the definition produces, and appear
+/// in information_schema and SHOW. Prisma finds a view in TABLES and then reads
+/// COLUMNS for it, so a zero-column answer reads as a broken object.
+#[test]
+fn a_view_reports_its_columns_and_their_types() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW V AS SELECT id, count FROM Widget",
+    );
+
+    let columns = rows(
+        &engine,
+        &mut session,
+        "SELECT column_name, data_type FROM information_schema.columns
+         WHERE table_schema = 'testdb' AND table_name = 'V' ORDER BY ordinal_position",
+    );
+    assert_eq!(
+        columns,
+        vec![vec!["id", "varchar"], vec!["count", "bigint"]]
+    );
+
+    let shown = rows(&engine, &mut session, "SHOW COLUMNS FROM V");
+    assert_eq!(shown.len(), 2);
+
+    // SHOW TABLES lists views, as MySQL does and as TABLES already reported.
+    let tables = rows(&engine, &mut session, "SHOW TABLES");
+    assert_eq!(tables, vec![vec!["V"], vec!["Widget"]]);
+}
+
+#[test]
+fn explicit_view_column_names_are_used() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW V (key_id, how_many) AS SELECT id, count FROM Widget",
+    );
+
+    let columns = rows(
+        &engine,
+        &mut session,
+        "SELECT column_name FROM information_schema.columns
+         WHERE table_name = 'V' ORDER BY ordinal_position",
+    );
+    assert_eq!(columns, vec![vec!["key_id"], vec!["how_many"]]);
+}
+
+/// A view resolves before a table, so letting a table take a view's name makes
+/// the table permanently unreachable.
+#[test]
+fn a_table_cannot_take_a_views_name() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW V AS SELECT id FROM Widget",
+    );
+
+    let err = engine
+        .execute(&mut session, "CREATE TABLE V (z INT)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1050);
+}
+
+/// A correlated subquery with no FROM of its own must still see the outer row.
+#[test]
+fn a_correlated_subquery_without_from_sees_the_outer_row() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    let echoed = rows(
+        &engine,
+        &mut session,
+        "SELECT (SELECT id) FROM Widget ORDER BY id LIMIT 1",
+    );
+    assert_eq!(echoed, vec![vec!["a"]]);
+}
+
+/// Under ANSI_QUOTES a qualified name arrives double-quoted per part.
+#[test]
+fn an_ansi_quoted_qualified_name_resolves() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    session.config.sql_mode.push_str(",ANSI_QUOTES");
+
+    let found = rows(
+        &engine,
+        &mut session,
+        r#"SELECT id FROM "testdb"."Widget" ORDER BY id LIMIT 1"#,
+    );
+    assert_eq!(found, vec![vec!["a"]]);
+}
+
+/// A multi-action ALTER must not have its rename applied while the rest is
+/// silently dropped.
+#[test]
+fn a_multi_action_alter_is_not_partially_applied() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (a INT NOT NULL, b INT, PRIMARY KEY (a))",
+    );
+    run(&engine, &mut session, "CREATE INDEX old_ix ON T (b)");
+
+    let outcome = engine.execute(
+        &mut session,
+        "ALTER TABLE T RENAME INDEX old_ix TO new_ix, ADD COLUMN c INT",
+        &[],
+    );
+
+    match outcome {
+        // Either the whole statement applies, or it is refused. What must not
+        // happen is a success that dropped the ADD COLUMN.
+        Ok(_) => {
+            let columns = rows(&engine, &mut session, "SELECT c FROM T");
+            assert!(columns.is_empty() || columns[0].len() == 1);
+        }
+        Err(e) => assert_ne!(e.code, 0),
+    }
+}

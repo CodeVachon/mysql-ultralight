@@ -1,11 +1,11 @@
 ---
 id: 19
 title: Views are part of the schema surface
-state: Todo
+state: Done
 parent: 4
 labels: [compat, blocker]
 created: 2026-08-18T15:29:25Z
-updated: 2026-08-18T15:37:17Z
+updated: 2026-08-18T18:52:11Z
 ---
 
 ## Description
@@ -23,3 +23,7 @@ Consequence: CREATE VIEW, view resolution during query planning, and information
 ### 2026-08-18T15:37:17Z — Christopher Vachon (user)
 
 Corrected count on 2026-08-18 using a whitespace-normalised scan rather than line greps: 1 CREATE VIEW in the migrations (RecipientListFeed, which splits CREATE OR REPLACE and VIEW across two lines and so evaded every single-line pattern) and 39 in provisions/mysql/3-anzen-views.sql. Also note that a fresh container built from those provisions currently fails: the views file references u.defaultPaidLeavePayrollExport, which the 2024-11-14 structure dump does not define.
+
+### 2026-08-18T18:52:11Z — Christopher Vachon (user)
+
+Implemented 2026-08-18. CREATE VIEW, CREATE OR REPLACE VIEW and DROP VIEW are supported; a view is stored as its definition text and materialised on read, so it reflects later writes rather than being a copy. Views are queryable, filterable and joinable like tables, appear in information_schema.VIEWS with their definition, and appear in information_schema.TABLES with TABLE_TYPE = VIEW so Prisma's introspection filter excludes them from base tables. A depth limit refuses a self-referential view.

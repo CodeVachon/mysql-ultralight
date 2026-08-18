@@ -41,23 +41,60 @@ pub struct Session {
     pub user_variables: BTreeMap<String, Value>,
     /// Session-scoped overrides of system variables.
     overrides: BTreeMap<String, String>,
+    /// Statements held by `PREPARE`, keyed by name. Server-side prepared
+    /// statements are how the migrations express conditional DDL, and they
+    /// outlive the statement that created them.
+    pub prepared: BTreeMap<String, String>,
     pub in_transaction: bool,
+    /// How many views deep evaluation currently is, so a self-referential view
+    /// is refused rather than exhausting the stack.
+    pub view_depth: usize,
+    /// The parsed form of `config.sql_mode`, with the string it came from so a
+    /// direct mutation of `config` cannot leave it stale.
+    parsed_mode: crate::dialect::SqlMode,
+    parsed_from: String,
     pub last_insert_id: u64,
     pub affected_rows: u64,
 }
 
 impl Session {
     pub fn new(config: ServerConfig, connection_id: u32) -> Self {
+        let parsed_mode = crate::dialect::SqlMode::parse(&config.sql_mode);
+        let parsed_from = config.sql_mode.clone();
         Self {
             config,
             current_database: None,
             connection_id,
             user_variables: BTreeMap::new(),
             overrides: BTreeMap::new(),
+            prepared: BTreeMap::new(),
             in_transaction: false,
+            view_depth: 0,
+            parsed_mode,
+            parsed_from,
             last_insert_id: 0,
             affected_rows: 0,
         }
+    }
+
+    /// The parsing mode this session runs under.
+    pub fn sql_mode(&self) -> crate::dialect::SqlMode {
+        // Parsing the mode allocates per flag and `||` is evaluated once per
+        // row, so the result is cached. `config` is public, so the cache is
+        // validated against the string rather than trusting every caller to
+        // have gone through `set_system_variable`: a stale mode would silently
+        // change what a query means.
+        if self.parsed_from == self.config.sql_mode {
+            self.parsed_mode
+        } else {
+            crate::dialect::SqlMode::parse(&self.config.sql_mode)
+        }
+    }
+
+    /// Recomputes the cached mode after the configuration changes.
+    fn refresh_mode(&mut self) {
+        self.parsed_from = self.config.sql_mode.clone();
+        self.parsed_mode = crate::dialect::SqlMode::parse(&self.config.sql_mode);
     }
 
     pub fn set_user_variable(&mut self, name: &str, value: Value) {
@@ -76,6 +113,7 @@ impl Session {
         let name = normalize_scope(name);
         if name == "sql_mode" {
             self.config.sql_mode = value.clone();
+            self.refresh_mode();
         }
         self.overrides.insert(name, value);
     }
