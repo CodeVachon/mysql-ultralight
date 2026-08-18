@@ -1,0 +1,17 @@
+[package]
+name = "mysql-ultralight-conformance"
+description = "Extracts the SQL conformance surface of a target codebase"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "conformance"
+path = "src/main.rs"
+
+[dependencies]
+sqlparser = "0.62"
+serde_json = "1"

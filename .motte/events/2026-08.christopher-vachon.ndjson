@@ -41,3 +41,7 @@
 {"at":"2026-08-18T15:29:25Z","id":18,"by":"Christopher Vachon","as":"user","type":"created","title":"Parser must be sql_mode aware (ANSI_QUOTES, PIPES_AS_CONCAT)","state":"Todo"}
 {"at":"2026-08-18T15:29:25Z","id":19,"by":"Christopher Vachon","as":"user","type":"created","title":"Views are part of the schema surface","state":"Todo"}
 {"at":"2026-08-18T15:37:17Z","id":11,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-08-18T15:39:36Z","id":14,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-08-18T15:51:57Z","id":20,"by":"Christopher Vachon","as":"user","type":"created","title":"Dynamic SQL: user variables, PREPARE, EXECUTE, DEALLOCATE","state":"Todo"}
+{"at":"2026-08-18T15:51:57Z","id":21,"by":"Christopher Vachon","as":"user","type":"created","title":"ALTER TABLE RENAME INDEX, and DROP EVENT","state":"Todo"}
+{"at":"2026-08-18T15:51:58Z","id":14,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}

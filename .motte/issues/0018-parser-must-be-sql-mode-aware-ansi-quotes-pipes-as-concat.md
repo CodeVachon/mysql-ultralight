@@ -5,7 +5,7 @@ state: Todo
 parent: 4
 labels: [compat, parser, blocker]
 created: 2026-08-18T15:29:25Z
-updated: 2026-08-18T15:37:17Z
+updated: 2026-08-18T15:51:57Z
 ---
 
 ## Description
@@ -33,3 +33,7 @@ Note the spike handler in crates/cli/src/spike.rs currently reports the MySQL 8 
 ### 2026-08-18T15:37:17Z — Christopher Vachon (user)
 
 Confirmed empirically on 2026-08-18 by querying a container built from the repo's my.cnf: @@sql_mode is REAL_AS_FLOAT,PIPES_AS_CONCAT,ANSI_QUOTES,IGNORE_SPACE,ONLY_FULL_GROUP_BY,STRICT_ALL_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION.
+
+### 2026-08-18T15:51:57Z — Christopher Vachon (user)
+
+Confirmed by the conformance extraction with concrete failures. Four rejected statements trace to IGNORE_SPACE: LEFT (MD5 (UUID ()), 21) writes the LEFT() function with a space, and sqlparser-rs reads LEFT as the start of a LEFT JOIN. Errors surface as 'Expected: ), found: ,' and 'Expected: joined table, found: .'. This is the sql_mode dependency showing up in the parser exactly as predicted, and it is not theoretical.

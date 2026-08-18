@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/server", "crates/cli"]
+members = ["crates/protocol", "crates/server", "crates/cli", "crates/conformance"]
 
 [workspace.package]
 version = "0.0.1"

@@ -1,0 +1,1416 @@
+{
+  "data_types": {
+    "BOOLEAN": 533,
+    "DATE": 1,
+    "DATETIME": 819,
+    "DECIMAL": 155,
+    "DOUBLE": 60,
+    "ENUM": 213,
+    "INT": 113,
+    "INTEGER": 155,
+    "JSON": 54,
+    "LONGTEXT": 15,
+    "SMALLINT": 7,
+    "TEXT": 122,
+    "TINYINT": 374,
+    "VARCHAR": 2359
+  },
+  "features": {
+    "AUTO_INCREMENT": 1,
+    "CASE expression": 85,
+    "CROSS JOIN": 28,
+    "DELETE with JOIN": 3,
+    "EXISTS subquery": 72,
+    "GROUP BY": 80,
+    "HAVING": 3,
+    "INNER JOIN": 68,
+    "INSERT IGNORE": 425,
+    "LEFT JOIN": 308,
+    "LIMIT": 168,
+    "ON DELETE CASCADE": 213,
+    "ON DELETE SET NULL": 300,
+    "ON DUPLICATE KEY UPDATE": 14,
+    "ON UPDATE CASCADE": 785,
+    "ORDER BY": 156,
+    "REGEXP": 11,
+    "UNION": 20,
+    "character set clause": 288,
+    "check constraint": 1,
+    "collation clause": 496,
+    "common table expression": 19,
+    "foreign key": 824,
+    "generated column": 3,
+    "information_schema access": 50,
+    "multi-table UPDATE": 57,
+    "recursive CTE": 1,
+    "subquery in FROM": 29,
+    "view: CREATE": 40,
+    "window function": 15
+  },
+  "functions": {
+    "ANY_VALUE": 1,
+    "AVG": 2,
+    "CAST": 27,
+    "COALESCE": 304,
+    "COLUMNS": 6,
+    "CONCAT": 161,
+    "CONCAT_WS": 9,
+    "COUNT": 160,
+    "CURDATE": 2,
+    "CURRENT_DATE": 1,
+    "CURRENT_TIMESTAMP": 638,
+    "DATABASE": 38,
+    "DATEDIFF": 14,
+    "DATE_ADD": 10,
+    "DATE_FORMAT": 10,
+    "DATE_SUB": 2,
+    "DAY": 2,
+    "ENUM_VALUES": 1,
+    "EXPENSELINEITEMRECORD": 1,
+    "FIND_IN_SET": 1,
+    "FLOOR": 12,
+    "FORMAT": 9,
+    "GROUP_CONCAT": 18,
+    "IDX_TSDR_UPDATEDAT": 1,
+    "IDX_TSERS_ARCHIVED": 1,
+    "IDX_TSERS_COMPANYID": 1,
+    "IDX_TSERS_JOBID": 1,
+    "IDX_TSERS_SLUG": 1,
+    "IDX_TSERS_SUBMITTEDDATE": 1,
+    "IDX_TSERS_SUMMARYUPDATED": 1,
+    "IDX_TSERS_TIMESHEETRECORDID": 1,
+    "IDX_TSERS_USERID": 1,
+    "IDX_TSRS_TIMESHEETRECORDID": 1,
+    "IDX_TSR_UPDATEDAT": 1,
+    "IFNULL": 124,
+    "JSON_ARRAYAGG": 3,
+    "JSON_ARRAY_APPEND": 2,
+    "JSON_EXTRACT": 18,
+    "JSON_MERGE_PATCH": 2,
+    "JSON_OBJECT": 2,
+    "JSON_SET": 1,
+    "JSON_UNQUOTE": 9,
+    "JSON_VALID": 2,
+    "LCASE": 1,
+    "LENGTH": 19,
+    "LOCATE": 2,
+    "LOWER": 4,
+    "LPAD": 7,
+    "MAX": 58,
+    "MD5": 456,
+    "MIN": 13,
+    "MONTH": 2,
+    "NOTE": 1,
+    "NOW": 159,
+    "NULLIF": 1,
+    "RAND": 11,
+    "REGEXP_REPLACE": 6,
+    "REPLACE": 49,
+    "ROUND": 26,
+    "ROW": 17,
+    "ROW_NUMBER": 29,
+    "ST_DISTANCE_SPHERE": 5,
+    "SUBSTRING": 66,
+    "SUBSTRING_INDEX": 3,
+    "SUM": 204,
+    "TIMESHEETEXPENSEREPORTSUMMARY": 1,
+    "TIMESHEETRECORD": 1,
+    "TIMESHEETREPORTSUMMARY": 1,
+    "TIMESTAMPDIFF": 3,
+    "TRIM": 23,
+    "UPPER": 1,
+    "UUID": 438,
+    "VALUE": 12,
+    "_FEEDBACKTOUSER": 1
+  },
+  "parse_failures": [
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20250226140500_system_estimate_number_remove_job_number/migration.sql",
+      "line": 24,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20250404143620_add_new_auth_fields/migration.sql",
+      "line": 69,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql1"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20250404143620_add_new_auth_fields/migration.sql",
+      "line": 83,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql2"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20250404143620_add_new_auth_fields/migration.sql",
+      "line": 98,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql3"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20250404143620_add_new_auth_fields/migration.sql",
+      "line": 112,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql4"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20250404143620_add_new_auth_fields/migration.sql",
+      "line": 127,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql5"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20250404143620_add_new_auth_fields/migration.sql",
+      "line": 143,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql6"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20250404143620_add_new_auth_fields/migration.sql",
+      "line": 158,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20250404143620_add_new_auth_fields/migration.sql",
+      "line": 173,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql7"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20250404143620_add_new_auth_fields/migration.sql",
+      "line": 188,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql8"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20250404143620_add_new_auth_fields/migration.sql",
+      "line": 203,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql9"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20250404143620_add_new_auth_fields/migration.sql",
+      "line": 218,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql10"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20250404143620_add_new_auth_fields/migration.sql",
+      "line": 232,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql11"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20250411181808_add_oauth_user_flags/migration.sql",
+      "line": 12,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20250425103628_add_default_redirect/migration.sql",
+      "line": 14,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: TO, found: `_DropboxSignEventToHumanResourceDocument_B_fkey` at Line: 1, Column: 69",
+      "file": "apps/api/prisma/migrations/20250728133203_add_fields_for_dropbox/migration.sql",
+      "line": 48,
+      "source": "migrations",
+      "sql": "ALTER TABLE `_DropboxSignEventToHumanResourceDocument` RENAME INDEX `_DropboxSignEventToHumanResourceDocument_B_fkey` TO `_DropboxSignEventToHumanResourceDocume…"
+    },
+    {
+      "error": "sql parser error: Expected: TO, found: `_DropboxSignTemplateToHumanResourceDocument_B_fkey` at Line: 1, Column: 72",
+      "file": "apps/api/prisma/migrations/20250728133203_add_fields_for_dropbox/migration.sql",
+      "line": 51,
+      "source": "migrations",
+      "sql": "ALTER TABLE `_DropboxSignTemplateToHumanResourceDocument` RENAME INDEX `_DropboxSignTemplateToHumanResourceDocument_B_fkey` TO `_DropboxSignTemplateToHumanResou…"
+    },
+    {
+      "error": "sql parser error: Expected: TO, found: `_HumanResourceDocumentTrackingToDocument_B_fkey` at Line: 1, Column: 69",
+      "file": "apps/api/prisma/migrations/20250728133203_add_fields_for_dropbox/migration.sql",
+      "line": 54,
+      "source": "migrations",
+      "sql": "ALTER TABLE `_HumanResourceDocumentTrackingToDocument` RENAME INDEX `_HumanResourceDocumentTrackingToDocument_B_fkey` TO `_HumanResourceDocumentTrackingToDocume…"
+    },
+    {
+      "error": "sql parser error: Expected: ), found: , at Line: 23, Column: 76",
+      "file": "apps/api/prisma/migrations/20251104210900_user_datamodel_003_form_elements/migration.sql",
+      "line": 62,
+      "source": "migrations",
+      "sql": "INSERT IGNORE INTO DocumentModelFormElements ( id, documentModelFormId, documentAttributeAssignmentId ) SELECT LEFT (MD5 (UUID ()), 21) as id, ( SELECT id FROM …"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 8,
+      "source": "migrations",
+      "sql": "SET @fk_exists := ( SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'UserLocation_job…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 14,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `UserLocation` DROP FOREIGN KEY `UserLocation_jobId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 15,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 17",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 17,
+      "source": "migrations",
+      "sql": "SET @idx_exists := ( SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'UserLocation' AND INDEX_NAME = 'UserLo…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 24,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@idx_exists > 0, 'DROP INDEX `UserLocation_jobId_idx` ON `UserLocation`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 25,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 17",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 27,
+      "source": "migrations",
+      "sql": "SET @col_exists := ( SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'UserLocation' AND COLUMN_NAME = 'jobId' )"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 34,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@col_exists > 0, 'ALTER TABLE `UserLocation` DROP COLUMN `jobId`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 35,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 17",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 38,
+      "source": "migrations",
+      "sql": "SET @col_exists := ( SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'UserLocation' AND COLUMN_NAME = 'checkInI…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 45,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@col_exists = 0, 'ALTER TABLE `UserLocation` ADD COLUMN `checkInId` VARCHAR(21) NOT NULL;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 46,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 17",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 48,
+      "source": "migrations",
+      "sql": "SET @idx_exists := ( SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'UserLocation' AND INDEX_NAME = 'UserLo…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 55,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@idx_exists = 0, 'CREATE INDEX `UserLocation_checkInId_idx` ON `UserLocation`(`checkInId`);', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 56,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 58,
+      "source": "migrations",
+      "sql": "SET @fk_exists := ( SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'UserLocation_che…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 64,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists = 0, 'ALTER TABLE `UserLocation` ADD CONSTRAINT `UserLocation_checkInId_fkey` FOREIGN KEY (`checkInId`) REFERENCES `CheckIn`(`id`) ON …"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124120000_userlocation_checkin/migration.sql",
+      "line": 65,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 4,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = '_CostCodeToJob_A_…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 5,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `_CostCodeToJob` DROP FOREIGN KEY `_CostCodeToJob_A_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 6,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 9,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = '_CostCodeToJob_B_…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 10,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `_CostCodeToJob` DROP FOREIGN KEY `_CostCodeToJob_B_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 11,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 14,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = '_CostCodeToProjec…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 15,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `_CostCodeToProject` DROP FOREIGN KEY `_CostCodeToProject_A_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 16,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 19,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = '_CostCodeToProjec…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 20,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `_CostCodeToProject` DROP FOREIGN KEY `_CostCodeToProject_B_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 21,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 24,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = '_CostCodeToTag_A_…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 25,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `_CostCodeToTag` DROP FOREIGN KEY `_CostCodeToTag_A_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 26,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 29,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = '_CostCodeToTag_B_…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 30,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `_CostCodeToTag` DROP FOREIGN KEY `_CostCodeToTag_B_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 31,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 17",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 34,
+      "source": "migrations",
+      "sql": "SET @col_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Job' AND COLUMN_NAME = 'costCodeType')"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 35,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@col_exists > 0, 'ALTER TABLE `Job` DROP COLUMN `costCodeType`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 36,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 19",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 39,
+      "source": "migrations",
+      "sql": "SET @table_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '_CostCodeToJob')"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 40,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@table_exists > 0, 'DROP TABLE `_CostCodeToJob`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 41,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 19",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 44,
+      "source": "migrations",
+      "sql": "SET @table_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '_CostCodeToProject')"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 45,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@table_exists > 0, 'DROP TABLE `_CostCodeToProject`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 46,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 19",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 49,
+      "source": "migrations",
+      "sql": "SET @table_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '_CostCodeToTag')"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 50,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@table_exists > 0, 'DROP TABLE `_CostCodeToTag`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 51,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 19",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 54,
+      "source": "migrations",
+      "sql": "SET @table_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'CostCode')"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 55,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@table_exists > 0, 'DROP TABLE `CostCode`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 56,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 74,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'BillingTemplateLi…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 75,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCode` DROP FOREIGN KEY `BillingTemplateLineItem_jobId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 76,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 77,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCode` ADD CONSTRAINT `CostCode_jobId_fkey` FOREIGN KEY (`jobId`) REFERENCES `Job` (`id`) ON DELETE RESTRICT ON …"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 78,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 80,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'BillingTemplateLi…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 81,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCode` DROP FOREIGN KEY `BillingTemplateLineItem_areaId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 82,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 83,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCode` ADD CONSTRAINT `CostCode_areaId_fkey` FOREIGN KEY (`areaId`) REFERENCES `JobSpecificationLabel` (`id`) ON…"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 84,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 86,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'BillingTemplateLi…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 87,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCode` DROP FOREIGN KEY `BillingTemplateLineItem_systemId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 88,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 89,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCode` ADD CONSTRAINT `CostCode_systemId_fkey` FOREIGN KEY (`systemId`) REFERENCES `JobSpecificationLabel` (`id`…"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 90,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 93,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'BillingTemplateLi…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 94,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCode` DROP FOREIGN KEY `BillingTemplateLineItem_phaseId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 95,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 96,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCode` ADD CONSTRAINT `CostCode_phaseId_fkey` FOREIGN KEY (`phaseId`) REFERENCES `JobSpecificationLabel` (`id`) …"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 97,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 99,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'BillingTemplateLi…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 100,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCode` DROP FOREIGN KEY `BillingTemplateLineItem_moduleId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 101,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 102,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCode` ADD CONSTRAINT `CostCode_moduleId_fkey` FOREIGN KEY (`moduleId`) REFERENCES `JobSpecificationLabel` (`id`…"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 103,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 105,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'BillingTemplateLi…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 106,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCode` DROP FOREIGN KEY `BillingTemplateLineItem_componentId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 107,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 108,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCode` ADD CONSTRAINT `CostCode_componentId_fkey` FOREIGN KEY (`componentId`) REFERENCES `JobSpecificationLabel`…"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 109,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 111,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'BillingTemplateLi…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 112,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCode` DROP FOREIGN KEY `BillingTemplateLineItem_accountCategoryId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 113,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 114,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCode` ADD CONSTRAINT `CostCode_accountCategoryId_fkey` FOREIGN KEY (`accountCategoryId`) REFERENCES `AccountCat…"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 115,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 117,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'BillingTemplateLi…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 118,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCode` DROP FOREIGN KEY `BillingTemplateLineItem_accountItemId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 119,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 120,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCode` ADD CONSTRAINT `CostCode_accountItemId_fkey` FOREIGN KEY (`accountItemId`) REFERENCES `AccountItem` (`id`…"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 121,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 125,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'GlobalBillingTemp…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 126,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCodeTemplateLineItem` DROP FOREIGN KEY `GlobalBillingTemplateLineItem_areaId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 127,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 128,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCodeTemplateLineItem` ADD CONSTRAINT `CostCodeTemplateLineItem_areaId_fkey` FOREIGN KEY (`areaId`) REFERENCES `…"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 129,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 131,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'GlobalBillingTemp…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 132,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCodeTemplateLineItem` DROP FOREIGN KEY `GlobalBillingTemplateLineItem_systemId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 133,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 134,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCodeTemplateLineItem` ADD CONSTRAINT `CostCodeTemplateLineItem_systemId_fkey` FOREIGN KEY (`systemId`) REFERENC…"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 135,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 137,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'GlobalBillingTemp…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 138,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCodeTemplateLineItem` DROP FOREIGN KEY `GlobalBillingTemplateLineItem_globalBillingTemplateId_fkey`;', 'SELECT …"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 139,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 140,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCodeTemplateLineItem` ADD CONSTRAINT `CostCodeTemplateLineItem_costCodeTemplateId_fkey` FOREIGN KEY (`costCodeT…"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 141,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 144,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'GlobalBillingTemp…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 145,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCodeTemplateLineItem` DROP FOREIGN KEY `GlobalBillingTemplateLineItem_accountCategoryId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 146,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 147,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCodeTemplateLineItem` ADD CONSTRAINT `CostCodeTemplateLineItem_accountCategoryId_fkey` FOREIGN KEY (`accountCat…"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 148,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 150,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'GlobalBillingTemp…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 151,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCodeTemplateLineItem` DROP FOREIGN KEY `GlobalBillingTemplateLineItem_accountItemId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 152,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 153,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCodeTemplateLineItem` ADD CONSTRAINT `CostCodeTemplateLineItem_accountItemId_fkey` FOREIGN KEY (`accountItemId`…"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 154,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 156,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'GlobalBillingTemp…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 157,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCodeTemplateLineItem` DROP FOREIGN KEY `GlobalBillingTemplateLineItem_phaseId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 158,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 159,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCodeTemplateLineItem` ADD CONSTRAINT `CostCodeTemplateLineItem_phaseId_fkey` FOREIGN KEY (`phaseId`) REFERENCES…"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 160,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 162,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'GlobalBillingTemp…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 163,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCodeTemplateLineItem` DROP FOREIGN KEY `GlobalBillingTemplateLineItem_moduleId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 164,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 165,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCodeTemplateLineItem` ADD CONSTRAINT `CostCodeTemplateLineItem_moduleId_fkey` FOREIGN KEY (`moduleId`) REFERENC…"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 166,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 168,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'GlobalBillingTemp…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 169,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCodeTemplateLineItem` DROP FOREIGN KEY `GlobalBillingTemplateLineItem_componentId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 170,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 171,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `CostCodeTemplateLineItem` ADD CONSTRAINT `CostCodeTemplateLineItem_componentId_fkey` FOREIGN KEY (`componentId`) RE…"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 172,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 191,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'JobBillLineItem_b…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 192,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `JobBillLineItem` DROP FOREIGN KEY `JobBillLineItem_billingTemplateLineItemId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 193,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 194,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `JobBillLineItem` ADD CONSTRAINT `JobBillLineItem_costCodeId_fkey` FOREIGN KEY (`costCodeId`) REFERENCES `CostCode` …"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 195,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 16",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 198,
+      "source": "migrations",
+      "sql": "SET @fk_exists := (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'ProgressReportLin…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 199,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `ProgressReportLineItem` DROP FOREIGN KEY `ProgressReportLineItem_billingTemplateLineItemId_fkey`;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 200,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 201,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@fk_exists > 0, 'ALTER TABLE `ProgressReportLineItem` ADD CONSTRAINT `ProgressReportLineItem_costCodeId_fkey` FOREIGN KEY (`costCodeId`) REFERENC…"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 202,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: TO, found: `BillingTemplateLineItem_unique_key` at Line: 1, Column: 37",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 205,
+      "source": "migrations",
+      "sql": "ALTER TABLE `CostCode` RENAME INDEX `BillingTemplateLineItem_unique_key` TO `CostCode_unique_key`"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 23",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 224,
+      "source": "migrations",
+      "sql": "SET @cost_code_exists := (SELECT COUNT(*) FROM `ReferenceModel` WHERE `model` = 'CostCode')"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 32",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 225,
+      "source": "migrations",
+      "sql": "SET @cost_code_template_exists := (SELECT COUNT(*) FROM `ReferenceModel` WHERE `model` = 'CostCodeTemplate')"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 42",
+      "file": "apps/api/prisma/migrations/20251124161800_old_cost_code_cleanup/migration.sql",
+      "line": 226,
+      "source": "migrations",
+      "sql": "SET @cost_code_template_line_item_exists := (SELECT COUNT(*) FROM `ReferenceModel` WHERE `model` = 'CostCodeTemplateLineItem')"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 17",
+      "file": "apps/api/prisma/migrations/20251204120000_userlocation_accuracy/migration.sql",
+      "line": 4,
+      "source": "migrations",
+      "sql": "SET @col_exists := ( SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'UserLocation' AND COLUMN_NAME = 'accuracy…"
+    },
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: := at Line: 1, Column: 10",
+      "file": "apps/api/prisma/migrations/20251204120000_userlocation_accuracy/migration.sql",
+      "line": 11,
+      "source": "migrations",
+      "sql": "SET @sql := IF(@col_exists = 0, 'ALTER TABLE `UserLocation` ADD COLUMN `accuracy` DECIMAL(10, 2) NULL;', 'SELECT 1;')"
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM at Line: 1, Column: 14",
+      "file": "apps/api/prisma/migrations/20251204120000_userlocation_accuracy/migration.sql",
+      "line": 12,
+      "source": "migrations",
+      "sql": "PREPARE stmt FROM @sql"
+    },
+    {
+      "error": "sql parser error: Expected: TO, found: `CostCode_unique_key_new` at Line: 1, Column: 37",
+      "file": "apps/api/prisma/migrations/20260128185556_cost_code_unique_key/migration.sql",
+      "line": 14,
+      "source": "migrations",
+      "sql": "ALTER TABLE `CostCode` RENAME INDEX `CostCode_unique_key_new` TO `CostCode_unique_key`"
+    },
+    {
+      "error": "sql parser error: Expected: TO, found: `CostCodeTemplateLineItem_label_unique_key_new` at Line: 1, Column: 53",
+      "file": "apps/api/prisma/migrations/20260128185556_cost_code_unique_key/migration.sql",
+      "line": 16,
+      "source": "migrations",
+      "sql": "ALTER TABLE `CostCodeTemplateLineItem` RENAME INDEX `CostCodeTemplateLineItem_label_unique_key_new` TO `CostCodeTemplateLineItem_label_unique_key`"
+    },
+    {
+      "error": "sql parser error: Expected: COLLATION, CONNECTOR, DATABASE, EXTENSION, FUNCTION, INDEX, OPERATOR, POLICY, PROCEDURE, ROLE, SCHEMA, SECRET, SEQUENCE, STAGE, TABLE, TRIGGER, TYPE, VIEW, MATERIALIZED VIEW or USER after DROP, found: EVENT at Line: 1, Column: 6",
+      "file": "apps/api/prisma/migrations/20260324000000_purchase_order_tables/migration.sql",
+      "line": 173,
+      "source": "migrations",
+      "sql": "DROP EVENT IF EXISTS `UpdateJobPONumbersVisual`"
+    },
+    {
+      "error": "sql parser error: Expected: joined table, found: . at Line: 66, Column: 25",
+      "file": "apps/api/src/dataview/noteView.ts",
+      "line": 340,
+      "source": "application code",
+      "sql": "SELECT n.id, n.title, n.body, n.isDraft, n.isPinned, n.createdAt, n.updatedAt, COALESCE(comment_agg.maxCommentUpdatedAt, n.updatedAt) AS lastActivityDateTime, n…"
+    },
+    {
+      "error": "sql parser error: Expected: joined table, found: . at Line: 21, Column: 32",
+      "file": "apps/api/src/graphql/models/JobActivityReportFeed.ts",
+      "line": 312,
+      "source": "application code",
+      "sql": "WITH BaseFacetData AS ( SELECT DISTINCT j.id, j.name as jobName, j.fullJobNumber, j.projectId, j.projectName, j.projectNumber, COALESCE(j.companyId, j.projectCu…"
+    },
+    {
+      "error": "sql parser error: Expected: joined table, found: . at Line: 9, Column: 25",
+      "file": "apps/api/src/models/ExpenseLineItemRecord.ts",
+      "line": 144,
+      "source": "application code",
+      "sql": "SELECT id, CASE WHEN referenceModel = 'Job' THEN CONCAT(fullJobNumber, ' - ', name) WHEN referenceModel = 'Equipment' THEN CONCAT(fullJobNumber, ' - ', name) EN…"
+    }
+  ],
+  "parse_gaps": [
+    {
+      "error": "sql parser error: Expected: equals sign or TO, found: :=",
+      "example": "SET @fk_exists := ( SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'UserLocation_job…",
+      "statements": 93
+    },
+    {
+      "error": "sql parser error: Expected: AS, found: FROM",
+      "example": "PREPARE stmt FROM @sql",
+      "statements": 69
+    },
+    {
+      "error": "sql parser error: Expected: TO, found: `<identifier>`",
+      "example": "ALTER TABLE `_DropboxSignEventToHumanResourceDocument` RENAME INDEX `_DropboxSignEventToHumanResourceDocument_B_fkey` TO `_DropboxSignEventToHumanResourceDocume…",
+      "statements": 6
+    },
+    {
+      "error": "sql parser error: Expected: joined table, found: .",
+      "example": "SELECT n.id, n.title, n.body, n.isDraft, n.isPinned, n.createdAt, n.updatedAt, COALESCE(comment_agg.maxCommentUpdatedAt, n.updatedAt) AS lastActivityDateTime, n…",
+      "statements": 3
+    },
+    {
+      "error": "sql parser error: Expected: ), found: ,",
+      "example": "INSERT IGNORE INTO DocumentModelFormElements ( id, documentModelFormId, documentAttributeAssignmentId ) SELECT LEFT (MD5 (UUID ()), 21) as id, ( SELECT id FROM …",
+      "statements": 1
+    },
+    {
+      "error": "sql parser error: Expected: COLLATION, CONNECTOR, DATABASE, EXTENSION, FUNCTION, INDEX, OPERATOR, POLICY, PROCEDURE, ROLE, SCHEMA, SECRET, SEQUENCE, STAGE, TABLE, TRIGGER, TYPE, VIEW, MATERIALIZED VIEW or USER after DROP, found: EVENT",
+      "example": "DROP EVENT IF EXISTS `UpdateJobPONumbersVisual`",
+      "statements": 1
+    }
+  ],
+  "sources": [
+    {
+      "failed": 170,
+      "files": 604,
+      "fragments": 0,
+      "parsed": 2991,
+      "source": "migrations",
+      "statements": 3161,
+      "unrecoverable": 0
+    },
+    {
+      "failed": 0,
+      "files": 4,
+      "fragments": 0,
+      "parsed": 1191,
+      "source": "provisions",
+      "statements": 1191,
+      "unrecoverable": 0
+    },
+    {
+      "failed": 3,
+      "files": 165,
+      "fragments": 281,
+      "parsed": 306,
+      "source": "application code",
+      "statements": 309,
+      "unrecoverable": 193
+    }
+  ],
+  "statement_kinds": {
+    "AlterTable": 1172,
+    "CreateIndex": 90,
+    "CreateTable": 490,
+    "CreateView": 40,
+    "Deallocate": 69,
+    "Delete": 27,
+    "Drop": 223,
+    "Execute": 69,
+    "Insert": 1010,
+    "LockTables": 200,
+    "Query": 287,
+    "Set": 39,
+    "UnlockTables": 200,
+    "Update": 572
+  }
+}
