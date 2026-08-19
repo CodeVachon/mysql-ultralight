@@ -108,11 +108,21 @@ impl Engine {
             return None;
         }
 
-        // Run as a probe: a SELECT is not automatically free of consequences,
-        // and the functions that are not are refused where they are called
-        // rather than by reading the statement, which would miss the ones
-        // inside a view's definition.
-        Some(expr::probing(|| self.query(session, query)).ok()?.columns)
+        // Run as a probe over no rows: a SELECT is not automatically free of
+        // consequences, and the functions that are not are refused where they
+        // are called rather than by reading the statement, which would miss
+        // the ones inside a view's definition.
+        //
+        // Shaping is what keeps this cheap. Every column type the projection
+        // declares is derived from the expression and the input schema rather
+        // than from a value, so the same code answers the same way over an
+        // empty table — and preparing a query stops costing as much as running
+        // it. `describe_matches_execute` holds the two to each other.
+        Some(
+            expr::probing(|| shaping(|| self.query(session, query)))
+                .ok()?
+                .columns,
+        )
     }
 
     /// An owned copy of the whole catalog.
@@ -1312,11 +1322,28 @@ impl Engine {
             }
         }
 
-        // With no rows on the left the factor was never evaluated, so the shape
-        // is worked out once against nothing.
+        // With no rows on the left the factor was never evaluated, so the
+        // shape is worked out once against a row of NULLs.
+        //
+        // Not against nothing: `JSON_TABLE(t.doc, ...)` is correlated, so
+        // evaluating it with no row in scope fails to resolve `t.doc` and the
+        // whole relation errors. Its shape is its COLUMNS clause and not its
+        // document, so a NULL document gives the same columns and no rows —
+        // which is what describing a prepared statement over an empty table
+        // needs, and what an empty table needs at execution too.
         let right_columns = match columns {
             Some(columns) => columns,
-            None => self.relation_of(session, factor)?.columns,
+            None => {
+                let mut scoped = session.clone();
+                let mut schema = refs.clone();
+                let mut values = vec![Value::Null; schema.len()];
+                if let Some(enclosing) = &session.lateral {
+                    schema.extend(enclosing.schema.iter().cloned());
+                    values.extend(enclosing.values.iter().cloned());
+                }
+                scoped.lateral = Some(OuterRow { schema, values });
+                self.relation_of(&scoped, factor)?.columns
+            }
         };
 
         let mut all = left.columns;
@@ -1485,28 +1512,39 @@ impl Engine {
                     return self.materialise_view(session, &view, &db, &shown);
                 }
 
-                let mut table = if db.eq_ignore_ascii_case(INFORMATION_SCHEMA) {
-                    let catalog = self.catalog()?;
-                    info_schema::table(&catalog, session, &table_name)?
-                } else {
-                    let catalog = self.catalog()?;
-                    catalog
-                        .database(&db)
-                        .ok_or_else(|| EngineError::unknown_database(&db))?
-                        .table(&table_name)
-                        .cloned()
-                        .ok_or_else(|| EngineError::no_such_table(&table_name))?
-                };
                 // An alias replaces the table name for qualified references,
                 // but a write still has to find the table it came from — and a
                 // self-join is only expressible with aliases, so both are kept.
-                let base_name = table.name.clone();
-                if let Some(alias) = alias {
-                    table.name = alias.name.value.clone();
+                let shown = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| table_name.clone());
+
+                // Describing a statement reads the shape and leaves the rows
+                // behind. The table still has to be found, so preparing a
+                // statement that names one that does not exist fails the same
+                // way running it would.
+                let with_rows = !SHAPING.with(std::cell::Cell::get);
+                if db.eq_ignore_ascii_case(INFORMATION_SCHEMA) {
+                    let catalog = self.catalog()?;
+                    // Built empty rather than built and discarded: describing
+                    // `SELECT ... FROM information_schema.columns` against the
+                    // target schema would otherwise assemble a row per column
+                    // of every table, on every prepare.
+                    let table = if with_rows {
+                        info_schema::table(&catalog, session, &table_name)?
+                    } else {
+                        info_schema::shape(session, &table_name)?
+                    };
+                    return Ok(Relation::from_table_named(&db, &table, &shown, with_rows));
                 }
-                let mut relation = Relation::from_table(&db, &table);
-                relation.base_tables = vec![base_name];
-                Ok(relation)
+                let catalog = self.catalog()?;
+                let stored = catalog
+                    .database(&db)
+                    .ok_or_else(|| EngineError::unknown_database(&db))?
+                    .table(&table_name)
+                    .ok_or_else(|| EngineError::no_such_table(&table_name))?;
+                Ok(Relation::from_table_named(&db, stored, &shown, with_rows))
             }
             // `JSON_TABLE(doc, '$[*]' COLUMNS(...))` turns a document into
             // rows. The migrations use it to unpack a stored configuration
@@ -4855,6 +4893,37 @@ fn computed_column_type(
         Expr::Nested(inner) => computed_column_type(inner, refs, input),
         _ => ColumnType::VarString,
     }
+}
+
+thread_local! {
+    /// Whether the current call is establishing a statement's shape rather
+    /// than answering it.
+    ///
+    /// A thread-local rather than a parameter because it has to reach through
+    /// every recursion a FROM clause can take — views, derived tables, CTEs,
+    /// scalar subqueries — and threading a flag through all of them would put
+    /// the same argument in twenty signatures that do not otherwise care.
+    static SHAPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Restores the shaping flag however the scope is left.
+struct Shaping(bool);
+
+impl Drop for Shaping {
+    fn drop(&mut self) {
+        SHAPING.with(|s| s.set(self.0));
+    }
+}
+
+/// Runs `f` with stored tables read for their columns and not their rows.
+///
+/// Restored through a guard rather than a trailing assignment, because the
+/// flag left set is the worst possible state: every later query on the thread
+/// would read stored tables as empty and answer *successfully* with no rows.
+/// A wrong answer, where this engine is supposed to produce a clear error.
+fn shaping<T>(f: impl FnOnce() -> T) -> T {
+    let _restore = Shaping(SHAPING.with(|s| s.replace(true)));
+    f()
 }
 
 /// The column positions a GROUP BY determines, which is more than the columns

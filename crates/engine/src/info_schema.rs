@@ -12,6 +12,18 @@ use crate::types::{SqlType, TypeKind};
 use crate::value::Value;
 
 /// Builds the named `information_schema` table.
+/// The same tables with their columns and no rows, for describing a statement.
+///
+/// Built by asking for the real thing against an empty catalog rather than
+/// keeping a second list of column names. Two lists would drift, and a
+/// describe that declares a column the query does not return is the exact
+/// failure this is meant to prevent.
+pub fn shape(session: &Session, name: &str) -> EngineResult<Table> {
+    let mut shape = table(&Catalog::new(), session, name)?;
+    shape.rows.clear();
+    Ok(shape)
+}
+
 pub fn table(catalog: &Catalog, session: &Session, name: &str) -> EngineResult<Table> {
     let lower = name.to_ascii_lowercase();
     Ok(match lower.as_str() {

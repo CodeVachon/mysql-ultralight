@@ -67,7 +67,10 @@ pub mod charset {
 }
 
 /// One column in a result set.
-#[derive(Debug, Clone)]
+///
+/// Compared field by field to decide whether a prepared statement's cached
+/// metadata has gone stale, so a change to any of it counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDef {
     pub schema: String,
     pub table: String,

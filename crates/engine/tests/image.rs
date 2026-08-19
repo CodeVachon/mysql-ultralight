@@ -474,13 +474,11 @@ fn describing_never_snapshots_restores_or_takes_a_lock() {
     let written = std::env::temp_dir().join("mu-image-describe-never.mus");
     std::fs::remove_file(&written).ok();
 
+    // Where the call is on the path to a column's shape, it is reached and
+    // refused, and the statement describes as nothing.
     for sql in [
         format!("SELECT ultralight_restore('{}')", path.display()),
         format!("SELECT ultralight_snapshot('{}')", written.display()),
-        format!(
-            "SELECT id FROM Parent WHERE ultralight_restore('{}') = 1",
-            path.display()
-        ),
         format!(
             "WITH c AS (SELECT ultralight_restore('{}') AS r) SELECT r FROM c",
             path.display()
@@ -492,6 +490,23 @@ fn describing_never_snapshots_restores_or_takes_a_lock() {
             "described something with consequences: {sql}"
         );
     }
+
+    // In a WHERE clause it is not reached at all, because describing reads the
+    // schema and not the rows — so there is nothing to refuse, and a shape
+    // comes back. What must still be true is the same thing: that describing
+    // it changed nothing, which the assertions below check.
+    let shaped = engine.describe(
+        &session,
+        &format!(
+            "SELECT id FROM Parent WHERE ultralight_restore('{}') = 1",
+            path.display()
+        ),
+        0,
+    );
+    assert_eq!(
+        shaped.map(|columns| columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()),
+        Some(vec!["id".to_owned()])
+    );
 
     // Nothing was restored, nothing was written, and the lock is free.
     assert_eq!(

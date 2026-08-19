@@ -40,24 +40,35 @@ pub struct Relation {
 }
 
 impl Relation {
-    /// Builds a relation from one stored table.
-    pub fn from_table(schema: &str, table: &Table) -> Self {
+    /// Builds a relation from one stored table, under the name a qualified
+    /// reference will use, and optionally without the rows.
+    ///
+    /// `shown` is the alias where one was given. Taking it here rather than
+    /// renaming a cloned table means describing a statement never copies the
+    /// rows it is not going to read — which is the whole reason preparing a
+    /// query no longer costs as much as running it.
+    pub fn from_table_named(schema: &str, table: &Table, shown: &str, with_rows: bool) -> Self {
+        let rows = if with_rows {
+            table.rows.clone()
+        } else {
+            Vec::new()
+        };
         Self {
             columns: table
                 .columns
                 .iter()
                 .map(|c| RelColumn {
                     schema: schema.to_owned(),
-                    table: table.name.clone(),
+                    table: shown.to_owned(),
                     name: c.name.clone(),
                     ty: c.ty.clone(),
                     nullable: c.nullable,
                 })
                 .collect(),
-            rows: table.rows.clone(),
-            sources: vec![table.name.clone()],
+            origins: (0..rows.len()).map(|i| vec![Some(i)]).collect(),
+            rows,
+            sources: vec![shown.to_owned()],
             base_tables: vec![table.name.clone()],
-            origins: (0..table.rows.len()).map(|i| vec![Some(i)]).collect(),
         }
     }
 
