@@ -530,6 +530,27 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             Ok(bool_value((matched.truthy() == Some(true)) != *negated))
         }
 
+        // `x COLLATE c` compares x under a different collation. Comparison
+        // here is case-insensitive, so a `_ci` collation is honoured by doing
+        // nothing; `_bin` and `_cs` would compare differently and are refused
+        // rather than ignored.
+        //
+        // One gap is knowingly left open: comparison here is accent-*sensitive*,
+        // so the accent-insensitive collations — `utf8mb4_unicode_ci`,
+        // `utf8mb4_0900_ai_ci` — fold `café` and `cafe` together in MySQL and
+        // not here. That is a property of every comparison the engine makes,
+        // including the server's default collation, rather than something this
+        // expression introduces, so refusing it here would reject the schema
+        // while leaving the same difference everywhere else.
+        Expr::Collate { expr, collation } => {
+            let name = collation.to_string().to_ascii_lowercase();
+            let name = name.trim_matches('`');
+            if !name.ends_with("_ci") {
+                return Err(unsupported(format!("the `{name}` collation")));
+            }
+            eval(expr, ctx)
+        }
+
         Expr::Function(f) => {
             let name = f.name.to_string().to_ascii_lowercase();
 
@@ -773,6 +794,17 @@ fn binary(
                     (Some(false), Some(false)) => bool_value(false),
                     _ => Value::Null,
                 }
+            }
+        }
+
+        // `->` extracts, `->>` extracts and unquotes. Both are shorthand for
+        // the function pair, so they go through the same code.
+        B::Arrow | B::LongArrow => {
+            let extracted = functions::call("json_extract", vec![left, right], ctx.session)?;
+            if matches!(op, B::LongArrow) {
+                functions::call("json_unquote", vec![extracted], ctx.session)?
+            } else {
+                extracted
             }
         }
 

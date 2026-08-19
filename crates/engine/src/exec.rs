@@ -938,11 +938,43 @@ impl Engine {
                 self.select_without_table(session, select, outer)?,
             ));
         }
-        if select.from.len() > 1 {
-            return Err(unsupported("comma-separated FROM items"));
-        }
 
-        let relation = self.build_relation(session, &select.from[0])?;
+        // A JSON_TABLE in this FROM may take its document from the enclosing
+        // query's row, so the outer row has to be in scope while the relation
+        // is built — not only while its expressions are evaluated.
+        let scoped;
+        let session = match outer {
+            Some(outer) => {
+                scoped = {
+                    let mut copy = session.clone();
+                    copy.lateral = Some(outer.clone());
+                    copy
+                };
+                &scoped
+            }
+            _ => session,
+        };
+
+        // `FROM a, b` is a cross join, and `JSON_TABLE` is conventionally
+        // written that way — so the comma form is folded here rather than
+        // refused, with the same lateral handling a JOIN gets.
+        let mut relation = self.build_relation(session, &select.from[0])?;
+        for item in &select.from[1..] {
+            let cross = JoinOperator::CrossJoin(sqlparser::ast::JoinConstraint::None);
+            relation = match &item.relation {
+                // Built per row rather than once: evaluating it here would ask
+                // for a column of the table on the left, which is not in scope
+                // until there is a row to read it from.
+                TableFactor::JsonTable { .. } if item.joins.is_empty() => {
+                    self.lateral_join(session, relation, &item.relation, &cross)?
+                }
+                _ => {
+                    let next = self.build_relation(session, item)?;
+                    self.join(session, relation, next, &cross)?
+                }
+            };
+        }
+        let relation = relation;
         // The outer row's columns are appended, so an unqualified name resolves
         // against this query's columns first and the enclosing one only if it
         // is not found here, which is MySQL's scoping rule.
@@ -1080,11 +1112,137 @@ impl Engine {
         let mut left = self.relation_of(session, &from.relation)?;
 
         for join in &from.joins {
+            // JSON_TABLE is implicitly LATERAL: its document is usually a
+            // column of a table named earlier in the FROM, so it has to be
+            // expanded once per row on the left rather than once for the join.
+            if let TableFactor::JsonTable { .. } = &join.relation {
+                left = self.lateral_join(session, left, &join.relation, &join.join_operator)?;
+                continue;
+            }
+
             let right = self.relation_of(session, &join.relation)?;
             left = self.join(session, left, right, &join.join_operator)?;
         }
 
         Ok(left)
+    }
+
+    /// Joins a factor that is re-evaluated for each row on the left.
+    ///
+    /// Each left row is joined to the rows its own evaluation produced, which
+    /// is what makes `JSON_TABLE(t.doc, ...)` mean the document in *that* row.
+    fn lateral_join(
+        &self,
+        session: &Session,
+        left: Relation,
+        factor: &TableFactor,
+        operator: &JoinOperator,
+    ) -> EngineResult<Relation> {
+        use sqlparser::ast::JoinConstraint;
+
+        // The same set `join()` accepts, refused the same way: a RIGHT or FULL
+        // join here would otherwise quietly behave as an inner one.
+        let (constraint, outer_left) = match operator {
+            JoinOperator::Inner(c) | JoinOperator::Join(c) => (Some(c), false),
+            JoinOperator::LeftOuter(c) | JoinOperator::Left(c) => (Some(c), true),
+            JoinOperator::CrossJoin(_) => (None, false),
+            other => return Err(unsupported(format!("join type `{other:?}`"))),
+        };
+
+        let refs = left.refs();
+        let mut columns: Option<Vec<crate::relation::RelColumn>> = None;
+        let mut rows = Vec::new();
+        let mut origins = Vec::new();
+
+        for (index, row) in left.rows.iter().enumerate() {
+            // The left row is put in scope as an outer row, which is the same
+            // seam a correlated subquery uses. Any enclosing correlation is
+            // kept behind it, so a subquery that names another table first can
+            // still reach the row it is correlated to.
+            let mut scoped = session.clone();
+            let mut schema = refs.clone();
+            let mut values = row.clone();
+            if let Some(enclosing) = &session.lateral {
+                schema.extend(enclosing.schema.iter().cloned());
+                values.extend(enclosing.values.iter().cloned());
+            }
+            scoped.lateral = Some(OuterRow { schema, values });
+            let expanded = self.relation_of(&scoped, factor)?;
+
+            // The shape does not depend on the row, so the first one settles it
+            // — and an empty left side still has to produce columns.
+            let width = expanded.columns.len();
+            if columns.is_none() {
+                columns = Some(expanded.columns.clone());
+            }
+
+            // The ON clause is evaluated against the joined row, exactly as it
+            // is for an ordinary join. Ignoring it would turn every
+            // `JOIN JSON_TABLE(...) ON ...` into a cross join.
+            let mut joined_refs = refs.clone();
+            joined_refs.extend(
+                expanded
+                    .columns
+                    .iter()
+                    .map(|c| ColumnRef::new(&c.table, &c.name)),
+            );
+
+            let mut matched = false;
+            for produced in expanded.rows {
+                let mut joined = row.clone();
+                joined.extend(produced);
+
+                let keep = match constraint {
+                    None | Some(JoinConstraint::None) => true,
+                    Some(JoinConstraint::On(predicate)) => {
+                        let ctx = Context {
+                            row: Some(Row {
+                                schema: &joined_refs,
+                                values: &joined,
+                            }),
+                            session,
+                            executor: Some(self),
+                        };
+                        expr::eval(predicate, &ctx)?.truthy() == Some(true)
+                    }
+                    Some(other) => {
+                        return Err(unsupported(format!("`{other:?}` on a lateral join")))
+                    }
+                };
+                if !keep {
+                    continue;
+                }
+
+                matched = true;
+                rows.push(joined);
+                origins.push(left.origins[index].clone());
+            }
+
+            // A left join keeps the row even when nothing on the right matched.
+            if !matched && outer_left {
+                let mut padded = row.clone();
+                padded.extend(std::iter::repeat_n(Value::Null, width));
+                rows.push(padded);
+                origins.push(left.origins[index].clone());
+            }
+        }
+
+        // With no rows on the left the factor was never evaluated, so the shape
+        // is worked out once against nothing.
+        let right_columns = match columns {
+            Some(columns) => columns,
+            None => self.relation_of(session, factor)?.columns,
+        };
+
+        let mut all = left.columns;
+        all.extend(right_columns);
+        Ok(Relation {
+            columns: all,
+            rows,
+            sources: left.sources,
+            base_tables: left.base_tables,
+            origins,
+        })
     }
 
     /// Nested-loop join of two materialised relations.
@@ -1265,6 +1423,16 @@ impl Engine {
                 relation.base_tables = vec![base_name];
                 Ok(relation)
             }
+            // `JSON_TABLE(doc, '$[*]' COLUMNS(...))` turns a document into
+            // rows. The migrations use it to unpack a stored configuration
+            // array into something they can join against.
+            TableFactor::JsonTable {
+                json_expr,
+                json_path,
+                columns,
+                alias,
+            } => self.json_table(session, json_expr, json_path, columns, alias.as_ref()),
+
             TableFactor::Derived {
                 subquery, alias, ..
             } => {
@@ -2076,6 +2244,20 @@ impl Engine {
                     )
                 }
             }
+            // Unlike GROUP_CONCAT this keeps each value's type, so numbers
+            // stay numbers in the document — and it keeps NULLs, which become
+            // JSON nulls rather than being dropped.
+            "json_arrayagg" => {
+                if distinct {
+                    return Err(unsupported("DISTINCT in JSON_ARRAYAGG()"));
+                }
+                if matching.is_empty() {
+                    Value::Null
+                } else {
+                    let items = values.iter().map(crate::json::from_value).collect();
+                    crate::json::render(&serde_json::Value::Array(items))
+                }
+            }
             other => return Err(unsupported(format!("aggregate `{other}()`"))),
         })
     }
@@ -2137,6 +2319,12 @@ impl Engine {
         let rendered = insert.table.to_string();
         let (db, table_name) = self.split_parts(session, &rendered)?;
         let ignore = insert.ignore;
+
+        let duplicate_key_update = match &insert.on {
+            None => None,
+            Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments)) => Some(assignments),
+            Some(other) => return Err(unsupported(format!("INSERT ... {other}"))),
+        };
 
         // `INSERT ... SELECT` runs its query first and to completion. MySQL
         // reads the whole source before writing, so a statement whose SELECT
@@ -2280,10 +2468,16 @@ impl Engine {
                 .filter(|(_, c)| c.auto_increment)
                 .map(|(i, _)| i)
                 .collect();
+            let mut generated_id = None;
             for slot in auto_increment {
                 if row[slot].is_null() {
                     row[slot] = Value::Int(table.next_auto_increment);
-                    last_id = table.next_auto_increment as u64;
+                    // Recorded rather than reported: an `ON DUPLICATE KEY
+                    // UPDATE` that updates instead of inserting must not hand
+                    // back an id for a row that does not exist. MySQL still
+                    // consumes the counter value, which is why it advances
+                    // here either way.
+                    generated_id = Some(table.next_auto_increment as u64);
                     table.next_auto_increment += 1;
                 } else if let Some(explicit) = row[slot].as_int() {
                     // An explicit value moves the counter past it, as MySQL
@@ -2309,6 +2503,66 @@ impl Engine {
             // the same path UPDATE uses.
             let row = self.finalise_row(table, row, &session_snapshot)?;
 
+            // `ON DUPLICATE KEY UPDATE` turns a collision into an update of
+            // the row that was already there, rather than an error. Checked
+            // before the constraints below, because a collision is the
+            // expected case for it rather than a failure.
+            if let Some(assignments) = duplicate_key_update {
+                if let Some(existing) = table.conflicting_row(&row) {
+                    let before = table.rows[existing].clone();
+                    let mut updated = before.clone();
+                    let updated_refs: Vec<ColumnRef> = table
+                        .columns
+                        .iter()
+                        .map(|c| ColumnRef::new(&table.name, &c.name))
+                        .collect();
+
+                    for assignment in assignments {
+                        let column_name = assignment_column(&assignment.target)?;
+                        let slot = table.column_index(&column_name).ok_or_else(|| {
+                            EngineError::unknown_column(&column_name, "field list")
+                        })?;
+                        // The right-hand side sees the row as it stands, which
+                        // is what `c = c + 1` means here — while `VALUES(c)`
+                        // names the value the insert would have written, which
+                        // is the ordinary way to spell an upsert.
+                        let ctx = Context {
+                            row: Some(Row {
+                                schema: &updated_refs,
+                                values: &updated,
+                            }),
+                            session: &session_snapshot,
+                            executor: Some(self),
+                        };
+                        let value = match values_reference(&assignment.value) {
+                            Some(referenced) => {
+                                let from = table.column_index(&referenced).ok_or_else(|| {
+                                    EngineError::unknown_column(&referenced, "field list")
+                                })?;
+                                row[from].clone()
+                            }
+                            None => expr::eval(&assignment.value, &ctx)?,
+                        };
+                        updated[slot] = table.columns[slot].ty.coerce(value, &column_name)?;
+                    }
+
+                    let updated = self.finalise_row(table, updated, &session_snapshot)?;
+                    foreign_keys::check(&fk_parents, &updated, &table_name)?;
+                    // Against the table's own rows, skipping the one being
+                    // updated — cloning them here would copy the whole table
+                    // once per conflicting row of a multi-row insert.
+                    table.check_unique(&updated, Some(existing))?;
+
+                    // MySQL reports two affected rows for a row it updated this
+                    // way, and one for a row it inserted.
+                    if updated != before {
+                        table.rows[existing] = updated;
+                        inserted += 2;
+                    }
+                    continue;
+                }
+            }
+
             // IGNORE covers a foreign key violation as well as a duplicate
             // key; MySQL downgrades both to a warning and skips the row.
             let admissible = foreign_keys::check(&fk_parents, &row, &table_name)
@@ -2326,12 +2580,21 @@ impl Engine {
             }
 
             table.rows.push(row);
+            if let Some(id) = generated_id {
+                last_id = id;
+            }
             inserted += 1;
         }
 
         self.commit_database(&db, working)?;
         mark_modified(session, &db, std::slice::from_ref(&table_name));
-        session.last_insert_id = last_id;
+        // `LAST_INSERT_ID()` keeps its previous value when a statement
+        // generated none — an upsert that updated rather than inserted has no
+        // id to report, but it has not erased the one before it either. The
+        // OK packet still carries 0, which is what MySQL sends.
+        if last_id != 0 {
+            session.last_insert_id = last_id;
+        }
         session.affected_rows = inserted;
         Ok(Outcome::Affected {
             rows: inserted,
@@ -3168,6 +3431,130 @@ impl Engine {
             origins: vec![Vec::new(); rows.rows.len()],
             columns,
             rows: rows.rows,
+            sources: Vec::new(),
+            base_tables: Vec::new(),
+        })
+    }
+
+    /// Expands a JSON document into rows, one per match of the row path.
+    ///
+    /// Each column takes its value from a path evaluated against that match,
+    /// and `FOR ORDINALITY` numbers the rows from one. A column whose path
+    /// matches nothing is NULL, which is MySQL's default and the only sensible
+    /// reading of "this element has no such member".
+    fn json_table(
+        &self,
+        session: &Session,
+        document: &Expr,
+        row_path: &sqlparser::ast::ValueWithSpan,
+        columns: &[sqlparser::ast::JsonTableColumn],
+        alias: Option<&sqlparser::ast::TableAlias>,
+    ) -> EngineResult<Relation> {
+        use sqlparser::ast::JsonTableColumn as Column;
+
+        let name = alias
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| "json_table".to_owned());
+
+        // The document usually comes from a column of a table named earlier
+        // in the FROM, which reaches here as the lateral row.
+        let outer = session.lateral.clone();
+        let ctx = match &outer {
+            Some(row) => Context {
+                row: Some(Row {
+                    schema: &row.schema,
+                    values: &row.values,
+                }),
+                session,
+                executor: Some(self),
+            },
+            None => Context::rowless(session).with_executor(self),
+        };
+        let source = expr::eval(document, &ctx)?;
+        let parsed = crate::json::parse(&source)?;
+        let path = crate::json::parse_path(&literal_text(row_path))?;
+
+        // Described before any row is read, so an empty document still yields
+        // the right shape rather than a relation with no columns.
+        let mut rel_columns = Vec::with_capacity(columns.len());
+        for column in columns {
+            let (column_name, ty) = match column {
+                Column::Named(named) => (
+                    named.name.value.clone(),
+                    crate::types::SqlType::from_ast(&named.r#type)?,
+                ),
+                Column::ForOrdinality(ident) => (
+                    ident.value.clone(),
+                    crate::types::SqlType::from_ast(&sqlparser::ast::DataType::BigInt(None))?,
+                ),
+                Column::Nested(_) => return Err(unsupported("NESTED PATH in JSON_TABLE")),
+            };
+            rel_columns.push(crate::relation::RelColumn {
+                schema: session.current_database.clone().unwrap_or_default(),
+                table: name.clone(),
+                name: column_name,
+                ty,
+                nullable: true,
+            });
+        }
+
+        let mut rows = Vec::new();
+        for (ordinal, matched) in crate::json::select(&parsed, &path).into_iter().enumerate() {
+            let mut row = Vec::with_capacity(columns.len());
+            for column in columns {
+                row.push(match column {
+                    Column::ForOrdinality(_) => Value::Int(ordinal as i64 + 1),
+                    Column::Named(named) => {
+                        if named.exists {
+                            return Err(unsupported("EXISTS in a JSON_TABLE column"));
+                        }
+                        // `DEFAULT x ON EMPTY` and `ERROR ON ERROR` change what
+                        // a column holds when its path matches nothing, so
+                        // accepting and ignoring them would answer NULL where
+                        // MySQL answers a default or refuses outright.
+                        if named.on_empty.is_some() || named.on_error.is_some() {
+                            return Err(unsupported(
+                                "ON EMPTY and ON ERROR in a JSON_TABLE column",
+                            ));
+                        }
+                        let column_path = crate::json::parse_path(&literal_text(&named.path))?;
+                        // A wildcard can select several values, and a column
+                        // holds one. MySQL rejects it rather than picking.
+                        if column_path.is_multiple() {
+                            return Err(EngineError::new(
+                                3153,
+                                "42000",
+                                "In this situation, path expressions may not contain the * \
+                                 or ** tokens or an array range",
+                            ));
+                        }
+                        match crate::json::select(matched, &column_path).first() {
+                            // Unquoted, because a column declared VARCHAR wants
+                            // the string rather than the string in quotes.
+                            Some(found) => crate::json::unquote(found),
+                            None => Value::Null,
+                        }
+                    }
+                    Column::Nested(_) => return Err(unsupported("NESTED PATH in JSON_TABLE")),
+                });
+            }
+            rows.push(row);
+        }
+
+        // Coerced after the fact so a column declared INT is an integer, which
+        // is what a join against a real column has to compare against.
+        for row in &mut rows {
+            for (value, column) in row.iter_mut().zip(&rel_columns) {
+                if !value.is_null() {
+                    *value = column.ty.coerce(value.clone(), &column.name)?;
+                }
+            }
+        }
+
+        Ok(Relation {
+            origins: vec![Vec::new(); rows.len()],
+            columns: rel_columns,
+            rows,
             sources: Vec::new(),
             base_tables: Vec::new(),
         })
@@ -4329,7 +4716,9 @@ fn factor_name(factor: &TableFactor) -> Option<String> {
                 .map(|a| a.name.value.clone())
                 .unwrap_or_else(|| object_name(name)),
         ),
-        TableFactor::Derived { alias, .. } => alias.as_ref().map(|a| a.name.value.clone()),
+        TableFactor::Derived { alias, .. } | TableFactor::JsonTable { alias, .. } => {
+            alias.as_ref().map(|a| a.name.value.clone())
+        }
         _ => None,
     }
 }
@@ -4439,6 +4828,37 @@ fn check_full_group_by(
              column; this is incompatible with sql_mode=only_full_group_by"
         ),
     ))
+}
+
+/// The column a `VALUES(col)` in an `ON DUPLICATE KEY UPDATE` names.
+///
+/// Inside that clause `VALUES(x)` does not call anything — it stands for the
+/// value the insert would have written to `x`, which is how an upsert says
+/// "take the new value".
+fn values_reference(e: &Expr) -> Option<String> {
+    let Expr::Function(f) = e else {
+        return None;
+    };
+    if !f.name.to_string().eq_ignore_ascii_case("values") {
+        return None;
+    }
+    match function_arguments(f).first() {
+        Some(Expr::Identifier(ident)) => Some(ident.value.clone()),
+        Some(Expr::CompoundIdentifier(parts)) => parts.last().map(|p| p.value.clone()),
+        _ => None,
+    }
+}
+
+/// The text of a string literal, as written without its quotes.
+///
+/// JSON_TABLE's paths are literals by grammar, so this cannot fail — but the
+/// AST still carries a general value, and rendering that would keep the quotes.
+fn literal_text(value: &sqlparser::ast::ValueWithSpan) -> String {
+    match &value.value {
+        sqlparser::ast::Value::SingleQuotedString(s)
+        | sqlparser::ast::Value::DoubleQuotedString(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// Whether an expression reads any column outside an aggregate.
@@ -4559,7 +4979,7 @@ fn aggregate_is_distinct(f: &sqlparser::ast::Function) -> bool {
 fn is_aggregate(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "count" | "sum" | "avg" | "min" | "max" | "group_concat"
+        "count" | "sum" | "avg" | "min" | "max" | "group_concat" | "json_arrayagg"
     )
 }
 

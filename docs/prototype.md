@@ -43,6 +43,9 @@ start plus 26.1s of `prisma migrate deploy`. See [`baseline-mysql.md`](baseline-
 - **Grouping** — `GROUP BY` over several columns, `HAVING`, aggregates folded inside larger
   expressions such as `SUM(a) / COUNT(*)`, `COUNT(DISTINCT x)`, and NULLs grouped together
 - **Set operators** — `UNION`, `INTERSECT` and `EXCEPT`, each with `ALL`
+- **JSON** — `JSON_EXTRACT` and the `->`/`->>` operators, `JSON_OBJECT`, `JSON_ARRAY`,
+  `JSON_SET`, `JSON_MERGE_PATCH`, `JSON_ARRAYAGG`, `JSON_TABLE` with `FOR ORDINALITY`, and
+  the path syntax they address with
 - **Multi-table DML** — `UPDATE a JOIN b SET ...` and `DELETE a FROM a JOIN b`, writing back
   through the join to the rows it came from
 - **Window functions** — `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `FIRST_VALUE`,
@@ -94,7 +97,8 @@ union and stops parsing.
 
 Parsing every statement and *running* every statement are different claims, and only the
 second one matters. Pointing `prisma migrate deploy` at the engine with the real
-604-migration history applies **453 of 604** today, stopping at `JSON_TABLE`.
+604-migration history now applies **all 604**, and reports "No pending migrations to
+apply" when run again against the image baked from it.
 
 Everything between the two numbers was found this way, one migration at a time. Some of it
 was missing features — multi-statement commands (Prisma sends a whole migration file as one
@@ -147,16 +151,17 @@ process per test file pays it every time. Baking the result once and loading it 
 
 ```sh
 mysql-ultralight --port 3306 &                       # 0.1ms, empty
-npx prisma migrate deploy                            # once, ~7s here
-mysql -e "SELECT ultralight_snapshot('schema.mus')"  # 29ms, 630 KB
+npx prisma migrate deploy                            # once, 13.6s here
+mysql -e "SELECT ultralight_snapshot('schema.mus')"  # 5ms, 918 KB
 
-mysql-ultralight --state schema.mus                  # 0.9–1.7ms, every test process
+mysql-ultralight --state schema.mus                  # 1.3–1.7ms, every test process
 ```
 
-The image carries the whole catalog — 241 tables, 2,367 columns, seed rows, foreign keys,
+The image carries the whole catalog — 278 tables, 2,771 columns, seed rows, foreign keys,
 indexes, generated columns, `CHECK` constraints and auto-increment counters — and a server
 booted from one is indistinguishable from one that ran the migrations: the constraints
-still bite, and `prisma migrate deploy` against it reports the migrations already applied.
+still bite, and `prisma migrate deploy` against it answers **"No pending migrations to
+apply"**.
 
 `SELECT ultralight_restore('schema.mus')` does the same to a *running* server, which resets
 it between test files without paying for a new process at all.
@@ -220,13 +225,49 @@ What the review found correct is worth recording too: every field of every catal
 round trips, and 200,000 randomly mutated or truncated images produced zero panics and only
 clean errors.
 
+## Review hardening (JSON and upserts)
+
+Fifteen findings, all fixed but one, which is recorded below instead. The worst was a
+silent cross join: **`JOIN JSON_TABLE(...) ON <cond>` ignored the condition entirely**,
+because the lateral path read the join operator only to decide whether it was outer.
+`ON jt.k = 2` returned every row, `ON 1 = 0` returned every row, and a `RIGHT JOIN` — which
+the ordinary path refuses — quietly behaved as an inner one.
+
+Four more were wrong answers in the JSON layer: `JSON_EXTRACT` returned an empty array
+where MySQL returns NULL, so `IS NULL` was false for a path that matched nothing; `$[*]`
+did not treat a scalar or object as a one-element array the way `$[0]` already did, so a
+`JSON_TABLE` over an object produced no rows and the row vanished from the join; a JSON
+`null` collapsed into SQL NULL, making "the key holds null" indistinguishable from "there
+is no such key"; and whitespace between path legs — `$. a`, which MySQL accepts — became
+part of the member name and matched nothing.
+
+On the upsert side: `ON DUPLICATE KEY UPDATE` reported an insert id for a row it had not
+inserted, so a client reading it back got a phantom; it updated the row a *secondary* key
+named when the primary key also collided; `VALUES(col)`, the ordinary way to spell an
+upsert, was unsupported; and `JSON_ARRAYAGG` dropped NULLs, applied a `DISTINCT` MySQL does
+not accept, and returned `[]` rather than NULL for no rows.
+
+`JSON_TABLE` column clauses that change the answer — `DEFAULT ... ON EMPTY`, `ERROR ON
+EMPTY`, and a wildcard in a column path — were parsed and dropped, and are now refused
+alongside the `EXISTS` and `NESTED PATH` that already were.
+
+### The one that is not fixed
+
+**Nested JSON constructors double-encode.** `JSON_OBJECT('a', JSON_ARRAY(1, 2))` yields
+`{"a": "[1,2]"}` where MySQL yields `{"a": [1, 2]}`. JSON is held as text, and a JSON
+result is an ordinary string by the time it reaches the next function, so nothing
+distinguishes "a document" from "a string that looks like one" — which means it cannot be
+detected and refused either. Fixing it properly means a JSON-tagged value, which touches
+the wire encoding and the image format. Nothing in the 604 migrations nests a JSON
+constructor, so it is recorded rather than rushed.
+
 ## What it does not do yet
 
 Named honestly, because the engine returns an error rather than a wrong answer for each:
 explicit window frames (`ROWS`/`RANGE BETWEEN`), named `WINDOW` clauses, `NTH_VALUE`, a
 computed (non-constant) offset or default in `LAG`/`LEAD`, `ORDER BY` and `LIMIT` on an
-`UPDATE` or `DELETE`, `DELETE ... USING`, `WITH RECURSIVE`, `JSON_TABLE` and the JSON
-function library, and the date and spatial functions.
+`UPDATE` or `DELETE`, `DELETE ... USING`, `WITH RECURSIVE`, `NESTED PATH` in `JSON_TABLE`,
+the date-arithmetic functions, and the spatial pair `ST_Distance_Sphere` and `POINT`.
 
 Two limitations are worth stating rather than implying away.
 

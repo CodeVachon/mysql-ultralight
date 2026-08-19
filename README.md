@@ -11,12 +11,26 @@ It is **not** for production. There is no durability, and there never will be.
 
 ## Status
 
-Working prototype. `prisma db push` creates a schema against it, and Prisma Client does
-CRUD — create, findMany, findUnique, filtering, count, update, pagination, delete.
+It runs a real application's database. All **604 migrations** of a production Prisma
+history apply, `prisma db push` creates a schema, and Prisma Client does CRUD against it.
 
-**Cold start is 2.05ms median** from process spawn to a client holding the handshake. The
-equivalent on real MySQL is 4.5–8.9s of container start plus 26.1s of `prisma migrate
-deploy`, measured on the same machine against the same schema.
+| | Real MySQL 8 | mysql-ultralight |
+|---|---|---|
+| Start | 4.5–8.9s of container | **0.1ms** |
+| Schema | 26.1s of `prisma migrate deploy` | **1.3–1.7ms** from a baked image |
+
+The second row is the point. Bake the migrations once into a state image, and every test
+process loads the whole schema — 278 tables, 2,771 columns, seed rows and all their
+constraints — in about a millisecond. `prisma migrate deploy` against a server booted from
+one answers "No pending migrations to apply".
+
+```sh
+mysql-ultralight --port 3306 &                       # bake, once
+npx prisma migrate deploy
+mysql -e "SELECT ultralight_snapshot('schema.mus')"
+
+mysql-ultralight --state schema.mus                  # every test process
+```
 
 See [`docs/prototype.md`](docs/prototype.md) for what works and what does not,
 [`docs/baseline-mysql.md`](docs/baseline-mysql.md) for the numbers it has to beat, and
@@ -50,6 +64,7 @@ which is the fastest way to see what a client actually asks a MySQL server for.
 | `--socket <PATH>` | Also listen on a unix socket. Keep the path under ~100 bytes |
 | `--database <NAME>` | Database created at startup (default: `test`) |
 | `--password <PASS>` | Require this password; omitted means any credentials work |
+| `--state <PATH>` | Load a baked state image instead of an empty catalog |
 | `--server-version <V>` | Version string reported to clients |
 | `--trace` | Log all protocol activity to stderr |
 
@@ -69,12 +84,34 @@ ready port=3307 socket=- startup_ms=1.312
 | `crates/engine` | Catalog, storage, expressions, executor, sessions, `information_schema` |
 | `crates/cli` | The `mysql-ultralight` binary, and the engine/server adapter |
 | `crates/conformance` | Extracts a target codebase's SQL surface |
+| `packages/npm` | `@codevachon/mysql-ultralight`: the JS API and platform packages |
+
+## From JavaScript
+
+```sh
+npm install --save-dev @codevachon/mysql-ultralight
+```
+
+```js
+import { start } from '@codevachon/mysql-ultralight';
+
+const db = await start({ image: '.cache/schema.mus' });
+process.env.DATABASE_URL = db.url;
+// ...
+await db.stop();
+```
+
+Port 0 by default, so parallel test workers cannot race for one, and `start()` resolves
+only once the server is accepting connections. See
+[`packages/npm/README.md`](packages/npm/README.md).
 
 ## Development
 
 ```sh
-./scripts/check.sh          # the gate: fmt, clippy, tests, unused deps, advisories
+./scripts/check.sh          # the gate: fmt, clippy, tests, npm tests, unused deps,
+                            # advisories, and Fallow over the npm package
 ./scripts/check.sh --fix    # format and apply clippy's suggestions first
+./scripts/check.sh --fast   # skip the slower supply-chain checks
 ```
 
 A pre-commit hook runs the same script. A fresh clone needs `git config core.hooksPath

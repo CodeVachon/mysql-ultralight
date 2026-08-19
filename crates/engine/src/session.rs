@@ -56,6 +56,12 @@ pub struct Session {
     /// How many views deep evaluation currently is, so a self-referential view
     /// is refused rather than exhausting the stack.
     pub view_depth: usize,
+    /// The row a lateral factor is being evaluated against.
+    ///
+    /// `JSON_TABLE(t.doc, ...)` is expanded once per row of the tables named
+    /// before it, and this is how that row reaches the expression — the same
+    /// shape a correlated subquery uses, because it is the same problem.
+    pub lateral: Option<crate::expr::OuterRow>,
     /// Common table expressions in scope, innermost last.
     ///
     /// A CTE is named like a table but exists only for the statement that
@@ -85,6 +91,7 @@ impl Session {
             in_transaction: false,
             transaction: None,
             view_depth: 0,
+            lateral: None,
             ctes: Vec::new(),
             parsed_mode,
             parsed_from,

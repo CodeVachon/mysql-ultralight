@@ -1,0 +1,334 @@
+//! JSON values and the path syntax that addresses into them.
+//!
+//! MySQL stores JSON as its own type and reaches into it with a path language
+//! of its own — `$.a[0].b`, `$[*]`. The engine keeps JSON as text, because that
+//! is how it arrives and leaves on the wire, and parses it where a function
+//! actually needs the structure.
+//!
+//! The path subset here is what the target codebase uses: the root, member
+//! names, array indexes, and the `[*]` wildcard. Anything else is an error
+//! rather than a silent miss, because a path that quietly matches nothing looks
+//! exactly like a column that is legitimately absent.
+
+use serde_json::Value as Json;
+
+use crate::error::{EngineError, EngineResult};
+use crate::value::Value;
+
+/// One step of a JSON path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Step {
+    /// `.name`
+    Key(String),
+    /// `[3]`
+    Index(usize),
+    /// `[*]`, every element of an array.
+    Every,
+}
+
+/// A parsed `$`-rooted path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Path {
+    steps: Vec<Step>,
+}
+
+impl Path {
+    /// Whether the path can match more than one value, which is what decides
+    /// between returning a value and returning an array of them.
+    pub fn is_multiple(&self) -> bool {
+        self.steps.contains(&Step::Every)
+    }
+}
+
+fn bad_path(path: &str) -> EngineError {
+    EngineError::new(
+        3143,
+        "42000",
+        format!("Invalid JSON path expression '{path}'"),
+    )
+}
+
+/// Parses `$`, `$.a`, `$[0]`, `$[*]`, and combinations of those.
+pub fn parse_path(path: &str) -> EngineResult<Path> {
+    let trimmed = path.trim();
+    let mut chars = trimmed.chars().peekable();
+    if chars.next() != Some('$') {
+        return Err(bad_path(path));
+    }
+
+    let mut steps = Vec::new();
+    loop {
+        // MySQL allows space around each leg — `$. a` and `$ .a` are the same
+        // path as `$.a`. Folding it into the member name makes a legal path
+        // match nothing, which reads exactly like an absent key.
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let Some(c) = chars.next() else { break };
+        match c {
+            '.' => {
+                while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                    chars.next();
+                }
+                // A quoted member allows the dots and brackets a bare one
+                // cannot carry.
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    let mut name = String::new();
+                    loop {
+                        match chars.next() {
+                            Some('"') => break,
+                            Some(ch) => name.push(ch),
+                            None => return Err(bad_path(path)),
+                        }
+                    }
+                    steps.push(Step::Key(name));
+                    continue;
+                }
+
+                let mut name = String::new();
+                while let Some(&ch) = chars.peek() {
+                    if ch == '.' || ch == '[' {
+                        break;
+                    }
+                    name.push(ch);
+                    chars.next();
+                }
+                // Trailing space belongs to the separator, not the name.
+                let name = name.trim_end().to_owned();
+                if name.is_empty() {
+                    return Err(bad_path(path));
+                }
+                steps.push(Step::Key(name));
+            }
+            '[' => {
+                let mut inner = String::new();
+                loop {
+                    match chars.next() {
+                        Some(']') => break,
+                        Some(ch) => inner.push(ch),
+                        None => return Err(bad_path(path)),
+                    }
+                }
+                if inner.trim() == "*" {
+                    steps.push(Step::Every);
+                } else {
+                    let index: usize = inner.trim().parse().map_err(|_| bad_path(path))?;
+                    steps.push(Step::Index(index));
+                }
+            }
+            _ => return Err(bad_path(path)),
+        }
+    }
+
+    Ok(Path { steps })
+}
+
+/// Every value the path selects, in document order.
+pub fn select<'a>(root: &'a Json, path: &Path) -> Vec<&'a Json> {
+    let mut current = vec![root];
+    for step in &path.steps {
+        let mut next = Vec::new();
+        for value in current {
+            match step {
+                Step::Key(name) => {
+                    if let Some(found) = value.as_object().and_then(|o| o.get(name)) {
+                        next.push(found);
+                    }
+                }
+                Step::Index(i) => {
+                    match value.as_array() {
+                        Some(items) => next.extend(items.get(*i)),
+                        // MySQL treats a scalar as a one-element array, so
+                        // `$[0]` on a scalar is the scalar itself.
+                        None if *i == 0 => next.push(value),
+                        None => {}
+                    }
+                }
+                Step::Every => match value.as_array() {
+                    Some(items) => next.extend(items.iter()),
+                    // A scalar or object is treated as a one-element array, the
+                    // same auto-wrapping `[0]` does — without it a JSON_TABLE
+                    // over an object yields no rows and the row vanishes.
+                    None => next.push(value),
+                },
+            }
+        }
+        current = next;
+    }
+    current
+}
+
+/// Parses a value that is meant to hold JSON.
+///
+/// An engine `Value` reaches here as text, because that is how JSON is stored
+/// and transmitted. Text that is not JSON is an error rather than a NULL: a
+/// column holding `{"a":1` is a bug somewhere, and answering NULL hides it.
+pub fn parse(value: &Value) -> EngineResult<Json> {
+    if value.is_null() {
+        return Ok(Json::Null);
+    }
+    let text = value.as_text();
+    serde_json::from_str(&text).map_err(|e| {
+        EngineError::new(
+            3141,
+            "22032",
+            format!("Invalid JSON text: \"{e}\" in argument to a JSON function"),
+        )
+    })
+}
+
+/// Renders JSON back into the engine's text representation.
+///
+/// A JSON `null` renders as the text `null`, not as SQL NULL: "the key is
+/// present and holds null" and "there is no such key" are different answers,
+/// and collapsing them makes `IS NULL` true for both.
+pub fn render(json: &Json) -> Value {
+    Value::text(json.to_string())
+}
+
+/// A JSON value as SQL sees it once the quotes come off.
+///
+/// `JSON_UNQUOTE` and `->>` both want this: a JSON string becomes the string,
+/// and everything else keeps its JSON rendering.
+pub fn unquote(json: &Json) -> Value {
+    match json {
+        Json::String(s) => Value::text(s),
+        // JSON null unquotes to the text `null`, as MySQL does — it is a value
+        // that was there, not a value that was missing.
+        other => Value::text(other.to_string()),
+    }
+}
+
+/// An engine value as JSON, for building documents.
+///
+/// Text that happens to parse as JSON is *not* treated as JSON: MySQL keeps a
+/// string a string unless it is cast, and guessing would turn a column holding
+/// `"123"` into a number.
+///
+/// The cost of that is real and worth naming: the engine has no JSON-typed
+/// value, so the result of one JSON function fed to another arrives here as
+/// text and is embedded as a string. `JSON_OBJECT('a', JSON_ARRAY(1, 2))`
+/// yields `{"a": "[1,2]"}` where MySQL yields `{"a": [1, 2]}`. Nothing
+/// distinguishes the two cases at this point, so it cannot be detected and
+/// refused either; a JSON-tagged value is what would fix it.
+pub fn from_value(value: &Value) -> Json {
+    match value {
+        Value::Null => Json::Null,
+        Value::Int(n) => Json::from(*n),
+        Value::Float(f) => serde_json::Number::from_f64(*f).map_or(Json::Null, Json::Number),
+        Value::Text(s) => Json::String(s.clone()),
+        Value::Bytes(b) => Json::String(String::from_utf8_lossy(b).into_owned()),
+    }
+}
+
+/// Replaces or inserts the value at a path, as `JSON_SET` does.
+///
+/// Only paths that name one place can be written to, which is MySQL's rule
+/// too: `$[*]` selects many and there is no sensible single write.
+pub fn set(root: &mut Json, path: &Path, new: Json) -> EngineResult<()> {
+    if path.is_multiple() {
+        return Err(EngineError::new(
+            3149,
+            "42000",
+            "In this situation, path expressions may not contain the * token",
+        ));
+    }
+
+    let Some((last, leading)) = path.steps.split_last() else {
+        *root = new;
+        return Ok(());
+    };
+
+    let mut current = root;
+    for step in leading {
+        current = match step {
+            Step::Key(name) => match current {
+                Json::Object(map) => map.entry(name.clone()).or_insert(Json::Null),
+                // A path through something that is not an object matches
+                // nothing, and MySQL leaves the document alone.
+                _ => return Ok(()),
+            },
+            Step::Index(i) => match current {
+                Json::Array(items) if *i < items.len() => &mut items[*i],
+                _ => return Ok(()),
+            },
+            Step::Every => unreachable!("rejected above"),
+        };
+    }
+
+    match last {
+        Step::Key(name) => {
+            if let Json::Object(map) = current {
+                map.insert(name.clone(), new);
+            }
+        }
+        Step::Index(i) => match current {
+            Json::Array(items) => {
+                if *i < items.len() {
+                    items[*i] = new;
+                } else {
+                    items.push(new);
+                }
+            }
+            // Setting `$[0]` on a scalar replaces it, which is what treating a
+            // scalar as a one-element array implies.
+            other if *i == 0 => *other = new,
+            _ => {}
+        },
+        Step::Every => unreachable!("rejected above"),
+    }
+    Ok(())
+}
+
+/// Appends to the array at a path, as `JSON_ARRAY_APPEND` does.
+///
+/// A path naming something that is not an array wraps it into one first, which
+/// is MySQL's behaviour rather than an error.
+pub fn append(root: &mut Json, path: &Path, new: Json) -> EngineResult<()> {
+    if path.is_multiple() {
+        return Err(EngineError::new(
+            3149,
+            "42000",
+            "In this situation, path expressions may not contain the * token",
+        ));
+    }
+
+    let target = select(root, path).first().map(|v| (*v).clone());
+    let Some(existing) = target else {
+        return Ok(());
+    };
+    let appended = match existing {
+        Json::Array(mut items) => {
+            items.push(new);
+            Json::Array(items)
+        }
+        scalar => Json::Array(vec![scalar, new]),
+    };
+    set(root, path, appended)
+}
+
+/// Merges `patch` into `target` by RFC 7386, which is `JSON_MERGE_PATCH`.
+pub fn merge_patch(target: &Json, patch: &Json) -> Json {
+    match patch {
+        Json::Object(patch_map) => {
+            let mut merged = match target {
+                Json::Object(map) => map.clone(),
+                // Anything that is not an object is replaced wholesale before
+                // the patch is applied.
+                _ => serde_json::Map::new(),
+            };
+            for (key, value) in patch_map {
+                if value.is_null() {
+                    // Null in a patch means remove, not set to null.
+                    merged.remove(key);
+                } else {
+                    let existing = merged.get(key).cloned().unwrap_or(Json::Null);
+                    merged.insert(key.clone(), merge_patch(&existing, value));
+                }
+            }
+            Json::Object(merged)
+        }
+        other => other.clone(),
+    }
+}

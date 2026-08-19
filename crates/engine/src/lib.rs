@@ -13,6 +13,7 @@ pub mod foreign_keys;
 pub mod functions;
 pub mod image;
 pub mod info_schema;
+pub mod json;
 pub mod params;
 pub mod relation;
 pub mod result;

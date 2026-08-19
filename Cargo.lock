@@ -177,6 +177,7 @@ dependencies = [
  "md-5",
  "mysql-ultralight-protocol",
  "regex",
+ "serde_json",
  "sqlparser",
 ]
 

@@ -4546,3 +4546,584 @@ fn describing_leaves_the_session_alone() {
         .unwrap();
     assert_eq!(session.affected_rows, affected_before);
 }
+
+// --- JSON -------------------------------------------------------------------
+
+#[test]
+fn json_paths_extract_and_unquote() {
+    let (engine, mut session) = engine();
+    let doc = r#"{"id": 7, "label": "seven", "tags": ["a", "b"], "nested": {"k": 1}}"#;
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            &format!(
+                "SELECT JSON_EXTRACT('{doc}', '$.id'), \
+                        JSON_EXTRACT('{doc}', '$.label'), \
+                        JSON_UNQUOTE(JSON_EXTRACT('{doc}', '$.label')), \
+                        JSON_EXTRACT('{doc}', '$.tags[1]'), \
+                        JSON_EXTRACT('{doc}', '$.nested.k'), \
+                        JSON_EXTRACT('{doc}', '$.missing')"
+            )
+        ),
+        vec![vec!["7", "\"seven\"", "seven", "\"b\"", "1", "NULL"]]
+    );
+
+    // A wildcard selects many, so the result is an array even when it matches
+    // once — that is how a caller can tell the two apart.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            &format!("SELECT JSON_EXTRACT('{doc}', '$.tags[*]')")
+        ),
+        vec![vec!["[\"a\",\"b\"]"]]
+    );
+}
+
+#[test]
+fn the_arrow_operators_are_extract_and_unquote() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Doc (id INTEGER NOT NULL, body JSON NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        r#"INSERT INTO Doc VALUES (1, '{"name": "ada", "n": 3}')"#,
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT body -> '$.name', body ->> '$.name', body -> '$.n' FROM Doc"
+        ),
+        vec![vec!["\"ada\"", "ada", "3"]]
+    );
+}
+
+#[test]
+fn json_documents_are_built_and_merged() {
+    let (engine, mut session) = engine();
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_OBJECT('a', 1, 'b', 'two'), JSON_ARRAY(1, 'x', NULL)"
+        ),
+        vec![vec!["{\"a\":1,\"b\":\"two\"}", "[1,\"x\",null]"]]
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            r#"SELECT JSON_MERGE_PATCH('{"a":1,"b":2}', '{"b":3,"c":4}'),
+                      JSON_SET('{"a":1}', '$.a', 9, '$.b', 2),
+                      JSON_ARRAY_APPEND('{"xs":[1]}', '$.xs', 2)"#
+        ),
+        vec![vec![
+            "{\"a\":1,\"b\":3,\"c\":4}",
+            "{\"a\":9,\"b\":2}",
+            "{\"xs\":[1,2]}"
+        ]]
+    );
+
+    // Null in a patch removes the member rather than setting it to null.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            r#"SELECT JSON_MERGE_PATCH('{"a":1,"b":2}', '{"b":null}')"#
+        ),
+        vec![vec!["{\"a\":1}"]]
+    );
+}
+
+#[test]
+fn json_is_inspected_and_validated() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            r#"SELECT JSON_VALID('{"a":1}'), JSON_VALID('{oops'),
+                      JSON_TYPE('[]'), JSON_TYPE('"s"'), JSON_TYPE('1.5'),
+                      JSON_LENGTH('[1,2,3]'), JSON_KEYS('{"a":1,"b":2}'),
+                      JSON_CONTAINS('{"a":1,"b":2}', '{"a":1}')"#
+        ),
+        vec![vec![
+            "1",
+            "0",
+            "ARRAY",
+            "STRING",
+            "DOUBLE",
+            "3",
+            "[\"a\",\"b\"]",
+            "1"
+        ]]
+    );
+
+    // Text that is not JSON is an error, not a NULL: a column holding a
+    // truncated document is a bug, and NULL hides it as merely absent.
+    let err = engine
+        .execute(&mut session, "SELECT JSON_EXTRACT('{oops', '$.a')", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 3141);
+
+    // So is a path the engine cannot read.
+    let err = engine
+        .execute(&mut session, "SELECT JSON_EXTRACT('{}', 'a.b')", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 3143);
+}
+
+#[test]
+fn json_arrayagg_keeps_each_value_s_type() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_ARRAYAGG(count) FROM Widget"
+        ),
+        vec![vec!["[3,1,2]"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_ARRAYAGG(name) FROM Widget WHERE count > 1"
+        ),
+        vec![vec!["[\"alpha\",\"gamma\"]"]]
+    );
+}
+
+#[test]
+fn json_table_turns_a_document_into_rows() {
+    let (engine, mut session) = engine();
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            r#"SELECT jt.n, jt.id, jt.label
+               FROM JSON_TABLE(
+                   '[{"id": "a", "label": "first"}, {"id": "b"}]',
+                   '$[*]' COLUMNS(
+                       n FOR ORDINALITY,
+                       id VARCHAR(10) PATH '$.id',
+                       label VARCHAR(20) PATH '$.label'
+                   )
+               ) jt"#
+        ),
+        // A path that matches nothing is NULL, which is the only sensible
+        // reading of "this element has no such member".
+        vec![vec!["1", "a", "first"], vec!["2", "b", "NULL"]]
+    );
+}
+
+#[test]
+fn json_table_reads_the_document_from_the_row_it_is_joined_to() {
+    // JSON_TABLE is implicitly LATERAL: the document is a column of a table
+    // named before it, so it expands once per row rather than once per query.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Board (id INTEGER NOT NULL, config JSON NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        r#"INSERT INTO Board VALUES
+            (1, '[{"col": "one"}, {"col": "two"}]'),
+            (2, '[{"col": "three"}]')"#,
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT b.id, jt.col FROM Board b, \
+             JSON_TABLE(b.config, '$[*]' COLUMNS(col VARCHAR(10) PATH '$.col')) jt \
+             ORDER BY b.id, jt.col",
+        ),
+        vec![vec!["1", "one"], vec!["1", "two"], vec!["2", "three"]]
+    );
+
+    // And from the enclosing query when it is the only thing in a subquery's
+    // FROM, which is how the migrations rewrite a stored configuration.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, (SELECT COUNT(*) FROM \
+             JSON_TABLE(Board.config, '$[*]' COLUMNS(col VARCHAR(10) PATH '$.col')) jt) \
+             FROM Board ORDER BY id",
+        ),
+        vec![vec!["1", "2"], vec!["2", "1"]]
+    );
+}
+
+#[test]
+fn on_duplicate_key_update_updates_instead_of_failing() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Pair (
+            id INTEGER NOT NULL,
+            a INTEGER NOT NULL,
+            b INTEGER NOT NULL,
+            note VARCHAR(20) NULL,
+            PRIMARY KEY (id),
+            UNIQUE INDEX Pair_a_b_key (a, b)
+        )",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Pair VALUES (1, 1, 1, 'first')",
+    );
+
+    // A collision on the composite key updates the row that is already there.
+    // MySQL reports two affected rows for that, and one for an insert.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "INSERT INTO Pair VALUES (2, 1, 1, 'second') ON DUPLICATE KEY UPDATE note = 'updated'"
+        ),
+        2
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, note FROM Pair ORDER BY id"
+        ),
+        vec![vec!["1", "updated"]]
+    );
+
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "INSERT INTO Pair VALUES (3, 2, 2, 'new') ON DUPLICATE KEY UPDATE note = 'updated'"
+        ),
+        1
+    );
+
+    // The right-hand side sees the row as it stands, so it can build on it.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Pair VALUES (4, 2, 2, 'x') ON DUPLICATE KEY UPDATE a = a + 10",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a FROM Pair WHERE id = 3"),
+        vec![vec!["12"]]
+    );
+}
+
+#[test]
+fn a_case_insensitive_collate_is_the_comparison_the_engine_already_does() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM Widget WHERE name COLLATE utf8mb4_unicode_ci = 'ALPHA'"
+        ),
+        vec![vec!["a"]]
+    );
+
+    // A collation that would compare differently is refused rather than
+    // quietly ignored, which would answer the wrong question.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT id FROM Widget WHERE name COLLATE utf8mb4_bin = 'ALPHA'",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1235);
+}
+
+#[test]
+fn a_lateral_join_honours_its_on_clause() {
+    // Reading the operator only for its outer-ness turned every
+    // `JOIN JSON_TABLE(...) ON ...` into a cross join, silently.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Doc2 (id INTEGER NOT NULL, doc JSON NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        r#"INSERT INTO Doc2 VALUES (1, '[{"k":1},{"k":2},{"k":3}]')"#,
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT t.id, jt.k FROM Doc2 t \
+             JOIN JSON_TABLE(t.doc, '$[*]' COLUMNS(k INT PATH '$.k')) jt ON jt.k = 2"
+        ),
+        vec![vec!["1", "2"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT t.id FROM Doc2 t \
+             JOIN JSON_TABLE(t.doc, '$[*]' COLUMNS(k INT PATH '$.k')) jt ON 1 = 0"
+        ),
+        Vec::<Vec<String>>::new()
+    );
+
+    // A left join keeps the row and pads it, rather than keeping every
+    // unmatched expansion.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT t.id, jt.k FROM Doc2 t \
+             LEFT JOIN JSON_TABLE(t.doc, '$[*]' COLUMNS(k INT PATH '$.k')) jt ON jt.k = 99"
+        ),
+        vec![vec!["1", "NULL"]]
+    );
+
+    // A join type the ordinary path refuses must not be quietly downgraded to
+    // an inner join here.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT t.id FROM Doc2 t \
+             RIGHT JOIN JSON_TABLE(t.doc, '$[*]' COLUMNS(k INT PATH '$.k')) jt ON jt.k = 1",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1235);
+}
+
+#[test]
+fn json_extract_is_null_when_no_path_matches() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            r#"SELECT JSON_EXTRACT('{"a":1}', '$.x', '$.y'), JSON_EXTRACT('[]', '$[*]')"#
+        ),
+        vec![vec!["NULL", "NULL"]]
+    );
+}
+
+#[test]
+fn a_wildcard_wraps_a_document_that_is_not_an_array() {
+    // MySQL treats a scalar or object as a one-element array for both `[0]`
+    // and `[*]`. Without it a JSON_TABLE over an object yields no rows and the
+    // row disappears from the join.
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            r#"SELECT JSON_EXTRACT('{"a":1}', '$[*]'), JSON_EXTRACT('7', '$[*]')"#
+        ),
+        vec![vec!["[{\"a\":1}]", "[7]"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            r#"SELECT jt.a FROM JSON_TABLE('{"a":5}', '$[*]' COLUMNS(a INT PATH '$.a')) jt"#
+        ),
+        vec![vec!["5"]]
+    );
+}
+
+#[test]
+fn a_json_null_is_a_value_not_an_absence() {
+    // "The key holds null" and "there is no such key" are different answers,
+    // and collapsing them makes IS NULL true for both.
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            r#"SELECT JSON_EXTRACT('{"a":null}', '$.a') IS NULL,
+                      JSON_EXTRACT('{"a":null}', '$.b') IS NULL,
+                      JSON_UNQUOTE(JSON_EXTRACT('{"a":null}', '$.a')),
+                      JSON_TYPE(JSON_EXTRACT('{"a":null}', '$.a'))"#
+        ),
+        vec![vec!["0", "1", "null", "NULL"]]
+    );
+}
+
+#[test]
+fn a_json_path_may_be_spaced_the_way_mysql_allows() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            r#"SELECT JSON_EXTRACT('{"a":1}', '$. a'),
+                      JSON_EXTRACT('{"a":{"b":2}}', '$.a .b'),
+                      JSON_EXTRACT('{"a":1}', '$ .a')"#
+        ),
+        vec![vec!["1", "2", "1"]]
+    );
+}
+
+#[test]
+fn json_arrayagg_keeps_nulls_and_is_null_when_empty() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N2 (id INTEGER NOT NULL, v INTEGER NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO N2 VALUES (1,1),(2,NULL),(3,2)",
+    );
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT JSON_ARRAYAGG(v) FROM N2"),
+        vec![vec!["[1,null,2]"]]
+    );
+    // No rows is NULL, not an empty array.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_ARRAYAGG(v) FROM N2 WHERE v > 99"
+        ),
+        vec![vec!["NULL"]]
+    );
+    // MySQL has no DISTINCT here, so applying one would answer a question it
+    // never accepts.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT JSON_ARRAYAGG(DISTINCT v) FROM N2",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1235);
+}
+
+#[test]
+fn a_json_table_column_clause_that_changes_the_answer_is_refused() {
+    let (engine, mut session) = engine();
+    for sql in [
+        "SELECT jt.k FROM JSON_TABLE('[{}]', '$[*]' COLUMNS(k INT PATH '$.k' DEFAULT '9' ON EMPTY)) jt",
+        "SELECT jt.k FROM JSON_TABLE('[{}]', '$[*]' COLUMNS(k INT PATH '$.k' ERROR ON EMPTY)) jt",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1235, "for: {sql}");
+    }
+
+    // A column holds one value, so a path that can select several is refused
+    // rather than silently picking.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT jt.k FROM JSON_TABLE('[[1,2]]', '$[*]' COLUMNS(k INT PATH '$[*]')) jt",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 3153);
+}
+
+#[test]
+fn an_upsert_reports_no_insert_id_and_takes_the_values_it_would_have_written() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Up (
+            id INTEGER NOT NULL AUTO_INCREMENT,
+            k VARCHAR(10) NOT NULL,
+            n INTEGER NOT NULL,
+            PRIMARY KEY (id),
+            UNIQUE INDEX Up_k_key (k)
+        )",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Up (k, n) VALUES ('a', 1)",
+    );
+    let first_id = rows(&engine, &mut session, "SELECT LAST_INSERT_ID()");
+
+    // `VALUES(n)` is the ordinary way to spell "take the new value".
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "INSERT INTO Up (k, n) VALUES ('a', 5) ON DUPLICATE KEY UPDATE n = VALUES(n)"
+        ),
+        2
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT n FROM Up WHERE k = 'a'"),
+        vec![vec!["5"]]
+    );
+
+    // The counter is consumed, as MySQL does — but no id is reported for a row
+    // that was never inserted, or a client reads back a phantom.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        first_id
+    );
+}
+
+#[test]
+fn an_upsert_updates_the_row_the_primary_key_names() {
+    // Colliding on both the primary key and a secondary one, MySQL updates the
+    // row the primary key found.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Two (
+            id INTEGER NOT NULL,
+            k VARCHAR(10) NOT NULL,
+            n INTEGER NOT NULL,
+            PRIMARY KEY (id),
+            UNIQUE INDEX Two_k_key (k)
+        )",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Two VALUES (1,'a',3), (4,'b',1)",
+    );
+
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Two VALUES (1,'b',1) ON DUPLICATE KEY UPDATE n = 999",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id, n FROM Two ORDER BY id"),
+        vec![vec!["1", "999"], vec!["4", "1"]]
+    );
+}

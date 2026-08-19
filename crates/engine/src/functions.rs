@@ -5,7 +5,8 @@
 
 use sqlparser::ast::DataType;
 
-use crate::error::{unsupported, EngineResult};
+use crate::error::{unsupported, EngineError, EngineResult};
+use crate::json;
 use crate::session::Session;
 use crate::value::Value;
 
@@ -15,6 +16,195 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
     let text = |i: usize| arg(i).as_text();
 
     Ok(match name {
+        // -- JSON -------------------------------------------------------------
+        //
+        // JSON is held as text and parsed here, where the structure is actually
+        // needed. Text that is not JSON is an error rather than a NULL: a
+        // column holding a truncated document is a bug, and answering NULL
+        // hides it behind a result that looks merely empty.
+        "json_extract" => {
+            if arg(0).is_null() {
+                return Ok(Value::Null);
+            }
+            let document = json::parse(&arg(0))?;
+
+            // Several paths, or one path with a wildcard, produce an array;
+            // a single path matching once produces the value itself.
+            let mut found = Vec::new();
+            let mut multiple = args.len() > 2;
+            for path in &args[1..] {
+                let parsed = json::parse_path(&path.as_text())?;
+                multiple = multiple || parsed.is_multiple();
+                found.extend(json::select(&document, &parsed).into_iter().cloned());
+            }
+
+            // "No path located a value" is NULL whether or not the paths
+            // could have matched several — an empty array would make
+            // `IS NULL` false where MySQL makes it true.
+            match (multiple, found.len()) {
+                (_, 0) => Value::Null,
+                (false, _) => json::render(&found[0]),
+                _ => json::render(&serde_json::Value::Array(found)),
+            }
+        }
+        "json_unquote" => {
+            if arg(0).is_null() {
+                return Ok(Value::Null);
+            }
+            // Already-unquoted text is returned as it is, which is what makes
+            // JSON_UNQUOTE(JSON_EXTRACT(...)) work whatever the extract found.
+            match serde_json::from_str::<serde_json::Value>(&text(0)) {
+                Ok(parsed) => json::unquote(&parsed),
+                Err(_) => arg(0),
+            }
+        }
+        "json_valid" => match arg(0) {
+            Value::Null => Value::Null,
+            other => Value::Int(i64::from(
+                serde_json::from_str::<serde_json::Value>(&other.as_text()).is_ok(),
+            )),
+        },
+        "json_quote" => {
+            if arg(0).is_null() {
+                return Ok(Value::Null);
+            }
+            Value::text(serde_json::Value::String(text(0)).to_string())
+        }
+        "json_array" => {
+            let items = args.iter().map(json::from_value).collect();
+            json::render(&serde_json::Value::Array(items))
+        }
+        "json_object" => {
+            if args.len() % 2 != 0 {
+                return Err(EngineError::new(
+                    1582,
+                    "42000",
+                    "Incorrect parameter count in the call to native function 'json_object'",
+                ));
+            }
+            let mut object = serde_json::Map::new();
+            for pair in args.chunks(2) {
+                // A NULL key has nothing sensible to become, and MySQL says so.
+                if pair[0].is_null() {
+                    return Err(EngineError::new(
+                        3158,
+                        "22032",
+                        "JSON documents may not contain NULL member names",
+                    ));
+                }
+                object.insert(pair[0].as_text(), json::from_value(&pair[1]));
+            }
+            json::render(&serde_json::Value::Object(object))
+        }
+        "json_length" => {
+            if arg(0).is_null() {
+                return Ok(Value::Null);
+            }
+            let document = json::parse(&arg(0))?;
+            let at = match args.get(1) {
+                Some(path) => {
+                    let parsed = json::parse_path(&path.as_text())?;
+                    match json::select(&document, &parsed).first() {
+                        Some(found) => (*found).clone(),
+                        None => return Ok(Value::Null),
+                    }
+                }
+                None => document,
+            };
+            Value::Int(match at {
+                serde_json::Value::Array(items) => items.len() as i64,
+                serde_json::Value::Object(map) => map.len() as i64,
+                // A scalar is one value, not zero.
+                _ => 1,
+            })
+        }
+        "json_type" => {
+            if arg(0).is_null() {
+                return Ok(Value::Null);
+            }
+            Value::text(match json::parse(&arg(0))? {
+                serde_json::Value::Null => "NULL",
+                serde_json::Value::Bool(_) => "BOOLEAN",
+                serde_json::Value::Number(n) if n.is_f64() => "DOUBLE",
+                serde_json::Value::Number(_) => "INTEGER",
+                serde_json::Value::String(_) => "STRING",
+                serde_json::Value::Array(_) => "ARRAY",
+                serde_json::Value::Object(_) => "OBJECT",
+            })
+        }
+        "json_keys" => {
+            if arg(0).is_null() {
+                return Ok(Value::Null);
+            }
+            match json::parse(&arg(0))? {
+                serde_json::Value::Object(map) => {
+                    let keys = map
+                        .keys()
+                        .map(|k| serde_json::Value::String(k.clone()))
+                        .collect();
+                    json::render(&serde_json::Value::Array(keys))
+                }
+                _ => Value::Null,
+            }
+        }
+        "json_contains" => {
+            if arg(0).is_null() || arg(1).is_null() {
+                return Ok(Value::Null);
+            }
+            let document = json::parse(&arg(0))?;
+            let candidate = json::parse(&arg(1))?;
+            let target = match args.get(2) {
+                Some(path) => {
+                    let parsed = json::parse_path(&path.as_text())?;
+                    match json::select(&document, &parsed).first() {
+                        Some(found) => (*found).clone(),
+                        None => return Ok(Value::Null),
+                    }
+                }
+                None => document,
+            };
+            Value::Int(i64::from(json_contains(&target, &candidate)))
+        }
+        "json_set" | "json_array_append" => {
+            if arg(0).is_null() {
+                return Ok(Value::Null);
+            }
+            if args.len() < 3 || (args.len() - 1) % 2 != 0 {
+                return Err(EngineError::new(
+                    1582,
+                    "42000",
+                    format!("Incorrect parameter count in the call to native function '{name}'"),
+                ));
+            }
+            let mut document = json::parse(&arg(0))?;
+            for pair in args[1..].chunks(2) {
+                let path = json::parse_path(&pair[0].as_text())?;
+                let new = json::from_value(&pair[1]);
+                if name == "json_set" {
+                    json::set(&mut document, &path, new)?;
+                } else {
+                    json::append(&mut document, &path, new)?;
+                }
+            }
+            json::render(&document)
+        }
+        "json_merge_patch" => {
+            let mut merged = serde_json::Value::Null;
+            for (i, argument) in args.iter().enumerate() {
+                // A NULL argument makes the whole result NULL, as MySQL does.
+                if argument.is_null() {
+                    return Ok(Value::Null);
+                }
+                let parsed = json::parse(argument)?;
+                merged = if i == 0 {
+                    parsed
+                } else {
+                    json::merge_patch(&merged, &parsed)
+                };
+            }
+            json::render(&merged)
+        }
+
         // -- regular expressions ---------------------------------------------
         //
         // MySQL 8 uses ICU regex syntax and the `regex` crate uses Rust's;
@@ -45,7 +235,7 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
             // MySQL's string functions is.
             let position = at(pos_at).and_then(|v| v.as_int()).unwrap_or(1);
             if position < 1 {
-                return Err(crate::EngineError::new(
+                return Err(EngineError::new(
                     1582,
                     "42000",
                     format!("Incorrect parameters in the call to native function '{name}'"),
@@ -481,6 +671,24 @@ fn like_at(t: &[char], mut ti: usize, p: &[char], mut pi: usize, escape: Option<
     ti == t.len()
 }
 
+/// Whether `candidate` is contained in `target`, by MySQL's rules.
+///
+/// An object contains another when it has every one of its members; an array
+/// contains a value when some element does. Anything else is equality.
+fn json_contains(target: &serde_json::Value, candidate: &serde_json::Value) -> bool {
+    use serde_json::Value as Json;
+    match (target, candidate) {
+        (Json::Object(a), Json::Object(b)) => b
+            .iter()
+            .all(|(k, v)| a.get(k).is_some_and(|found| json_contains(found, v))),
+        (Json::Array(a), Json::Array(b)) => b
+            .iter()
+            .all(|v| a.iter().any(|found| json_contains(found, v))),
+        (Json::Array(a), other) => a.iter().any(|found| json_contains(found, other)),
+        (a, b) => a == b,
+    }
+}
+
 /// The integer MySQL reads out of a value being cast.
 ///
 /// MySQL takes the leading numeric part and warns about the rest, so
@@ -528,7 +736,7 @@ fn compile_regex(pattern: &str, match_type: &str) -> EngineResult<regex::Regex> 
         .case_insensitive(case_insensitive)
         .build()
         .map_err(|e| {
-            crate::EngineError::new(
+            EngineError::new(
                 3692,
                 "HY000",
                 format!("Illegal argument to a regular expression: {e}"),

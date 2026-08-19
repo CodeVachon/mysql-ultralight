@@ -128,6 +128,55 @@ impl Table {
     ///
     /// `skip` excludes a row from the check, so an UPDATE does not collide
     /// with the row it is updating.
+    /// The row a candidate would collide with, if any.
+    ///
+    /// `ON DUPLICATE KEY UPDATE` needs the row itself rather than the error,
+    /// because it updates that row instead of failing. The primary key is
+    /// checked first, as MySQL does: a candidate colliding on both the primary
+    /// and a secondary key updates the row the primary key names.
+    pub fn conflicting_row(&self, candidate: &[Value]) -> Option<usize> {
+        let by_priority = self
+            .indexes
+            .iter()
+            .filter(|i| i.primary)
+            .chain(self.indexes.iter().filter(|i| i.unique && !i.primary));
+
+        for index in by_priority {
+            let positions: Vec<usize> = index
+                .columns
+                .iter()
+                .filter_map(|c| self.column_index(c))
+                .collect();
+            if positions.len() != index.columns.len() {
+                continue;
+            }
+            // A NULL never conflicts with anything, including another NULL.
+            if positions
+                .iter()
+                .any(|p| candidate.get(*p).is_some_and(Value::is_null))
+            {
+                continue;
+            }
+
+            let found = self.rows.iter().position(|row| {
+                positions.iter().all(|p| {
+                    matches!(
+                        (row.get(*p), candidate.get(*p)),
+                        (Some(a), Some(b)) if a.compare(b) == Some(std::cmp::Ordering::Equal)
+                    )
+                })
+            });
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+
+    /// Refuses a candidate row that would duplicate a unique or primary key.
+    ///
+    /// `skip` excludes one row, which is what an UPDATE needs: a row does not
+    /// collide with itself.
     pub fn check_unique(&self, candidate: &[Value], skip: Option<usize>) -> EngineResult<()> {
         for index in self.indexes.iter().filter(|i| i.unique || i.primary) {
             let positions: Vec<usize> = index
