@@ -178,13 +178,16 @@ pub fn parse(value: &Value) -> EngineResult<Json> {
     })
 }
 
-/// Renders JSON back into the engine's text representation.
+/// Renders JSON back into the engine's representation, tagged as a document.
+///
+/// Tagged, so that feeding one JSON function's result to another embeds a
+/// document rather than a string of its source text.
 ///
 /// A JSON `null` renders as the text `null`, not as SQL NULL: "the key is
 /// present and holds null" and "there is no such key" are different answers,
 /// and collapsing them makes `IS NULL` true for both.
 pub fn render(json: &Json) -> Value {
-    Value::text(json.to_string())
+    Value::Json(json.to_string())
 }
 
 /// A JSON value as SQL sees it once the quotes come off.
@@ -204,14 +207,9 @@ pub fn unquote(json: &Json) -> Value {
 ///
 /// Text that happens to parse as JSON is *not* treated as JSON: MySQL keeps a
 /// string a string unless it is cast, and guessing would turn a column holding
-/// `"123"` into a number.
-///
-/// The cost of that is real and worth naming: the engine has no JSON-typed
-/// value, so the result of one JSON function fed to another arrives here as
-/// text and is embedded as a string. `JSON_OBJECT('a', JSON_ARRAY(1, 2))`
-/// yields `{"a": "[1,2]"}` where MySQL yields `{"a": [1, 2]}`. Nothing
-/// distinguishes the two cases at this point, so it cannot be detected and
-/// refused either; a JSON-tagged value is what would fix it.
+/// `"123"` into a number. A JSON-tagged value is a document and is embedded as
+/// one, which is the whole reason the tag exists — `JSON_OBJECT('a',
+/// JSON_ARRAY(1, 2))` gives `{"a": [1, 2]}` rather than `{"a": "[1,2]"}`.
 pub fn from_value(value: &Value) -> Json {
     match value {
         Value::Null => Json::Null,
@@ -219,6 +217,12 @@ pub fn from_value(value: &Value) -> Json {
         Value::Float(f) => serde_json::Number::from_f64(*f).map_or(Json::Null, Json::Number),
         Value::Text(s) => Json::String(s.clone()),
         Value::Bytes(b) => Json::String(String::from_utf8_lossy(b).into_owned()),
+        // Every route to a tagged value validates it first — a constructor
+        // serialised it from a `Json`, a column coerced it, an image checked
+        // it on load — so this parses what one of those wrote. The fallback is
+        // unreachable rather than lenient; a JSON null beats re-encoding the
+        // source text as a string, which is the double-encoding this removes.
+        Value::Json(s) => serde_json::from_str(s).unwrap_or(Json::Null),
     }
 }
 

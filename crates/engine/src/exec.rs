@@ -4641,7 +4641,10 @@ fn default_row(table: &Table, ctx: &Context<'_>) -> EngineResult<Vec<Value>> {
                     .try_with_sql(e)
                     .and_then(|mut p| p.parse_expr())
                     .map_err(|err| EngineError::parse(format!("{err}")))?;
-                expr::eval(&parsed, ctx)?
+                // Coerced like any other value written to the column: an
+                // expression default that produces text for a JSON column has
+                // to arrive as a document, not as a string of one.
+                column.ty.coerce(expr::eval(&parsed, ctx)?, &column.name)?
             }
             (None, None) => Value::Null,
         };
@@ -4847,6 +4850,12 @@ fn literal_expr(value: &Value) -> Expr {
         Value::Bytes(v) => wrap(AstValue::SingleQuotedString(
             String::from_utf8_lossy(v).into_owned(),
         )),
+        // As a string literal, because the AST has no JSON literal — so this
+        // round trip loses the tag, and a document that goes back through it
+        // comes out as text. Nothing reaches here with a document today; if
+        // something does, it needs a `CAST(... AS JSON)` around it rather than
+        // a comment promising otherwise.
+        Value::Json(v) => wrap(AstValue::SingleQuotedString(v.clone())),
     }
 }
 
@@ -5383,6 +5392,10 @@ fn wire_type(value: &Value) -> ColumnType {
         Value::Int(_) => ColumnType::LongLong,
         Value::Float(_) => ColumnType::Double,
         Value::Bytes(_) => ColumnType::Blob,
+        // A document is declared as a string, like every other computed
+        // expression here: a JSON column keeps its declared JSON type, but
+        // singling out a *computed* document would make it the one expression
+        // whose type is known when dates and decimals are not.
         _ => ColumnType::VarString,
     }
 }

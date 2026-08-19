@@ -167,6 +167,11 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
             if arg(0).is_null() {
                 return Ok(Value::Null);
             }
+            // A string, not a document: JSON_QUOTE exists to produce the
+            // *text* of a JSON string literal, so `JSON_OBJECT('q',
+            // JSON_QUOTE('hi'))` is `{"q": "\"hi\""}` in MySQL. Tagging it
+            // would quote it once and embed it unquoted, which is the one
+            // context the function has.
             Value::text(serde_json::Value::String(text(0)).to_string())
         }
         "json_array" => {
@@ -738,9 +743,12 @@ pub fn cast(value: Value, ty: &DataType) -> EngineResult<Value> {
             Value::Text(value.as_text())
         }
         D::Date => Value::Text(value.as_text().chars().take(10).collect()),
-        D::Datetime(_) | D::Timestamp(_, _) | D::Time(_, _) | D::JSON => {
-            Value::Text(value.as_text())
-        }
+        D::Datetime(_) | D::Timestamp(_, _) | D::Time(_, _) => Value::Text(value.as_text()),
+        // The cast is how a string becomes a document, so it parses rather
+        // than relabelling: `JSON_OBJECT('c', CAST('[1,2]' AS JSON))` has to
+        // give `{"c": [1, 2]}`, and text that is not JSON is an error here
+        // exactly as it is on the way into a JSON column.
+        D::JSON => json::render(&json::parse(&value)?),
         D::Binary(_) | D::Varbinary(_) | D::Blob(_) => Value::Bytes(value.as_text().into_bytes()),
         other => return Err(unsupported(format!("CAST to `{other}`"))),
     })

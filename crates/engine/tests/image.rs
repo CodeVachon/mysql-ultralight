@@ -617,3 +617,82 @@ fn describing_refuses_consequences_hidden_inside_a_view() {
     assert!(written.exists());
     std::fs::remove_file(&written).ok();
 }
+
+#[test]
+fn a_document_survives_as_a_document() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE D (id INTEGER NOT NULL, doc JSON NULL, txt VARCHAR(20) NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        r#"INSERT INTO D VALUES (1, '{"a":[1,2]}', '[9,9]')"#,
+    );
+
+    let encoded = image::encode(&engine.catalog_snapshot().unwrap());
+    let decoded = image::decode(&encoded).unwrap();
+    let table = decoded.database("testdb").unwrap().table("D").unwrap();
+
+    // The tag is the difference between a document and a string that looks
+    // like one, so an image that dropped it would reload a catalog whose JSON
+    // columns nest as strings — a wrong answer a reload away from its cause.
+    assert!(
+        matches!(&table.rows[0][1], Value::Json(s) if s == r#"{"a":[1,2]}"#),
+        "{:?}",
+        table.rows[0][1]
+    );
+    assert!(
+        matches!(&table.rows[0][2], Value::Text(s) if s == "[9,9]"),
+        "{:?}",
+        table.rows[0][2]
+    );
+
+    // And it still nests correctly after the round trip.
+    let reloaded = Engine::from_catalog(decoded, ServerConfig::default()).unwrap();
+    let mut session = Session::new(ServerConfig::default(), 1);
+    session.current_database = Some("testdb".to_owned());
+    assert_eq!(
+        rows(
+            &reloaded,
+            &mut session,
+            "SELECT JSON_OBJECT('w', doc), JSON_OBJECT('w', txt) FROM D"
+        ),
+        vec![vec![r#"{"w":{"a":[1,2]}}"#, r#"{"w":"[9,9]"}"#]]
+    );
+}
+
+#[test]
+fn an_image_whose_document_is_not_a_document_is_refused() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE D (id INTEGER NOT NULL, doc JSON NULL, PRIMARY KEY (id))",
+    );
+    run(&engine, &mut session, "INSERT INTO D VALUES (1, '[111]')");
+
+    let mut encoded = image::encode(&engine.catalog_snapshot().unwrap());
+
+    // Corrupted in place, so every later offset still lines up and the only
+    // thing wrong with the file is the document itself.
+    let at = encoded
+        .windows(5)
+        .position(|w| w == b"[111]")
+        .expect("the document is in the image");
+    encoded[at..at + 5].copy_from_slice(b"[111 ");
+
+    let err = image::decode(&encoded).unwrap_err();
+    assert_eq!(err.code, 1105, "{err}");
+    assert!(
+        err.message.contains("tagged JSON"),
+        "the error should name what is wrong: {err}"
+    );
+
+    // A value that is tagged JSON is therefore always a document, which is
+    // what lets every reader of one parse without a fallback.
+    let good = image::encode(&engine.catalog_snapshot().unwrap());
+    assert!(image::decode(&good).is_ok());
+}

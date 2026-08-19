@@ -25,7 +25,7 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// A mismatch is refused rather than guessed at: reading a v1 image as v2 would
 /// not fail cleanly, it would silently produce a catalog with the wrong shape,
 /// and every test running against it would be wrong in a way nothing reports.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Writes the whole catalog.
 pub fn encode(catalog: &Catalog) -> Vec<u8> {
@@ -434,6 +434,13 @@ fn write_value(w: &mut Writer, value: &Value) {
             w.u32(b.len() as u32);
             w.bytes(b);
         }
+        // Appended, never inserted: tag 5 is new and 0 to 4 mean what they
+        // always did. A reader of this build still reads every tag an older
+        // one wrote.
+        Value::Json(s) => {
+            w.u8(5);
+            w.str(s);
+        }
     }
 }
 
@@ -446,6 +453,20 @@ fn read_value(r: &mut Reader<'_>) -> EngineResult<Value> {
         4 => {
             let len = r.u32()?;
             Value::Bytes(r.bytes(len as usize)?.to_vec())
+        }
+        5 => {
+            // Checked on the way in, so a `Value::Json` always holds something
+            // that parses. A truncated or hand-edited image would otherwise
+            // load rows that evaluate to JSON null inside every constructor
+            // and comparison, which is a wrong answer where the rest of the
+            // engine raises 3140 or 3141.
+            let text = r.str()?;
+            if serde_json::from_str::<serde_json::Value>(&text).is_err() {
+                return Err(malformed(format!(
+                    "value is tagged JSON but is not: {text:?}"
+                )));
+            }
+            Value::Json(text)
         }
         other => return Err(malformed(format!("unknown value tag {other}"))),
     })

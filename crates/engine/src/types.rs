@@ -231,7 +231,9 @@ impl SqlType {
             TypeKind::Date => Value::text("1970-01-01"),
             TypeKind::DateTime => Value::text("1970-01-01 00:00:00"),
             TypeKind::Time => Value::text("00:00:00"),
-            TypeKind::Json => Value::text("null"),
+            // Tagged, so a column filled from its default holds a document
+            // like every other row does.
+            TypeKind::Json => Value::Json("null".to_owned()),
             // An ENUM's implicit default is its first member, not an empty
             // string, which would not be a legal value at all.
             TypeKind::Enum => match self.variants.first() {
@@ -281,6 +283,24 @@ impl SqlType {
                     ));
                 }
                 Value::Text(text)
+            }
+            // A JSON column holds a document, so reading one and passing it to
+            // a JSON function embeds it as a document. MySQL validates on the
+            // way in, and so does this: a column that accepted `{"a":1` would
+            // fail every later read of it instead, far from the cause.
+            TypeKind::Json => {
+                let text = value.as_text();
+                // Serde's own message, because "invalid" without a position is
+                // no help against a document of any size — and the sibling
+                // 3141 raised by `json::parse` already says where.
+                if let Err(e) = serde_json::from_str::<serde_json::Value>(&text) {
+                    return Err(EngineError::new(
+                        3140,
+                        "22032",
+                        format!("Invalid JSON text: \"{e}\" in column '{column}'"),
+                    ));
+                }
+                Value::Json(text)
             }
             _ => Value::Text(value.as_text()),
         })

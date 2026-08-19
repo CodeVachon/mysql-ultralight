@@ -125,8 +125,12 @@ fn build_column_with_checks(
                 column.nullable = false;
             }
             ColumnOption::Unique(_) => column.unique = true,
+            // Coerced here rather than where it is used, so it is stored once
+            // in the shape the column holds and checked once against it: a
+            // `JSON DEFAULT ('{')` is refused by the CREATE that declares it
+            // rather than by the first read of a row that took it.
             ColumnOption::Default(e) => match expr::literal_of(e) {
-                Some(v) => column.default = Some(v),
+                Some(v) => column.default = Some(column.ty.coerce(v, &column.name)?),
                 // Anything not a constant is stored as text and evaluated per
                 // row, so CURRENT_TIMESTAMP differs between inserts.
                 None => column.default_expr = Some(e.to_string()),

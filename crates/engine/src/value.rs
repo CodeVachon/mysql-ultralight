@@ -6,8 +6,8 @@ use mysql_ultralight_protocol::Value as WireValue;
 
 /// A value as the engine holds it.
 ///
-/// Narrower than the wire type on purpose: MySQL transmits decimals, dates and
-/// JSON as text, so storing them as text keeps one representation rather than
+/// Narrower than the wire type on purpose: MySQL transmits decimals and dates
+/// as text, so storing them as text keeps one representation rather than
 /// converting at both ends.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -16,6 +16,15 @@ pub enum Value {
     Float(f64),
     Text(String),
     Bytes(Vec<u8>),
+    /// A JSON document, held as its serialised text.
+    ///
+    /// Text as well, then — but distinguishable from it, which is the whole
+    /// point. Without the tag, the result of one JSON function reaching
+    /// another is an ordinary string, and `JSON_OBJECT('a', JSON_ARRAY(1, 2))`
+    /// embeds it as one: `{"a": "[1,2]"}` where MySQL gives `{"a": [1, 2]}`.
+    /// Nothing about the string itself says which was meant, so the tag is the
+    /// only thing that can tell them apart.
+    Json(String),
 }
 
 impl Value {
@@ -28,11 +37,15 @@ impl Value {
     }
 
     /// The value as an integer, where that is meaningful.
+    ///
+    /// A document reads like the text it is: a JSON column holding `3` is 3 in
+    /// arithmetic, as it was before documents were tagged, and refusing here
+    /// would turn `doc + 0` into NULL for a value MySQL happily adds.
     pub fn as_int(&self) -> Option<i64> {
         match self {
             Value::Int(v) => Some(*v),
             Value::Float(v) => Some(*v as i64),
-            Value::Text(v) => {
+            Value::Text(v) | Value::Json(v) => {
                 let t = v.trim();
                 t.parse::<i64>()
                     .ok()
@@ -46,7 +59,7 @@ impl Value {
         match self {
             Value::Int(v) => Some(*v as f64),
             Value::Float(v) => Some(*v),
-            Value::Text(v) => v.trim().parse().ok(),
+            Value::Text(v) | Value::Json(v) => v.trim().parse().ok(),
             _ => None,
         }
     }
@@ -59,6 +72,9 @@ impl Value {
             Value::Float(v) => format_float(*v),
             Value::Text(v) => v.clone(),
             Value::Bytes(v) => String::from_utf8_lossy(v).into_owned(),
+            // The document as it was serialised, which is what MySQL sends and
+            // what a client reads back.
+            Value::Json(v) => v.clone(),
         }
     }
 
@@ -75,6 +91,9 @@ impl Value {
             // comparison silently kept every row.
             Value::Text(v) => Some(numeric_prefix(v) != 0.0),
             Value::Bytes(v) => Some(numeric_prefix(&String::from_utf8_lossy(v)) != 0.0),
+            // Read like the text it used to be, so tagging a value changed
+            // nothing about how a WHERE clause treats it.
+            Value::Json(v) => Some(numeric_prefix(v) != 0.0),
         }
     }
 
@@ -126,6 +145,8 @@ impl Value {
             Value::Float(v) => WireValue::F64(*v),
             Value::Text(v) => WireValue::Str(v.clone()),
             Value::Bytes(v) => WireValue::Bytes(v.clone()),
+            // JSON crosses the wire as text, which is how MySQL transmits it.
+            Value::Json(v) => WireValue::Str(v.clone()),
         }
     }
 

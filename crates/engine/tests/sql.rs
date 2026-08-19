@@ -6245,3 +6245,245 @@ fn a_comma_list_is_a_multi_table_delete_too() {
         vec![vec!["2"]]
     );
 }
+
+#[test]
+fn a_nested_json_constructor_builds_a_document_not_a_string() {
+    let (engine, mut session) = engine();
+
+    // The whole reason a JSON value is tagged. Without it the inner call's
+    // result reaches the outer one as an ordinary string and is embedded as
+    // one: `{"a": "[1,2]"}`, which is valid JSON and the wrong answer.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_OBJECT('a', JSON_ARRAY(1, 2)),
+                    JSON_ARRAY(JSON_ARRAY(1), JSON_OBJECT('k', 1)),
+                    JSON_OBJECT('a', JSON_OBJECT('b', JSON_ARRAY(1)))"
+        ),
+        vec![vec![
+            r#"{"a":[1,2]}"#,
+            r#"[[1],{"k":1}]"#,
+            r#"{"a":{"b":[1]}}"#
+        ]]
+    );
+
+    // A string stays a string. Guessing by whether it parses would turn a
+    // column holding `[9,9]` into an array nobody asked for.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Doc (id INT, doc JSON, txt VARCHAR(50))",
+    );
+    run(
+        &engine,
+        &mut session,
+        r#"INSERT INTO Doc VALUES (1, '{"a":[1,2],"b":"s"}', '[9,9]')"#,
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_OBJECT('d', doc), JSON_OBJECT('t', txt) FROM Doc"
+        ),
+        vec![vec![r#"{"d":{"a":[1,2],"b":"s"}}"#, r#"{"t":"[9,9]"}"#]]
+    );
+
+    // Every other producer of a document nests too.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_OBJECT('e', JSON_EXTRACT(doc, '$.a')),
+                    JSON_OBJECT('c', CAST('[1,2]' AS JSON)),
+                    JSON_OBJECT('q', JSON_QUOTE('hi')),
+                    JSON_OBJECT('s', JSON_SET(doc, '$.c', 3)),
+                    JSON_OBJECT('m', JSON_MERGE_PATCH(doc, JSON_OBJECT('b', 2)))
+             FROM Doc"
+        ),
+        vec![vec![
+            r#"{"e":[1,2]}"#,
+            r#"{"c":[1,2]}"#,
+            // JSON_QUOTE produces the *text* of a JSON string, so nesting it
+            // quotes it again — which is what MySQL does, because that text is
+            // the only thing the function is for.
+            r#"{"q":"\"hi\""}"#,
+            r#"{"s":{"a":[1,2],"b":"s","c":3}}"#,
+            r#"{"m":{"a":[1,2],"b":2}}"#
+        ]]
+    );
+
+    // An aggregate that builds a document nests too, in a query of its own
+    // because mixing it with the columns above is an ONLY_FULL_GROUP_BY error.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_OBJECT('n', JSON_ARRAYAGG(id)) FROM Doc"
+        ),
+        vec![vec![r#"{"n":[1]}"#]]
+    );
+
+    // JSON_UNQUOTE and ->> return text by definition, so they nest as strings.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_OBJECT('u', JSON_UNQUOTE(JSON_EXTRACT(doc, '$.b'))),
+                    JSON_OBJECT('v', doc->>'$.b')
+             FROM Doc"
+        ),
+        vec![vec![r#"{"u":"s"}"#, r#"{"v":"s"}"#]]
+    );
+}
+
+#[test]
+fn a_json_column_refuses_text_that_is_not_a_document() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE Doc (id INT, doc JSON)");
+
+    // MySQL validates on the way in. Accepting `{"a":1` would make every later
+    // read of the column fail instead, a long way from the cause.
+    run(&engine, &mut session, r#"INSERT INTO Doc VALUES (0, '{}')"#);
+    for sql in [
+        r#"INSERT INTO Doc VALUES (1, '{"a":1')"#,
+        "INSERT INTO Doc VALUES (1, 'not json')",
+        r#"UPDATE Doc SET doc = '['"#,
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 3140, "{sql}");
+    }
+
+    // The shapes that are documents are all accepted, including the scalars.
+    for literal in [r#"{"a":1}"#, "[1,2]", "null", "true", "3", r#""s""#] {
+        run(
+            &engine,
+            &mut session,
+            &format!("INSERT INTO Doc VALUES (1, '{literal}')"),
+        );
+    }
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Doc"),
+        vec![vec!["7"]]
+    );
+
+    // NULL is not a document and is still allowed.
+    run(&engine, &mut session, "INSERT INTO Doc VALUES (2, NULL)");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT doc FROM Doc WHERE id = 2 AND doc IS NULL"
+        ),
+        vec![vec!["NULL"]]
+    );
+}
+
+#[test]
+fn a_document_read_back_is_still_a_document() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE Doc (id INT, doc JSON)");
+    run(
+        &engine,
+        &mut session,
+        r#"INSERT INTO Doc VALUES (1, '{"a":1}')"#,
+    );
+
+    // Round-tripping through a table keeps the tag, so what came out of one
+    // statement nests correctly in the next.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Doc SELECT 2, JSON_OBJECT('w', doc) FROM Doc WHERE id = 1",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_OBJECT('z', doc) FROM Doc WHERE id = 2"
+        ),
+        vec![vec![r#"{"z":{"w":{"a":1}}}"#]]
+    );
+
+    // And it is still text everywhere text is what was asked for: comparison,
+    // concatenation and the wire all see the serialised document.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CONCAT('<', doc, '>'), doc = '{\"a\":1}', LENGTH(doc)
+             FROM Doc WHERE id = 1"
+        ),
+        vec![vec![r#"<{"a":1}>"#, "1", "7"]]
+    );
+
+    // Including arithmetic. Tagging a value must not change what reading it as
+    // a number means, or a JSON column holding `3` stops being 3.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Num (id INT, doc JSON, txt VARCHAR(10))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Num VALUES (1, '3', '3')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT doc + 0, doc * 2, CAST(doc AS SIGNED), doc = txt FROM Num"
+        ),
+        vec![vec!["3", "6", "3", "1"]]
+    );
+
+    // A column filled from a default holds a document too, so a defaulted row
+    // nests the same way an inserted one does. Both routes to one: the
+    // declared expression, and the implicit value used to backfill an added
+    // NOT NULL column or to fill an omitted one under INSERT IGNORE.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Def (
+            id INT,
+            doc JSON NOT NULL DEFAULT (JSON_ARRAY()),
+            lit JSON NOT NULL DEFAULT ('[1]'),
+            -- An expression that yields text rather than a document, so the
+            -- coercion is the only thing that can tag it.
+            made JSON NOT NULL DEFAULT (CONCAT('[', '2', ']'))
+        )",
+    );
+    run(&engine, &mut session, "INSERT INTO Def (id) VALUES (1)");
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE Def ADD COLUMN more JSON NOT NULL",
+    );
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE Def ADD COLUMN added JSON DEFAULT ('[7]')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_OBJECT('d', doc, 'l', lit, 'x', made, 'm', more, 'a', added)
+             FROM Def"
+        ),
+        // Keys come out sorted, which is how the document is serialised.
+        vec![vec![r#"{"a":[7],"d":[],"l":[1],"m":null,"x":[2]}"#]]
+    );
+
+    // A default is checked by the statement that declares it, not by the first
+    // read of a row that took it — which is where the failure would otherwise
+    // surface, a long way from the CREATE that caused it.
+    for sql in [
+        "CREATE TABLE Bad (id INT, doc JSON DEFAULT ('{'))",
+        "ALTER TABLE Def ADD COLUMN worse JSON DEFAULT ('nope')",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 3140, "{sql}");
+    }
+}

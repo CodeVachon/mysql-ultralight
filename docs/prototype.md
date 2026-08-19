@@ -251,15 +251,24 @@ not accept, and returned `[]` rather than NULL for no rows.
 EMPTY`, and a wildcard in a column path — were parsed and dropped, and are now refused
 alongside the `EXISTS` and `NESTED PATH` that already were.
 
-### The one that is not fixed
+### The one that took a new value type
 
-**Nested JSON constructors double-encode.** `JSON_OBJECT('a', JSON_ARRAY(1, 2))` yields
-`{"a": "[1,2]"}` where MySQL yields `{"a": [1, 2]}`. JSON is held as text, and a JSON
-result is an ordinary string by the time it reaches the next function, so nothing
-distinguishes "a document" from "a string that looks like one" — which means it cannot be
-detected and refused either. Fixing it properly means a JSON-tagged value, which touches
-the wire encoding and the image format. Nothing in the 604 migrations nests a JSON
-constructor, so it is recorded rather than rushed.
+**Nested JSON constructors double-encoded.** `JSON_OBJECT('a', JSON_ARRAY(1, 2))` yielded
+`{"a": "[1,2]"}` where MySQL yields `{"a": [1, 2]}`. JSON was held as text, so a JSON
+result was an ordinary string by the time it reached the next function and was embedded as
+one. Nothing distinguished "a document" from "a string that looks like one", which meant it
+could not be detected and refused either — the one place the engine could be silently wrong
+rather than clearly unsupported.
+
+`Value::Json` is that distinction: still the serialised text, but tagged. Everything that
+builds a document returns one, a `JSON` column coerces to one, and `CAST(... AS JSON)`
+parses rather than relabels. A string stays a string — guessing by whether it parses would
+turn a column holding `[9,9]` into an array nobody asked for. The tag reaches the state
+image as value tag 5, appended rather than inserted, which is what took `FORMAT_VERSION`
+to 2.
+
+It also made a second thing possible: a `JSON` column now validates on the way in, as
+MySQL does, instead of accepting `{"a":1` and failing every later read of it.
 
 ## The example, and what it found
 

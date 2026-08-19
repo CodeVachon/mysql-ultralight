@@ -101,6 +101,9 @@ pub fn literal(value: &Value) -> String {
             }
         }
         Value::Text(v) => quote(v),
+        // Quoted like text, because that is the only literal syntax MySQL has
+        // for a document. A JSON column coerces it back on the way in.
+        Value::Json(v) => quote(v),
         // Hex literals avoid any question of encoding.
         Value::Bytes(v) => {
             let mut s = String::with_capacity(v.len() * 2 + 3);
