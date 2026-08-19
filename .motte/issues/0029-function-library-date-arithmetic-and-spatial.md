@@ -1,11 +1,11 @@
 ---
 id: 29
 title: "Function library: date arithmetic and spatial"
-state: Todo
+state: Done
 parent: 6
 labels: [executor, compat]
 created: 2026-08-18T20:59:12Z
-updated: 2026-08-19T19:19:29Z
+updated: 2026-08-19T19:20:30Z
 ---
 
 ## Description
