@@ -1,0 +1,147 @@
+name: Release
+
+# Driven by a tag, so publishing is something a person does deliberately rather
+# than something a merge does by accident.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish, e.g. 1.2.3'
+        required: true
+      dry-run:
+        description: 'Build and pack, but do not publish'
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ] && [ "${{ matrix.target }}" != "x86_64-unknown-linux-gnu" ]; then
+            cross build --release --locked --target ${{ matrix.target }} -p mysql-ultralight-cli
+          else
+            rustup target add ${{ matrix.target }}
+            cargo build --release --locked --target ${{ matrix.target }} -p mysql-ultralight-cli
+          fi
+
+      # A binary that cannot run is worse than a build that failed, and only the
+      # host-architecture targets can be checked here.
+      - name: Smoke test
+        if: matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          ./target/${{ matrix.target }}/release/mysql-ultralight --help > /dev/null
+          node --test packages/npm/test/start.test.js
+        env:
+          MYSQL_ULTRALIGHT_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/mysql-ultralight
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/mysql-ultralight
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Lets npm record where the package was built from.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: binaries
+
+      - name: Work out the version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "value=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stage the packages
+        working-directory: packages/npm
+        run: node scripts/prepare-release.js "${{ steps.version.outputs.value }}" --binaries ../../binaries
+
+      # The wrapper is exercised against a real published layout before anything
+      # is published, using the binary this run built.
+      - name: Test against the built binary
+        working-directory: packages/npm
+        run: node --test test/start.test.js
+        env:
+          MYSQL_ULTRALIGHT_BINARY: ${{ github.workspace }}/packages/npm/platform/linux-x64-gnu/mysql-ultralight
+
+      - name: Pack
+        working-directory: packages/npm
+        run: |
+          for platform in platform/*/; do
+            (cd "$platform" && npm pack --pack-destination "$GITHUB_WORKSPACE/packed")
+          done
+          npm pack --pack-destination "$GITHUB_WORKSPACE/packed"
+          ls -lh "$GITHUB_WORKSPACE/packed"
+
+      # The platform packages go first: the wrapper depends on them, and a
+      # wrapper on the registry whose binaries are not yet there is an install
+      # that fails for whoever gets in between.
+      - name: Publish
+        if: inputs.dry-run != true
+        working-directory: packages/npm
+        run: |
+          for platform in platform/*/; do
+            (cd "$platform" && npm publish --access public --provenance)
+          done
+          npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Attach the binaries to the release
+        if: startsWith(github.ref, 'refs/tags/') && inputs.dry-run != true
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packed/*.tgz
+          generate_release_notes: true

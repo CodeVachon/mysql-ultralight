@@ -26,6 +26,13 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
 
+      # The gate runs the npm package's tests and Fallow, so the version of
+      # node is part of what is being checked rather than whatever the runner
+      # image happens to ship.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - uses: Swatinem/rust-cache@v2
 
       # Installed via binstall so CI does not pay to compile them every run.

@@ -103,7 +103,9 @@ run "tests       " cargo test --workspace
 # spawn the release binary, so they need one built.
 if [ -d packages/npm ]; then
     run_if_available "npm build   " cargo cargo build --release --quiet
-    run_if_available "npm tests   " node node --test packages/npm/test/start.test.js
+    # Through a shell so the glob expands: this node treats a bare directory as
+    # a module path rather than a directory of tests.
+    run_if_available "npm tests   " node bash -c 'node --test packages/npm/test/*.test.js' 
 fi
 
 if [ "$FAST" = 0 ]; then

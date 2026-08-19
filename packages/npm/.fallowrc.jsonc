@@ -13,5 +13,9 @@
 
     // Each platform package is a manifest plus a binary dropped in by the
     // release workflow — there is no source in them to analyse.
-    "ignorePatterns": ["platform/**"]
+    "ignorePatterns": ["platform/**"],
+
+    // Run by the release workflow rather than imported, so nothing in the
+    // package graph reaches it.
+    "entry": ["src/index.js", "bin/mysql-ultralight.js", "scripts/prepare-release.js"]
 }
