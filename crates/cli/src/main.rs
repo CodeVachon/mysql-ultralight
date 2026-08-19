@@ -18,6 +18,7 @@ struct Options {
     version: String,
     password: Option<String>,
     trace: bool,
+    state: Option<String>,
 }
 
 impl Default for Options {
@@ -31,6 +32,7 @@ impl Default for Options {
             version: DEFAULT_VERSION.to_owned(),
             password: None,
             trace: false,
+            state: None,
         }
     }
 }
@@ -46,6 +48,7 @@ OPTIONS:
     --port <PORT>        TCP port to listen on; 0 picks a free one (default: 0)
     --socket <PATH>      Also listen on a unix socket at PATH
     --database <NAME>    Database to create at startup (default: test)
+    --state <PATH>       Load a baked state image instead of an empty catalog
     --password <PASS>    Require this password; omit to accept any credentials
     --server-version <V> Version string reported to clients (default: {DEFAULT_VERSION})
     --trace              Log every connection, command, and result to stderr
@@ -53,7 +56,20 @@ OPTIONS:
 
 On startup the server prints one line to stdout:
     ready port=<PORT> socket=<PATH|-> startup_ms=<MS>
-so a harness can parse the port and wait for readiness without polling."
+so a harness can parse the port and wait for readiness without polling.
+
+STATE IMAGES
+    Replaying a migration history costs seconds; loading its result costs
+    milliseconds. Bake once, then boot from the image:
+
+        mysql-ultralight --port 3306 &
+        npx prisma migrate deploy
+        mysql -h 127.0.0.1 -P 3306 -e \"SELECT ultralight_snapshot('schema.mus')\"
+
+        mysql-ultralight --state schema.mus     # every test process
+
+    `SELECT ultralight_restore('schema.mus')` does the same to a running server,
+    which resets it between test files without paying for a new process."
     );
     std::process::exit(2);
 }
@@ -69,6 +85,7 @@ fn parse_args() -> Options {
                 options.port = value().parse().unwrap_or_else(|_| usage());
             }
             "--socket" => options.socket = Some(value()),
+            "--state" => options.state = Some(value()),
             "--database" => options.database = Some(value()),
             "--password" => options.password = Some(value()),
             "--server-version" => options.version = value(),
@@ -149,6 +166,17 @@ async fn main() -> std::io::Result<()> {
         ..Default::default()
     };
     let engine = Engine::new(engine_config.clone());
+
+    // The image carries its own databases, so it is loaded before the
+    // bootstrap: a `--database` that the image already holds must not be
+    // recreated empty over the top of the baked one.
+    if let Some(path) = &options.state {
+        if let Err(e) = engine.load_image(std::path::Path::new(path)) {
+            eprintln!("could not load state image {path}: {e}");
+            std::process::exit(1);
+        }
+    }
+
     // A server with no database is unusable, and every client expects the one
     // named in its connection string to exist.
     if let Some(name) = &options.database {

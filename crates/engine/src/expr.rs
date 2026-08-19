@@ -56,6 +56,13 @@ pub trait Executor {
     /// Applies a named-lock operation on behalf of one connection.
     fn named_lock(&self, op: LockOp, name: &str, connection_id: u32) -> Value;
 
+    /// Writes the whole catalog to a file, or reads one back.
+    ///
+    /// Exposed as a function so any MySQL client can drive it: the bake step is
+    /// `prisma migrate deploy` followed by one `SELECT`, with no side channel
+    /// and no second protocol.
+    fn state_image(&self, save: bool, path: &str) -> EngineResult<Value>;
+
     /// The next value for `RAND()`, in [0, 1).
     ///
     /// Deterministic, like [`Executor::next_uuid`]: a test that shuffles or
@@ -166,6 +173,38 @@ impl<'a> Context<'a> {
             .ok_or_else(|| EngineError::unknown_column(name, "field list"))
     }
 }
+
+// Whether this thread is describing a statement rather than running it for
+// its result. Set for the duration of one probe, which runs to completion on
+// one thread because nothing in the engine awaits.
+thread_local! {
+    static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` as a probe, in which nothing with consequences may be called.
+///
+/// Describing a statement means running it, and a `SELECT` is not automatically
+/// free of consequences: a few functions write a file, replace the catalog,
+/// take a lock, or advance a counter whose whole point is to read the same on
+/// every run. Refusing them here rather than by inspecting the statement text
+/// catches the ones that hide — inside a view's definition, a CTE, a subquery.
+pub fn probing<T>(f: impl FnOnce() -> T) -> T {
+    PROBING.with(|p| p.set(true));
+    let out = f();
+    PROBING.with(|p| p.set(false));
+    out
+}
+
+/// The functions a probe must not call, because they outlive their result.
+const IMPURE: &[&str] = &[
+    "ultralight_snapshot",
+    "ultralight_restore",
+    "get_lock",
+    "release_lock",
+    "release_all_locks",
+    "uuid",
+    "rand",
+];
 
 /// Evaluates an expression to a single value.
 pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
@@ -493,6 +532,13 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
 
         Expr::Function(f) => {
             let name = f.name.to_string().to_ascii_lowercase();
+
+            if PROBING.with(std::cell::Cell::get) && IMPURE.contains(&name.as_str()) {
+                return Err(unsupported(format!(
+                    "{name}() in a statement being described rather than run"
+                )));
+            }
+
             let args = function_args(f, ctx)?;
 
             // Named locks need engine state rather than session state, so they
@@ -505,6 +551,30 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
                 "release_all_locks" => Some(LockOp::ReleaseAll),
                 _ => None,
             };
+            if let "ultralight_snapshot" | "ultralight_restore" = name.as_str() {
+                let Some(engine) = ctx.executor else {
+                    return Err(unsupported(format!("{name}() here")));
+                };
+                let Some(path) = args.first().filter(|v| !v.is_null()) else {
+                    return Err(unsupported(format!("{name}() without a path")));
+                };
+                // An image is the whole catalog, and a transaction is a
+                // promise about part of it. Snapshotting inside one would bake
+                // rows that a rollback then removes from the live catalog but
+                // not from the file; restoring inside one leaves the rollback
+                // replaying pre-transaction tables over a catalog that has
+                // been replaced wholesale, which lands somewhere that is
+                // neither the image nor where it started.
+                if ctx.session.in_transaction {
+                    return Err(EngineError::new(
+                        1105,
+                        "HY000",
+                        format!("{name}() cannot be called inside a transaction"),
+                    ));
+                }
+                return engine.state_image(name == "ultralight_snapshot", &path.as_text());
+            }
+
             if name == "rand" {
                 let Some(engine) = ctx.executor else {
                     return Err(unsupported("rand() here"));

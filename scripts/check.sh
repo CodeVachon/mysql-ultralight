@@ -99,12 +99,28 @@ run "format      " cargo fmt --all --check
 run "clippy      " cargo clippy --workspace --all-targets --all-features -- -D warnings
 run "tests       " cargo test --workspace
 
+# The npm package is real JavaScript, so it gets its own checks. Its tests
+# spawn the release binary, so they need one built.
+if [ -d packages/npm ]; then
+    run_if_available "npm build   " cargo cargo build --release --quiet
+    run_if_available "npm tests   " node node --test packages/npm/test/start.test.js
+fi
+
 if [ "$FAST" = 0 ]; then
-    # Unused dependencies. The closest analogue to what Fallow gave the JS
+    # Unused dependencies. The closest analogue to what Fallow gives the JS
     # side; the Rust compiler will not tell you about these.
     run_if_available "unused deps " cargo-machete cargo machete
     # RustSec advisories against the lockfile.
     run_if_available "advisories  " cargo-audit cargo audit
+
+    # Fallow analyses TypeScript and JavaScript only, so it runs against the
+    # npm package and nothing else. Pointed at the Rust crates it would
+    # discover no files and report a green score over nothing analysed, which
+    # in a gate is worse than an error.
+    if [ -d packages/npm ]; then
+        run_if_available "npm fallow  " npx \
+            bash -c 'cd packages/npm && npx --yes --quiet fallow@latest dead-code --fail-on-issues' 
+    fi
 fi
 
 echo

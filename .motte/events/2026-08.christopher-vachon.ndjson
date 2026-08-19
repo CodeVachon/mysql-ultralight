@@ -76,3 +76,4 @@
 {"at":"2026-08-18T20:59:12Z","id":29,"by":"Christopher Vachon","as":"user","type":"created","title":"Function library: dates, REGEXP, JSON and spatial","state":"Todo"}
 {"at":"2026-08-18T21:18:33Z","id":30,"by":"Christopher Vachon","as":"user","type":"created","title":"DML modifiers: ORDER BY, LIMIT and USING on UPDATE and DELETE","state":"Todo"}
 {"at":"2026-08-18T22:40:24Z","id":31,"by":"Christopher Vachon","as":"user","type":"created","title":"Run the real 604-migration history end to end","state":"Todo"}
+{"at":"2026-08-19T02:15:44Z","id":32,"by":"Christopher Vachon","as":"user","type":"created","title":"Prepare describes by executing, so an expensive query costs twice","state":"Todo"}

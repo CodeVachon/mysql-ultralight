@@ -1,0 +1,25 @@
+{
+    "name": "@codevachon/mysql-ultralight-darwin-arm64",
+    "version": "0.0.1",
+    "description": "mysql-ultralight binary for darwin-arm64",
+    "license": "MIT OR Apache-2.0",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/CodeVachon/mysql-ultralight.git",
+        "directory": "packages/npm/platform/darwin-arm64"
+    },
+    "os": [
+        "darwin"
+    ],
+    "cpu": [
+        "arm64"
+    ],
+    "files": [
+        "mysql-ultralight",
+        "README.md"
+    ],
+    "engines": {
+        "node": ">=18"
+    },
+    "rustTarget": "aarch64-apple-darwin"
+}

@@ -1,0 +1,17 @@
+{
+    "$schema": "https://docs.fallow.tools/schema/fallow-config.json",
+
+    // The platform packages are resolved at runtime by a name built from a
+    // template string, so no static analysis can see the reference. They are
+    // genuinely used; dropping one leaves that platform with no binary.
+    "ignoreDependencies": [
+        "@codevachon/mysql-ultralight-darwin-arm64",
+        "@codevachon/mysql-ultralight-linux-x64-gnu",
+        "@codevachon/mysql-ultralight-linux-x64-musl",
+        "@codevachon/mysql-ultralight-linux-arm64-gnu"
+    ],
+
+    // Each platform package is a manifest plus a binary dropped in by the
+    // release workflow — there is no source in them to analyse.
+    "ignorePatterns": ["platform/**"]
+}

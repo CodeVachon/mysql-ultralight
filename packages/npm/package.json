@@ -1,0 +1,43 @@
+{
+    "name": "@codevachon/mysql-ultralight",
+    "version": "0.0.1",
+    "description": "A fast-starting, MySQL 8 compatible in-memory database for tests",
+    "keywords": [
+        "mysql",
+        "testing",
+        "prisma",
+        "in-memory",
+        "database",
+        "jest",
+        "vitest"
+    ],
+    "license": "MIT OR Apache-2.0",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/CodeVachon/mysql-ultralight.git",
+        "directory": "packages/npm"
+    },
+    "main": "src/index.js",
+    "types": "index.d.ts",
+    "bin": {
+        "mysql-ultralight": "bin/mysql-ultralight.js"
+    },
+    "files": [
+        "src",
+        "bin",
+        "index.d.ts",
+        "README.md"
+    ],
+    "engines": {
+        "node": ">=18"
+    },
+    "scripts": {
+        "test": "node --test test/*.test.js"
+    },
+    "optionalDependencies": {
+        "@codevachon/mysql-ultralight-darwin-arm64": "0.0.1",
+        "@codevachon/mysql-ultralight-linux-x64-gnu": "0.0.1",
+        "@codevachon/mysql-ultralight-linux-x64-musl": "0.0.1",
+        "@codevachon/mysql-ultralight-linux-arm64-gnu": "0.0.1"
+    }
+}

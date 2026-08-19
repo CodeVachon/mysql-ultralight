@@ -57,11 +57,17 @@ impl Handler for TestHandler {
 
     fn prepare(&mut self, id: u32, sql: &str) -> Result<Prepared, ErrPacket> {
         let param_count = sql.matches('?').count() as u16;
+        // A real handler works the shape out before running the statement; the
+        // test one knows it, and declares it the same way.
+        let columns = match self.query(sql) {
+            Ok(Response::ResultSet(rs)) => rs.columns,
+            _ => Vec::new(),
+        };
         Ok(Prepared {
             id,
             sql: sql.to_owned(),
             param_count,
-            columns: Vec::new(),
+            columns,
         })
     }
 
@@ -242,6 +248,34 @@ impl Client {
 
         Ok(rows)
     }
+}
+
+/// Extracts the column name from a ColumnDefinition41 packet.
+///
+/// A client that reads a result by column name — the Prisma migration engine
+/// does — gets nothing useful if this is empty, and reports the column
+/// positionally instead. That failure is invisible until something looks a
+/// column up by name and silently finds none.
+fn parse_column_name(packet: &[u8]) -> String {
+    let mut r = BufReader::new(packet);
+    // catalog, schema, table, org_table, then the name.
+    for _ in 0..4 {
+        r.lenenc_bytes().unwrap();
+    }
+    String::from_utf8_lossy(r.lenenc_bytes().unwrap().unwrap()).into_owned()
+}
+
+/// Reads the column definitions of a result set, returning their names.
+async fn column_names(client: &mut Client) -> Vec<String> {
+    let first = client.recv().await.unwrap();
+    let mut r = BufReader::new(&first);
+    let count = r.lenenc_int().unwrap().unwrap() as usize;
+    let mut names = Vec::with_capacity(count);
+    for _ in 0..count {
+        let packet = client.recv().await.unwrap();
+        names.push(parse_column_name(&packet));
+    }
+    names
 }
 
 /// Extracts the type code from a ColumnDefinition41 packet.
@@ -651,4 +685,42 @@ async fn long_data_for_an_unknown_statement_is_discarded() {
     // COM_STMT_SEND_LONG_DATA draws no reply; the connection must stay usable.
     let rows = client.query("SELECT 1").await.unwrap();
     assert_eq!(rows, vec![vec![Some("1".to_owned())]]);
+}
+
+#[tokio::test]
+async fn a_text_result_carries_its_column_names() {
+    let addr = start_server(None).await;
+    let mut client = Client::connect(&addr, "", true).await.unwrap();
+
+    client.send(0x03, b"MULTI").await.unwrap();
+    assert_eq!(column_names(&mut client).await, vec!["a", "b"]);
+}
+
+#[tokio::test]
+async fn a_prepared_statement_declares_its_columns_before_execution() {
+    // A client caches the column metadata from the prepare response and reads
+    // executions against it. Declaring zero columns there leaves it with no
+    // names at all, so every lookup by name fails and the result reads as
+    // positional — which is how `_prisma_migrations` went missing from an
+    // introspection that had in fact returned it.
+    let addr = start_server(None).await;
+    let mut client = Client::connect(&addr, "", true).await.unwrap();
+
+    client.send(0x16, b"MULTI").await.unwrap();
+    let response = client.recv().await.unwrap();
+    assert_eq!(response[0], 0x00, "prepare should succeed");
+
+    let mut r = BufReader::new(&response);
+    r.u8().unwrap();
+    let _stmt_id = r.u32().unwrap();
+    let column_count = r.u16().unwrap();
+    let param_count = r.u16().unwrap();
+    assert_eq!(param_count, 0);
+    assert_eq!(column_count, 2, "prepare must declare the result columns");
+
+    let mut names = Vec::new();
+    for _ in 0..column_count {
+        names.push(parse_column_name(&client.recv().await.unwrap()));
+    }
+    assert_eq!(names, vec!["a", "b"]);
 }

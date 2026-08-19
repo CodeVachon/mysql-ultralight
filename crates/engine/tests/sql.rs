@@ -4471,3 +4471,78 @@ fn unnamed_foreign_keys_get_distinct_names() {
         vec![vec!["C2_ibfk_1"], vec!["C2_ibfk_2"], vec!["PRIMARY"]]
     );
 }
+
+#[test]
+fn a_statement_describes_its_columns_before_it_runs() {
+    // The prepare response carries this, and a client caches it: without it a
+    // result has no column names and every lookup by name quietly finds none.
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    let described = engine
+        .describe(&session, "SELECT id, name FROM Widget", 0)
+        .unwrap();
+    assert_eq!(
+        described.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+        vec!["id", "name"]
+    );
+
+    // An alias is the name the client sees, and a parameter does not change
+    // the shape — it is bound to NULL for the probe.
+    let described = engine
+        .describe(&session, "SELECT count AS n FROM Widget WHERE id = ?", 1)
+        .unwrap();
+    assert_eq!(
+        described.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+        vec!["n"]
+    );
+}
+
+#[test]
+fn describing_never_runs_a_write() {
+    // The probe executes the statement, so anything that could write has to be
+    // refused: describing it would apply it, and then executing would apply it
+    // twice.
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    for sql in [
+        "UPDATE Widget SET count = 99",
+        "DELETE FROM Widget",
+        "INSERT INTO Widget (id, name) VALUES ('z', 'zed')",
+        "WITH c AS (SELECT id FROM Widget) UPDATE Widget w JOIN c ON c.id = w.id SET w.count = 42",
+        "DROP TABLE Widget",
+    ] {
+        assert!(
+            engine.describe(&session, sql, 0).is_none(),
+            "described a write: {sql}"
+        );
+    }
+
+    // Nothing ran.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT count FROM Widget ORDER BY id"
+        ),
+        vec![vec!["3"], vec!["1"], vec!["2"]]
+    );
+}
+
+#[test]
+fn describing_leaves_the_session_alone() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Widget (id, name) VALUES ('d', 'delta')",
+    );
+    let affected_before = session.affected_rows;
+
+    engine
+        .describe(&session, "SELECT id FROM Widget", 0)
+        .unwrap();
+    assert_eq!(session.affected_rows, affected_before);
+}

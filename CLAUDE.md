@@ -29,22 +29,25 @@ call it, so it must never diverge from what they need:
 | Tests | `cargo test --workspace` |
 | Unused dependencies | `cargo machete` |
 | Security advisories | `cargo audit` |
+| npm package tests | `node --test packages/npm/test/*.test.js` |
+| npm dead code | `fallow dead-code` in `packages/npm` |
 
 Flags: `--fast` skips the supply-chain checks, `--fix` formats and applies clippy
 suggestions first, `--require-tools` turns a missing tool into a failure rather than a
 skip. CI sets that automatically via the `CI` environment variable, so a tool that fails
 to install fails the build instead of quietly reducing coverage.
 
-### Fallow does not apply here
+### Fallow applies to `packages/npm` only
 
 The user's other projects gate on [Fallow](https://docs.fallow.tools). **Fallow is
-TypeScript/JavaScript only.** Run against this Rust repo it discovers zero files and
+TypeScript/JavaScript only.** Run against the Rust crates it discovers zero files and
 reports a green "Health score: 100 A" over nothing analyzed — a false pass, which is
-worse than an error in a gate. `cargo machete` and `cargo audit` replace it.
+worse than an error in a gate. `cargo machete` and `cargo audit` cover the Rust side.
 
-If a JS/TS surface ever lands here — the npm distribution wrapper in Phase 7 will be real
-JavaScript — Fallow becomes appropriate **for that subtree** and should be added to
-`scripts/check.sh` then.
+The npm package is real JavaScript, so `scripts/check.sh` runs Fallow against
+`packages/npm` and nothing else. Its config lives in `packages/npm/.fallowrc.jsonc`; the
+platform packages are listed in `ignoreDependencies` because they are resolved at runtime
+by a name built from a template string, which no static analysis can see.
 
 ## Hooks
 
@@ -61,7 +64,10 @@ git config core.hooksPath .githooks
 |---|---|
 | `crates/protocol` | Wire codec: framing, capabilities, auth, handshake, columns, values |
 | `crates/server` | Connection state machine, command dispatch, tracing |
+| `crates/engine` | Catalog, executor, SQL rewriting, and the state image |
 | `crates/cli` | The `mysql-ultralight` binary |
+| `crates/conformance` | Extracts the SQL surface of a target codebase |
+| `packages/npm` | `@codevachon/mysql-ultralight`: the JS API and the platform packages |
 
 ## Conventions
 
@@ -73,6 +79,10 @@ git config core.hooksPath .githooks
   only through end-to-end paths.
 - **Unsupported means a clear error**, never a wrong answer. `ErrPacket::unsupported`
   exists so gaps surface as actionable messages.
+- **The state image format is append-only.** Field order in `crates/engine/src/image.rs`
+  *is* the format. Nothing may be reordered and nothing inserted in the middle; a change
+  means a new `FORMAT_VERSION`. Readers bind fields to `let` bindings in write order for
+  exactly this reason — a struct literal would make a reordering silent.
 - The conformance target is the real Appello schema at
   `~/Repositories/Appello/application-mono-repo/apps/api/prisma` — 203 models, 605
   migrations. See `docs/spike-wire-protocol.md`.

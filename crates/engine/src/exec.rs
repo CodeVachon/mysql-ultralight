@@ -17,6 +17,7 @@ use crate::ddl;
 use crate::error::{unsupported, EngineError, EngineResult};
 use crate::expr::{self, ColumnRef, Context, OuterRow, Row};
 use crate::foreign_keys::{self, Action};
+use crate::image;
 use crate::info_schema;
 use crate::params;
 use crate::relation::Relation;
@@ -68,6 +69,111 @@ impl Engine {
         self.catalog_mut()?.create_database(name, true)
     }
 
+    /// The columns a statement will return, worked out before it runs.
+    ///
+    /// A client caches the metadata from `COM_STMT_PREPARE` and reads every
+    /// execution against it, so declaring nothing there costs the result its
+    /// column *names*: the client falls back to positional ones and any lookup
+    /// by name silently finds nothing. Prisma's migration engine does exactly
+    /// that lookup, and concluded `_prisma_migrations` did not exist in a
+    /// result that plainly contained it.
+    ///
+    /// Only a read can be probed, and it is run with every parameter bound to
+    /// NULL, because a statement's shape does not depend on its arguments.
+    /// `None` means the shape could not be established without running
+    /// something that might write — the caller then declares no columns, which
+    /// is where this started but is at least not a wrong answer.
+    pub fn describe(
+        &self,
+        session: &Session,
+        sql: &str,
+        parameters: usize,
+    ) -> Option<Vec<OutColumn>> {
+        let bound = params::bind(sql, &vec![Value::Null; parameters]);
+        if rewrite::intercept(&bound).is_some() {
+            return None;
+        }
+
+        let normalised = rewrite::normalise(&bound, session.sql_mode());
+        let statements = Parser::parse_sql(&MySqlDialect {}, &normalised).ok()?;
+        let [Statement::Query(query)] = statements.as_slice() else {
+            return None;
+        };
+        // `WITH ... UPDATE` is a query whose body writes, and probing it would
+        // apply the statement twice.
+        if matches!(
+            query.body.as_ref(),
+            SetExpr::Update(_) | SetExpr::Insert(_) | SetExpr::Delete(_)
+        ) {
+            return None;
+        }
+
+        // Run as a probe: a SELECT is not automatically free of consequences,
+        // and the functions that are not are refused where they are called
+        // rather than by reading the statement, which would miss the ones
+        // inside a view's definition.
+        Some(expr::probing(|| self.query(session, query)).ok()?.columns)
+    }
+
+    /// An owned copy of the whole catalog.
+    ///
+    /// The state image is the reason this is public: baking and inspecting an
+    /// image are both operations on a catalog rather than on a connection.
+    pub fn catalog_snapshot(&self) -> EngineResult<Catalog> {
+        Ok(self.catalog()?.clone())
+    }
+
+    /// An engine holding an already-built catalog, as read from an image.
+    ///
+    /// A failure here has to be reported rather than swallowed: an engine that
+    /// quietly kept its empty catalog would answer every query with "no such
+    /// table" and look like a schema problem.
+    pub fn from_catalog(catalog: Catalog, config: ServerConfig) -> EngineResult<Arc<Self>> {
+        let engine = Self::new(config);
+        *engine.catalog.write().map_err(|_| poisoned())? = catalog;
+        Ok(engine)
+    }
+
+    /// Writes the whole catalog to a file.
+    ///
+    /// Taken under the writer gate as well as a read lock, so the image cannot
+    /// catch a writer mid-statement: a writer computes against a copy and swaps
+    /// it in at the end, and a snapshot between those two points would record a
+    /// catalog that never existed.
+    pub fn save_image(&self, path: &std::path::Path) -> EngineResult<()> {
+        let _writing = self.begin_write()?;
+        let bytes = image::encode(&*self.catalog()?);
+        // Written to a neighbouring temporary and renamed, so a reader can
+        // never see a half-written image — a test suite booting from one would
+        // fail somewhere far from the cause.
+        // The temporary is unique rather than `<name>.tmp`: two bake processes
+        // writing neighbouring images in one directory would otherwise share a
+        // name and truncate each other's half-written file.
+        let mut temporary = path.as_os_str().to_owned();
+        temporary.push(format!(".{}.tmp", std::process::id()));
+        let temporary = std::path::PathBuf::from(temporary);
+
+        // Errors name the file that was asked for, not the temporary, which
+        // the caller has never heard of.
+        let written =
+            std::fs::write(&temporary, &bytes).and_then(|()| std::fs::rename(&temporary, path));
+        if let Err(e) = written {
+            // Nothing should be left lying next to the target after a failure.
+            let _ = std::fs::remove_file(&temporary);
+            return Err(file_error(path, "write", &e));
+        }
+        Ok(())
+    }
+
+    /// Replaces the whole catalog with one read from a file.
+    pub fn load_image(&self, path: &std::path::Path) -> EngineResult<()> {
+        let bytes = std::fs::read(path).map_err(|e| file_error(path, "read", &e))?;
+        let restored = image::decode(&bytes)?;
+        let _writing = self.begin_write()?;
+        *self.catalog_mut()? = restored;
+        Ok(())
+    }
+
     fn catalog(&self) -> EngineResult<std::sync::RwLockReadGuard<'_, Catalog>> {
         self.catalog.read().map_err(|_| poisoned())
     }
@@ -83,11 +189,25 @@ impl Engine {
     /// connection commits in the gap and the swap silently discards its rows,
     /// while both statements report success. Reads are unaffected — they take
     /// the catalog's read lock and never this.
-    fn begin_write(&self) -> EngineResult<std::sync::MutexGuard<'_, ()>> {
+    fn begin_write(&self) -> EngineResult<WriteGate<'_>> {
+        // Re-entering would wait on a lock this thread already holds, forever,
+        // and because the gate is global that wedges every other connection
+        // too. Only `ultralight_snapshot` and `ultralight_restore` can reach
+        // it from inside a statement, and both say so rather than hanging.
+        if WRITING.with(std::cell::Cell::get) {
+            return Err(EngineError::new(
+                1105,
+                "HY000",
+                "this cannot be called from inside a statement that writes",
+            ));
+        }
+
         // A poisoned gate means a writer panicked mid-statement. The catalog
         // is untouched in that case, because a writer only swaps in at the
         // end, so taking the gate anyway is safe.
-        Ok(self.writes.lock().unwrap_or_else(|e| e.into_inner()))
+        let guard = self.writes.lock().unwrap_or_else(|e| e.into_inner());
+        WRITING.with(|held| held.set(true));
+        Ok(WriteGate { _guard: guard })
     }
 
     /// A private copy of one database, to compute a write against.
@@ -3303,6 +3423,19 @@ impl crate::expr::Executor for Engine {
         Ok(self.query_with_outer(session, query, outer.as_ref())?.rows)
     }
 
+    fn state_image(&self, save: bool, path: &str) -> EngineResult<Value> {
+        let path = std::path::Path::new(path);
+        if save {
+            self.save_image(path)?;
+        } else {
+            self.load_image(path)?;
+        }
+        // A row rather than an OK packet, because it is a function: a client
+        // that selects it wants something back, and 1 is what MySQL's own
+        // side-effecting functions return.
+        Ok(Value::Int(1))
+    }
+
     fn next_random(&self, seed: Option<i64>) -> f64 {
         // A seed restarts the sequence, as MySQL's RAND(N) does; without one
         // the counter simply advances. xorshift64* keeps this to a few lines
@@ -3558,6 +3691,36 @@ enum SourceValue {
     // and every value of every inserted row is one of these.
     Expr(Box<Expr>),
     Value(Value),
+}
+
+/// Names the file and what was being done to it.
+///
+/// The bare `io::Error` says "permission denied" without saying to what, and a
+/// bake step that cannot write its image should not need a strace to diagnose.
+fn file_error(path: &std::path::Path, action: &str, e: &std::io::Error) -> EngineError {
+    EngineError::new(
+        1105,
+        "HY000",
+        format!("cannot {action} state image `{}`: {e}", path.display()),
+    )
+}
+
+// Whether this thread is inside a writer's copy-compute-commit cycle. A
+// statement runs to completion on one thread — nothing in the engine awaits —
+// so a thread-local is exactly the scope of one statement.
+thread_local! {
+    static WRITING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Holds the writer gate, and the flag that makes re-entering it detectable.
+struct WriteGate<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
+}
+
+impl Drop for WriteGate<'_> {
+    fn drop(&mut self) {
+        WRITING.with(|held| held.set(false));
+    }
 }
 
 /// A row before and after an UPDATE, which is what a cascade needs to match

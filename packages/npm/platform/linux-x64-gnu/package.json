@@ -1,0 +1,28 @@
+{
+    "name": "@codevachon/mysql-ultralight-linux-x64-gnu",
+    "version": "0.0.1",
+    "description": "mysql-ultralight binary for linux-x64-gnu",
+    "license": "MIT OR Apache-2.0",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/CodeVachon/mysql-ultralight.git",
+        "directory": "packages/npm/platform/linux-x64-gnu"
+    },
+    "os": [
+        "linux"
+    ],
+    "cpu": [
+        "x64"
+    ],
+    "files": [
+        "mysql-ultralight",
+        "README.md"
+    ],
+    "engines": {
+        "node": ">=18"
+    },
+    "libc": [
+        "glibc"
+    ],
+    "rustTarget": "x86_64-unknown-linux-gnu"
+}

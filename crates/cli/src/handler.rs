@@ -80,13 +80,22 @@ impl Handler for EngineHandler {
     }
 
     fn prepare(&mut self, id: u32, sql: &str) -> Result<Prepared, ErrPacket> {
+        let param_count = count_placeholders(sql);
+        // Worked out now because the client caches it: a prepare that declares
+        // no columns leaves every later execution nameless. A statement whose
+        // shape cannot be established without running something that might
+        // write declares nothing, as it did before.
+        let columns = self
+            .engine
+            .describe(&self.session, sql, param_count as usize)
+            .map(|columns| columns.iter().map(|c| c.to_wire()).collect())
+            .unwrap_or_default();
+
         Ok(Prepared {
             id,
             sql: sql.to_owned(),
-            param_count: count_placeholders(sql),
-            // Column metadata is not known until the statement runs, which is
-            // also what MySQL reports for a statement it cannot resolve early.
-            columns: Vec::new(),
+            param_count,
+            columns,
         })
     }
 

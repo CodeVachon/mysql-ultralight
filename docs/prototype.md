@@ -137,14 +137,96 @@ returned values that agreed to nine decimal places, so `ORDER BY RAND()` did not
 and `WHERE RAND() < 0.5` matched every row or none; and `CAST('12abc' AS SIGNED)` returned
 NULL where MySQL returns 12.
 
+## The state image
+
+The point of the whole project, and the one number that justifies it.
+
+`prisma migrate deploy` over the real history costs 26.1s, and a suite that starts a fresh
+process per test file pays it every time. Baking the result once and loading it costs
+**about a millisecond**:
+
+```sh
+mysql-ultralight --port 3306 &                       # 0.1ms, empty
+npx prisma migrate deploy                            # once, ~7s here
+mysql -e "SELECT ultralight_snapshot('schema.mus')"  # 29ms, 630 KB
+
+mysql-ultralight --state schema.mus                  # 0.9–1.7ms, every test process
+```
+
+The image carries the whole catalog — 241 tables, 2,367 columns, seed rows, foreign keys,
+indexes, generated columns, `CHECK` constraints and auto-increment counters — and a server
+booted from one is indistinguishable from one that ran the migrations: the constraints
+still bite, and `prisma migrate deploy` against it reports the migrations already applied.
+
+`SELECT ultralight_restore('schema.mus')` does the same to a *running* server, which resets
+it between test files without paying for a new process at all.
+
+The format is hand-rolled for the same reason the wire codec is. Field order is the format,
+so nothing may be reordered and a new field means a new version number. A version mismatch,
+a truncation, a foreign file and trailing bytes are all refused: reading a stale image
+"successfully" would produce a catalog with the wrong shape and no complaint, and every
+test running against it would be wrong in a way nothing reports. The image is written to a
+neighbouring temporary and renamed, so a reader can never see a half-written one.
+
+## The bug the image found
+
+Booting from an image was the first time anything asked this engine for a table it had not
+just created, and `prisma migrate deploy` promptly failed with `Table '_prisma_migrations'
+already exists` — after an introspection query that had returned that very table.
+
+**`COM_STMT_PREPARE` declared zero columns.** A client caches the column metadata from the
+prepare response and reads every later execution against it, so declaring nothing there
+costs the result its column *names*. Prisma reads `table_name` out of that introspection by
+name, found nothing, and concluded the table was missing. `SELECT 1 AS alpha` came back as
+`f0`.
+
+Nothing caught it because Prisma Client maps columns by position using its own schema — the
+migration engine is the first consumer that reads a raw result by name. The prepare response
+now describes the statement first: it is parsed, refused if it could write, run with every
+parameter bound to NULL, and the resulting columns declared. The text protocol always
+carried names correctly, which is why this hid for so long; both paths are now tested
+directly at the wire level.
+
+## Review hardening (state image)
+
+Thirteen findings, all fixed. Two would have been serious in ordinary use:
+
+- **A snapshot inside a write deadlocked the whole server.** Writers hold a global,
+  non-reentrant gate across their copy-compute-commit cycle, so
+  `INSERT INTO t VALUES (ultralight_snapshot('x'))` waited on a lock it already held —
+  and because the gate is global, every other connection wedged behind it. Re-entering it
+  is now an error that names the problem.
+- **Describing a statement ran it, and a `SELECT` is not automatically free of
+  consequences.** `COM_STMT_PREPARE` of `SELECT ultralight_restore('x')` replaced the live
+  catalog without executing anything. The refusal is at the point of the call rather than
+  a scan of the statement text, because a call hides just as easily inside a view's
+  definition or a CTE.
+
+Two more were wrong answers rather than hazards: a snapshot taken inside a transaction
+baked uncommitted rows into the image permanently, and a restore inside one left `ROLLBACK`
+replaying pre-transaction tables over a catalog that had been replaced wholesale, landing
+somewhere that was neither the image nor where it started. Both are refused inside a
+transaction now. Describing also consumed a `UUID()` or `RAND()` from the engine's
+counters, so the same test produced different generated ids depending only on whether the
+client used a prepared statement.
+
+The rest: a failed snapshot left its temporary file behind and reported the temporary's
+path rather than the one asked for; two bake processes in one directory shared a temporary
+name; `from_catalog` silently kept an empty catalog if the lock was poisoned; and the image
+readers built structs whose field evaluation order *was* the format, so a tidy-up that
+reordered them would have changed the format with no compile error and no test failure.
+
+What the review found correct is worth recording too: every field of every catalog type
+round trips, and 200,000 randomly mutated or truncated images produced zero panics and only
+clean errors.
+
 ## What it does not do yet
 
 Named honestly, because the engine returns an error rather than a wrong answer for each:
 explicit window frames (`ROWS`/`RANGE BETWEEN`), named `WINDOW` clauses, `NTH_VALUE`, a
 computed (non-constant) offset or default in `LAG`/`LEAD`, `ORDER BY` and `LIMIT` on an
 `UPDATE` or `DELETE`, `DELETE ... USING`, `WITH RECURSIVE`, `JSON_TABLE` and the JSON
-function library, the date and spatial functions, and the state image that would make
-startup skip migrations entirely.
+function library, and the date and spatial functions.
 
 Two limitations are worth stating rather than implying away.
 

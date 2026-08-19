@@ -260,6 +260,19 @@ impl Catalog {
         }
     }
 
+    /// Every database, by the key it is stored under.
+    ///
+    /// For the state image, which has to round trip the key as well as the
+    /// name: lookup is case-insensitive but the key is what was written.
+    pub(crate) fn all_databases(&self) -> &BTreeMap<String, Database> {
+        &self.databases
+    }
+
+    /// Puts a database back under a given key, for reading a state image.
+    pub(crate) fn insert_database(&mut self, key: String, database: Database) {
+        self.databases.insert(key, database);
+    }
+
     pub fn database_names(&self) -> Vec<String> {
         self.databases.keys().cloned().collect()
     }
