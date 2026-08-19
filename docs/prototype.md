@@ -261,6 +261,40 @@ detected and refused either. Fixing it properly means a JSON-tagged value, which
 the wire encoding and the image format. Nothing in the 604 migrations nests a JSON
 constructor, so it is recorded rather than rushed.
 
+## The example, and what it found
+
+`examples/prisma-app` is a worked Prisma application the gate runs: its own
+schema, four migrations including an `ALTER` and a data migration, and tests
+that bake an image and drive Prisma Client against it. It exists because the
+layers were only ever tested separately — the seam where a real driver's
+expectations meet the wire protocol and the SQL had no coverage at all.
+
+It found three engine bugs in its first hour, none reachable from a unit test:
+
+- **`information_schema` reported numbers as text.** Prisma's schema describer
+  reads `seq_in_index` as an integer and unwraps it, so `prisma db pull`,
+  `migrate dev` and `migrate diff` crashed outright against this engine. They
+  work now: `db pull` reads the real 278-table schema back as 209 models and
+  66 enums.
+- **A binary string was true whenever it was non-empty**, so `BINARY '0'` was
+  true and Prisma's foreign-key query — which compares `BINARY a = BINARY b` —
+  matched every pair. A four-row answer came back as sixty-four, silently. The
+  fix is that a binary string is read for its leading number, as a string is.
+- **`NOW(3)` ignored its precision**, so a `DATETIME(3)` column filled by it
+  held whole seconds, and two rows written in the same second compared equal.
+
+Two more came out of describing columns properly: `SUM` and `MAX` were reported
+as text rather than the type they fold, and a view's columns were described with
+no type at all.
+
+The review of the example itself was as useful as the example. Four of its tests
+passed for the wrong reasons — a rollback test that held just as well against an
+engine that never wrote anything, an excerpt assertion that could not fail, a
+schema comparison that omitted the defaults and keys it claimed to cover and
+would have passed on two empty results, and a tautology on an auto-increment id.
+Each is now pinned to an exact value, and the rollback test was checked by
+breaking `ROLLBACK` and watching it fail.
+
 ## What it does not do yet
 
 Named honestly, because the engine returns an error rather than a wrong answer for each:

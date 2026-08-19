@@ -31,6 +31,7 @@ call it, so it must never diverge from what they need:
 | Security advisories | `cargo audit` |
 | npm package tests | `node --test packages/npm/test/*.test.js` |
 | npm dead code | `fallow dead-code` in `packages/npm` |
+| Prisma end to end | `node --test` in `examples/prisma-app` |
 
 Flags: `--fast` skips the supply-chain checks, `--fix` formats and applies clippy
 suggestions first, `--require-tools` turns a missing tool into a failure rather than a
@@ -68,6 +69,7 @@ git config core.hooksPath .githooks
 | `crates/cli` | The `mysql-ultralight` binary |
 | `crates/conformance` | Extracts the SQL surface of a target codebase |
 | `packages/npm` | `@codevachon/mysql-ultralight`: the JS API and the platform packages |
+| `examples/prisma-app` | A worked Prisma application; the only check covering all layers at once |
 
 ## Conventions
 

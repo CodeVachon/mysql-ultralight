@@ -5127,3 +5127,176 @@ fn an_upsert_updates_the_row_the_primary_key_names() {
         vec![vec!["1", "999"], vec!["4", "1"]]
     );
 }
+
+#[test]
+fn a_binary_string_is_read_for_its_leading_number() {
+    // MySQL reads a string, binary or not, for the number at the front of it.
+    // Treating a byte string as "true when non-empty" made `WHERE BINARY x`
+    // true for the byte '0' — so a filter over a cast comparison kept every
+    // row, which is how a foreign-key lookup came back as a cross join.
+    let (engine, mut session) = engine();
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('a' = 'b' AS BINARY), CAST('a' = 'a' AS BINARY)"
+        ),
+        vec![vec!["0", "1"]]
+    );
+
+    widgets(&engine, &mut session);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM Widget WHERE CAST(name = 'alpha' AS BINARY)"
+        ),
+        vec![vec!["a"]]
+    );
+
+    // The same rule for ordinary strings: the leading number decides.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT IF('0', 'yes', 'no'), IF('1abc', 'yes', 'no'), IF('abc', 'yes', 'no')"
+        ),
+        vec![vec!["no", "yes", "no"]]
+    );
+}
+
+#[test]
+fn a_view_column_is_described_like_a_table_column() {
+    // A view's columns carry real types, and describing them as type-less made
+    // Prisma's introspection unwrap a None — `db pull` against any schema with
+    // a view crashed.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Src (
+            id INTEGER NOT NULL,
+            label VARCHAR(40) NOT NULL,
+            at DATE NOT NULL,
+            PRIMARY KEY (id)
+        )",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Seen AS SELECT id, label, at FROM Src",
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, DATETIME_PRECISION \
+             FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Seen' ORDER BY ORDINAL_POSITION"
+        ),
+        vec![
+            // Widened, not exact: a view's shape is taken from its result
+            // metadata, which carries a wire type rather than the declared
+            // one, so `int` reads back as a 19-digit integer and
+            // `varchar(40)` as text. Every column is described, which is what
+            // introspection needs; the exact width is #0035.
+            vec!["id", "NULL", "19", "NULL"],
+            vec!["label", "65535", "NULL", "NULL"],
+            // A DATE has no fractional seconds, which MySQL reports as 0
+            // rather than NULL: the precision exists and it is zero.
+            vec!["at", "NULL", "NULL", "0"],
+        ]
+    );
+}
+
+#[test]
+fn an_aggregate_keeps_the_type_of_what_it_folds() {
+    // Declared as text, `SUM(views)` reaches a typed client as the string
+    // "120" where MySQL sends the number.
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    let described = engine
+        .describe(
+            &session,
+            "SELECT COUNT(*), SUM(count), MAX(count), MIN(name), AVG(count) FROM Widget",
+            0,
+        )
+        .unwrap();
+    let types: Vec<String> = described.iter().map(|c| format!("{:?}", c.ty)).collect();
+    assert_eq!(
+        types,
+        vec!["LongLong", "LongLong", "LongLong", "VarString", "VarString"],
+        "an aggregate should carry its argument's type"
+    );
+}
+
+#[test]
+fn now_honours_its_precision() {
+    // A `DATETIME(3)` column filled by `NOW(3)` holding whole seconds makes two
+    // rows written in the same second compare equal.
+    let (engine, mut session) = engine();
+    let stamped = rows(&engine, &mut session, "SELECT NOW(3), NOW(6), NOW()");
+
+    assert!(
+        stamped[0][0].len() == 23 && stamped[0][0].contains('.'),
+        "NOW(3) gave {}",
+        stamped[0][0]
+    );
+    assert_eq!(stamped[0][1].len(), 26, "NOW(6) gave {}", stamped[0][1]);
+    assert_eq!(stamped[0][2].len(), 19, "NOW() gave {}", stamped[0][2]);
+}
+
+#[test]
+fn information_schema_reports_numbers_as_numbers() {
+    // These columns are read by tools, not people. Prisma's schema describer
+    // asks `statistics` for `seq_in_index` and unwraps it as an integer, so
+    // handing back the string "1" crashed `prisma db pull` outright.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Typed (
+            id INTEGER NOT NULL AUTO_INCREMENT,
+            note VARCHAR(20) NULL,
+            body TEXT NULL,
+            kind ENUM('a', 'bb', 'ccc') NULL,
+            amount DECIMAL(10, 2) NULL,
+            at DATETIME(3) NULL,
+            PRIMARY KEY (id)
+        )",
+    );
+
+    let ordinal = rows(
+        &engine,
+        &mut session,
+        "SELECT SEQ_IN_INDEX + 1 FROM information_schema.statistics \
+         WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Typed'",
+    );
+    assert_eq!(ordinal, vec![vec!["2"]], "seq_in_index is not arithmetic");
+
+    // MySQL reports a precision for every numeric type and a maximum length
+    // for every string type, whether or not the DDL wrote one.
+    let described = rows(
+        &engine,
+        &mut session,
+        "SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, \
+                DATETIME_PRECISION \
+         FROM information_schema.columns \
+         WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Typed' ORDER BY ORDINAL_POSITION",
+    );
+    assert_eq!(
+        described,
+        vec![
+            vec!["id", "NULL", "10", "0", "NULL"],
+            vec!["note", "20", "NULL", "NULL", "NULL"],
+            vec!["body", "65535", "NULL", "NULL", "NULL"],
+            // An ENUM's maximum is its longest member.
+            vec!["kind", "3", "NULL", "NULL", "NULL"],
+            vec!["amount", "NULL", "10", "2", "NULL"],
+            vec!["at", "NULL", "NULL", "NULL", "3"],
+        ]
+    );
+}

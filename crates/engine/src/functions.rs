@@ -490,8 +490,17 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         "row_count" => Value::Int(session.affected_rows as i64),
 
         // -- time ------------------------------------------------------------
+        // The argument is the fractional-second precision, and ignoring it is
+        // not cosmetic: a column declared `DATETIME(3)` filled by `NOW(3)`
+        // would hold a second-truncated value, so two rows written in the same
+        // second would compare equal when MySQL would order them.
         "now" | "current_timestamp" | "localtime" | "localtimestamp" | "sysdate" => {
-            Value::Text(now_datetime())
+            let digits = args
+                .first()
+                .and_then(|v| v.as_int())
+                .unwrap_or(0)
+                .clamp(0, 6);
+            Value::Text(now_datetime_with(digits as usize))
         }
         "curdate" | "current_date" => Value::Text(now_datetime()[..10].to_owned()),
         "curtime" | "current_time" => Value::Text(now_datetime()[11..].to_owned()),
@@ -539,12 +548,32 @@ fn unix_seconds() -> u64 {
         .unwrap_or(0)
 }
 
+fn unix_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+}
+
 /// The current UTC time as `YYYY-MM-DD HH:MM:SS`.
 ///
 /// Hand-rolled rather than pulling in a date crate: the engine needs one
 /// format, and a dependency here would be paid on every cold start.
 pub fn now_datetime() -> String {
     format_unix(unix_seconds())
+}
+
+/// `NOW(n)`: the current time with `n` fractional digits.
+pub fn now_datetime_with(digits: usize) -> String {
+    let whole = format_unix(unix_seconds());
+    if digits == 0 {
+        return whole;
+    }
+    let fraction = unix_nanos() % 1_000_000_000;
+    // Truncated rather than rounded, which is what MySQL does — rounding could
+    // carry into the next second and report a time that has not happened.
+    let scaled = fraction / 10u64.pow(9 - digits as u32);
+    format!("{whole}.{scaled:0width$}", width = digits)
 }
 
 /// Converts a Unix timestamp to `YYYY-MM-DD HH:MM:SS` using the civil-from-days

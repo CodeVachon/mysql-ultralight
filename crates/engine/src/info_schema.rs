@@ -89,13 +89,46 @@ fn build(name: &str, headers: &[&str], rows: Vec<Vec<Value>>) -> Table {
         .iter()
         .enumerate()
         .map(|(i, header)| {
-            let mut column = Column::new(*header, text_type());
+            // Typed from the data rather than declared text for everything.
+            // These columns are read by tools, not people: Prisma's schema
+            // describer asks `information_schema.statistics` for
+            // `seq_in_index` and unwraps it as an integer, so handing back the
+            // string "1" crashes `prisma db pull` and `prisma migrate dev`.
+            let numeric = rows
+                .iter()
+                .filter_map(|row| row.get(i))
+                .filter(|value| !value.is_null())
+                .all(|value| matches!(value, Value::Int(_)));
+            let has_values = rows
+                .iter()
+                .filter_map(|row| row.get(i))
+                .any(|value| !value.is_null());
+
+            let mut column = Column::new(
+                *header,
+                if numeric && has_values {
+                    integer_type()
+                } else {
+                    text_type()
+                },
+            );
             column.position = i + 1;
             column
         })
         .collect();
     table.rows = rows;
     table
+}
+
+fn integer_type() -> SqlType {
+    SqlType {
+        kind: TypeKind::Int,
+        declared: "bigint".to_owned(),
+        length: None,
+        scale: None,
+        unsigned: false,
+        variants: Vec::new(),
+    }
 }
 
 fn empty(name: &str, headers: &[&str]) -> Table {
@@ -244,39 +277,29 @@ fn columns(catalog: &Catalog) -> Table {
                     },
                     text(if column.nullable { "YES" } else { "NO" }),
                     text(column.ty.base_name()),
-                    match column.ty.kind {
-                        TypeKind::Text => column
-                            .ty
-                            .length
-                            .map(|l| Value::Int(l as i64))
-                            .unwrap_or(Value::Null),
-                        _ => Value::Null,
-                    },
-                    if numeric {
-                        column
-                            .ty
-                            .length
-                            .map(|l| Value::Int(l as i64))
-                            .unwrap_or(Value::Null)
-                    } else {
-                        Value::Null
-                    },
+                    character_maximum_length(&column.ty),
+                    numeric_precision(&column.ty),
                     if numeric {
                         Value::Int(column.ty.scale.unwrap_or(0) as i64)
                     } else {
                         Value::Null
                     },
-                    match column.ty.kind {
-                        TypeKind::DateTime | TypeKind::Time => {
-                            Value::Int(column.ty.length.unwrap_or(0) as i64)
-                        }
-                        _ => Value::Null,
-                    },
+                    datetime_precision(&column.ty),
                     text(&column.ty.declared),
+                    // MySQL also reports MUL for the first column of any other
+                    // index, which is how a describing tool learns that a
+                    // compound unique or a secondary index exists at all.
                     text(if column.primary_key {
                         "PRI"
                     } else if column.unique {
                         "UNI"
+                    } else if table.indexes.iter().any(|index| {
+                        index
+                            .columns
+                            .first()
+                            .is_some_and(|first| first.eq_ignore_ascii_case(&column.name))
+                    }) {
+                        "MUL"
                     } else {
                         ""
                     }),
@@ -314,10 +337,20 @@ fn columns(catalog: &Catalog) -> Table {
                     Value::Null,
                     text(if column.nullable { "YES" } else { "NO" }),
                     text(column.ty.base_name()),
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
-                    Value::Null,
+                    // Described exactly as a table's column is: a view's
+                    // columns carry real types, and reporting nothing for them
+                    // makes a describing tool see a type-less column.
+                    character_maximum_length(&column.ty),
+                    numeric_precision(&column.ty),
+                    if matches!(
+                        column.ty.kind,
+                        TypeKind::Int | TypeKind::Decimal | TypeKind::Float | TypeKind::Bool
+                    ) {
+                        Value::Int(column.ty.scale.unwrap_or(0) as i64)
+                    } else {
+                        Value::Null
+                    },
+                    datetime_precision(&column.ty),
                     text(&column.ty.declared),
                     text(""),
                     text(""),
@@ -351,6 +384,96 @@ fn columns(catalog: &Catalog) -> Table {
         ],
         rows,
     )
+}
+
+/// `CHARACTER_MAXIMUM_LENGTH`, which MySQL reports for every string type.
+///
+/// A `TEXT` column has a maximum whether or not the DDL wrote one, and an ENUM's
+/// is the length of its longest member. Reporting NULL instead is not merely
+/// incomplete: Prisma's schema describer unwraps this for a text column, so a
+/// missing value crashes `prisma migrate dev` and `prisma db pull` — which is
+/// how this was found.
+fn character_maximum_length(ty: &crate::types::SqlType) -> Value {
+    let bytes = match ty.kind {
+        TypeKind::Text => match ty.length {
+            Some(length) => length,
+            // The width implied by the spelling, as MySQL stores it.
+            None => match ty.base_name().as_str() {
+                "tinytext" => 255,
+                "mediumtext" => 16_777_215,
+                "longtext" => 4_294_967_295,
+                _ => 65_535,
+            },
+        },
+        TypeKind::Blob => match ty.base_name().as_str() {
+            "tinyblob" => 255,
+            "mediumblob" => 16_777_215,
+            "longblob" => 4_294_967_295,
+            _ => 65_535,
+        },
+        // The longest value it can hold, which for a SET is every member plus
+        // the commas between them.
+        TypeKind::Enum => ty
+            .variants
+            .iter()
+            .map(|v| v.chars().count())
+            .max()
+            .unwrap_or(0) as u64,
+        TypeKind::Set => {
+            let members: usize = ty.variants.iter().map(|v| v.chars().count()).sum();
+            (members + ty.variants.len().saturating_sub(1)) as u64
+        }
+        TypeKind::Json => return Value::Null,
+        _ => return Value::Null,
+    };
+    Value::Int(bytes as i64)
+}
+
+/// `DATETIME_PRECISION`, the fractional-second digits a temporal type carries.
+///
+/// A `DATE` has none, which MySQL reports as 0 rather than NULL — the column
+/// exists and its precision is zero, which is not the same as "not applicable".
+fn datetime_precision(ty: &crate::types::SqlType) -> Value {
+    match ty.kind {
+        TypeKind::DateTime | TypeKind::Time => Value::Int(ty.length.unwrap_or(0) as i64),
+        TypeKind::Date => Value::Int(0),
+        _ => Value::Null,
+    }
+}
+
+/// `NUMERIC_PRECISION`, which MySQL reports for every numeric type.
+///
+/// An `INT` has a precision of 10 whether or not the DDL wrote a display width,
+/// and describing tools read it as a given.
+fn numeric_precision(ty: &crate::types::SqlType) -> Value {
+    let precision = match ty.kind {
+        // A DECIMAL carries its own, and defaults to MySQL's 10 without one.
+        TypeKind::Decimal => ty.length.unwrap_or(10),
+        TypeKind::Float => {
+            if ty.base_name() == "float" {
+                12
+            } else {
+                22
+            }
+        }
+        TypeKind::Int => match ty.base_name().as_str() {
+            "tinyint" => 3,
+            "smallint" => 5,
+            "mediumint" => 7,
+            "bigint" => {
+                if ty.unsigned {
+                    20
+                } else {
+                    19
+                }
+            }
+            _ => 10,
+        },
+        // BOOLEAN is TINYINT(1) underneath.
+        TypeKind::Bool => 3,
+        _ => return Value::Null,
+    };
+    Value::Int(precision as i64)
 }
 
 fn statistics(catalog: &Catalog) -> Table {

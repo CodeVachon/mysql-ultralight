@@ -1,0 +1,79 @@
+// A schema chosen for coverage rather than realism: every construct here is
+// one a real application leans on, and one this engine has to get right.
+//
+// Relations: one-to-one (Profile), one-to-many (Post), and implicit
+// many-to-many (Tag, which makes Prisma create the `_PostToTag` join table).
+// Types: enums, JSON, Decimal, Text, and DateTime with `now()` and `@updatedAt`.
+// Ids: cuid, uuid and autoincrement, which are three different code paths.
+// Constraints: a compound unique, a secondary index, and cascading deletes.
+
+generator client {
+    provider = "prisma-client-js"
+}
+
+datasource db {
+    provider = "mysql"
+    url      = env("DATABASE_URL")
+}
+
+enum Role {
+    ADMIN
+    EDITOR
+    VIEWER
+}
+
+enum Status {
+    DRAFT
+    PUBLISHED
+    ARCHIVED
+}
+
+model Author {
+    id        String   @id @default(cuid()) @db.VarChar(30)
+    email     String   @unique @db.VarChar(191)
+    name      String   @db.VarChar(120)
+    role      Role     @default(VIEWER)
+    bio       String?  @db.Text
+    createdAt DateTime @default(now()) @db.DateTime(3)
+    updatedAt DateTime @updatedAt @db.DateTime(3)
+
+    profile Profile?
+    posts   Post[]
+}
+
+model Profile {
+    id       Int     @id @default(autoincrement())
+    authorId String  @unique @db.VarChar(30)
+    website  String? @db.VarChar(200)
+    settings Json?
+
+    author Author @relation(fields: [authorId], references: [id], onDelete: Cascade)
+}
+
+model Post {
+    id        String   @id @default(uuid()) @db.VarChar(36)
+    authorId  String   @db.VarChar(30)
+    title     String   @db.VarChar(200)
+    slug      String   @db.VarChar(200)
+    body      String?  @db.LongText
+    excerpt   String?  @db.VarChar(280)
+    status    Status   @default(DRAFT)
+    views     Int      @default(0)
+    price     Decimal? @db.Decimal(10, 2)
+    metadata  Json?
+    createdAt DateTime @default(now()) @db.DateTime(3)
+    updatedAt DateTime @updatedAt @db.DateTime(3)
+
+    author Author @relation(fields: [authorId], references: [id], onDelete: Cascade)
+    tags   Tag[]
+
+    @@unique([authorId, slug])
+    @@index([status, createdAt])
+}
+
+model Tag {
+    id   Int    @id @default(autoincrement())
+    name String @unique @db.VarChar(60)
+
+    posts Post[]
+}

@@ -1042,8 +1042,17 @@ impl Engine {
             || select.projection.iter().any(select_item_aggregates);
 
         if aggregating {
-            let mut grouped =
-                self.grouped(session, select, &refs, &matching, &group_exprs, order)?;
+            let mut grouped = self.grouped(
+                session,
+                select,
+                Input {
+                    refs: &refs,
+                    columns: &relation.columns,
+                    matching: &matching,
+                },
+                &group_exprs,
+                order,
+            )?;
             apply_distinct(&mut grouped, select.distinct.as_ref())?;
             return Ok(Ordered::sorted(grouped));
         }
@@ -1554,7 +1563,7 @@ impl Engine {
                             // encodes by the declared type.
                             columns.push(OutColumn::new(
                                 alias.unwrap_or_else(|| render_expr(e)),
-                                computed_column_type(e),
+                                computed_column_type(e, refs, &relation.columns),
                             ));
                             plan.push(Projection::Window(windows.len()));
                             windows.push(values);
@@ -1858,11 +1867,15 @@ impl Engine {
         &self,
         session: &Session,
         select: &Select,
-        refs: &[ColumnRef],
-        matching: &[&Vec<Value>],
+        input: Input<'_>,
         group_exprs: &[Expr],
         order: Option<&OrderBy>,
     ) -> EngineResult<ResultSet> {
+        let Input {
+            refs,
+            columns: input_columns,
+            matching,
+        } = input;
         // `GROUP BY 1` means the first select column, not the literal 1.
         // Treating it as a literal gives every row the same key and collapses
         // the whole table into one group.
@@ -1937,7 +1950,9 @@ impl Engine {
         // Computed columns are reported as strings, as the ungrouped path does.
         let columns: Vec<OutColumn> = items
             .iter()
-            .map(|(alias, e)| OutColumn::new(alias.clone(), computed_column_type(e)))
+            .map(|(alias, e)| {
+                OutColumn::new(alias.clone(), computed_column_type(e, refs, input_columns))
+            })
             .collect();
 
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -3929,6 +3944,17 @@ impl Executed {
     }
 }
 
+/// The rows a query folds over, and the two schemas needed to read them.
+///
+/// `refs` is what a name resolves against — this query's columns plus any the
+/// enclosing one contributes — while `columns` is the relation itself, which is
+/// where a column's declared type lives.
+struct Input<'a> {
+    refs: &'a [ColumnRef],
+    columns: &'a [crate::relation::RelColumn],
+    matching: &'a [&'a Vec<Value>],
+}
+
 /// A result together with whether its ORDER BY still needs applying.
 struct Ordered {
     result: ResultSet,
@@ -4590,15 +4616,41 @@ fn literal_expr(value: &Value) -> Expr {
 /// group may produce a different type, and the binary protocol encodes by the
 /// declared type, so the client would decode the wrong thing. Only the shapes
 /// that are always integral are claimed as such.
-fn computed_column_type(e: &Expr) -> ColumnType {
+/// The type to declare for an expression, before any row has been evaluated.
+///
+/// `refs` carries the input columns so an aggregate over one can keep its type:
+/// `SUM(views)` of an integer column is an integer, and reporting it as a
+/// string makes a typed client hand back `"120"` where MySQL hands back `120`.
+fn computed_column_type(
+    e: &Expr,
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+) -> ColumnType {
     match e {
         Expr::Function(f) => {
             let name = f.name.to_string().to_ascii_lowercase();
             match name.as_str() {
                 "count" | "row_number" | "rank" | "dense_rank" => ColumnType::LongLong,
+                // MIN and MAX keep the type of what they fold; a SUM of
+                // integers is an integer.
+                "sum" | "min" | "max" => aggregate_argument(f)
+                    .map(|argument| computed_column_type(&argument, refs, input))
+                    .unwrap_or(ColumnType::VarString),
                 _ => ColumnType::VarString,
             }
         }
+        // A column reference keeps the type it was declared with.
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => column_slot(refs, e)
+            .and_then(|slot| input.get(slot))
+            .map(|column| column.ty.column_type())
+            .unwrap_or(ColumnType::VarString),
+        // A literal is typed by what it is; anything else stays a string,
+        // because its type is not known until a row is evaluated.
+        Expr::Value(v) => match &v.value {
+            sqlparser::ast::Value::Number(_, _) => ColumnType::LongLong,
+            _ => ColumnType::VarString,
+        },
+        Expr::Nested(inner) => computed_column_type(inner, refs, input),
         _ => ColumnType::VarString,
     }
 }

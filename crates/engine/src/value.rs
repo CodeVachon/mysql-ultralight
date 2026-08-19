@@ -68,8 +68,13 @@ impl Value {
             Value::Null => None,
             Value::Int(v) => Some(*v != 0),
             Value::Float(v) => Some(*v != 0.0),
-            Value::Text(v) => Some(v.trim().parse::<f64>().map(|f| f != 0.0).unwrap_or(false)),
-            Value::Bytes(v) => Some(!v.is_empty()),
+            // A string is read for its leading number, so '0' and 'abc' are
+            // both false and '1abc' is true. A binary string is read the same
+            // way: treating it as "true when non-empty" made `WHERE BINARY x`
+            // true for the byte '0', which is how a filter over a cast
+            // comparison silently kept every row.
+            Value::Text(v) => Some(numeric_prefix(v) != 0.0),
+            Value::Bytes(v) => Some(numeric_prefix(&String::from_utf8_lossy(v)) != 0.0),
         }
     }
 
@@ -176,6 +181,27 @@ fn format_float(v: f64) -> String {
     }
     let s = v.to_string();
     s.strip_suffix(".0").map(str::to_owned).unwrap_or(s)
+}
+
+/// The number MySQL reads out of the front of a string.
+///
+/// Not a parse of the whole thing: MySQL takes the leading numeric part and
+/// ignores the rest, so `'12abc'` is 12 and `'abc'` is 0. Used wherever a
+/// string has to answer a numeric question, which includes being true or false.
+fn numeric_prefix(text: &str) -> f64 {
+    let trimmed = text.trim_start();
+    let mut end = 0;
+    let mut seen_dot = false;
+    for (i, c) in trimmed.char_indices() {
+        let acceptable =
+            c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+')) || (c == '.' && !seen_dot);
+        if !acceptable {
+            break;
+        }
+        seen_dot |= c == '.';
+        end = i + c.len_utf8();
+    }
+    trimmed[..end].parse().unwrap_or(0.0)
 }
 
 #[cfg(test)]

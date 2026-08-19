@@ -1,11 +1,11 @@
 ---
 id: 34
 title: A worked Prisma example the gate can run
-state: Todo
+state: Done
 parent: 9
 labels: [compat, prisma, testing]
 created: 2026-08-19T13:22:10Z
-updated: 2026-08-19T14:01:13Z
+updated: 2026-08-19T14:45:01Z
 ---
 
 ## Description
@@ -85,3 +85,13 @@ Location: examples/prisma-app/.
 Prisma version: pinned to 5.4.2, matching apps/api in the Appello monorepo, and bumped when that bumps.
 
 Whether the gate always runs it: yes. I had worried the npm install made it too expensive to run unconditionally; measured on this machine that was wrong. Cold install with an empty npm cache is 4.19s and 54 MB, a warm install is 0.96s, npm ci from a lockfile is 0.54s, prisma generate is 0.41s and prisma migrate deploy of a one-migration history is 0.68s. Once node_modules exists a gate run pays about 1.1s, which is noise beside the Rust build. Only CI pays the cold path, and only until setup-node's cache is pointed at the example.
+
+### 2026-08-19T14:45:01Z — Christopher Vachon (user)
+
+Built. examples/prisma-app with a 4-migration history, 16 tests, and gate + CI wiring.
+
+It earned its place immediately: it found that information_schema reported numbers as text (which crashed Prisma's schema describer, so db pull, migrate dev and migrate diff were all unusable), that a binary string was true whenever non-empty (so Prisma's foreign-key query returned a cross join, silently), and that NOW(3) ignored its precision. Describing columns properly then turned up two more: SUM and MAX reported as text, and view columns described with no type at all. prisma db pull now reads the real 278-table schema as 209 models and 66 enums.
+
+The review of the example found four tests that passed for the wrong reasons, including a rollback test that held against an engine that never wrote anything. All are pinned to exact values now, and the rollback test was verified by breaking ROLLBACK.
+
+Left open: #0035, a view's columns are described with a widened type.

@@ -85,6 +85,7 @@ ready port=3307 socket=- startup_ms=1.312
 | `crates/cli` | The `mysql-ultralight` binary, and the engine/server adapter |
 | `crates/conformance` | Extracts a target codebase's SQL surface |
 | `packages/npm` | `@codevachon/mysql-ultralight`: the JS API and platform packages |
+| `examples/prisma-app` | A worked Prisma application, run by the gate |
 
 ## From JavaScript
 
@@ -105,14 +106,22 @@ Port 0 by default, so parallel test workers cannot race for one, and `start()` r
 only once the server is accepting connections. See
 [`packages/npm/README.md`](packages/npm/README.md).
 
+[`examples/prisma-app`](examples/prisma-app) is the worked version of all of this: a real
+schema, a real migration history, and tests that bake an image and run Prisma Client
+against it. It runs as part of the gate, so the documented path is the tested one.
+
 ## Development
 
 ```sh
-./scripts/check.sh          # the gate: fmt, clippy, tests, npm tests, unused deps,
-                            # advisories, and Fallow over the npm package
+./scripts/check.sh          # the gate: fmt, clippy, tests, npm tests, the Prisma
+                            # example, unused deps, advisories, and Fallow over
+                            # the npm package
 ./scripts/check.sh --fix    # format and apply clippy's suggestions first
 ./scripts/check.sh --fast   # skip the slower supply-chain checks
 ```
+
+The example needs its dependencies once: `(cd examples/prisma-app && npm install)`. Until
+then the gate reports it as a skip rather than passing over it.
 
 A pre-commit hook runs the same script. A fresh clone needs `git config core.hooksPath
 .githooks` to enable it.

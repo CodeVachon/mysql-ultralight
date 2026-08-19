@@ -105,7 +105,31 @@ if [ -d packages/npm ]; then
     run_if_available "npm build   " cargo cargo build --release --quiet
     # Through a shell so the glob expands: this node treats a bare directory as
     # a module path rather than a directory of tests.
-    run_if_available "npm tests   " node bash -c 'node --test packages/npm/test/*.test.js' 
+    run_if_available "npm tests   " node bash -c 'node --test packages/npm/test/*.test.js'
+fi
+
+# The example is the only check that exercises the npm package, the wire
+# protocol and Prisma Client at once. It needs its dependencies installed —
+# reported as a skip rather than silently passing, and a failure under CI,
+# which is the same rule every other tool here follows.
+if [ -d examples/prisma-app ]; then
+    if [ -d examples/prisma-app/node_modules ] && [ -x target/release/mysql-ultralight ]; then
+        # MYSQL_ULTRALIGHT_BINARY pins the example to the binary this run built.
+        # Without it, an installed platform package would win once the packages
+        # are published, and the one check that covers every layer would be
+        # testing the *released* engine rather than this commit.
+        #
+        # --no-install so a partial node_modules cannot make the gate fetch a
+        # different Prisma from the registry.
+        run "example     " env "MYSQL_ULTRALIGHT_BINARY=$PWD/target/release/mysql-ultralight" \
+            bash -c 'cd examples/prisma-app && npx --no-install prisma generate >/dev/null && node --test test/*.test.js'
+    elif [ "$REQUIRE_TOOLS" = 1 ]; then
+        printf '  %s ... %s\n' "example     " "${RED}FAILED (no release binary, or examples/prisma-app not installed)${OFF}"
+        FAILED+=("example")
+    else
+        printf '  %s ... %s\n' "example     " "${YELLOW}skipped (needs a release build and npm install in examples/prisma-app)${OFF}"
+        SKIPPED+=("example")
+    fi
 fi
 
 if [ "$FAST" = 0 ]; then
@@ -130,6 +154,7 @@ echo
 if [ ${#SKIPPED[@]} -gt 0 ]; then
     printf '%s\n' "${YELLOW}Skipped: ${SKIPPED[*]}${OFF}"
     echo "  Install with: cargo install cargo-machete cargo-audit --locked"
+    echo "  And, for the example: (cd examples/prisma-app && npm install)"
 fi
 
 if [ ${#FAILED[@]} -gt 0 ]; then
