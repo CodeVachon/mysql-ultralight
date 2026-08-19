@@ -1,6 +1,6 @@
 {
     "name": "@codevachon/mysql-ultralight",
-    "version": "0.0.1",
+    "version": "0.1.0",
     "description": "A fast-starting, MySQL 8 compatible in-memory database for tests",
     "keywords": [
         "mysql",
@@ -35,9 +35,9 @@
         "test": "node --test test/*.test.js"
     },
     "optionalDependencies": {
-        "@codevachon/mysql-ultralight-darwin-arm64": "0.0.1",
-        "@codevachon/mysql-ultralight-linux-x64-gnu": "0.0.1",
-        "@codevachon/mysql-ultralight-linux-x64-musl": "0.0.1",
-        "@codevachon/mysql-ultralight-linux-arm64-gnu": "0.0.1"
+        "@codevachon/mysql-ultralight-darwin-arm64": "0.1.0",
+        "@codevachon/mysql-ultralight-linux-arm64-gnu": "0.1.0",
+        "@codevachon/mysql-ultralight-linux-x64-gnu": "0.1.0",
+        "@codevachon/mysql-ultralight-linux-x64-musl": "0.1.0"
     }
 }

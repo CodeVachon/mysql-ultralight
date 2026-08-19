@@ -153,7 +153,7 @@ dependencies = [
 
 [[package]]
 name = "mysql-ultralight-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "mysql-ultralight-engine",
  "mysql-ultralight-protocol",
@@ -163,7 +163,7 @@ dependencies = [
 
 [[package]]
 name = "mysql-ultralight-conformance"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "mysql-ultralight-engine",
  "serde_json",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "mysql-ultralight-engine"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "md-5",
  "mysql-ultralight-protocol",
@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "mysql-ultralight-protocol"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "sha1",
  "tokio",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "mysql-ultralight-server"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "mysql-ultralight-protocol",
  "tokio",

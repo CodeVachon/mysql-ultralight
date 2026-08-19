@@ -1,11 +1,11 @@
 ---
 id: 29
-title: "Function library: dates, REGEXP, JSON and spatial"
+title: "Function library: date arithmetic and spatial"
 state: Todo
 parent: 6
 labels: [executor, compat]
 created: 2026-08-18T20:59:12Z
-updated: 2026-08-19T12:30:57Z
+updated: 2026-08-19T12:48:52Z
 ---
 
 ## Description

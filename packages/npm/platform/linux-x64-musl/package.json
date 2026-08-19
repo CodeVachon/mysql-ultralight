@@ -1,6 +1,6 @@
 {
     "name": "@codevachon/mysql-ultralight-linux-x64-musl",
-    "version": "0.0.1",
+    "version": "0.1.0",
     "description": "mysql-ultralight binary for linux-x64-musl",
     "license": "MIT OR Apache-2.0",
     "repository": {

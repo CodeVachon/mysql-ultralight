@@ -78,3 +78,9 @@
 {"at":"2026-08-18T22:40:24Z","id":31,"by":"Christopher Vachon","as":"user","type":"created","title":"Run the real 604-migration history end to end","state":"Todo"}
 {"at":"2026-08-19T02:15:44Z","id":32,"by":"Christopher Vachon","as":"user","type":"created","title":"Prepare describes by executing, so an expensive query costs twice","state":"Todo"}
 {"at":"2026-08-19T12:47:14Z","id":33,"by":"Christopher Vachon","as":"user","type":"created","title":"JSON values are text, so nested constructors double-encode","state":"Todo"}
+{"at":"2026-08-19T12:48:15Z","id":2,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-19T12:48:15Z","id":3,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-19T12:48:15Z","id":5,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-19T12:48:15Z","id":7,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-19T12:48:15Z","id":31,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-19T12:48:52Z","id":29,"by":"Christopher Vachon","as":"user","type":"title","from":"Function library: dates, REGEXP, JSON and spatial","to":"Function library: date arithmetic and spatial"}

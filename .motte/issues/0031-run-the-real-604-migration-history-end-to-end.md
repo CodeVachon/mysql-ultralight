@@ -1,11 +1,11 @@
 ---
 id: 31
 title: Run the real 604-migration history end to end
-state: Todo
+state: Done
 parent: 8
 labels: [compat, prisma, milestone]
 created: 2026-08-18T22:40:24Z
-updated: 2026-08-19T12:30:57Z
+updated: 2026-08-19T12:48:15Z
 ---
 
 ## Description

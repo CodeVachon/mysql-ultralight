@@ -1,11 +1,11 @@
 ---
 id: 7
 title: Phase 6 — State image (fast boot)
-state: Todo
+state: Done
 labels: [epic, phase-6]
 blockedBy: [5]
 created: 2026-08-18T14:10:54Z
-updated: 2026-08-19T01:58:50Z
+updated: 2026-08-19T12:48:15Z
 ---
 
 ## Description

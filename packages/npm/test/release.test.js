@@ -65,9 +65,12 @@ describe('prepare-release', () => {
 
     it('refuses something that is not a version', (t) => {
         const root = copyOfPackage(t);
+        // Whatever the version is now — the point is that a mistyped tag
+        // cannot half-release, not what the current number happens to be.
+        const before = manifests(root).main.version;
+
         assert.throws(() => run(root, ['latest']), /not a semver version/);
-        // The manifests are untouched, so a mistyped tag cannot half-release.
-        assert.equal(manifests(root).main.version, '0.0.1');
+        assert.equal(manifests(root).main.version, before);
     });
 
     it('stages a binary into each platform package', (t) => {

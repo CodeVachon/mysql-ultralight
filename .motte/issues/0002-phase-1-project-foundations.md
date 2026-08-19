@@ -1,10 +1,10 @@
 ---
 id: 2
 title: Phase 1 — Project foundations
-state: Todo
+state: Done
 labels: [epic, phase-1]
 created: 2026-08-18T14:10:54Z
-updated: 2026-08-18T14:20:37Z
+updated: 2026-08-19T12:48:15Z
 ---
 
 ## Description
@@ -16,3 +16,7 @@ Repo scaffolding for a public OSS Rust project: workspace layout, license (MIT o
 ### 2026-08-18T14:20:37Z — Christopher Vachon (user)
 
 Unblocked from the spike on 2026-08-18: with Rust committed, repo scaffolding, license, CI matrix and release automation no longer depend on the spike outcome and can proceed in parallel with Tracks A and C.
+
+### 2026-08-19T12:48:15Z — Christopher Vachon (user)
+
+Closed 2026-08-19. Everything this phase asked for exists: the workspace and its five crates, scripts/check.sh as the single definition of clean, a version-controlled pre-commit hook, a CI workflow that runs that same script and builds all four supported targets, and a tagged release workflow that publishes the npm packages.
