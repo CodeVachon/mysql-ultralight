@@ -1,0 +1,17 @@
+{
+    "name": "mysql-ultralight-node-test-example",
+    "version": "0.1.0",
+    "private": true,
+    "description": "Testing the example app with node:test, and checking the image against the migrations",
+    "license": "MIT OR Apache-2.0",
+    "engines": {
+        "node": ">=20.11"
+    },
+    "scripts": {
+        "pretest": "npm --prefix ../app run bake --silent",
+        "test": "node --test test/*.test.js"
+    },
+    "devDependencies": {
+        "@mysql-ultralight-example/app": "file:../app"
+    }
+}

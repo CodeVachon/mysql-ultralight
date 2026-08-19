@@ -108,29 +108,44 @@ if [ -d packages/npm ]; then
     run_if_available "npm tests   " node bash -c 'node --test packages/npm/test/*.test.js'
 fi
 
-# The example is the only check that exercises the npm package, the wire
-# protocol and Prisma Client at once. It needs its dependencies installed —
-# reported as a skip rather than silently passing, and a failure under CI,
-# which is the same rule every other tool here follows.
-if [ -d examples/prisma-app ]; then
-    if [ -d examples/prisma-app/node_modules ] && [ -x target/release/mysql-ultralight ]; then
-        # MYSQL_ULTRALIGHT_BINARY pins the example to the binary this run built.
-        # Without it, an installed platform package would win once the packages
-        # are published, and the one check that covers every layer would be
-        # testing the *released* engine rather than this commit.
-        #
-        # --no-install so a partial node_modules cannot make the gate fetch a
-        # different Prisma from the registry.
-        run "example     " env "MYSQL_ULTRALIGHT_BINARY=$PWD/target/release/mysql-ultralight" \
-            bash -c 'cd examples/prisma-app && npx --no-install prisma generate >/dev/null && node --test test/*.test.js'
-    elif [ "$REQUIRE_TOOLS" = 1 ]; then
-        printf '  %s ... %s\n' "example     " "${RED}FAILED (no release binary, or examples/prisma-app not installed)${OFF}"
-        FAILED+=("example")
-    else
-        printf '  %s ... %s\n' "example     " "${YELLOW}skipped (needs a release build and npm install in examples/prisma-app)${OFF}"
-        SKIPPED+=("example")
+# The examples are the only checks that exercise the npm package, the wire
+# protocol and a real client at once. Each needs its dependencies installed —
+# reported as a skip rather than silently passing, and a failure under CI, which
+# is the rule every other tool here follows.
+#
+# `node-test` answers "does the engine work"; `jest` and `vitest` answer "does
+# the wiring still work", which breaks when the package's API moves.
+run_example() {
+    local label="$1" directory="$2" command="$3"
+
+    if [ ! -d "$directory" ]; then
+        return 0
     fi
-fi
+    if [ -d "$directory/node_modules" ] && [ -x target/release/mysql-ultralight ]; then
+        # MYSQL_ULTRALIGHT_BINARY pins the example to the binary this run built.
+        # Without it an installed platform package would win once the packages
+        # are published, and the checks that cover every layer would be testing
+        # the *released* engine rather than this commit.
+        run "$label" env "MYSQL_ULTRALIGHT_BINARY=$PWD/target/release/mysql-ultralight" \
+            bash -c "cd $directory && $command"
+        return $?
+    fi
+    if [ "$REQUIRE_TOOLS" = 1 ]; then
+        printf '  %s ... %s\n' "$label" "${RED}FAILED (no release binary, or $directory not installed)${OFF}"
+        FAILED+=("$label")
+        return 1
+    fi
+    printf '  %s ... %s\n' "$label" "${YELLOW}skipped (needs a release build and npm install in $directory)${OFF}"
+    SKIPPED+=("$label")
+}
+
+# The app is built and baked once; every runner's `pretest` then re-bakes,
+# which is a no-op after the first. Typechecked here because Vitest transpiles
+# without checking, so a type error would otherwise ship green.
+run_example "app         " examples/app 'npm run build --silent && npm run typecheck --silent'
+run_example "node:test   " examples/node-test 'npm test --silent'
+run_example "jest        " examples/jest 'npm run typecheck --silent && npm test --silent'
+run_example "vitest      " examples/vitest 'npm run typecheck --silent && npm test --silent' 
 
 if [ "$FAST" = 0 ]; then
     # Unused dependencies. The closest analogue to what Fallow gives the JS
@@ -139,14 +154,17 @@ if [ "$FAST" = 0 ]; then
     # RustSec advisories against the lockfile.
     run_if_available "advisories  " cargo-audit cargo audit
 
-    # Fallow analyses TypeScript and JavaScript only, so it runs against the
-    # npm package and nothing else. Pointed at the Rust crates it would
-    # discover no files and report a green score over nothing analysed, which
-    # in a gate is worse than an error.
-    if [ -d packages/npm ]; then
-        run_if_available "npm fallow  " npx \
-            bash -c 'cd packages/npm && npx --yes --quiet fallow@latest dead-code --fail-on-issues' 
-    fi
+    # Fallow analyses TypeScript and JavaScript only, so it runs over the npm
+    # package and the examples and nothing else. Pointed at the Rust crates it
+    # would discover no files and report a green score over nothing analysed,
+    # which in a gate is worse than an error.
+    for javascript in packages/npm examples/app examples/jest examples/vitest; do
+        if [ -d "$javascript" ]; then
+            printf -v label 'fallow %-6s' "$(basename "$javascript")"
+            run_if_available "$label" npx \
+                bash -c "cd $javascript && npx --yes --quiet fallow@latest dead-code --fail-on-issues"
+        fi
+    done
 fi
 
 echo
@@ -154,7 +172,7 @@ echo
 if [ ${#SKIPPED[@]} -gt 0 ]; then
     printf '%s\n' "${YELLOW}Skipped: ${SKIPPED[*]}${OFF}"
     echo "  Install with: cargo install cargo-machete cargo-audit --locked"
-    echo "  And, for the example: (cd examples/prisma-app && npm install)"
+    echo "  And, for the examples: for d in examples/*/; do npm install --prefix \"$d\"; done"
 fi
 
 if [ ${#FAILED[@]} -gt 0 ]; then

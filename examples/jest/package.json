@@ -1,0 +1,27 @@
+{
+    "name": "mysql-ultralight-jest-example",
+    "version": "0.1.0",
+    "private": true,
+    "description": "Testing the example app with Jest, two ways",
+    "license": "MIT OR Apache-2.0",
+    "engines": {
+        "node": ">=20.11"
+    },
+    "scripts": {
+        "pretest": "npm --prefix ../app run bake --silent",
+        "test": "npm run test:isolated && npm run test:shared",
+        "pretest:isolated": "npm --prefix ../app run bake --silent",
+        "test:isolated": "jest --config jest.config.isolated.js",
+        "pretest:shared": "npm --prefix ../app run bake --silent",
+        "test:shared": "jest --config jest.config.shared.js",
+        "typecheck": "tsc --noEmit"
+    },
+    "devDependencies": {
+        "@mysql-ultralight-example/app": "file:../app",
+        "@types/jest": "29.5.14",
+        "@types/node": "22.10.2",
+        "jest": "29.7.0",
+        "ts-jest": "29.2.5",
+        "typescript": "5.7.2"
+    }
+}

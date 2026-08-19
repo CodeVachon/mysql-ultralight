@@ -85,7 +85,10 @@ ready port=3307 socket=- startup_ms=1.312
 | `crates/cli` | The `mysql-ultralight` binary, and the engine/server adapter |
 | `crates/conformance` | Extracts a target codebase's SQL surface |
 | `packages/npm` | `@codevachon/mysql-ultralight`: the JS API and platform packages |
-| `examples/prisma-app` | A worked Prisma application, run by the gate |
+| `examples/app` | The example application: one schema, one history, the controllers |
+| `examples/node-test` | Testing it with `node:test`, and the engine-level claims |
+| `examples/jest` | Testing it with Jest, shared and per-file |
+| `examples/vitest` | Testing it with Vitest, the same two ways |
 
 ## From JavaScript
 
@@ -106,9 +109,20 @@ Port 0 by default, so parallel test workers cannot race for one, and `start()` r
 only once the server is accepting connections. See
 [`packages/npm/README.md`](packages/npm/README.md).
 
-[`examples/prisma-app`](examples/prisma-app) is the worked version of all of this: a real
-schema, a real migration history, and tests that bake an image and run Prisma Client
-against it. It runs as part of the gate, so the documented path is the tested one.
+[`examples/app`](examples/app) is the worked version of all of this: a real schema, a real
+migration history, and the controllers a test suite would exercise.
+[`node-test`](examples/node-test), [`jest`](examples/jest) and
+[`vitest`](examples/vitest) contain nothing but tests, and all three test that same app —
+comparing runners is only useful if the thing under test is identical.
+
+Each runner example shows two models: the **drop-in**, one database for the whole run,
+which is the smallest change to a suite that already talks to MySQL; and **per-file
+isolation**, a fresh database for every test file, which is what a millisecond startup
+makes affordable and a real MySQL does not. Both prove the difference rather than
+asserting it — two test files claim the same unique value, which collides under a shared
+database and does not under isolation.
+
+They run as part of the gate, so the documented path is the tested one.
 
 ## Development
 
@@ -120,8 +134,8 @@ against it. It runs as part of the gate, so the documented path is the tested on
 ./scripts/check.sh --fast   # skip the slower supply-chain checks
 ```
 
-The example needs its dependencies once: `(cd examples/prisma-app && npm install)`. Until
-then the gate reports it as a skip rather than passing over it.
+The examples need their dependencies once — `for d in examples/*/; do npm install --prefix
+"$d"; done`. Until then the gate reports them as skips rather than passing over them.
 
 A pre-commit hook runs the same script. A fresh clone needs `git config core.hooksPath
 .githooks` to enable it.

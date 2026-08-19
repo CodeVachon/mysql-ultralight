@@ -35,7 +35,7 @@ jobs:
           # The example installs Prisma; cached, that is about a second rather
           # than four.
           cache: npm
-          cache-dependency-path: examples/prisma-app/package-lock.json
+          cache-dependency-path: examples/*/package-lock.json
 
       - uses: Swatinem/rust-cache@v2
 
@@ -50,8 +50,11 @@ jobs:
       # --omit=optional so the published platform packages, once they exist,
       # cannot supply a binary in place of the one this run builds. The gate
       # also pins MYSQL_ULTRALIGHT_BINARY for the same reason.
-      - name: Install the example's dependencies
-        run: npm ci --omit=optional --prefix examples/prisma-app
+      - name: Install the examples' dependencies
+        run: |
+          for example in examples/*/; do
+            npm ci --omit=optional --prefix "$example"
+          done
 
       # The same script the pre-commit hook runs, so local and CI cannot drift.
       - name: Run checks

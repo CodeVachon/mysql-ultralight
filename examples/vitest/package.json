@@ -1,0 +1,26 @@
+{
+    "name": "mysql-ultralight-vitest-example",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "description": "Testing the example app with Vitest, two ways",
+    "license": "MIT OR Apache-2.0",
+    "engines": {
+        "node": ">=20.11"
+    },
+    "scripts": {
+        "pretest": "npm --prefix ../app run bake --silent",
+        "test": "npm run test:isolated && npm run test:shared",
+        "pretest:isolated": "npm --prefix ../app run bake --silent",
+        "test:isolated": "vitest run --config vitest.isolated.config.ts",
+        "pretest:shared": "npm --prefix ../app run bake --silent",
+        "test:shared": "vitest run --config vitest.shared.config.ts",
+        "typecheck": "tsc --noEmit"
+    },
+    "devDependencies": {
+        "@mysql-ultralight-example/app": "file:../app",
+        "@types/node": "22.10.2",
+        "typescript": "5.7.2",
+        "vitest": "2.1.8"
+    }
+}

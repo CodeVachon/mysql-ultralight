@@ -31,7 +31,8 @@ call it, so it must never diverge from what they need:
 | Security advisories | `cargo audit` |
 | npm package tests | `node --test packages/npm/test/*.test.js` |
 | npm dead code | `fallow dead-code` in `packages/npm` |
-| Prisma end to end | `node --test` in `examples/prisma-app` |
+| Prisma end to end | `npm test` in `examples/node-test` |
+| Runner wiring | `npm test` in `examples/jest` and `examples/vitest` |
 
 Flags: `--fast` skips the supply-chain checks, `--fix` formats and applies clippy
 suggestions first, `--require-tools` turns a missing tool into a failure rather than a
@@ -45,8 +46,8 @@ TypeScript/JavaScript only.** Run against the Rust crates it discovers zero file
 reports a green "Health score: 100 A" over nothing analyzed — a false pass, which is
 worse than an error in a gate. `cargo machete` and `cargo audit` cover the Rust side.
 
-The npm package is real JavaScript, so `scripts/check.sh` runs Fallow against
-`packages/npm` and nothing else. Its config lives in `packages/npm/.fallowrc.jsonc`; the
+The npm package and the examples are real JavaScript, so `scripts/check.sh` runs Fallow
+against `packages/npm` and each example that has source of its own. Its config lives in `packages/npm/.fallowrc.jsonc`; the
 platform packages are listed in `ignoreDependencies` because they are resolved at runtime
 by a name built from a template string, which no static analysis can see.
 
@@ -69,7 +70,10 @@ git config core.hooksPath .githooks
 | `crates/cli` | The `mysql-ultralight` binary |
 | `crates/conformance` | Extracts the SQL surface of a target codebase |
 | `packages/npm` | `@codevachon/mysql-ultralight`: the JS API and the platform packages |
-| `examples/prisma-app` | A worked Prisma application; the only check covering all layers at once |
+| `examples/app` | The example application: schema, migrations, controllers, and how a test gets a database |
+| `examples/node-test` | Tests only. The engine-level claims: image equals migrations, no drift |
+| `examples/jest` | Tests only, shared and per-file |
+| `examples/vitest` | Tests only, the same two models |
 
 ## Conventions
 
@@ -81,6 +85,10 @@ git config core.hooksPath .githooks
   only through end-to-end paths.
 - **Unsupported means a clear error**, never a wrong answer. `ErrPacket::unsupported`
   exists so gaps surface as actionable messages.
+- **One app, many runners.** `examples/app` owns the schema, the migrations and the
+  controllers; every runner example contains nothing but tests. A schema copied per
+  runner is a schema that drifts per runner, and comparing runners is only meaningful
+  when the thing under test is identical.
 - **The state image format is append-only.** Field order in `crates/engine/src/image.rs`
   *is* the format. Nothing may be reordered and nothing inserted in the middle; a change
   means a new `FORMAT_VERSION`. Readers bind fields to `let` bindings in write order for

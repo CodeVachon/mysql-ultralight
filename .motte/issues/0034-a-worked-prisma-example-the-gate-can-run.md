@@ -5,7 +5,7 @@ state: Done
 parent: 9
 labels: [compat, prisma, testing]
 created: 2026-08-19T13:22:10Z
-updated: 2026-08-19T14:45:01Z
+updated: 2026-08-19T16:14:03Z
 ---
 
 ## Description
@@ -95,3 +95,11 @@ It earned its place immediately: it found that information_schema reported numbe
 The review of the example found four tests that passed for the wrong reasons, including a rollback test that held against an engine that never wrote anything. All are pinned to exact values now, and the rollback test was verified by breaking ROLLBACK.
 
 Left open: #0035, a view's columns are described with a widened type.
+
+### 2026-08-19T16:14:03Z — Christopher Vachon (user)
+
+Restructured 2026-08-19 at the user's direction: one Prisma and controller setup, and the test examples contain only tests.
+
+examples/app now owns the schema, the four migrations, the controllers under test, and how a test gets a database. examples/node-test (formerly prisma-app), examples/jest and examples/vitest hold nothing but tests and the wiring that hands them a database, and all three exercise the same app — comparing runners is only meaningful when the thing under test is identical, and a schema copied per runner drifts per runner.
+
+The split also fixed three findings from the review of the Jest and Vitest examples at once, because the expensive step moved out of the test hooks: bake() runs once from pretest in a single process, and startDatabase() only loads the image. That removes the cold-cache bake from a hook with a five-second timeout, removes the per-worker bake race, and makes 'the migrations run once' true rather than aspirational.

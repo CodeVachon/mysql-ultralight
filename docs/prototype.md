@@ -263,9 +263,10 @@ constructor, so it is recorded rather than rushed.
 
 ## The example, and what it found
 
-`examples/prisma-app` is a worked Prisma application the gate runs: its own
-schema, four migrations including an `ALTER` and a data migration, and tests
-that bake an image and drive Prisma Client against it. It exists because the
+`examples/app` is a worked Prisma application the gate runs: its own schema,
+four migrations including an `ALTER` and a data migration, and the controllers
+a suite would exercise. Three runner examples — `node-test`, `jest` and
+`vitest` — contain nothing but tests, and all three test that same app. It exists because the
 layers were only ever tested separately — the seam where a real driver's
 expectations meet the wire protocol and the SQL had no coverage at all.
 

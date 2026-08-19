@@ -1,0 +1,11 @@
+{
+    "$schema": "https://docs.fallow.tools/schema/fallow-config.json",
+
+    // Jest reaches these by path from jest.config.*.js, as strings — nothing
+    // in the module graph points at them, so they have to be declared.
+    "entry": [
+        "test/support/global-setup.ts",
+        "test/support/global-teardown.ts",
+        "test/support/per-file.ts"
+    ]
+}
