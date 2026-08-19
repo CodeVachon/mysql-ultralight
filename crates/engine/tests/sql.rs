@@ -5300,3 +5300,486 @@ fn information_schema_reports_numbers_as_numbers() {
         ]
     );
 }
+
+// --- dates, times and geography ---------------------------------------------
+
+#[test]
+fn the_date_parts_come_out() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT YEAR('2026-05-02 10:20:30'), MONTH('2026-05-02 10:20:30'),
+                    DAY('2026-05-02 10:20:30'), HOUR('2026-05-02 10:20:30'),
+                    MINUTE('2026-05-02 10:20:30'), SECOND('2026-05-02 10:20:30'),
+                    QUARTER('2026-05-02'), DAYOFYEAR('2026-05-02'),
+                    DAYOFWEEK('2026-05-02'), WEEKDAY('2026-05-02')"
+        ),
+        // 2 May 2026 is a Saturday: DAYOFWEEK counts from Sunday = 1, WEEKDAY
+        // from Monday = 0, and the two disagree on purpose.
+        vec![vec![
+            "2026", "5", "2", "10", "20", "30", "2", "122", "7", "5"
+        ]]
+    );
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT HOUR(NULL), DAYOFWEEK(NULL)"),
+        vec![vec!["NULL", "NULL"]]
+    );
+}
+
+#[test]
+fn date_format_renders_the_specifiers_it_claims() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            r"SELECT DATE_FORMAT('2026-01-02 03:04:05', '%Y-%m'),
+                     DATE_FORMAT('2026-01-02 03:04:05', '%Y-%m-%dT%H:%i:%s.000Z'),
+                     DATE_FORMAT('2026-01-02 15:04:05', '%W %M %e, %Y at %h:%i %p'),
+                     DATE_FORMAT('2026-01-02', '100%% of %j')"
+        ),
+        vec![vec![
+            "2026-01",
+            "2026-01-02T03:04:05.000Z",
+            "Friday January 2, 2026 at 03:04 PM",
+            "100% of 002"
+        ]]
+    );
+
+    // A specifier the engine has not implemented is an error, not passed
+    // through: MySQL renders an unknown one as the bare letter, so a silent
+    // pass-through would be indistinguishable from a literal and the caller
+    // would get a string that looks almost right.
+    let err = engine
+        .execute(&mut session, "SELECT DATE_FORMAT('2026-01-02', '%U')", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1235);
+}
+
+#[test]
+fn date_arithmetic_walks_the_calendar() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT DATE_ADD('2026-01-31', INTERVAL 1 DAY),
+                    DATE_SUB('2026-03-01', INTERVAL 1 DAY),
+                    DATE_ADD('2024-02-28', INTERVAL 1 DAY),
+                    DATE_ADD('2026-01-31', INTERVAL 90 MINUTE),
+                    DATE_ADD('2026-01-01', INTERVAL 1 YEAR),
+                    ADDDATE('2026-01-01', 7)"
+        ),
+        vec![vec![
+            "2026-02-01",
+            "2026-02-28",
+            // 2024 is a leap year, so the 28th is not the last day.
+            "2024-02-29",
+            // A unit with a clock turns a date into a datetime.
+            "2026-01-31 01:30:00",
+            "2027-01-01",
+            "2026-01-08"
+        ]]
+    );
+
+    // Adding a month clamps to the shorter month rather than rolling over,
+    // which is what MySQL does and what makes month arithmetic non-obvious.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT DATE_ADD('2026-01-31', INTERVAL 1 MONTH),
+                    DATE_ADD('2026-01-31', INTERVAL 13 MONTH),
+                    DATE_SUB('2026-03-31', INTERVAL 1 MONTH)"
+        ),
+        vec![vec!["2026-02-28", "2027-02-28", "2026-02-28"]]
+    );
+}
+
+#[test]
+fn differences_are_measured_in_whole_units() {
+    let (engine, mut session) = engine();
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT DATEDIFF('2026-01-10', '2026-01-01'),
+                    DATEDIFF('2026-01-01', '2026-01-10'),
+                    DATEDIFF('2026-01-02 23:59:59', '2026-01-01 00:00:01')"
+        ),
+        // DATEDIFF counts days, not 24-hour spans: the third is 1, not 1.99.
+        vec![vec!["9", "-9", "1"]]
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TIMESTAMPDIFF(SECOND, '2026-01-01 00:00:00', '2026-01-01 00:02:03'),
+                    TIMESTAMPDIFF(MINUTE, '2026-01-01 00:00:00', '2026-01-01 02:00:00'),
+                    TIMESTAMPDIFF(HOUR, '2026-01-01 00:00:00', '2026-01-01 02:59:00'),
+                    TIMESTAMPDIFF(DAY, '2026-01-01', '2026-01-10'),
+                    TIMESTAMPDIFF(MONTH, '2026-01-31', '2026-03-01'),
+                    TIMESTAMPDIFF(YEAR, '2026-01-01', '2027-06-01')"
+        ),
+        // Truncated toward zero throughout: 2h59m is two hours, and 31 Jan to
+        // 1 Mar is one month because the day of month has not come round yet.
+        vec![vec!["123", "120", "2", "9", "1", "1"]]
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT DATEDIFF(NULL, '2026-01-01'), TIMESTAMPDIFF(DAY, NULL, '2026-01-01')"
+        ),
+        vec![vec!["NULL", "NULL"]]
+    );
+}
+
+#[test]
+fn a_malformed_date_is_null_not_a_nearby_one() {
+    // MySQL answers NULL with a warning for a bad datetime *inside an
+    // expression* — strict mode governs data-change statements, not
+    // expression evaluation — so failing the statement here would kill a
+    // query MySQL answers. What must not happen is a nearby date, which would
+    // hide the bad value instead of showing it.
+    let (engine, mut session) = engine();
+    for sql in [
+        "SELECT DATEDIFF('2026-13-01', '2026-01-01')",
+        "SELECT DATE_ADD('not a date', INTERVAL 1 DAY)",
+        "SELECT HOUR('2026-01-01 25:00:00')",
+        "SELECT DATE_FORMAT('2026-02-30', '%Y')",
+        // Day zero is not the last of the previous month, and reading it as
+        // 2025-12-31 would answer a different question without saying so.
+        "SELECT DATE_ADD('2026-01-00', INTERVAL 1 DAY)",
+        "SELECT DAYOFYEAR('2026-01-00')",
+        "SELECT DATE_FORMAT('2026-01-00', '%M')",
+        "SELECT DATE_ADD('2026-00-01', INTERVAL 1 DAY)",
+        // Out of range rather than merely wrong: parsed as `i64` and checked
+        // before narrowing, because `as u32` wraps this one to day zero and it
+        // would then take the path above and answer.
+        "SELECT DATE_ADD('2026-01-4294967296', INTERVAL 1 DAY)",
+        // The year is bounded to MySQL's own range at both ends.
+        "SELECT DATE_ADD('99999-01-01', INTERVAL 1 DAY)",
+        "SELECT DATE_ADD('9999-12-31', INTERVAL 1 DAY)",
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec!["NULL"]],
+            "{sql}"
+        );
+    }
+
+    // One bad value behaves one way. These used to split on '-' and read the
+    // year out of a date that has no year, while QUARTER of the same text was
+    // NULL.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT YEAR('2026-13-45'), MONTH('2026-13-45'), DAY('2026-13-45'), QUARTER('2026-13-45')"
+        ),
+        vec![vec!["NULL", "NULL", "NULL", "NULL"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT YEAR('2026-05-02'), MONTH('2026-05-02 11:00:00'), DAY('2026-05-02')"
+        ),
+        vec![vec!["2026", "5", "2"]]
+    );
+
+    // An interval the engine cannot read is still a clear error, because that
+    // is a gap in the engine rather than a value MySQL would call NULL.
+    //
+    // The compound unit is refused by the parser before the engine sees it,
+    // which is the same outcome by a shorter route.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT DATE_ADD('2026-01-01', INTERVAL '1 2' DAY_HOUR)",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1064);
+
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT TIMESTAMPDIFF(FORTNIGHT, '2026-01-01', '2026-02-01')",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1235);
+
+    // The boundaries the day check is built on still pass on both sides.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT DATE_ADD('2024-02-29', INTERVAL 1 DAY), DATE_ADD('2026-01-31', INTERVAL 1 DAY)"
+        ),
+        vec![vec!["2024-03-01", "2026-02-01"]]
+    );
+}
+
+#[test]
+fn distance_on_the_sphere_matches_mysql() {
+    let (engine, mut session) = engine();
+
+    // One degree of latitude on MySQL's sphere, whose radius is 6,370,986m.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROUND(ST_Distance_Sphere(POINT(0, 0), POINT(0, 1))),
+                    ROUND(ST_Distance_Sphere(POINT(0, 0), POINT(0, 0)))"
+        ),
+        vec![vec!["111195", "0"]]
+    );
+
+    // A point is held as WKT, which is what ST_AsText would return.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT POINT(1.5, -2.25)"),
+        vec![vec!["POINT(1.5 -2.25)"]]
+    );
+
+    // The bounds are MySQL's, and the asymmetry is real: longitude is
+    // exclusive at -180 and inclusive at 180.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT ST_Distance_Sphere(POINT(-180, 0), POINT(0, 0))",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 3616);
+
+    run(
+        &engine,
+        &mut session,
+        "SELECT ST_Distance_Sphere(POINT(180, 0), POINT(0, 0))",
+    );
+
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT ST_Distance_Sphere(POINT(0, 91), POINT(0, 0))",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 3617);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ST_Distance_Sphere(NULL, POINT(0, 0))"
+        ),
+        vec![vec!["NULL"]]
+    );
+
+    // Antipodal points are half the circumference apart, not NaN. The
+    // haversine term is at most 1 in exact arithmetic but can round a couple
+    // of ulps past it, and `asin` above 1 is NaN — so the third pair here,
+    // found by sweeping near-antipodal points for one whose `sqrt` stays above
+    // 1, is the case the clamp exists for.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROUND(ST_Distance_Sphere(POINT(0, 90), POINT(0, -90))),
+                    ROUND(ST_Distance_Sphere(POINT(0, 0), POINT(180, 0))),
+                    ROUND(ST_Distance_Sphere(
+                        POINT(15.029258415716725, -62.926012829802886),
+                        POINT(-164.9707415845351, 62.92601282966185)))"
+        ),
+        vec![vec!["20015043", "20015043", "20015043"]]
+    );
+}
+
+#[test]
+fn an_aggregate_with_no_from_folds_over_one_implicit_row() {
+    let (engine, mut session) = engine();
+
+    // A FROM-less SELECT is evaluated against one implicit row, not none, so
+    // the argument is folded rather than skipped. Over an empty group these
+    // would be `0, NULL, NULL`, which reads as an answer rather than a bug.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*), SUM(1), MAX(2)"),
+        vec![vec!["1", "1", "2"]]
+    );
+
+    // The implicit row is the enclosing one where there is one, so a
+    // correlated aggregate still counts its own row rather than zero.
+    run(&engine, &mut session, "CREATE TABLE Two (id INT)");
+    run(&engine, &mut session, "INSERT INTO Two VALUES (1), (2)");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, (SELECT COUNT(*)) FROM Two"
+        ),
+        vec![vec!["1", "1"], vec!["2", "1"]]
+    );
+}
+
+#[test]
+fn an_interval_too_large_to_land_is_null_rather_than_a_panic() {
+    let (engine, mut session) = engine();
+
+    // Every one of these is a statement anyone can write, and each multiplies
+    // the amount by something. Unchecked they panic in a debug build and wrap
+    // to a plausible-looking wrong date in release, where overflow checks are
+    // off — so the failure would reach a user as an answer.
+    for sql in [
+        "SELECT DATE_ADD('2026-01-01', INTERVAL 999999999999999999 DAY)",
+        "SELECT DATE_ADD('2026-01-01', INTERVAL 9223372036854775807 YEAR)",
+        "SELECT DATE_ADD('2026-01-01', INTERVAL 9223372036854775807 QUARTER)",
+        "SELECT DATE_ADD('2026-01-01', INTERVAL 9223372036854775807 WEEK)",
+        "SELECT DATE_ADD('2026-01-01', INTERVAL 9223372036854775807 HOUR)",
+        // Negating i64::MIN overflows, which is its own arithmetic trap.
+        "SELECT DATE_SUB('2026-01-01', INTERVAL -9223372036854775808 DAY)",
+        "SELECT TIMESTAMPADD(YEAR, 9223372036854775807, '2026-01-01')",
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec!["NULL"]],
+            "{sql}"
+        );
+    }
+
+    // The widest span that does fit is still computed rather than refused.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TIMESTAMPDIFF(MICROSECOND, '0000-01-01', '9999-12-31')"
+        ),
+        vec![vec!["315569433600000000"]]
+    );
+}
+
+#[test]
+fn an_interval_reads_null_and_fractions_as_mysql_does() {
+    let (engine, mut session) = engine();
+
+    // NULL is a value here, not a failure: this is the shape a prepared
+    // `DATE_SUB(NOW(), INTERVAL ? DAY)` takes when the parameter binds NULL,
+    // and erroring would fail the whole statement over one row.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT DATE_ADD('2026-01-01', INTERVAL NULL DAY), DATE_SUB(NULL, INTERVAL 1 DAY)"
+        ),
+        vec![vec!["NULL", "NULL"]]
+    );
+
+    // A fractional amount rounds rather than truncating, so 1.5 days is two.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT DATE_ADD('2026-01-01', INTERVAL 1.5 DAY),
+                    DATE_ADD('2026-01-01', INTERVAL 1.2 DAY)"
+        ),
+        vec![vec!["2026-01-03", "2026-01-02"]]
+    );
+}
+
+#[test]
+fn a_bare_interval_unit_is_not_read_as_a_column() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Span (id INT, d DATETIME)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Span VALUES (1, '2026-01-01 00:00:00'), (1, '2026-03-05 00:00:00')",
+    );
+
+    // TIMESTAMPDIFF writes its unit as a bare keyword, which parses as an
+    // identifier indistinguishable from a column. The ONLY_FULL_GROUP_BY check
+    // walks the raw AST, so without dropping that argument it rejects this for
+    // selecting a nonaggregated column named `DAY`.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, TIMESTAMPDIFF(DAY, MIN(d), MAX(d)) FROM Span GROUP BY id"
+        ),
+        vec![vec!["1", "63"]]
+    );
+
+    // A genuinely ungrouped column in the same call is still caught.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT id, TIMESTAMPDIFF(DAY, d, MAX(d)) FROM Span GROUP BY id",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1055);
+}
+
+#[test]
+fn the_clock_extractors_take_a_bare_time() {
+    let (engine, mut session) = engine();
+
+    // HOUR, MINUTE, SECOND and MICROSECOND accept a TIME, which has no
+    // calendar at all — a `WHERE HOUR(t) = 9` over a TIME column would
+    // otherwise fail the query rather than filter it.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT HOUR('10:30:45'), MINUTE('10:30:45'), SECOND('10:30:45'),
+                    MICROSECOND('10:30:45.5')"
+        ),
+        vec![vec!["10", "30", "45", "500000"]]
+    );
+
+    // A TIME runs past 24 hours, because it is a duration as much as a clock.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT HOUR('838:59:59')"),
+        vec![vec!["838"]]
+    );
+
+    // The extractors that need a calendar do not accept one.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT DAYOFWEEK('10:30:45'), QUARTER('10:30:45')"
+        ),
+        vec![vec!["NULL", "NULL"]]
+    );
+}
+
+#[test]
+fn a_fraction_is_rendered_at_full_width() {
+    let (engine, mut session) = engine();
+
+    // MySQL renders `.100000`, not `.1`. Trimming would give a different
+    // string for the same instant than DATE_FORMAT's `%f`, and a client
+    // reading fractional seconds by fixed width would misread it.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT DATE_ADD('2026-01-01 00:00:00.1', INTERVAL 1 SECOND),
+                    DATE_FORMAT('2026-01-01 00:00:00.1', '%f')"
+        ),
+        vec![vec!["2026-01-01 00:00:01.100000", "100000"]]
+    );
+}

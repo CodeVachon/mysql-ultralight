@@ -8,6 +8,7 @@ use sqlparser::ast::DataType;
 use crate::error::{unsupported, EngineError, EngineResult};
 use crate::json;
 use crate::session::Session;
+use crate::temporal;
 use crate::value::Value;
 
 /// Dispatches a scalar function call.
@@ -16,6 +17,104 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
     let text = |i: usize| arg(i).as_text();
 
     Ok(match name {
+        // -- dates and times ---------------------------------------------------
+        //
+        // `DATE_ADD`, `DATE_SUB` and `TIMESTAMPDIFF` are not here: their
+        // arguments are an `INTERVAL` or a bare unit keyword rather than
+        // values, so they are handled where the expression is still an AST.
+        "hour" | "minute" | "second" | "microsecond" | "dayofweek" | "dayofyear" | "quarter"
+        | "weekday" | "last_day" => {
+            if arg(0).is_null() {
+                return Ok(Value::Null);
+            }
+            // The clock extractors also take a bare TIME, which has no
+            // calendar at all: `HOUR('10:30:00')` is 10 in MySQL, and a
+            // `WHERE HOUR(t) = 9` over a TIME column would otherwise fail the
+            // query rather than filter it.
+            let clock_only = matches!(name, "hour" | "minute" | "second" | "microsecond");
+            let parsed = temporal::parse(&text(0)).or_else(|| {
+                clock_only
+                    .then(|| temporal::parse_clock(&text(0)))
+                    .flatten()
+            });
+            // A value MySQL cannot read is NULL and a warning, not a failed
+            // statement — and the neighbouring YEAR/MONTH/DAY are lenient too,
+            // so erroring here would make the same bad input behave two ways.
+            let Some(stamp) = parsed else {
+                return Ok(Value::Null);
+            };
+            match name {
+                "hour" => Value::Int(i64::from(stamp.hour)),
+                "minute" => Value::Int(i64::from(stamp.minute)),
+                "second" => Value::Int(i64::from(stamp.second)),
+                "microsecond" => Value::Int(i64::from(stamp.micros)),
+                "dayofweek" => Value::Int(i64::from(stamp.day_of_week())),
+                // WEEKDAY counts from Monday = 0, where DAYOFWEEK counts from
+                // Sunday = 1. The two disagree on purpose and MySQL keeps both.
+                "weekday" => Value::Int(i64::from((stamp.day_of_week() + 5) % 7)),
+                "dayofyear" => Value::Int(i64::from(stamp.day_of_year())),
+                "quarter" => Value::Int(i64::from((stamp.month - 1) / 3 + 1)),
+                _ => {
+                    let last_day = stamp
+                        .add(temporal::Unit::Month, 1)
+                        .map(|next| temporal::Stamp {
+                            day: 1,
+                            has_time: false,
+                            ..next
+                        })
+                        .and_then(|first_of_next| first_of_next.add(temporal::Unit::Day, -1));
+                    match last_day {
+                        Some(day) => Value::text(day.render()),
+                        None => Value::Null,
+                    }
+                }
+            }
+        }
+        "date_format" => {
+            if arg(0).is_null() || arg(1).is_null() {
+                return Ok(Value::Null);
+            }
+            match temporal::parse(&text(0)) {
+                Some(stamp) => Value::text(temporal::format(&stamp, &text(1))?),
+                None => Value::Null,
+            }
+        }
+        "datediff" => {
+            if arg(0).is_null() || arg(1).is_null() {
+                return Ok(Value::Null);
+            }
+            // Whole days between the dates, ignoring the time of day, which is
+            // what makes `DATEDIFF(x, NOW())` a count of days rather than of
+            // 24-hour spans.
+            match (temporal::parse(&text(0)), temporal::parse(&text(1))) {
+                (Some(a), Some(b)) => Value::Int(
+                    temporal::days_from_civil(a.year, a.month, a.day)
+                        - temporal::days_from_civil(b.year, b.month, b.day),
+                ),
+                _ => Value::Null,
+            }
+        }
+
+        // -- spatial -----------------------------------------------------------
+        //
+        // Only what the target codebase uses: a point, and the distance
+        // between two of them. Held as WKT text, which is what `ST_AsText`
+        // returns and so is a representation a client can already read.
+        "point" => {
+            if arg(0).is_null() || arg(1).is_null() {
+                return Ok(Value::Null);
+            }
+            let (x, y) = (as_number(&arg(0), "point")?, as_number(&arg(1), "point")?);
+            Value::text(format!("POINT({x} {y})"))
+        }
+        "st_distance_sphere" => {
+            if arg(0).is_null() || arg(1).is_null() {
+                return Ok(Value::Null);
+            }
+            let (a, b) = (read_point(&text(0))?, read_point(&text(1))?);
+            Value::Float(distance_on_sphere(a, b))
+        }
+
         // -- JSON -------------------------------------------------------------
         //
         // JSON is held as text and parsed here, where the structure is actually
@@ -509,9 +608,12 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
             let s = text(0);
             Value::Text(s.chars().take(10).collect())
         }
-        "year" => parse_date_part(&text(0), 0),
-        "month" => parse_date_part(&text(0), 1),
-        "day" | "dayofmonth" => parse_date_part(&text(0), 2),
+        // Through the same parser as the rest, so one bad value behaves one
+        // way: splitting on '-' used to read '2026-13-45' as the year 2026
+        // while QUARTER of the same text is NULL.
+        "year" => date_part(&arg(0), |s| i64::from(s.year as u32)),
+        "month" => date_part(&arg(0), |s| i64::from(s.month)),
+        "day" | "dayofmonth" => date_part(&arg(0), |s| i64::from(s.day)),
 
         other => return Err(unsupported(format!("function `{other}()`"))),
     })
@@ -530,13 +632,13 @@ fn pad_to(s: &str, width: usize, pad: &str, left: bool) -> String {
     }
 }
 
-fn parse_date_part(s: &str, index: usize) -> Value {
-    match s
-        .split(['-', ' ', ':'])
-        .nth(index)
-        .and_then(|p| p.parse::<i64>().ok())
-    {
-        Some(v) => Value::Int(v),
+/// One field of a date, or NULL when the value is not a date at all.
+fn date_part(value: &Value, field: impl Fn(&temporal::Stamp) -> i64) -> Value {
+    if value.is_null() {
+        return Value::Null;
+    }
+    match temporal::parse(&value.as_text()) {
+        Some(stamp) => Value::Int(field(&stamp)),
         None => Value::Null,
     }
 }
@@ -771,6 +873,92 @@ fn compile_regex(pattern: &str, match_type: &str) -> EngineResult<regex::Regex> 
                 format!("Illegal argument to a regular expression: {e}"),
             )
         })
+}
+
+/// A number from a value, for a function that has no sensible reading of text.
+fn as_number(value: &Value, function: &str) -> EngineResult<f64> {
+    value.as_float().ok_or_else(|| {
+        EngineError::new(
+            1367,
+            "22007",
+            format!("Illegal non-numeric value in the call to native function '{function}'"),
+        )
+    })
+}
+
+/// The longitude and latitude of a WKT point, in that order.
+///
+/// MySQL's `POINT(x, y)` takes longitude first, and `ST_Distance_Sphere`
+/// validates both: latitude is inclusive at both ends, longitude is exclusive
+/// at -180 and inclusive at 180. That asymmetry is real, and the error codes
+/// are the ones an application catches.
+fn read_point(text: &str) -> EngineResult<(f64, f64)> {
+    let inner = text
+        .trim()
+        .strip_prefix("POINT(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .ok_or_else(|| {
+            EngineError::new(
+                3037,
+                "22023",
+                "Invalid GIS data provided to function st_distance_sphere.",
+            )
+        })?;
+
+    let mut parts = inner.split_whitespace();
+    let mut coordinate = || -> EngineResult<f64> {
+        parts.next().and_then(|p| p.parse().ok()).ok_or_else(|| {
+            EngineError::new(
+                3037,
+                "22023",
+                "Invalid GIS data provided to function st_distance_sphere.",
+            )
+        })
+    };
+    let longitude = coordinate()?;
+    let latitude = coordinate()?;
+
+    if !(-180.0 < longitude && longitude <= 180.0) {
+        return Err(EngineError::new(
+            3616,
+            "22S03",
+            format!(
+                "Longitude {longitude} is out of range in function st_distance_sphere. \
+                 It must be within (-180.000000, 180.000000]."
+            ),
+        ));
+    }
+    if !(-90.0..=90.0).contains(&latitude) {
+        return Err(EngineError::new(
+            3617,
+            "22S03",
+            format!(
+                "Latitude {latitude} is out of range in function st_distance_sphere. \
+                 It must be within [-90.000000, 90.000000]."
+            ),
+        ));
+    }
+    Ok((longitude, latitude))
+}
+
+/// Great-circle distance in metres, by the haversine formula.
+///
+/// The radius is MySQL's own 6,370,986 m rather than a more modern figure, so
+/// a distance computed here matches one computed there.
+fn distance_on_sphere((lon_a, lat_a): (f64, f64), (lon_b, lat_b): (f64, f64)) -> f64 {
+    const RADIUS: f64 = 6_370_986.0;
+
+    let (phi_a, phi_b) = (lat_a.to_radians(), lat_b.to_radians());
+    let delta_phi = (lat_b - lat_a).to_radians();
+    let delta_lambda = (lon_b - lon_a).to_radians();
+
+    let h = (delta_phi / 2.0).sin().powi(2)
+        + phi_a.cos() * phi_b.cos() * (delta_lambda / 2.0).sin().powi(2);
+    // `h` is at most 1 in exact arithmetic, but rounding the sum can push it a
+    // couple of ulps past — and `asin` of anything above 1 is NaN, so a pair of
+    // very nearly antipodal points would report a distance of NaN rather than
+    // half the circumference. Clamping costs nothing and removes that entirely.
+    2.0 * RADIUS * h.min(1.0).sqrt().asin()
 }
 
 #[cfg(test)]

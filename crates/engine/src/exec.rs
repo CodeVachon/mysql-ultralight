@@ -1496,13 +1496,43 @@ impl Engine {
         let mut columns = Vec::new();
         let mut row = Vec::new();
 
+        // A FROM-less SELECT is evaluated against *one* implicit row, not none:
+        // `SELECT COUNT(*)` is 1 in MySQL, `SELECT SUM(1)` is 1 and
+        // `SELECT MAX(2)` is 2. Folding over an empty group would answer
+        // `0, NULL, NULL` — which reads as a result rather than as a mistake —
+        // and would never evaluate the aggregate's argument at all.
+        //
+        // The row is the enclosing one where there is one, so a correlated
+        // `SELECT (SELECT COUNT(*)) FROM t` still counts its own row.
+        let (implicit_schema, implicit_values) = match outer {
+            Some(outer) => (outer.schema.clone(), outer.values.clone()),
+            None => (Vec::new(), Vec::new()),
+        };
+        let implicit_row = [&implicit_values];
+
         for item in &select.projection {
             let (alias, e) = match item {
                 SelectItem::UnnamedExpr(e) => (render_expr(e), e),
                 SelectItem::ExprWithAlias { expr, alias } => (alias.value.clone(), expr),
                 other => return Err(unsupported(format!("select item `{other}`"))),
             };
-            let value = expr::eval(e, &ctx)?;
+            let value = if let Expr::Function(f) = e {
+                if f.over.is_none() && is_aggregate(&f.name.to_string()) {
+                    let name = f.name.to_string().to_ascii_lowercase();
+                    self.fold(
+                        session,
+                        &name,
+                        aggregate_argument(f).as_ref(),
+                        &implicit_schema,
+                        &implicit_row,
+                        aggregate_is_distinct(f),
+                    )?
+                } else {
+                    expr::eval(e, &ctx)?
+                }
+            } else {
+                expr::eval(e, &ctx)?
+            };
             columns.push(OutColumn::new(alias, wire_type(&value)));
             row.push(value);
         }
@@ -4882,6 +4912,22 @@ fn check_full_group_by(
     ))
 }
 
+/// A function's arguments that are actually values.
+///
+/// `TIMESTAMPDIFF(DAY, a, b)` writes its unit as a bare keyword, which parses
+/// as an identifier indistinguishable from a column. Anything walking the AST
+/// for column references has to drop it, or `SELECT id, TIMESTAMPDIFF(DAY,
+/// MIN(d), MAX(d)) ... GROUP BY id` is rejected for selecting a column named
+/// `DAY` that does not exist.
+fn value_arguments(f: &sqlparser::ast::Function) -> Vec<Expr> {
+    let args = function_arguments(f);
+    let name = f.name.to_string();
+    if name.eq_ignore_ascii_case("timestampdiff") || name.eq_ignore_ascii_case("timestampadd") {
+        return args.into_iter().skip(1).collect();
+    }
+    args
+}
+
 /// The column a `VALUES(col)` in an `ON DUPLICATE KEY UPDATE` names.
 ///
 /// Inside that clause `VALUES(x)` does not call anything — it stands for the
@@ -4919,7 +4965,7 @@ fn references_column(e: &Expr) -> bool {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
         // An aggregate consumes its columns, so they are not loose references.
         Expr::Function(f) if f.over.is_none() && is_aggregate(&f.name.to_string()) => false,
-        Expr::Function(f) => function_arguments(f).iter().any(references_column),
+        Expr::Function(f) => value_arguments(f).iter().any(references_column),
         Expr::BinaryOp { left, right, .. } => references_column(left) || references_column(right),
         Expr::UnaryOp { expr, .. }
         | Expr::Nested(expr)

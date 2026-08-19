@@ -560,6 +560,16 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
                 )));
             }
 
+            // These read part of their argument list as syntax rather than as
+            // values: an `INTERVAL`, or a bare unit keyword that would
+            // otherwise resolve as a column. They are handled before the
+            // arguments are evaluated for that reason.
+            if let "date_add" | "date_sub" | "adddate" | "subdate" | "timestampdiff"
+            | "timestampadd" = name.as_str()
+            {
+                return temporal_call(&name, f, ctx);
+            }
+
             let args = function_args(f, ctx)?;
 
             // Named locks need engine state rather than session state, so they
@@ -628,6 +638,29 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
 
         other => Err(unsupported(format!("expression `{other}`"))),
     }
+}
+
+/// A function's arguments as expressions, for the few that read their
+/// arguments as syntax rather than as values.
+fn argument_exprs(f: &sqlparser::ast::Function) -> Vec<Expr> {
+    let FunctionArguments::List(list) = &f.args else {
+        return Vec::new();
+    };
+    list.args
+        .iter()
+        .filter_map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+            | FunctionArg::Named {
+                arg: FunctionArgExpr::Expr(e),
+                ..
+            }
+            | FunctionArg::ExprNamed {
+                arg: FunctionArgExpr::Expr(e),
+                ..
+            } => Some(e.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Evaluates a function's arguments left to right.
@@ -859,4 +892,129 @@ fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> EngineResult<
         B::Modulo => Value::Float(a % b),
         _ => unreachable!("caller restricts the operator set"),
     })
+}
+
+/// The date functions whose arguments are partly syntax.
+///
+/// `DATE_ADD(x, INTERVAL 1 DAY)` carries an interval, and
+/// `TIMESTAMPDIFF(DAY, a, b)` names its unit with a bare keyword that would
+/// otherwise resolve as a column — which is exactly the error it used to give.
+fn temporal_call(
+    name: &str,
+    f: &sqlparser::ast::Function,
+    ctx: &Context<'_>,
+) -> EngineResult<Value> {
+    use crate::temporal::{self, Unit};
+
+    let args = argument_exprs(f);
+    // NULL in, NULL out — and a value MySQL cannot read as a datetime is NULL
+    // too, with a warning rather than a failed statement.
+    let stamp = |e: &Expr| -> EngineResult<Option<temporal::Stamp>> {
+        let value = eval(e, ctx)?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        Ok(temporal::parse(&value.as_text()))
+    };
+
+    match name {
+        "timestampdiff" | "timestampadd" => {
+            let [unit, first, second] = args.as_slice() else {
+                return Err(unsupported(format!("{name}() with these arguments")));
+            };
+            // The unit arrives as an identifier because that is what a bare
+            // keyword parses to; its *name* is the value.
+            let Expr::Identifier(ident) = unit else {
+                return Err(unsupported(format!("a computed unit in {name}()")));
+            };
+            let unit = Unit::parse(&ident.value)?;
+
+            if name == "timestampadd" {
+                let Some(to) = stamp(second)? else {
+                    return Ok(Value::Null);
+                };
+                let Some(amount) = eval(first, ctx)?.as_int() else {
+                    return Ok(Value::Null);
+                };
+                return Ok(match to.add(unit, amount) {
+                    Some(moved) => Value::text(moved.render()),
+                    None => Value::Null,
+                });
+            }
+
+            match (stamp(first)?, stamp(second)?) {
+                (Some(from), Some(to)) => Ok(from.diff(unit, &to).map_or(Value::Null, Value::Int)),
+                _ => Ok(Value::Null),
+            }
+        }
+        _ => {
+            let [subject, interval] = args.as_slice() else {
+                return Err(unsupported(format!("{name}() with these arguments")));
+            };
+            let Some(stamp) = stamp(subject)? else {
+                return Ok(Value::Null);
+            };
+
+            let Some((amount, unit)) = read_interval(interval, ctx)? else {
+                return Ok(Value::Null);
+            };
+            // `checked_neg`, because negating `i64::MIN` overflows and
+            // `DATE_SUB(x, INTERVAL -9223372036854775808 DAY)` is a statement
+            // anyone can write.
+            let signed = if name == "date_sub" || name == "subdate" {
+                match amount.checked_neg() {
+                    Some(signed) => signed,
+                    None => return Ok(Value::Null),
+                }
+            } else {
+                amount
+            };
+            Ok(match stamp.add(unit, signed) {
+                Some(moved) => Value::text(moved.render()),
+                None => Value::Null,
+            })
+        }
+    }
+}
+
+/// The amount and unit of an `INTERVAL n UNIT`.
+///
+/// `ADDDATE(x, 7)` — a bare number with no interval — means days, which is the
+/// one place MySQL infers a unit.
+fn read_interval(
+    e: &Expr,
+    ctx: &Context<'_>,
+) -> EngineResult<Option<(i64, crate::temporal::Unit)>> {
+    use crate::temporal::Unit;
+
+    // NULL is a value here, not a failure: `DATE_SUB(NOW(), INTERVAL ? DAY)`
+    // with a NULL parameter is NULL in MySQL, and erroring would fail the
+    // whole statement over one unbound row.
+    //
+    // A fractional amount rounds rather than truncating, which is what MySQL
+    // does — `INTERVAL 1.5 DAY` moves two days, not one.
+    let amount = |e: &Expr| -> EngineResult<Option<i64>> {
+        let value = eval(e, ctx)?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        // Via `as_float`, because `as_int` truncates a float and MySQL rounds:
+        // `INTERVAL 1.5 DAY` moves two days, not one. An out-of-range float
+        // saturates rather than wrapping, and the checked arithmetic in
+        // `Stamp::add` turns that into NULL.
+        Ok(match value.as_float() {
+            Some(number) => Some(number.round() as i64),
+            None => value.as_int(),
+        })
+    };
+
+    let Expr::Interval(interval) = e else {
+        return Ok(amount(e)?.map(|a| (a, Unit::Day)));
+    };
+
+    let Some(field) = &interval.leading_field else {
+        return Err(unsupported("an INTERVAL without a unit"));
+    };
+    let unit = Unit::parse(&field.to_string())?;
+    Ok(amount(&interval.value)?.map(|a| (a, unit)))
 }

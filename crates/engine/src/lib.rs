@@ -19,6 +19,7 @@ pub mod relation;
 pub mod result;
 pub mod rewrite;
 pub mod session;
+pub mod temporal;
 pub mod types;
 pub mod value;
 
