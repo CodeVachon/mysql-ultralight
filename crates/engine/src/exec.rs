@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use mysql_ultralight_protocol::ColumnType;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, Expr, GroupByExpr, Insert, JoinOperator, ObjectName, ObjectType,
-    OrderBy, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
     TableWithJoins,
 };
 use sqlparser::dialect::MySqlDialect;
@@ -467,12 +467,6 @@ impl Engine {
                 if update.from.is_some() {
                     return Err(unsupported("UPDATE ... FROM"));
                 }
-                if !update.order_by.is_empty() {
-                    return Err(unsupported("ORDER BY in an UPDATE"));
-                }
-                if update.limit.is_some() {
-                    return Err(unsupported("LIMIT in an UPDATE"));
-                }
                 if update.returning.is_some() {
                     return Err(unsupported("RETURNING"));
                 }
@@ -481,6 +475,8 @@ impl Engine {
                     &update.table,
                     &update.assignments,
                     update.selection.as_ref(),
+                    &update.order_by,
+                    update.limit.as_ref(),
                 )
             }
             Statement::Delete(delete) => self.delete(session, delete),
@@ -955,26 +951,7 @@ impl Engine {
             _ => session,
         };
 
-        // `FROM a, b` is a cross join, and `JSON_TABLE` is conventionally
-        // written that way — so the comma form is folded here rather than
-        // refused, with the same lateral handling a JOIN gets.
-        let mut relation = self.build_relation(session, &select.from[0])?;
-        for item in &select.from[1..] {
-            let cross = JoinOperator::CrossJoin(sqlparser::ast::JoinConstraint::None);
-            relation = match &item.relation {
-                // Built per row rather than once: evaluating it here would ask
-                // for a column of the table on the left, which is not in scope
-                // until there is a row to read it from.
-                TableFactor::JsonTable { .. } if item.joins.is_empty() => {
-                    self.lateral_join(session, relation, &item.relation, &cross)?
-                }
-                _ => {
-                    let next = self.build_relation(session, item)?;
-                    self.join(session, relation, next, &cross)?
-                }
-            };
-        }
-        let relation = relation;
+        let relation = self.build_relation_list(session, &select.from)?;
         // The outer row's columns are appended, so an unqualified name resolves
         // against this query's columns first and the enclosing one only if it
         // is not found here, which is MySQL's scoping rule.
@@ -1114,6 +1091,105 @@ impl Engine {
             *slot = row;
         }
         Ok(true)
+    }
+
+    /// Narrows the rows a single-table UPDATE or DELETE touches, in the order
+    /// it touches them.
+    ///
+    /// `matching` is every row the WHERE clause accepted, by index. ORDER BY
+    /// and LIMIT then decide *which* of those the statement acts on, which is
+    /// why neither may be dropped: `DELETE FROM t LIMIT 1` with the LIMIT
+    /// ignored empties the table.
+    ///
+    /// The order matters even without a LIMIT, because it is the order the
+    /// rows are written in — `UPDATE t SET id = id + 1 ORDER BY id DESC`
+    /// succeeds where the same statement unordered collides with itself.
+    fn dml_row_order(
+        &self,
+        session: &Session,
+        refs: &[ColumnRef],
+        rows: &[Vec<Value>],
+        matching: Vec<usize>,
+        order_by: &[OrderByExpr],
+        limit: Option<&Expr>,
+    ) -> EngineResult<Vec<usize>> {
+        let mut chosen = matching;
+
+        if !order_by.is_empty() {
+            let mut keys: Vec<(Vec<Value>, usize)> = Vec::with_capacity(chosen.len());
+            for index in chosen {
+                let ctx = Context {
+                    row: Some(Row {
+                        schema: refs,
+                        values: &rows[index],
+                    }),
+                    session,
+                    executor: Some(self),
+                };
+                let mut key = Vec::with_capacity(order_by.len());
+                for item in order_by {
+                    key.push(expr::eval(&item.expr, &ctx)?);
+                }
+                keys.push((key, index));
+            }
+            let descending: Vec<bool> = order_by
+                .iter()
+                .map(|i| i.options.asc == Some(false))
+                .collect();
+            keys.sort_by(|a, b| compare_keys(&a.0, &b.0, &descending));
+            chosen = keys.into_iter().map(|(_, index)| index).collect();
+        }
+
+        if let Some(limit) = limit {
+            let ctx = Context::rowless(session).with_executor(self);
+            // An exact non-negative integer, not whatever coerces into one:
+            // `as_int` truncates, so `LIMIT 1.9` would quietly become one row
+            // and `LIMIT '2'` two. MySQL refuses both, and a LIMIT that is
+            // rounded rather than refused is the wrong number of rows removed.
+            let count = match expr::eval(limit, &ctx)? {
+                Value::Int(count) if count >= 0 => count,
+                _ => {
+                    return Err(EngineError::parse(
+                        "the LIMIT of an UPDATE or DELETE must be a non-negative row count",
+                    ))
+                }
+            };
+            chosen.truncate(count as usize);
+        }
+
+        Ok(chosen)
+    }
+
+    /// Materialises a comma-separated list of FROM or USING items.
+    ///
+    /// `FROM a, b` is a cross join, and `JSON_TABLE` is conventionally written
+    /// that way — so the comma form is folded here rather than refused, with
+    /// the same lateral handling a JOIN gets.
+    fn build_relation_list(
+        &self,
+        session: &Session,
+        items: &[TableWithJoins],
+    ) -> EngineResult<Relation> {
+        let Some((first, rest)) = items.split_first() else {
+            return Err(unsupported("a FROM clause with no tables"));
+        };
+        let mut relation = self.build_relation(session, first)?;
+        for item in rest {
+            let cross = JoinOperator::CrossJoin(sqlparser::ast::JoinConstraint::None);
+            relation = match &item.relation {
+                // Built per row rather than once: evaluating it here would ask
+                // for a column of the table on the left, which is not in scope
+                // until there is a row to read it from.
+                TableFactor::JsonTable { .. } if item.joins.is_empty() => {
+                    self.lateral_join(session, relation, &item.relation, &cross)?
+                }
+                _ => {
+                    let next = self.build_relation(session, item)?;
+                    self.join(session, relation, next, &cross)?
+                }
+            };
+        }
+        Ok(relation)
     }
 
     /// Materialises a FROM clause, joining as needed.
@@ -2653,8 +2729,17 @@ impl Engine {
         table: &TableWithJoins,
         assignments: &[Assignment],
         selection: Option<&Expr>,
+        order_by: &[OrderByExpr],
+        limit: Option<&Expr>,
     ) -> EngineResult<Outcome> {
         if !table.joins.is_empty() {
+            // MySQL refuses both on the multi-table form, because "the first
+            // row" is not defined across a join.
+            if !order_by.is_empty() || limit.is_some() {
+                return Err(unsupported(
+                    "ORDER BY or LIMIT on a multi-table UPDATE, which MySQL does not allow either",
+                ));
+            }
             return self.update_joined(session, table, assignments, selection);
         }
         let TableFactor::Table { name, alias, .. } = &table.relation else {
@@ -2716,11 +2801,16 @@ impl Engine {
         let mut changed: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
         let mut rows = table.rows.clone();
 
-        for index in 0..rows.len() {
+        // Which rows to write is settled before any of them is written. The
+        // predicate only ever reads its own row, so this sees exactly what the
+        // single pass did — but ORDER BY and LIMIT need the whole matching set
+        // in hand before the first write.
+        let mut matching = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
             let ctx = Context {
                 row: Some(Row {
                     schema: &refs,
-                    values: &rows[index],
+                    values: row,
                 }),
                 session: &session_snapshot,
                 executor: Some(self),
@@ -2729,9 +2819,22 @@ impl Engine {
                 Some(p) => expr::eval(p, &ctx)?.truthy() == Some(true),
                 None => true,
             };
-            if !matched {
-                continue;
+            if matched {
+                matching.push(index);
             }
+        }
+        let chosen =
+            self.dml_row_order(&session_snapshot, &refs, &rows, matching, order_by, limit)?;
+
+        for index in chosen {
+            let ctx = Context {
+                row: Some(Row {
+                    schema: &refs,
+                    values: &rows[index],
+                }),
+                session: &session_snapshot,
+                executor: Some(self),
+            };
 
             let mut candidate = rows[index].clone();
             let mut assigned: Vec<usize> = Vec::with_capacity(assignments.len());
@@ -2969,18 +3072,6 @@ impl Engine {
         session: &mut Session,
         delete: &sqlparser::ast::Delete,
     ) -> EngineResult<Outcome> {
-        // As with UPDATE, a clause that is parsed but never read turns a
-        // precise statement into a broad one: `DELETE ... LIMIT 1` would empty
-        // the table.
-        if delete.using.is_some() {
-            return Err(unsupported("USING in a DELETE"));
-        }
-        if !delete.order_by.is_empty() {
-            return Err(unsupported("ORDER BY in a DELETE"));
-        }
-        if delete.limit.is_some() {
-            return Err(unsupported("LIMIT in a DELETE"));
-        }
         if delete.returning.is_some() {
             return Err(unsupported("RETURNING"));
         }
@@ -2989,11 +3080,38 @@ impl Engine {
             sqlparser::ast::FromTable::WithFromKeyword(t)
             | sqlparser::ast::FromTable::WithoutKeyword(t) => t,
         };
-        if from.len() != 1 {
-            return Err(unsupported("comma-separated DELETE targets"));
+
+        // MySQL writes a multi-table DELETE two ways, and they disagree about
+        // where the targets live: `DELETE a FROM a JOIN b` names them before
+        // FROM, and `DELETE FROM a USING a JOIN b` names them after it. Both
+        // reach the same executor with the targets pulled out first.
+        if let Some(using) = &delete.using {
+            // The two spellings name their targets in different places, so a
+            // statement using both says two different things at once. MySQL
+            // rejects it, and taking either half silently would delete from a
+            // table the other half did not name.
+            if !delete.tables.is_empty() {
+                return Err(EngineError::parse(
+                    "a DELETE names its targets either before FROM or after it, not both: \
+                     write `DELETE a FROM a JOIN b ON ...` or `DELETE FROM a USING a JOIN b ON ...`",
+                ));
+            }
+            let targets = from
+                .iter()
+                .map(target_name)
+                .collect::<EngineResult<Vec<String>>>()?;
+            return self.delete_joined(session, delete, using, &targets);
         }
-        if !from[0].joins.is_empty() || !delete.tables.is_empty() {
-            return self.delete_joined(session, delete, &from[0]);
+        // A comma list is a cross join here as it is anywhere else, so
+        // `DELETE t1 FROM t1, t2 WHERE t1.id = t2.id` — the commoner spelling
+        // of a multi-table delete — takes the same path as the JOIN form.
+        if from.len() > 1 || !from[0].joins.is_empty() || !delete.tables.is_empty() {
+            let targets = delete
+                .tables
+                .iter()
+                .map(object_name_tail)
+                .collect::<Vec<_>>();
+            return self.delete_joined(session, delete, from, &targets);
         }
         let TableFactor::Table { name, alias, .. } = &from[0].relation else {
             return Err(unsupported("this DELETE target"));
@@ -3023,14 +3141,12 @@ impl Engine {
             .map(|c| ColumnRef::new(&addressed_as, &c.name))
             .collect();
 
-        let before = table.rows.len();
-        let mut kept = Vec::with_capacity(before);
-        let mut removed_rows: Vec<Vec<Value>> = Vec::new();
-        for row in std::mem::take(&mut table.rows) {
+        let mut matching = Vec::new();
+        for (index, row) in table.rows.iter().enumerate() {
             let ctx = Context {
                 row: Some(Row {
                     schema: &refs,
-                    values: &row,
+                    values: row,
                 }),
                 session: &session_snapshot,
                 executor: Some(self),
@@ -3040,9 +3156,36 @@ impl Engine {
                 None => true,
             };
             if matched {
-                removed_rows.push(row);
-            } else {
-                kept.push(row);
+                matching.push(index);
+            }
+        }
+        let chosen = self.dml_row_order(
+            &session_snapshot,
+            &refs,
+            &table.rows,
+            matching,
+            &delete.order_by,
+            delete.limit.as_ref(),
+        )?;
+
+        // Removed in the order chosen, so a cascade follows the same order the
+        // statement asked for; kept in storage order, which is the table's.
+        //
+        // One pass over a position map rather than a set plus a clone of every
+        // doomed row: `DELETE FROM t` with no WHERE takes all of them, and a
+        // suite clearing a table between cases should not pay for a second
+        // copy of it.
+        const KEEP: usize = usize::MAX;
+        let mut slot_of = vec![KEEP; table.rows.len()];
+        for (slot, index) in chosen.iter().enumerate() {
+            slot_of[*index] = slot;
+        }
+        let mut removed_rows: Vec<Vec<Value>> = vec![Vec::new(); chosen.len()];
+        let mut kept: Vec<Vec<Value>> = Vec::with_capacity(table.rows.len() - chosen.len());
+        for (index, row) in std::mem::take(&mut table.rows).into_iter().enumerate() {
+            match slot_of[index] {
+                KEEP => kept.push(row),
+                slot => removed_rows[slot] = row,
             }
         }
 
@@ -3062,25 +3205,35 @@ impl Engine {
 
     /// `DELETE a FROM a JOIN b ON ...`, where the named tables are the ones
     /// rows are removed from and the join only decides which.
+    ///
+    /// `targets` is that list of names, already pulled from whichever half of
+    /// the statement the spelling put it in.
     fn delete_joined(
         &self,
         session: &mut Session,
         delete: &sqlparser::ast::Delete,
-        from: &TableWithJoins,
+        from: &[TableWithJoins],
+        targets: &[String],
     ) -> EngineResult<Outcome> {
+        // Neither is defined across a join, and MySQL refuses both here too.
+        if !delete.order_by.is_empty() || delete.limit.is_some() {
+            return Err(unsupported(
+                "ORDER BY or LIMIT on a multi-table DELETE, which MySQL does not allow either",
+            ));
+        }
         let db = session
             .current_database
             .clone()
             .ok_or_else(EngineError::no_database)?;
         let session_snapshot = session.clone();
 
-        let relation = self.build_relation(&session_snapshot, from)?;
+        let relation = self.build_relation_list(&session_snapshot, from)?;
         let refs = relation.refs();
 
         // MySQL rejects `DELETE FROM a JOIN b` outright: with a join, the
         // target has to be named. Defaulting to every table in the join would
         // empty tables nobody asked to touch.
-        if delete.tables.is_empty() {
+        if targets.is_empty() {
             return Err(EngineError::parse(
                 "a multi-table DELETE must name the tables to delete from, \
                  as in `DELETE a FROM a JOIN b ON ...`",
@@ -3088,18 +3241,8 @@ impl Engine {
         }
         reject_duplicate_sources(&relation)?;
 
-        let named: Vec<String> = delete
-            .tables
-            .iter()
-            .map(|t| {
-                t.0.last()
-                    .map(|p| p.to_string().trim_matches('`').to_owned())
-                    .unwrap_or_default()
-            })
-            .collect();
-
-        let mut sources: Vec<usize> = Vec::with_capacity(named.len());
-        for name in &named {
+        let mut sources: Vec<usize> = Vec::with_capacity(targets.len());
+        for name in targets {
             let source = relation
                 .source_index(name)
                 .ok_or_else(|| EngineError::no_such_table(name))?;
@@ -4105,6 +4248,35 @@ fn restore_tables(catalog: &mut Catalog, snapshot: &Catalog, tables: &[(String, 
             }
         }
     }
+}
+
+/// The last part of a qualified name, as a delete target is addressed.
+fn object_name_tail(name: &ObjectName) -> String {
+    name.0
+        .last()
+        .map(|p| p.to_string().trim_matches('`').to_owned())
+        .unwrap_or_default()
+}
+
+/// The name a `DELETE FROM a, b USING ...` target is addressed by.
+///
+/// An alias wins over the table name, because that is what the USING clause
+/// will have called it and what a qualified column reference resolves against.
+fn target_name(item: &TableWithJoins) -> EngineResult<String> {
+    let TableFactor::Table { name, alias, .. } = &item.relation else {
+        return Err(unsupported("this DELETE target"));
+    };
+    // A join here would be naming a target and describing the relation at
+    // once; USING is where the relation belongs.
+    if !item.joins.is_empty() {
+        return Err(unsupported(
+            "a join among the targets of a DELETE ... USING",
+        ));
+    }
+    Ok(alias
+        .as_ref()
+        .map(|a| a.name.value.clone())
+        .unwrap_or_else(|| object_name_tail(name)))
 }
 
 /// MySQL refuses a join in which two sources answer to the same name, because

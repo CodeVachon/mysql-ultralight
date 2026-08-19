@@ -300,9 +300,11 @@ breaking `ROLLBACK` and watching it fail.
 
 Named honestly, because the engine returns an error rather than a wrong answer for each:
 explicit window frames (`ROWS`/`RANGE BETWEEN`), named `WINDOW` clauses, `NTH_VALUE`, a
-computed (non-constant) offset or default in `LAG`/`LEAD`, `ORDER BY` and `LIMIT` on an
-`UPDATE` or `DELETE`, `DELETE ... USING`, `WITH RECURSIVE`, `NESTED PATH` in `JSON_TABLE`,
-the date-arithmetic functions, and the spatial pair `ST_Distance_Sphere` and `POINT`.
+computed (non-constant) offset or default in `LAG`/`LEAD`, `WITH RECURSIVE`, and
+`NESTED PATH` in `JSON_TABLE`.
+
+`ORDER BY` and `LIMIT` on an `UPDATE` or `DELETE` are refused only on the multi-table
+forms, where MySQL refuses them too — "the first row" is not defined across a join.
 
 Two limitations are worth stating rather than implying away.
 
@@ -454,7 +456,8 @@ Two were wrong answers this work made reachable rather than introduced:
   share a total, and `LAST_VALUE` reads the last peer rather than the current row.
 
 The rest: `LIMIT`, `ORDER BY` and `USING` on an `UPDATE` or `DELETE` parsed and were
-dropped, so `DELETE ... LIMIT 1` emptied the table — all four are refused now; the
+dropped, so `DELETE ... LIMIT 1` emptied the table — all three are implemented now, and
+refused on the multi-table forms where MySQL refuses them too; the
 generated-column check ran only for the first assignment to a table, so
 `SET note = 'q', shout = 'NO'` wrote nothing and said nothing; a self-join `UPDATE`
 counted one physical row once per alias; a negative `LAG` offset quietly behaved as

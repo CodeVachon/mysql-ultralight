@@ -3521,22 +3521,65 @@ fn a_non_constant_lag_offset_is_refused() {
 }
 
 #[test]
-fn dml_clauses_that_are_not_implemented_are_refused() {
-    // Each of these parses and used to be dropped on the floor, which turns a
-    // one-row statement into a whole-table one.
+fn dml_modifiers_mysql_refuses_are_refused_here_too() {
     let (engine, mut session) = engine();
     widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Tag (wid VARCHAR(21), label VARCHAR(20))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Tag VALUES ('a', 'keep')",
+    );
 
+    // "The first row" is not defined across a join, so MySQL allows neither
+    // modifier on the multi-table forms. Accepting them would have to invent
+    // an order the user never asked for.
     for sql in [
-        "UPDATE Widget SET count = 9 LIMIT 1",
-        "UPDATE Widget SET count = 9 ORDER BY id LIMIT 1",
-        "DELETE FROM Widget LIMIT 1",
-        "DELETE FROM Widget ORDER BY id LIMIT 1",
-        "DELETE FROM Widget USING Widget WHERE id = 'a'",
+        "UPDATE Widget JOIN Tag ON Tag.wid = Widget.id SET count = 1 LIMIT 1",
+        "UPDATE Widget JOIN Tag ON Tag.wid = Widget.id SET count = 1 ORDER BY Widget.id",
+        "DELETE Widget FROM Widget JOIN Tag ON Tag.wid = Widget.id LIMIT 1",
+        "DELETE FROM Widget USING Widget JOIN Tag ON Tag.wid = Widget.id ORDER BY Widget.id",
     ] {
         let err = engine.execute(&mut session, sql, &[]).unwrap_err();
         assert_eq!(err.code, 1235, "expected ER_NOT_SUPPORTED_YET for: {sql}");
     }
+
+    // A LIMIT that is not an exact row count is refused rather than coerced
+    // into one. `1.9` truncating to a single row and `'2'` reading as two are
+    // the wrong number of rows deleted, quietly.
+    for sql in [
+        "DELETE FROM Widget LIMIT -1",
+        "DELETE FROM Widget LIMIT 'x'",
+        "DELETE FROM Widget LIMIT 1.9",
+        "DELETE FROM Widget LIMIT '2'",
+        "DELETE FROM Widget LIMIT NULL",
+        "UPDATE Widget SET count = 1 LIMIT -1",
+        "UPDATE Widget SET count = 1 LIMIT 0.5",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1064, "expected a syntax error for: {sql}");
+    }
+
+    // An ORDER BY that cannot be resolved is an error, not an ordering of
+    // nothing — silently falling back to storage order would let the LIMIT
+    // pick an arbitrary row and call it the first.
+    for sql in [
+        "DELETE FROM Widget ORDER BY nope LIMIT 1",
+        "UPDATE Widget SET count = 1 ORDER BY nope LIMIT 1",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1054, "{sql}");
+    }
+
+    // RETURNING is still not implemented, and still says so.
+    let err = engine
+        .execute(&mut session, "DELETE FROM Widget RETURNING id", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1235);
 
     // Every row survived every refusal.
     assert_eq!(
@@ -5781,5 +5824,424 @@ fn a_fraction_is_rendered_at_full_width() {
                     DATE_FORMAT('2026-01-01 00:00:00.1', '%f')"
         ),
         vec![vec!["2026-01-01 00:00:01.100000", "100000"]]
+    );
+}
+
+#[test]
+fn limit_narrows_an_update_or_delete_to_the_rows_order_by_picked() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    // Storage order is a, b, c and the counts are 3, 1, 2 — so every pick
+    // below lands on a different row than "the first one stored", which is
+    // what the statement would touch if the ORDER BY were dropped.
+    run(
+        &engine,
+        &mut session,
+        "DELETE FROM Widget ORDER BY count ASC LIMIT 1",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, count FROM Widget ORDER BY id"
+        ),
+        vec![vec!["a", "3"], vec!["c", "2"]]
+    );
+
+    // Ascending again, so the lower of the two remaining counts changes and
+    // the first row stored does not.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE Widget SET count = 99 ORDER BY count ASC LIMIT 1"
+        ),
+        1
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, count FROM Widget ORDER BY id"
+        ),
+        vec![vec!["a", "3"], vec!["c", "99"]]
+    );
+
+    // The WHERE clause narrows first and the LIMIT second, so a LIMIT larger
+    // than the match count takes all of it.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "DELETE FROM Widget WHERE count > 50 ORDER BY id LIMIT 5"
+        ),
+        1
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Widget ORDER BY id"),
+        vec![vec!["a"]]
+    );
+
+    // LIMIT 0 is a statement that matches rows and touches none of them.
+    assert_eq!(
+        affected(&engine, &mut session, "UPDATE Widget SET count = 7 LIMIT 0"),
+        0
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT count FROM Widget"),
+        vec![vec!["3"]]
+    );
+}
+
+#[test]
+fn a_limit_is_an_expression_and_may_be_a_parameter() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+
+    run(
+        &engine,
+        &mut session,
+        "DELETE FROM Widget ORDER BY id LIMIT 1 + 1",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Widget"),
+        vec![vec!["c"]]
+    );
+
+    // A bound parameter, which is the shape an application actually sends.
+    let (engine, mut session) = fresh_engine();
+    widgets(&engine, &mut session);
+    let outcome = engine
+        .execute(
+            &mut session,
+            "DELETE FROM Widget ORDER BY id LIMIT ?",
+            &[Value::Int(2)],
+        )
+        .unwrap();
+    assert!(matches!(outcome, Outcome::Affected { rows: 2, .. }));
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Widget"),
+        vec![vec!["c"]]
+    );
+}
+
+#[test]
+fn order_by_sets_the_order_an_update_writes_in() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Seq (id INT NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Seq VALUES (1), (2), (3)",
+    );
+
+    // Shifting every key up by one collides with itself unless the rows are
+    // written from the top down — which is the whole reason ORDER BY is
+    // honoured even with no LIMIT to narrow anything.
+    let err = engine
+        .execute(&mut session, "UPDATE Seq SET id = id + 1", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1062);
+
+    let err = engine
+        .execute(
+            &mut session,
+            "UPDATE Seq SET id = id + 1 ORDER BY id ASC",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1062);
+
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE Seq SET id = id + 1 ORDER BY id DESC"
+        ),
+        3
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Seq ORDER BY id"),
+        vec![vec!["2"], vec!["3"], vec!["4"]]
+    );
+}
+
+#[test]
+fn delete_using_names_its_targets_after_the_from() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Tag (wid VARCHAR(21), label VARCHAR(20))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Tag VALUES ('a', 'keep'), ('b', 'drop'), ('c', 'drop')",
+    );
+
+    // MySQL's other multi-table spelling: the targets come after FROM and the
+    // join comes after USING, where `DELETE a FROM a JOIN b` puts them the
+    // other way round. Both mean the same thing.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "DELETE FROM Widget USING Widget JOIN Tag ON Tag.wid = Widget.id \
+             WHERE Tag.label = 'drop'"
+        ),
+        2
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Widget"),
+        vec![vec!["a"]]
+    );
+    // Only the named target lost rows; the joined table is untouched.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Tag"),
+        vec![vec!["3"]]
+    );
+}
+
+#[test]
+fn delete_using_takes_several_targets_and_aliases() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Tag (wid VARCHAR(21), label VARCHAR(20))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Tag VALUES ('a', 'keep'), ('b', 'drop'), ('c', 'drop')",
+    );
+
+    // Two targets, so both tables lose the rows the join matched: two widgets
+    // and two tags.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "DELETE FROM Widget, Tag USING Widget JOIN Tag ON Tag.wid = Widget.id \
+             WHERE Tag.label = 'drop'"
+        ),
+        4
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Widget"),
+        vec![vec!["a"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT wid FROM Tag"),
+        vec![vec!["a"]]
+    );
+
+    // A target is addressed by its alias, because that is what USING called it.
+    let (engine, mut session) = fresh_engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Tag (wid VARCHAR(21), label VARCHAR(20))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Tag VALUES ('a', 'keep'), ('b', 'drop'), ('c', 'drop')",
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "DELETE FROM w USING Widget w JOIN Tag t ON t.wid = w.id WHERE t.label = 'drop'"
+        ),
+        2
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Widget"),
+        vec![vec!["a"]]
+    );
+
+    // A target that is not in the USING relation is an error, not a no-op.
+    let err = engine
+        .execute(
+            &mut session,
+            "DELETE FROM Nope USING Widget JOIN Tag ON Tag.wid = Widget.id",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1146);
+}
+
+#[test]
+fn a_delete_names_its_targets_in_one_place_only() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Tag (wid VARCHAR(21), label VARCHAR(20))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Tag VALUES ('a', 'keep'), ('b', 'drop')",
+    );
+
+    // Both spellings at once says two different things: `DELETE Widget FROM
+    // Widget, Tag USING ...` names one target before FROM and two after it.
+    // MySQL rejects it, and reading either half would delete from a table the
+    // other half did not name — which is how this once emptied Tag.
+    for sql in [
+        "DELETE Widget FROM Widget USING Widget JOIN Tag ON Tag.wid = Widget.id",
+        "DELETE Widget FROM Widget, Tag USING Widget JOIN Tag ON Tag.wid = Widget.id",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1064, "{sql}");
+    }
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Tag"),
+        vec![vec!["2"]]
+    );
+
+    // A comma in USING is still a cross join, as it is in a FROM clause.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "DELETE FROM Widget USING Widget, Tag WHERE Tag.wid = Widget.id"
+        ),
+        2
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Widget"),
+        vec![vec!["c"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Tag"),
+        vec![vec!["2"]]
+    );
+}
+
+#[test]
+fn a_limited_delete_cascades_to_exactly_what_it_removed() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE P (id INT NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C (
+            id INT NOT NULL,
+            pid INT NOT NULL,
+            PRIMARY KEY (id),
+            FOREIGN KEY (pid) REFERENCES P(id) ON DELETE CASCADE
+        )",
+    );
+    run(&engine, &mut session, "INSERT INTO P VALUES (1), (2), (3)");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO C VALUES (10, 1), (20, 2), (30, 3)",
+    );
+
+    // The cascade follows the rows the LIMIT chose, not every row the WHERE
+    // matched — the children of the parent that survived have to survive too.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "DELETE FROM P ORDER BY id DESC LIMIT 2"
+        ),
+        2
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM P ORDER BY id"),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM C ORDER BY id"),
+        vec![vec!["10"]]
+    );
+
+    // And the whole thing is still one unit of work.
+    run(&engine, &mut session, "START TRANSACTION");
+    run(&engine, &mut session, "DELETE FROM P ORDER BY id LIMIT 1");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM P"),
+        Vec::<Vec<String>>::new()
+    );
+    run(&engine, &mut session, "ROLLBACK");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM P ORDER BY id"),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM C ORDER BY id"),
+        vec![vec!["10"]]
+    );
+}
+
+#[test]
+fn a_comma_list_is_a_multi_table_delete_too() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Tag (wid VARCHAR(21), label VARCHAR(20))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Tag VALUES ('a', 'keep'), ('b', 'drop')",
+    );
+
+    // The commoner spelling of a multi-table delete: targets before FROM and a
+    // comma list after it, which is a cross join as it is anywhere else. This
+    // and the JOIN form take the same path, so refusing one and not the other
+    // would be an accident of which guard ran first.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "DELETE Widget FROM Widget, Tag WHERE Tag.wid = Widget.id"
+        ),
+        2
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Widget"),
+        vec![vec!["c"]]
+    );
+    // Only the named target lost rows.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Tag"),
+        vec![vec!["2"]]
+    );
+
+    // Naming no target at all is refused, because defaulting to every table in
+    // the list would empty ones nobody asked to touch.
+    let err = engine
+        .execute(
+            &mut session,
+            "DELETE FROM Widget, Tag WHERE Tag.wid = Widget.id",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1064);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Tag"),
+        vec![vec!["2"]]
     );
 }
