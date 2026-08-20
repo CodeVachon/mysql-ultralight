@@ -7328,3 +7328,139 @@ fn a_not_null_column_says_so_whatever_its_type() {
         assert_eq!(nullable(&engine, &session, sql), vec![expected], "{sql}");
     }
 }
+
+#[test]
+fn a_computed_column_is_described_by_its_expression() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE E (i INT, d DECIMAL(10,2), f DOUBLE, s VARCHAR(20), dt DATETIME, j JSON)",
+    );
+    let codes = |engine: &Engine, session: &Session, sql: &str| -> Vec<String> {
+        engine
+            .describe(session, sql, 0)
+            .unwrap()
+            .iter()
+            .map(|c| format!("{:?}", c.ty))
+            .collect()
+    };
+
+    // Every one of these was `VarString` — a third of everything the
+    // differential harness had to say. All measured against MySQL 8.3, because
+    // the asymmetries are not guessable: `LENGTH` is a number while `CONCAT`
+    // is a string, `JSON_LENGTH` a number while `JSON_TYPE` is a string.
+    for (sql, expected) in [
+        (
+            "SELECT LENGTH(s), CHAR_LENGTH(s), INSTR(s,'a'), LOCATE('a',s) FROM E",
+            vec!["LongLong"; 4],
+        ),
+        (
+            "SELECT CONCAT(s,'x'), UPPER(s), TRIM(s), SUBSTRING(s,1,2) FROM E",
+            vec!["VarString"; 4],
+        ),
+        (
+            "SELECT s LIKE 'a%', s IS NULL, i = 1, i > 1, NOT i FROM E",
+            vec!["LongLong"; 5],
+        ),
+        (
+            "SELECT i IN (1,2), i BETWEEN 1 AND 2, i IS NOT NULL FROM E",
+            vec!["LongLong"; 3],
+        ),
+        // A cast says what it wants — and a cast to CHAR makes a *varying*
+        // string where a declared CHAR column is a fixed one.
+        (
+            "SELECT CAST(i AS CHAR), CAST(s AS UNSIGNED), CAST(i AS DECIMAL(8,2)) FROM E",
+            vec!["VarString", "LongLong", "NewDecimal"],
+        ),
+        // These hand back an argument, widened to LONGLONG for integers —
+        // except NULLIF, which keeps the argument's own width.
+        (
+            "SELECT COALESCE(i,0), IFNULL(i,0), IF(1,i,0), ISNULL(i), NULLIF(i,5) FROM E",
+            vec!["LongLong", "LongLong", "LongLong", "LongLong", "Long"],
+        ),
+        // Arithmetic widens; division is exact even over two integers.
+        (
+            "SELECT i+1, i*2, i/2, i%2, -i, i+d, i+f FROM E",
+            vec![
+                "LongLong",
+                "LongLong",
+                "NewDecimal",
+                "LongLong",
+                "LongLong",
+                "NewDecimal",
+                "Double",
+            ],
+        ),
+        // A literal with a point is a DECIMAL to MySQL, and NULL has a code.
+        (
+            "SELECT 1, 'x', 1.5, NULL, TRUE",
+            vec!["LongLong", "VarString", "NewDecimal", "Null", "LongLong"],
+        ),
+        (
+            "SELECT JSON_OBJECT('a',1), JSON_TYPE(j), JSON_LENGTH(j), j->'$', j->>'$' FROM E",
+            vec!["Json", "VarString", "LongLong", "Json", "LongBlob"],
+        ),
+        (
+            "SELECT YEAR(dt), MONTH(dt), DATEDIFF(dt,dt), NOW(), CURDATE() FROM E",
+            vec!["Year", "LongLong", "LongLong", "DateTime", "Date"],
+        ),
+        // DATE_ADD gives back what it was given, which is usually a string.
+        (
+            "SELECT DATE_ADD(dt, INTERVAL 1 DAY), DATE_ADD('2026-01-01', INTERVAL 1 DAY),
+                    TIMESTAMPADD(HOUR, 1, dt) FROM E",
+            // A string argument gives MySQL's fixed-width `STRING`, and
+            // TIMESTAMPADD puts its unit first so the value is the third.
+            vec!["DateTime", "String", "DateTime"],
+        ),
+        (
+            "SELECT CASE WHEN i=1 THEN 'a' ELSE 'b' END, CASE WHEN i=1 THEN 1 ELSE 2 END FROM E",
+            vec!["VarString", "LongLong"],
+        ),
+        // Typed by their arguments rather than fixed: ABS and ROUND of a
+        // decimal are decimals, and GREATEST hands back whichever argument
+        // won. Calling these LONGLONG had the binary protocol send 0 for a
+        // string and drop a decimal's fraction.
+        (
+            "SELECT ABS(d), ROUND(d,1), GREATEST(s,'z'), LEAST(s,'z') FROM E",
+            vec!["NewDecimal", "NewDecimal", "VarString", "VarString"],
+        ),
+        // Arithmetic over something that is not known to be a number is a
+        // double, because that is what the evaluator produces: `'3.5' + 1` is
+        // 4.5, and calling it an integer sent 4.
+        ("SELECT s + 1 FROM E", vec!["Double"]),
+        // An alternative is typed by *all* of its branches, not the first: a
+        // TINYINT beside 1000 is one byte wide if only the first is read, and
+        // the client gets 232.
+        (
+            "SELECT CASE WHEN 0 THEN i ELSE 'txt' END, COALESCE(i,'x'), IF(0,i,'s') FROM E",
+            vec!["VarString"; 3],
+        ),
+        // An exponent literal is a double where one with a point is a decimal.
+        ("SELECT 1e3, 1.5", vec!["Double", "NewDecimal"]),
+        // POSITION and EXTRACT have their own grammar in the parser, so they
+        // never reach the by-name table and answered VAR_STRING. Their
+        // synonyms LOCATE and INSTR do arrive as calls, and always agreed.
+        (
+            "SELECT POSITION('b' IN s), LOCATE('b', s), INSTR(s, 'b'), EXTRACT(YEAR FROM dt) FROM E",
+            vec!["LongLong"; 4],
+        ),
+        // The same grammar split, the other way round: these are strings, and
+        // were only right because the fallback happens to be a string too.
+        (
+            "SELECT SUBSTRING(s, 2), SUBSTR(s, 2), MID(s, 2, 1), TRIM(s), LTRIM(s) FROM E",
+            vec!["VarString"; 5],
+        ),
+    ] {
+        assert_eq!(codes(&engine, &session, sql), expected, "{sql}");
+    }
+
+    // `SELECT IF()` reaches the planner before anything rejects the call, and
+    // indexing its empty argument list aborted the process — `panic = "abort"`
+    // means any client could stop the server with one token.
+    assert!(engine.execute(&mut session, "SELECT IF()", &[]).is_ok());
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 'still here'"),
+        vec![vec!["still here"]]
+    );
+}

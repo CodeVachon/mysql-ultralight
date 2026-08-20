@@ -1778,7 +1778,11 @@ impl Engine {
             // not, and says so. The distinction reaches a union, which takes
             // the nullability of either branch — so `SELECT id FROM t UNION
             // SELECT 1` must not be told the `1` might be missing.
-            let mut column = OutColumn::new(alias, wire_type(&value));
+            // From the expression, not from the value it happened to produce:
+            // a later row could produce another type, and describing a
+            // statement binds its parameters to NULL so there is often no
+            // value worth reading.
+            let mut column = OutColumn::new(alias, computed_column_type(e, &[], &[]));
             column.nullable = !never_null(e);
             columns.push(column);
             row.push(value);
@@ -2135,7 +2139,14 @@ impl Engine {
         // cosmetic: a union takes the nullability of either branch, so
         // `SELECT id FROM t UNION SELECT 1` would report a NOT NULL column as
         // nullable on the strength of a `1` that can never be NULL.
-        let mut column = OutColumn::new(name, ColumnType::VarString);
+        // Typed from the expression rather than reported as a string. Every
+        // computed column used to be a `VAR_STRING`, which is a third of what
+        // the differential harness had to say — a typed client handed back
+        // `"1"` where MySQL hands back `1`.
+        let mut column = OutColumn::new(
+            name,
+            computed_column_type(e, &relation.refs(), &relation.columns),
+        );
         column.nullable = !never_null(e);
         Ok((column, Projection::Expr(Box::new(e.clone()))))
     }
@@ -5116,6 +5127,100 @@ fn never_null(e: &Expr) -> bool {
     }
 }
 
+/// The MySQL type code for a function's result, where it does not depend on
+/// the arguments.
+///
+/// Every entry measured against MySQL 8.3 rather than reasoned about. The
+/// asymmetries are the reason: `LENGTH` is a `LONGLONG` while `CONCAT` is a
+/// `VAR_STRING`, `JSON_TYPE` is a string while `JSON_LENGTH` is a number, and
+/// `JSON_UNQUOTE` is a `LONG_BLOB` where `JSON_QUOTE` is a `VAR_STRING`.
+///
+/// Only names that reach here. `FLOOR`, `CEIL`, `POSITION`, `SUBSTRING`,
+/// `SUBSTR` and `TRIM` have their own grammar in `sqlparser`, so they arrive
+/// as `Expr::Floor` and friends and never as a call — listing them here would
+/// make the table look like it covers cases it does not. Their near-synonyms
+/// `CEILING`, `MID` and `LTRIM` do parse as calls and so are here.
+fn function_result_type(name: &str) -> Option<ColumnType> {
+    Some(match name {
+        // Counting and measuring, which are always integers.
+        "length" | "char_length" | "character_length" | "octet_length" | "instr" | "locate"
+        | "field" | "count" | "row_number" | "rank" | "dense_rank" | "connection_id"
+        | "last_insert_id" | "row_count" | "unix_timestamp" => ColumnType::LongLong,
+        // `MOD` of two integers is an integer, and `CEILING` is integral by
+        // definition. `ABS`, `ROUND`, `GREATEST` and `LEAST` are *not* here:
+        // they answer whatever they were given.
+        "mod" | "ceiling" => ColumnType::LongLong,
+        // The date parts, which are numbers rather than dates.
+        "timestampdiff" | "datediff" | "hour" | "minute" | "second" | "microsecond" | "quarter"
+        | "dayofweek" | "dayofyear" | "dayofmonth" | "day" | "month" | "weekday" => {
+            ColumnType::LongLong
+        }
+        "year" => ColumnType::Year,
+        "curdate" | "current_date" | "last_day" | "date" => ColumnType::Date,
+        "now" | "current_timestamp" | "localtime" | "localtimestamp" | "sysdate" => {
+            ColumnType::DateTime
+        }
+        "curtime" | "current_time" => ColumnType::Time,
+        // Documents. `JSON_UNQUOTE` is text rather than a document, and MySQL
+        // sends it as a long blob.
+        "json_object" | "json_array" | "json_extract" | "json_set" | "json_array_append"
+        | "json_merge_patch" | "json_keys" | "json_arrayagg" => ColumnType::Json,
+        "json_unquote" | "group_concat" => ColumnType::LongBlob,
+        "json_valid" | "json_length" | "json_contains" => ColumnType::LongLong,
+        // Everything that hands back a string.
+        "concat" | "concat_ws" | "upper" | "ucase" | "lower" | "lcase" | "ltrim" | "rtrim"
+        | "mid" | "left" | "right" | "replace" | "reverse" | "space" | "lpad" | "rpad" | "md5"
+        | "date_format" | "json_type" | "json_quote" | "database" | "schema" | "version"
+        | "user" | "current_user" | "session_user" | "system_user" | "uuid" => {
+            ColumnType::VarString
+        }
+        _ => return None,
+    })
+}
+
+/// The wider of two numeric codes, for an operator with two operands.
+fn arithmetic_type(a: ColumnType, b: ColumnType) -> ColumnType {
+    let approximate = |t: ColumnType| matches!(t, ColumnType::Float | ColumnType::Double);
+    let exact = |t: ColumnType| matches!(t, ColumnType::Decimal | ColumnType::NewDecimal);
+    if approximate(a) || approximate(b) {
+        ColumnType::Double
+    } else if exact(a) || exact(b) {
+        ColumnType::NewDecimal
+    } else if is_integer(a) && is_integer(b) {
+        // Two integers of any width give a `LONGLONG`: a sum or a product
+        // outgrows both, and the binary protocol would send too few bytes for
+        // it under any narrower code.
+        ColumnType::LongLong
+    } else {
+        // An operand of unknown type — a string column, a subquery, a function
+        // this does not recognise. MySQL answers DOUBLE for arithmetic over a
+        // string, and so does the evaluator: `'3.5' + 1` is 4.5. Calling it an
+        // integer had the binary protocol send 4.
+        ColumnType::Double
+    }
+}
+
+/// One type for a set of alternatives, the way MySQL aggregates them.
+///
+/// Used wherever an expression can produce more than one of its parts —
+/// `CASE`, `COALESCE`, `IF`, `GREATEST`. Taking the first was the bug: a
+/// `CASE` returning a `TINYINT` in one branch and 1000 in another was declared
+/// one byte wide, and the binary protocol sent 232.
+fn combined(types: impl Iterator<Item = ColumnType>) -> ColumnType {
+    let mut answer: Option<ColumnType> = None;
+    for t in types {
+        // NULL says nothing about the others.
+        if t == ColumnType::Null {
+            continue;
+        }
+        answer = Some(match answer {
+            None => t,
+            Some(so_far) => widen(so_far, false, t, false),
+        });
+    }
+    answer.unwrap_or(ColumnType::Null)
+}
+
 /// The input column an expression names outright, if it names one.
 ///
 /// A bare reference carries the type it was declared with; anything computed
@@ -5145,7 +5250,6 @@ fn computed_column_type(
         Expr::Function(f) => {
             let name = f.name.to_string().to_ascii_lowercase();
             match name.as_str() {
-                "count" | "row_number" | "rank" | "dense_rank" => ColumnType::LongLong,
                 // MIN and MAX keep the type of what they fold, because the
                 // smallest and largest of a column are values of that column.
                 "min" | "max" => aggregate_argument(f)
@@ -5164,22 +5268,217 @@ fn computed_column_type(
                         _ => ColumnType::NewDecimal,
                     }
                 }
-                _ => ColumnType::VarString,
+                // A window over an integer widens to `LONGLONG`, as MySQL
+                // does: the frame can carry a value the column's width cannot.
+                "lag" | "lead" | "first_value" | "last_value" | "nth_value" => {
+                    let argument = function_arguments(f)
+                        .first()
+                        .map(|argument| computed_column_type(argument, refs, input));
+                    match argument {
+                        Some(t) if is_integer(t) => ColumnType::LongLong,
+                        Some(t) => t,
+                        None => ColumnType::VarString,
+                    }
+                }
+                // Shifting a date by an interval gives back what it was given
+                // — including when what it was given was a string, which is
+                // how it is usually written: `DATE_ADD('2026-01-01', ...)` is
+                // a `STRING` to MySQL and only a `DATETIME` when the argument
+                // was one.
+                "date_add" | "date_sub" | "adddate" | "subdate" | "timestampadd" => {
+                    // `TIMESTAMPADD(HOUR, 1, dt)` puts the unit first, so the
+                    // value it shifts is the third argument. Reading the first
+                    // resolved `HOUR` as an unknown column and answered with a
+                    // string.
+                    let args = function_arguments(f);
+                    let subject = if name == "timestampadd" {
+                        args.get(2)
+                    } else {
+                        args.first()
+                    };
+                    match subject.map(|argument| computed_column_type(argument, refs, input)) {
+                        Some(ColumnType::Date) => ColumnType::Date,
+                        Some(ColumnType::DateTime | ColumnType::Timestamp) => ColumnType::DateTime,
+                        // MySQL answers `STRING` here rather than
+                        // `VAR_STRING` — a fixed-width string, which is the
+                        // one place a computed column gets that code.
+                        _ => ColumnType::String,
+                    }
+                }
+                // These hand back one of their arguments, so they are typed by
+                // them — widened to `LONGLONG` for integers, as MySQL does.
+                // `NULLIF` is the exception and keeps the argument's own width.
+                "coalesce" | "ifnull" | "nvl" | "if" => {
+                    let args = function_arguments(f);
+                    // `IF` chooses between its second and third; the condition
+                    // says nothing about the result. `get(..)` rather than a
+                    // slice, because `SELECT IF()` is a statement anyone can
+                    // send and indexing an empty argument list aborted the
+                    // whole process.
+                    let candidates = if name == "if" {
+                        args.get(1..).unwrap_or(&[])
+                    } else {
+                        &args[..]
+                    };
+                    // Every candidate, not the first: the others are what gets
+                    // returned when the first is NULL. `COALESCE(i, 'x')` is a
+                    // string in MySQL, and calling it a LONGLONG had the binary
+                    // protocol send 0 for the `'x'`.
+                    combined(
+                        candidates
+                            .iter()
+                            .map(|a| computed_column_type(a, refs, input)),
+                    )
+                }
+                // Typed by what they were given rather than fixed: `ABS` and
+                // `ROUND` hand back a decimal for a decimal, and `GREATEST`
+                // hands back whichever argument won — including a string.
+                // Declaring these LONGLONG had the binary protocol send 0 for
+                // a string and truncate a decimal to its integer part.
+                "abs" | "round" | "greatest" | "least" => combined(
+                    function_arguments(f)
+                        .iter()
+                        .map(|a| computed_column_type(a, refs, input)),
+                ),
+                // `NULLIF` answers its first argument or NULL, and both fit
+                // that argument's own width.
+                "nullif" => function_arguments(f)
+                    .first()
+                    .map(|argument| computed_column_type(argument, refs, input))
+                    .unwrap_or(ColumnType::VarString),
+                "isnull" => ColumnType::LongLong,
+                // The ones whose answer does not depend on what they were
+                // given, and then everything unrecognised, which stays a
+                // string because nothing here knows better.
+                other => function_result_type(other).unwrap_or(ColumnType::VarString),
             }
         }
         // A column reference keeps the type it was declared with.
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => direct_column(e, refs, input)
             .map(|column| column.ty.column_type())
             .unwrap_or(ColumnType::VarString),
-        // A literal is typed by what it is; anything else stays a string,
-        // because its type is not known until a row is evaluated.
+        // A literal is typed by what it is. A number with a point is a
+        // DECIMAL to MySQL rather than a double, and NULL has its own code.
         Expr::Value(v) => match &v.value {
-            sqlparser::ast::Value::Number(_, _) => ColumnType::LongLong,
+            sqlparser::ast::Value::Number(text, _) => {
+                // A point makes a DECIMAL and an exponent makes a DOUBLE —
+                // `1.5` is NEWDECIMAL to MySQL and `1e3` is DOUBLE.
+                if text.contains('e') || text.contains('E') {
+                    ColumnType::Double
+                } else if text.contains('.') {
+                    ColumnType::NewDecimal
+                } else {
+                    ColumnType::LongLong
+                }
+            }
+            sqlparser::ast::Value::Boolean(_) => ColumnType::LongLong,
+            sqlparser::ast::Value::Null => ColumnType::Null,
             _ => ColumnType::VarString,
         },
+        // The expressions `sqlparser` gives their own grammar rather than
+        // routing through `Expr::Function`, so `function_result_type` never
+        // sees them. `POSITION` and `EXTRACT` answered `VAR_STRING` here until
+        // this arm existed, where MySQL says `LONGLONG` both times.
+        Expr::Position { .. } | Expr::Extract { .. } | Expr::Floor { .. } | Expr::Ceil { .. } => {
+            ColumnType::LongLong
+        }
+        Expr::Substring { .. } | Expr::Trim { .. } | Expr::Overlay { .. } => ColumnType::VarString,
+        // Anything that answers a yes-or-no question is an integer, which is
+        // the largest single group MySQL types differently from this engine.
+        Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsNotFalse(_)
+        | Expr::InList { .. }
+        | Expr::InSubquery { .. }
+        | Expr::Between { .. }
+        | Expr::Exists { .. }
+        | Expr::Like { .. }
+        | Expr::ILike { .. }
+        | Expr::RLike { .. }
+        | Expr::IsDistinctFrom(_, _)
+        | Expr::IsNotDistinctFrom(_, _) => ColumnType::LongLong,
+        Expr::BinaryOp { left, op, right } => {
+            use sqlparser::ast::BinaryOperator as B;
+            match op {
+                // A comparison or a logical connective is 0 or 1.
+                B::Eq | B::NotEq | B::Lt | B::LtEq | B::Gt | B::GtEq | B::And | B::Or | B::Xor => {
+                    ColumnType::LongLong
+                }
+                // Division is exact in MySQL, so it answers a decimal even
+                // over two integers.
+                B::Divide => ColumnType::NewDecimal,
+                B::Plus | B::Minus | B::Multiply | B::Modulo => arithmetic_type(
+                    computed_column_type(left, refs, input),
+                    computed_column_type(right, refs, input),
+                ),
+                // `->` yields a document and `->>` the text inside one.
+                B::Arrow => ColumnType::Json,
+                B::LongArrow => ColumnType::LongBlob,
+                _ => ColumnType::VarString,
+            }
+        }
+        Expr::UnaryOp { op, expr } => {
+            use sqlparser::ast::UnaryOperator as U;
+            match op {
+                U::Not => ColumnType::LongLong,
+                U::Minus | U::Plus => match computed_column_type(expr, refs, input) {
+                    t if is_integer(t) => ColumnType::LongLong,
+                    t => t,
+                },
+                _ => ColumnType::VarString,
+            }
+        }
+        // A cast says what it wants, which is the one place the answer is
+        // written down in the statement.
+        // `SIGNED` and `UNSIGNED` are spellings a cast accepts and a column
+        // declaration does not, so `SqlType::from_ast` has never heard of
+        // them and they are answered here.
+        Expr::Cast {
+            data_type:
+                sqlparser::ast::DataType::Signed
+                | sqlparser::ast::DataType::SignedInteger
+                | sqlparser::ast::DataType::Unsigned
+                | sqlparser::ast::DataType::UnsignedInteger,
+            ..
+        } => ColumnType::LongLong,
+        Expr::Cast { data_type, .. } => match crate::types::SqlType::from_ast(data_type) {
+            // A cast to CHAR makes a *varying* string: MySQL answers
+            // VAR_STRING where a declared `CHAR` column is a `STRING`.
+            Ok(t) if t.column_type() == ColumnType::String => ColumnType::VarString,
+            Ok(t) => t.column_type(),
+            Err(_) => ColumnType::VarString,
+        },
+        // A CASE is typed by what its branches produce; the first one that is
+        // not NULL stands for all of them.
+        Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => combined(
+            conditions
+                .iter()
+                .map(|w| &w.result)
+                .chain(else_result.as_deref())
+                .map(|r| computed_column_type(r, refs, input)),
+        ),
         Expr::Nested(inner) => computed_column_type(inner, refs, input),
         _ => ColumnType::VarString,
     }
+}
+
+/// Whether a code is one of MySQL's integer types.
+fn is_integer(t: ColumnType) -> bool {
+    matches!(
+        t,
+        ColumnType::Tiny
+            | ColumnType::Short
+            | ColumnType::Int24
+            | ColumnType::Long
+            | ColumnType::LongLong
+    )
 }
 
 thread_local! {

@@ -111,3 +111,5 @@
 {"at":"2026-08-20T16:36:46Z","id":47,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-20T16:36:46Z","id":38,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-20T17:50:54Z","id":39,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-20T17:57:30Z","id":49,"by":"Christopher Vachon","as":"user","type":"created","title":"DECIMAL loses its scale through an aggregate","state":"Todo"}
+{"at":"2026-08-20T18:33:08Z","id":40,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
