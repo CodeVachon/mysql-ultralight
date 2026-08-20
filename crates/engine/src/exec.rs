@@ -125,6 +125,73 @@ impl Engine {
         )
     }
 
+    /// Re-resolves every view in a database against the schema as it now is.
+    ///
+    /// Only `ALTER TABLE` needs this: it is the one statement that can change
+    /// a column's type while leaving the views over it valid. Dropping the
+    /// table or the column makes them fail on use instead, which is visible
+    /// rather than silent.
+    ///
+    /// Best effort by design — a view this no longer resolves keeps the shape
+    /// it had, because an `ALTER` must not fail on account of a view it did
+    /// not touch. Resolving reads the schema and not the rows, so the cost is
+    /// a parse and a walk per view.
+    fn refresh_view_shapes(&self, session: &Session, database: &str) -> EngineResult<()> {
+        let views: Vec<crate::catalog::View> = {
+            let catalog = self.catalog()?;
+            match catalog.database(database) {
+                Some(db) => db.views.values().cloned().collect(),
+                None => return Ok(()),
+            }
+        };
+
+        let mut refreshed = Vec::new();
+        for view in views {
+            let mut scoped = session.clone();
+            scoped.current_database = Some(database.to_owned());
+            let Ok(resolved) =
+                expr::probing(|| shaping(|| self.execute(&mut scoped, &view.definition, &[])))
+            else {
+                continue;
+            };
+            let Outcome::Rows(rows) = resolved else {
+                continue;
+            };
+            refreshed.push((
+                view.name.clone(),
+                Self::view_shape(&rows.columns, &view.columns),
+            ));
+        }
+
+        let mut catalog = self.catalog_mut()?;
+        let Some(db) = catalog.database_mut(database) else {
+            return Ok(());
+        };
+        for (name, shape) in refreshed {
+            if let Some(view) = db.views.get_mut(&name) {
+                view.shape = shape;
+            }
+        }
+        Ok(())
+    }
+
+    /// The stored shape of a view, from the columns its definition produced.
+    fn view_shape(columns: &[OutColumn], explicit: &[String]) -> Vec<crate::catalog::Column> {
+        columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let mut column = crate::catalog::Column::new(
+                    explicit.get(i).cloned().unwrap_or_else(|| c.name.clone()),
+                    c.sql_type(),
+                );
+                column.position = i + 1;
+                column.nullable = c.nullable;
+                column
+            })
+            .collect()
+    }
+
     /// An owned copy of the whole catalog.
     ///
     /// The state image is the reason this is public: baking and inspecting an
@@ -506,20 +573,7 @@ impl Engine {
                 let mut scoped = session.clone();
                 scoped.current_database = Some(db.clone());
                 let resolved = self.query(&scoped, &create.query)?;
-                let shape: Vec<crate::catalog::Column> = resolved
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| {
-                        let mut column = crate::catalog::Column::new(
-                            explicit.get(i).cloned().unwrap_or_else(|| c.name.clone()),
-                            crate::types::SqlType::from_column_type(c.ty),
-                        );
-                        column.position = i + 1;
-                        column.nullable = c.nullable;
-                        column
-                    })
-                    .collect();
+                let shape = Self::view_shape(&resolved.columns, &explicit);
 
                 let view = crate::catalog::View {
                     name: name.clone(),
@@ -543,13 +597,23 @@ impl Engine {
                 database.views.insert(name, view);
                 Ok(Outcome::ok())
             }
-            Statement::AlterTable(alter) => ddl::alter_table(
-                self,
-                session,
-                &alter.name,
-                &alter.operations,
-                alter.if_exists,
-            ),
+            Statement::AlterTable(alter) => {
+                let outcome = ddl::alter_table(
+                    self,
+                    session,
+                    &alter.name,
+                    &alter.operations,
+                    alter.if_exists,
+                )?;
+                // A view's shape is worked out once and stored, so widening a
+                // column leaves every view over it describing the old width.
+                // MySQL re-resolves a view when it is opened and reports the
+                // new one. Done after the DDL rather than inside it, because
+                // resolving runs a query and the DDL holds the write lock.
+                let (db, _) = self.split_name(session, &alter.name)?;
+                self.refresh_view_shapes(session, &db)?;
+                Ok(outcome)
+            }
             Statement::CreateIndex(create) => ddl::create_index(self, session, create),
             Statement::CreateDatabase {
                 db_name,
@@ -883,6 +947,24 @@ impl Engine {
 
                 // All three operators keep the first branch's column names,
                 // and all three remove duplicates unless ALL is given.
+                //
+                // The declared *type* is only kept where both branches agree.
+                // A column fed by `SMALLINT` on one side and `BIGINT` on the
+                // other holds values from both, so reporting the left one
+                // describes a column narrower than what it returns — MySQL
+                // aggregates the two into the wider type, and dropping back to
+                // the widening the wire type implies is the honest version of
+                // that without a type lattice.
+                for (i, column) in left.columns.iter_mut().enumerate() {
+                    let same = right
+                        .columns
+                        .get(i)
+                        .is_some_and(|r| r.declared == column.declared);
+                    if !same {
+                        column.declared = None;
+                    }
+                }
+
                 let all = matches!(
                     set_quantifier,
                     SetQuantifier::All | SetQuantifier::AllByName
@@ -1572,7 +1654,7 @@ impl Engine {
                             schema: String::new(),
                             table: name.clone(),
                             name: c.name.clone(),
-                            ty: crate::types::SqlType::from_column_type(c.ty),
+                            ty: c.sql_type(),
                             nullable: c.nullable,
                         })
                         .collect(),
@@ -2091,11 +2173,15 @@ impl Engine {
         // Column types cannot be inferred from the first group: a later group
         // may produce a different type, and the binary protocol encodes by the
         // declared type, so a client would silently decode the wrong thing.
-        // Computed columns are reported as strings, as the ungrouped path does.
+        // Computed columns are reported as strings, as the ungrouped path does
+        // — but a grouped column is still just a column, and keeps the type it
+        // was declared with, or `SELECT id FROM t GROUP BY id` would describe
+        // itself differently from `SELECT id FROM t`.
         let columns: Vec<OutColumn> = items
             .iter()
-            .map(|(alias, e)| {
-                OutColumn::new(alias.clone(), computed_column_type(e, refs, input_columns))
+            .map(|(alias, e)| match direct_column(e, refs, input_columns) {
+                Some(column) => OutColumn::from_sql_type(alias, &column.ty, column.nullable),
+                None => OutColumn::new(alias.clone(), computed_column_type(e, refs, input_columns)),
             })
             .collect();
 
@@ -3648,7 +3734,7 @@ impl Engine {
                 schema: schema.clone(),
                 table: name.to_owned(),
                 name: c.name.clone(),
-                ty: crate::types::SqlType::from_column_type(c.ty),
+                ty: c.sql_type(),
                 nullable: c.nullable,
             })
             .collect();
@@ -3836,7 +3922,7 @@ impl Engine {
                 // The inner query already worked out each column's type;
                 // discarding it reports every view column as text, and a typed
                 // client then decodes a number as a string.
-                ty: crate::types::SqlType::from_column_type(c.ty),
+                ty: c.sql_type(),
                 nullable: c.nullable,
             })
             .collect();
@@ -4870,6 +4956,26 @@ fn literal_expr(value: &Value) -> Expr {
 /// `refs` carries the input columns so an aggregate over one can keep its type:
 /// `SUM(views)` of an integer column is an integer, and reporting it as a
 /// string makes a typed client hand back `"120"` where MySQL hands back `120`.
+/// The input column an expression names outright, if it names one.
+///
+/// A bare reference carries the type it was declared with; anything computed
+/// from it does not. Everywhere that difference matters asks here rather than
+/// re-deriving it, so the projection and the grouped path cannot disagree
+/// about whether `id` is an `INT` or a widened `BIGINT`.
+fn direct_column<'a>(
+    e: &Expr,
+    refs: &[ColumnRef],
+    input: &'a [crate::relation::RelColumn],
+) -> Option<&'a crate::relation::RelColumn> {
+    match e {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            column_slot(refs, e).and_then(|slot| input.get(slot))
+        }
+        Expr::Nested(inner) => direct_column(inner, refs, input),
+        _ => None,
+    }
+}
+
 fn computed_column_type(
     e: &Expr,
     refs: &[ColumnRef],
@@ -4889,8 +4995,7 @@ fn computed_column_type(
             }
         }
         // A column reference keeps the type it was declared with.
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => column_slot(refs, e)
-            .and_then(|slot| input.get(slot))
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => direct_column(e, refs, input)
             .map(|column| column.ty.column_type())
             .unwrap_or(ColumnType::VarString),
         // A literal is typed by what it is; anything else stays a string,

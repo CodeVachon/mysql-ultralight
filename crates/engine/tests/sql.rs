@@ -1216,10 +1216,10 @@ fn a_view_reports_its_columns_and_their_types() {
         "SELECT column_name, data_type FROM information_schema.columns
          WHERE table_schema = 'testdb' AND table_name = 'V' ORDER BY ordinal_position",
     );
-    assert_eq!(
-        columns,
-        vec![vec!["id", "varchar"], vec!["count", "bigint"]]
-    );
+    // `count` is an INTEGER and says so. It read back as `bigint` while a
+    // view's shape was rebuilt from the wire type, which widens every integer
+    // size to one.
+    assert_eq!(columns, vec![vec!["id", "varchar"], vec!["count", "int"]]);
 
     let shown = rows(&engine, &mut session, "SHOW COLUMNS FROM V");
     assert_eq!(shown.len(), 2);
@@ -5240,13 +5240,12 @@ fn a_view_column_is_described_like_a_table_column() {
              WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Seen' ORDER BY ORDINAL_POSITION"
         ),
         vec![
-            // Widened, not exact: a view's shape is taken from its result
-            // metadata, which carries a wire type rather than the declared
-            // one, so `int` reads back as a 19-digit integer and
-            // `varchar(40)` as text. Every column is described, which is what
-            // introspection needs; the exact width is #0035.
-            vec!["id", "NULL", "19", "NULL"],
-            vec!["label", "65535", "NULL", "NULL"],
+            // Exact, not widened: the declared type travels with the column
+            // now, so `int` is 10 digits rather than the 19 a wire `LONGLONG`
+            // implies and `varchar(40)` keeps its 40 rather than reading as
+            // text.
+            vec!["id", "NULL", "10", "NULL"],
+            vec!["label", "40", "NULL", "NULL"],
             // A DATE has no fractional seconds, which MySQL reports as 0
             // rather than NULL: the precision exists and it is zero.
             vec!["at", "NULL", "NULL", "0"],
@@ -6486,4 +6485,280 @@ fn a_document_read_back_is_still_a_document() {
         let err = engine.execute(&mut session, sql, &[]).unwrap_err();
         assert_eq!(err.code, 3140, "{sql}");
     }
+}
+
+#[test]
+fn a_view_describes_its_columns_exactly_as_the_table_does() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Base (
+            id INT NOT NULL,
+            small SMALLINT NULL,
+            name VARCHAR(40) NOT NULL,
+            note TEXT NULL,
+            amt DECIMAL(10,2) NULL,
+            at DATETIME(3) NULL,
+            kind ENUM('x','y') NULL,
+            flag BOOLEAN NULL,
+            big BIGINT UNSIGNED NULL,
+            approx DOUBLE NULL,
+            PRIMARY KEY (id)
+        )",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Mirror AS
+         SELECT id, small, name, note, amt, at, kind, flag, big, approx FROM Base",
+    );
+
+    // The whole claim, in one comparison: a view over a table's columns is
+    // described the same way the table is. Reporting the wire type instead
+    // widened every one of them — `INT` read back as precision 19 and
+    // `VARCHAR(40)` as text, so `prisma db pull` generated a schema that did
+    // not match the one it was pulled from.
+    let describe = |engine: &Engine, session: &mut Session, table: &str| {
+        rows(
+            engine,
+            session,
+            &format!(
+                "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE,
+                        CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE,
+                        DATETIME_PRECISION
+                 FROM information_schema.columns
+                 WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = '{table}'
+                 ORDER BY ORDINAL_POSITION"
+            ),
+        )
+    };
+    let base = describe(&engine, &mut session, "Base");
+    assert_eq!(describe(&engine, &mut session, "Mirror"), base);
+
+    // And it is the real thing, not two matching widenings.
+    assert_eq!(
+        base[0],
+        vec!["id", "int", "int", "NO", "NULL", "10", "0", "NULL"]
+    );
+    assert_eq!(
+        base[2],
+        vec![
+            "name",
+            "varchar",
+            "varchar(40)",
+            "NO",
+            "40",
+            "NULL",
+            "NULL",
+            "NULL"
+        ]
+    );
+    assert_eq!(
+        base[5],
+        vec![
+            "at",
+            "datetime",
+            "datetime(3)",
+            "YES",
+            "NULL",
+            "NULL",
+            "NULL",
+            "3"
+        ]
+    );
+    // An approximate type has no fixed number of decimal places, so MySQL
+    // answers NULL for its scale rather than 0 — unlike the DECIMAL above,
+    // which reports the 2 its declaration gave it.
+    assert_eq!(
+        base[9],
+        vec!["approx", "double", "double", "YES", "NULL", "22", "NULL", "NULL"]
+    );
+
+    // Widening a column widens the views over it. A view's shape is worked out
+    // once and stored, so without re-resolving it every view keeps describing
+    // the old width — invisible while everything was widened to text, and a
+    // silently wrong schema now that the width is exact. MySQL re-resolves a
+    // view when it is opened.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE Base MODIFY name VARCHAR(80) NOT NULL",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_TYPE FROM information_schema.columns
+             WHERE TABLE_NAME = 'Mirror' AND COLUMN_NAME = 'name'"
+        ),
+        vec![vec!["varchar(80)"]]
+    );
+    assert_eq!(
+        describe(&engine, &mut session, "Mirror"),
+        describe(&engine, &mut session, "Base")
+    );
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE Base MODIFY name VARCHAR(40) NOT NULL",
+    );
+
+    // `CREATE VIEW v (a, b)` renames the columns and keeps their types.
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Named (a, b) AS SELECT id, name FROM Base",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.columns
+             WHERE TABLE_NAME = 'Named' ORDER BY ORDINAL_POSITION"
+        ),
+        vec![vec!["a", "int"], vec!["b", "varchar(40)"]]
+    );
+
+    // Grouping a column does not compute it, so it keeps its type: otherwise
+    // `SELECT id FROM t GROUP BY id` describes itself differently from
+    // `SELECT id FROM t`, and two views over the same column disagree.
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Grouped AS SELECT id, name FROM Base GROUP BY id, name",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLUMN_TYPE, NUMERIC_PRECISION, CHARACTER_MAXIMUM_LENGTH
+             FROM information_schema.columns
+             WHERE TABLE_NAME = 'Grouped' ORDER BY ORDINAL_POSITION"
+        ),
+        vec![
+            vec!["id", "int", "10", "NULL"],
+            vec!["name", "varchar(40)", "NULL", "40"]
+        ]
+    );
+
+    // A computed column has no declared type to keep, so it stays widened —
+    // honest rather than invented, and the same widening it always had. The
+    // spelling and the reported length agree, which they did not while the
+    // fallback carried no width: `varchar(512)` beside a maximum of 65535.
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Computed AS SELECT id, UPPER(name) AS up FROM Base",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.columns
+             WHERE TABLE_NAME = 'Computed' ORDER BY ORDINAL_POSITION"
+        ),
+        vec![vec!["id", "int"], vec!["up", "varchar"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_TYPE, CHARACTER_MAXIMUM_LENGTH FROM information_schema.columns
+             WHERE TABLE_NAME = 'Computed' AND COLUMN_NAME = 'up'"
+        ),
+        vec![vec!["varchar(512)", "512"]]
+    );
+
+    // The type travels through every shape a view is written in, because each
+    // of them carries the column rather than rebuilding it: a view of a view,
+    // a wildcard, a join, a union, and a derived table.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Side (bid INT NULL, label VARCHAR(12) NULL)",
+    );
+    for (name, definition) in [
+        ("Nested", "SELECT * FROM Mirror"),
+        ("Star", "SELECT * FROM Base"),
+        (
+            "Joined",
+            "SELECT Base.id, Side.label FROM Base JOIN Side ON Side.bid = Base.id",
+        ),
+        (
+            "United",
+            "SELECT id, name FROM Base UNION SELECT bid, label FROM Side",
+        ),
+        (
+            "Derived",
+            "SELECT d.id, d.name FROM (SELECT id, name FROM Base) d",
+        ),
+    ] {
+        run(
+            &engine,
+            &mut session,
+            &format!("CREATE VIEW {name} AS {definition}"),
+        );
+    }
+    let types = |engine: &Engine, session: &mut Session, view: &str| {
+        rows(
+            engine,
+            session,
+            &format!(
+                "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.columns
+                 WHERE TABLE_NAME = '{view}' ORDER BY ORDINAL_POSITION"
+            ),
+        )
+    };
+    assert_eq!(
+        types(&engine, &mut session, "Nested"),
+        types(&engine, &mut session, "Mirror")
+    );
+    assert_eq!(
+        types(&engine, &mut session, "Star"),
+        types(&engine, &mut session, "Base")
+    );
+    assert_eq!(
+        types(&engine, &mut session, "Joined"),
+        vec![vec!["id", "int"], vec!["label", "varchar(12)"]]
+    );
+    // A union keeps the type only where both branches declared the same one.
+    // `Side.bid` is an `INT` like `Base.id`, so `id` survives; `label` is a
+    // `VARCHAR(12)` against a `VARCHAR(40)`, and describing the column as
+    // either one is narrower than the values it holds.
+    assert_eq!(
+        types(&engine, &mut session, "United"),
+        vec![vec!["id", "int"], vec!["name", "varchar(512)"]]
+    );
+
+    // Which matters most where the two branches are different widths of the
+    // same kind: reporting the left one describes a column narrower than what
+    // it returns, and a tool generating a schema from that truncates.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Wide (big BIGINT NULL, small SMALLINT NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Mixed AS SELECT small FROM Wide UNION SELECT big FROM Wide",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Same AS SELECT small FROM Wide UNION SELECT small FROM Wide",
+    );
+    assert_eq!(
+        types(&engine, &mut session, "Mixed"),
+        vec![vec!["small", "bigint"]]
+    );
+    assert_eq!(
+        types(&engine, &mut session, "Same"),
+        vec![vec!["small", "smallint"]]
+    );
+    assert_eq!(
+        types(&engine, &mut session, "Derived"),
+        vec![vec!["id", "int"], vec!["name", "varchar(40)"]]
+    );
 }

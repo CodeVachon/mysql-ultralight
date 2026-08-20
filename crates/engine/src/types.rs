@@ -180,7 +180,14 @@ impl SqlType {
             | ColumnType::LongBlob
             | ColumnType::MediumBlob
             | ColumnType::TinyBlob => simple(TypeKind::Blob, "blob"),
-            _ => simple(TypeKind::Text, "varchar(512)"),
+            // The width is carried as well as spelled, so `COLUMN_TYPE` and
+            // `CHARACTER_MAXIMUM_LENGTH` agree: with `length: None` the pair
+            // said `varchar(512)` and 65535, two different widths for one
+            // column.
+            _ => SqlType {
+                length: Some(512),
+                ..simple(TypeKind::Text, "varchar(512)")
+            },
         }
     }
 

@@ -696,3 +696,57 @@ fn an_image_whose_document_is_not_a_document_is_refused() {
     let good = image::encode(&engine.catalog_snapshot().unwrap());
     assert!(image::decode(&good).is_ok());
 }
+
+#[test]
+fn a_view_keeps_its_column_types_through_an_image() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Base (id INT NOT NULL, name VARCHAR(40) NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Mirror AS SELECT id, name FROM Base",
+    );
+    run(&engine, &mut session, "INSERT INTO Base VALUES (1, 'a')");
+
+    let described = rows(
+        &engine,
+        &mut session,
+        "SELECT COLUMN_NAME, COLUMN_TYPE, NUMERIC_PRECISION, CHARACTER_MAXIMUM_LENGTH
+         FROM information_schema.columns
+         WHERE TABLE_NAME = 'Mirror' ORDER BY ORDINAL_POSITION",
+    );
+    assert_eq!(
+        described,
+        vec![
+            vec!["id", "int", "10", "NULL"],
+            vec!["name", "varchar(40)", "NULL", "40"]
+        ]
+    );
+
+    // The shape is stored with the view, so a booted image has to carry it —
+    // an image is how a test database starts, and a view described differently
+    // after a reload is a schema that drifts on restart.
+    let encoded = image::encode(&engine.catalog_snapshot().unwrap());
+    let reloaded =
+        Engine::from_catalog(image::decode(&encoded).unwrap(), ServerConfig::default()).unwrap();
+    let mut session = Session::new(ServerConfig::default(), 1);
+    session.current_database = Some("testdb".to_owned());
+    assert_eq!(
+        rows(
+            &reloaded,
+            &mut session,
+            "SELECT COLUMN_NAME, COLUMN_TYPE, NUMERIC_PRECISION, CHARACTER_MAXIMUM_LENGTH
+             FROM information_schema.columns
+             WHERE TABLE_NAME = 'Mirror' ORDER BY ORDINAL_POSITION"
+        ),
+        described
+    );
+    assert_eq!(
+        rows(&reloaded, &mut session, "SELECT id, name FROM Mirror"),
+        vec![vec!["1", "a"]]
+    );
+}

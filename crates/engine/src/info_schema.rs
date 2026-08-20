@@ -270,10 +270,6 @@ fn columns(catalog: &Catalog) -> Table {
         };
         for table in db.tables.values() {
             for column in &table.columns {
-                let numeric = matches!(
-                    column.ty.kind,
-                    TypeKind::Int | TypeKind::Decimal | TypeKind::Float
-                );
                 rows.push(vec![
                     text("def"),
                     text(&name),
@@ -291,11 +287,7 @@ fn columns(catalog: &Catalog) -> Table {
                     text(column.ty.base_name()),
                     character_maximum_length(&column.ty),
                     numeric_precision(&column.ty),
-                    if numeric {
-                        Value::Int(column.ty.scale.unwrap_or(0) as i64)
-                    } else {
-                        Value::Null
-                    },
+                    numeric_scale(&column.ty),
                     datetime_precision(&column.ty),
                     text(&column.ty.declared),
                     // MySQL also reports MUL for the first column of any other
@@ -354,14 +346,7 @@ fn columns(catalog: &Catalog) -> Table {
                     // makes a describing tool see a type-less column.
                     character_maximum_length(&column.ty),
                     numeric_precision(&column.ty),
-                    if matches!(
-                        column.ty.kind,
-                        TypeKind::Int | TypeKind::Decimal | TypeKind::Float | TypeKind::Bool
-                    ) {
-                        Value::Int(column.ty.scale.unwrap_or(0) as i64)
-                    } else {
-                        Value::Null
-                    },
+                    numeric_scale(&column.ty),
                     datetime_precision(&column.ty),
                     text(&column.ty.declared),
                     text(""),
@@ -449,6 +434,29 @@ fn datetime_precision(ty: &crate::types::SqlType) -> Value {
     match ty.kind {
         TypeKind::DateTime | TypeKind::Time => Value::Int(ty.length.unwrap_or(0) as i64),
         TypeKind::Date => Value::Int(0),
+        _ => Value::Null,
+    }
+}
+
+/// `NUMERIC_SCALE`, which MySQL reports for every exact numeric type.
+///
+/// One function rather than the rule written out at each caller: a table's
+/// columns and a view's are described by separate loops, and when each carried
+/// its own copy they drifted — a `BOOLEAN` reported scale 0 through a view and
+/// nothing through the table it came from.
+///
+/// A `FLOAT` or `DOUBLE` is the exception: it has a scale only when the DDL
+/// wrote one, because an approximate type without `(M,D)` has no fixed number
+/// of decimal places to report. MySQL answers NULL there.
+fn numeric_scale(ty: &crate::types::SqlType) -> Value {
+    match ty.kind {
+        TypeKind::Int | TypeKind::Decimal | TypeKind::Bool => {
+            Value::Int(ty.scale.unwrap_or(0) as i64)
+        }
+        TypeKind::Float => match ty.scale {
+            Some(scale) => Value::Int(scale as i64),
+            None => Value::Null,
+        },
         _ => Value::Null,
     }
 }

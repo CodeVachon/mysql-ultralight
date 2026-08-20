@@ -13,6 +13,18 @@ pub struct OutColumn {
     pub schema: String,
     pub ty: ColumnType,
     pub nullable: bool,
+    /// The type this column was declared with, where it has one.
+    ///
+    /// The wire type is a widening: `INT`, `SMALLINT` and `BIGINT` all leave
+    /// as `LONGLONG`, and every string type as `VAR_STRING`. That is fine for
+    /// a result — the client only needs to know how to decode it — but a view
+    /// stores its shape from these columns, and rebuilding an `SqlType` from
+    /// the wire type reports `bigint` for an `INT` column and `text` for a
+    /// `VARCHAR(40)`.
+    ///
+    /// `None` for a computed expression, which genuinely has no declared type:
+    /// inventing one would be worse than widening it.
+    pub declared: Option<SqlType>,
 }
 
 impl OutColumn {
@@ -23,6 +35,7 @@ impl OutColumn {
             schema: String::new(),
             ty,
             nullable: true,
+            declared: None,
         }
     }
 
@@ -33,7 +46,19 @@ impl OutColumn {
             schema: String::new(),
             ty: ty.column_type(),
             nullable,
+            declared: Some(ty.clone()),
         }
+    }
+
+    /// The type a relation built from this column should carry.
+    ///
+    /// The declared type where there is one, and the widening the wire type
+    /// implies where there is not — which is what every caller used to do
+    /// unconditionally.
+    pub fn sql_type(&self) -> SqlType {
+        self.declared
+            .clone()
+            .unwrap_or_else(|| SqlType::from_column_type(self.ty))
     }
 
     pub fn in_table(mut self, schema: &str, table: &str) -> Self {

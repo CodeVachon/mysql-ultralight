@@ -315,7 +315,7 @@ computed (non-constant) offset or default in `LAG`/`LEAD`, `WITH RECURSIVE`, and
 `ORDER BY` and `LIMIT` on an `UPDATE` or `DELETE` are refused only on the multi-table
 forms, where MySQL refuses them too — "the first row" is not defined across a join.
 
-Two limitations are worth stating rather than implying away.
+Three limitations are worth stating rather than implying away.
 
 **Transactions do not isolate concurrent connections.** The catalog is shared, so a second
 connection sees uncommitted writes. Rollback restores only the tables the transaction
@@ -327,6 +327,20 @@ wrong for anything else.
 **Rollback keeps a catalog snapshot rather than an undo log**, which is the honest trade
 for an in-memory engine holding a test-sized dataset; undo logging would be a great deal of
 machinery for a database that discards everything at process exit.
+
+**A computed column has no declared type.** `SELECT id, name FROM t` through a view is
+described exactly as the table is, because each column carries the type it was declared
+with. `SELECT UPPER(name) AS up` is not: the engine infers nothing about an expression's
+width, so the view reports `varchar(512)` where MySQL would say `varchar(40)`. The number
+is the widening every computed column has always had rather than anything about this
+expression, and a describing tool reads it as a given — so it is worth knowing before
+building a view whose columns are all computed.
+
+A `UNION` column is the same shape: it takes the declared type only where both branches
+declared the same one, because a column fed by a `SMALLINT` on one side and a `BIGINT` on
+the other holds values from both. MySQL aggregates the two into the wider type; this drops
+back to the widening rather than picking a side, which would describe a column narrower
+than what it returns.
 
 ## Review hardening (engine)
 
