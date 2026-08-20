@@ -34,6 +34,13 @@ call it, so it must never diverge from what they need:
 | Prisma end to end | `npm test` in `examples/node-test` |
 | Runner wiring | `npm test` in `examples/jest` and `examples/vitest` |
 
+`scripts/differential.sh` is deliberately *not* in the gate: it runs the SQL
+corpus against a real `mysql:8.3` in Docker and compares the answers, which a
+checkout cannot be assumed to be able to do. Run it when changing anything the
+engine answers with — it is the only thing here that checks this engine against
+MySQL rather than against what somebody remembered about MySQL. See
+[`crates/differential`](crates/differential/README.md).
+
 Flags: `--fast` skips the supply-chain checks, `--fix` formats and applies clippy
 suggestions first, `--require-tools` turns a missing tool into a failure rather than a
 skip. CI sets that automatically via the `CI` environment variable, so a tool that fails
@@ -69,6 +76,7 @@ git config core.hooksPath .githooks
 | `crates/engine` | Catalog, executor, SQL rewriting, and the state image |
 | `crates/cli` | The `mysql-ultralight` binary |
 | `crates/conformance` | Extracts the SQL surface of a target codebase |
+| `crates/differential` | Runs the same SQL against MySQL and this engine and diffs the answers |
 | `packages/npm` | `@codevachon/mysql-ultralight`: the JS API and the platform packages |
 | `examples/app` | The example application: schema, migrations, controllers, and how a test gets a database |
 | `examples/node-test` | Tests only. The engine-level claims: image equals migrations, no drift |

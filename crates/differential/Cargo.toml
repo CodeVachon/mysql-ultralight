@@ -1,0 +1,20 @@
+[package]
+name = "mysql-ultralight-differential"
+description = "Runs identical SQL against MySQL and mysql-ultralight and compares the answers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "differential"
+path = "src/main.rs"
+
+[dependencies]
+# `minimal-rust` rather than `minimal`: both spellings drop TLS, but `minimal`
+# resolves to flate2/zlib and so pulls libz-sys, which would put a C toolchain
+# in the way of `cargo test --workspace` for the sake of a development tool
+# talking to two servers on localhost.
+mysql = { version = "26", default-features = false, features = ["minimal-rust"] }

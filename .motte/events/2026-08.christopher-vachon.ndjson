@@ -93,3 +93,11 @@
 {"at":"2026-08-19T21:50:14Z","id":33,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-20T02:10:20Z","id":35,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-20T14:01:51Z","id":6,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-20T14:21:10Z","id":36,"by":"Christopher Vachon","as":"user","type":"created","title":"String functions answer '' where MySQL answers NULL","state":"Todo"}
+{"at":"2026-08-20T14:21:10Z","id":37,"by":"Christopher Vachon","as":"user","type":"created","title":"JSON is rendered compactly where MySQL spaces it","state":"Todo"}
+{"at":"2026-08-20T14:21:10Z","id":38,"by":"Christopher Vachon","as":"user","type":"created","title":"Every integer column is described as BIGINT on the wire","state":"Todo"}
+{"at":"2026-08-20T14:21:10Z","id":39,"by":"Christopher Vachon","as":"user","type":"created","title":"A NOT NULL string column is described as nullable","state":"Todo"}
+{"at":"2026-08-20T14:21:40Z","id":40,"by":"Christopher Vachon","as":"user","type":"created","title":"Computed expressions are described as strings","state":"Todo"}
+{"at":"2026-08-20T14:21:40Z","id":41,"by":"Christopher Vachon","as":"user","type":"created","title":"information_schema details that differ from MySQL","state":"Todo"}
+{"at":"2026-08-20T14:21:40Z","id":42,"by":"Christopher Vachon","as":"user","type":"created","title":"DIV and the arithmetic operators MySQL accepts","state":"Todo"}
+{"at":"2026-08-20T14:21:40Z","id":43,"by":"Christopher Vachon","as":"user","type":"created","title":"The arrow operators render with spaces in a column name","state":"Todo"}
