@@ -175,8 +175,19 @@ impl ColumnDef {
         self
     }
 
-    pub fn nullable(mut self) -> Self {
-        self.flags &= !flags::NOT_NULL;
+    /// Records whether the column accepts NULL.
+    ///
+    /// Sets the flag as well as clearing it. It used to only clear, and
+    /// `ColumnDef::new` only turned it on for the numeric codes — so a
+    /// nullable `INT` was right by being switched off again, while a
+    /// `NOT NULL VARCHAR` never had it switched on and reached the client as
+    /// optional. Generated code then modelled a non-null column as one.
+    pub fn nullable(mut self, nullable: bool) -> Self {
+        if nullable {
+            self.flags &= !flags::NOT_NULL;
+        } else {
+            self.flags |= flags::NOT_NULL;
+        }
         self
     }
 

@@ -370,7 +370,12 @@ where
                 let def = mysql_ultralight_protocol::ColumnDef::new(
                     format!("?{i}"),
                     mysql_ultralight_protocol::ColumnType::VarString,
-                );
+                )
+                // Said rather than relied on: `ColumnDef::new` seeds the flag
+                // from the type code, so this was a nullable string only
+                // because `VarString` happens to be in the arm that sets no
+                // flags.
+                .nullable(true);
                 packets.push(def.encode());
             }
             if !deprecate_eof {

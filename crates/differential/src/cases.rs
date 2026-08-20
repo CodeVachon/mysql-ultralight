@@ -177,6 +177,47 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // What a client is told about NULL. A typed client models a column it
+        // is told is nullable as optional, so a `NOT NULL` reported as
+        // nullable is the wrong shape in generated code.
+        name: "nullability",
+        setup: &[
+            "CREATE TABLE N (id INT NOT NULL, nn VARCHAR(9) NOT NULL, ny VARCHAR(9) NULL, \
+             inn INT NOT NULL, tn TEXT NOT NULL, dn DATETIME NOT NULL, \
+             en ENUM('a') NOT NULL, jn JSON NOT NULL, bn BLOB NOT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE M (aid INT NULL)",
+            "INSERT INTO N VALUES (1,'a','b',2,'t','2026-01-01 00:00:00','a','{}','x')",
+            // An unmatched row, so the outer joins actually pad something —
+            // without it the NULL half of those cases never happens.
+            "INSERT INTO M VALUES (1), (99)",
+        ],
+        cases: &[
+            // Every type, because the flag used to be set only for the
+            // numeric codes and so only the numeric columns were right.
+            same("SELECT * FROM N"),
+            // The preserved side of an outer join keeps NOT NULL; the
+            // null-supplying side loses it, because the join can invent a row
+            // of NULLs for it.
+            same("SELECT nn, inn FROM N LEFT JOIN M ON M.aid = N.id"),
+            same("SELECT M.aid, N.nn FROM M LEFT JOIN N ON N.id = M.aid"),
+            // A union is nullable if either branch is.
+            same("SELECT nn FROM N UNION SELECT ny FROM N"),
+            same("SELECT nn FROM N UNION SELECT nn FROM N"),
+            // A RIGHT JOIN pads the *left* side, which is the opposite of what
+            // the code relaxed — so the engine flagged a column NOT NULL and
+            // then sent NULL in it.
+            same("SELECT id, nn FROM N RIGHT JOIN M ON M.aid = N.id ORDER BY id"),
+            same("SELECT * FROM N RIGHT JOIN M ON M.aid = N.id ORDER BY id"),
+            same("SELECT * FROM N LEFT JOIN M ON M.aid = N.id ORDER BY id"),
+            // A literal branch is not nullable, and treating every computed
+            // column as if it were imported a nullability that does not exist.
+            same("SELECT id FROM N UNION SELECT 1 ORDER BY 1"),
+            same("SELECT id FROM N UNION SELECT 1 + 1 ORDER BY 1"),
+            same("SELECT id FROM N UNION ALL SELECT 2 ORDER BY 1"),
+            same("SELECT id FROM N UNION SELECT NULL ORDER BY 1"),
+        ],
+    },
+    Group {
         name: "joins and set operators",
         setup: &[
             "CREATE TABLE A (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",

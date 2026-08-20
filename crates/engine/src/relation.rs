@@ -99,15 +99,27 @@ impl Relation {
     /// Outer-joined columns become nullable regardless of their declaration:
     /// an unmatched row fills them with NULL, and reporting them as NOT NULL
     /// would be a metadata lie a client may act on.
-    pub fn joined_columns(&self, other: &Relation, force_nullable: bool) -> Vec<RelColumn> {
-        let mut columns = self.columns.clone();
-        for column in &other.columns {
-            let mut column = column.clone();
-            if force_nullable {
-                column.nullable = true;
-            }
-            columns.push(column);
+    /// The joined schema, with the side an outer join can pad marked nullable.
+    ///
+    /// Which side that is depends on the operator, and the two are not
+    /// interchangeable: a `LEFT JOIN` invents NULLs for the *right* relation
+    /// and a `RIGHT JOIN` for the *left*. Relaxing the right one for both made
+    /// the engine flag a column `NOT NULL` and then send NULL in it.
+    pub fn joined_columns(
+        &self,
+        other: &Relation,
+        relax_self: bool,
+        relax_other: bool,
+    ) -> Vec<RelColumn> {
+        fn relaxed(columns: &[RelColumn], relax: bool) -> impl Iterator<Item = RelColumn> + '_ {
+            columns.iter().map(move |column| {
+                let mut column = column.clone();
+                column.nullable |= relax;
+                column
+            })
         }
-        columns
+        relaxed(&self.columns, relax_self)
+            .chain(relaxed(&other.columns, relax_other))
+            .collect()
     }
 }

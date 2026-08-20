@@ -27,13 +27,13 @@ impl Handler for TestHandler {
                 vec![vec![Value::I64(1)]],
             ))),
             "SELECT NULL" => Ok(Response::ResultSet(ResultSet::with_rows(
-                vec![ColumnDef::new("null_col", ColumnType::VarString).nullable()],
+                vec![ColumnDef::new("null_col", ColumnType::VarString).nullable(true)],
                 vec![vec![Value::Null]],
             ))),
             "MULTI" => Ok(Response::ResultSet(ResultSet::with_rows(
                 vec![
                     ColumnDef::new("a", ColumnType::LongLong),
-                    ColumnDef::new("b", ColumnType::VarString).nullable(),
+                    ColumnDef::new("b", ColumnType::VarString).nullable(true),
                 ],
                 vec![
                     vec![Value::I64(1), Value::Str("one".into())],
@@ -77,7 +77,7 @@ impl Handler for TestHandler {
             let columns = params
                 .iter()
                 .enumerate()
-                .map(|(i, v)| ColumnDef::new(format!("p{i}"), v.inferred_type()).nullable())
+                .map(|(i, v)| ColumnDef::new(format!("p{i}"), v.inferred_type()).nullable(true))
                 .collect();
             return Ok(Response::ResultSet(ResultSet::with_rows(
                 columns,
@@ -527,7 +527,7 @@ impl Handler for RogueIdHandler {
     }
 
     fn execute(&mut self, _stmt: &Prepared, params: &[Value]) -> HandlerResult {
-        let columns = vec![ColumnDef::new("p0", ColumnType::LongLong).nullable()];
+        let columns = vec![ColumnDef::new("p0", ColumnType::LongLong).nullable(true)];
         Ok(Response::ResultSet(ResultSet::with_rows(
             columns,
             vec![params.to_vec()],

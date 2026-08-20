@@ -7213,3 +7213,118 @@ fn a_union_is_described_as_what_holds_both_branches() {
     assert_eq!(format!("{:?}", described[0].ty), "Blob");
     assert_ne!(described[0].to_wire().charset, 63, "should carry text");
 }
+
+#[test]
+fn a_not_null_column_says_so_whatever_its_type() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N (
+            id INT NOT NULL, nn VARCHAR(9) NOT NULL, ny VARCHAR(9) NULL,
+            inn INT NOT NULL, tn TEXT NOT NULL, dn DATETIME NOT NULL,
+            en ENUM('a') NOT NULL, jn JSON NOT NULL, bn BLOB NOT NULL,
+            PRIMARY KEY (id)
+        )",
+    );
+    run(&engine, &mut session, "CREATE TABLE M (aid INT NULL)");
+
+    // Read off the wire definition, not the engine's own `nullable` field.
+    // The bug was in `to_wire`, so a test asking the field it is derived from
+    // passes whether or not the flag ever reaches the client — which this one
+    // did, until breaking the fix failed to fail it.
+    let nullable = |engine: &Engine, session: &Session, sql: &str| -> Vec<bool> {
+        engine
+            .describe(session, sql, 0)
+            .unwrap()
+            .iter()
+            .map(|c| c.to_wire().flags & mysql_ultralight_protocol::column::flags::NOT_NULL == 0)
+            .collect()
+    };
+
+    // The flag was only ever *cleared*, and `ColumnDef::new` only turned it on
+    // for the numeric codes — so a nullable INT was right by being switched
+    // off again, while a NOT NULL VARCHAR never had it switched on at all.
+    // Generated code then modelled a non-null column as optional.
+    assert_eq!(
+        nullable(&engine, &session, "SELECT * FROM N"),
+        vec![false, false, true, false, false, false, false, false, false]
+    );
+
+    // An outer join can invent a row of NULLs for the side it does not
+    // preserve, so a NOT NULL column there stops being one.
+    assert_eq!(
+        nullable(
+            &engine,
+            &session,
+            "SELECT nn, inn FROM N LEFT JOIN M ON M.aid = N.id"
+        ),
+        vec![false, false]
+    );
+    assert_eq!(
+        nullable(
+            &engine,
+            &session,
+            "SELECT M.aid, N.nn FROM M LEFT JOIN N ON N.id = M.aid"
+        ),
+        vec![true, true]
+    );
+
+    // And a union is nullable if either branch is — which only became visible
+    // once NOT NULL was reported at all.
+    assert_eq!(
+        nullable(&engine, &session, "SELECT nn FROM N UNION SELECT ny FROM N"),
+        vec![true]
+    );
+    assert_eq!(
+        nullable(&engine, &session, "SELECT nn FROM N UNION SELECT nn FROM N"),
+        vec![false]
+    );
+
+    // A RIGHT JOIN pads the *left* side. Relaxing the right one for both
+    // operators had the engine flag a column NOT NULL and then send NULL in
+    // it, which is a lie a client cannot recover from.
+    assert_eq!(
+        nullable(
+            &engine,
+            &session,
+            "SELECT id, nn FROM N RIGHT JOIN M ON M.aid = N.id"
+        ),
+        vec![true, true]
+    );
+    assert_eq!(
+        nullable(
+            &engine,
+            &session,
+            "SELECT id, nn FROM N LEFT JOIN M ON M.aid = N.id"
+        ),
+        vec![false, false]
+    );
+    // One matching row and one that does not, so the join actually pads.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO N VALUES (1,'a','b',2,'t','2026-01-01 00:00:00','a','{}','x')",
+    );
+    run(&engine, &mut session, "INSERT INTO M VALUES (1), (99)");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM N RIGHT JOIN M ON M.aid = N.id ORDER BY id"
+        ),
+        vec![vec!["NULL"], vec!["1"]]
+    );
+
+    // And a literal branch is not nullable. Treating every computed column as
+    // if it were imported a nullability that does not exist, so a union with a
+    // constant reported a NOT NULL column as optional.
+    for (sql, expected) in [
+        ("SELECT id FROM N UNION SELECT 1", false),
+        ("SELECT id FROM N UNION SELECT 1 + 1", false),
+        ("SELECT id FROM N UNION ALL SELECT 2", false),
+        ("SELECT id FROM N UNION SELECT NULL", true),
+    ] {
+        assert_eq!(nullable(&engine, &session, sql), vec![expected], "{sql}");
+    }
+}

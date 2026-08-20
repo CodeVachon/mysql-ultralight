@@ -86,11 +86,7 @@ impl OutColumn {
                 def = def.unsigned();
             }
         }
-        if self.nullable {
-            def.nullable()
-        } else {
-            def
-        }
+        def.nullable(self.nullable)
     }
 }
 

@@ -959,6 +959,12 @@ impl Engine {
                     let Some(right) = right.columns.get(i) else {
                         continue;
                     };
+                    // A branch that can produce NULL makes the whole column
+                    // able to, whatever the other side declared. Only visible
+                    // once NOT NULL was reported at all: while every string
+                    // column was nullable this was right by accident.
+                    column.nullable |= right.nullable;
+
                     let unsigned =
                         |c: &Option<crate::types::SqlType>| c.as_ref().is_some_and(|d| d.unsigned);
                     // Signedness counts as a difference even when the codes
@@ -1494,7 +1500,9 @@ impl Engine {
             other => return Err(unsupported(format!("join type `{other:?}`"))),
         };
 
-        let columns = left.joined_columns(&right, outer_left || outer_right);
+        // A LEFT JOIN pads the right side and a RIGHT JOIN the left, so each
+        // relaxes the one the other keeps.
+        let columns = left.joined_columns(&right, outer_right, outer_left);
         let refs: Vec<ColumnRef> = columns
             .iter()
             .map(|c| ColumnRef::new(&c.table, &c.name))
@@ -1766,7 +1774,13 @@ impl Engine {
             } else {
                 expr::eval(e, &ctx)?
             };
-            columns.push(OutColumn::new(alias, wire_type(&value)));
+            // A literal knows whether it can be NULL; anything computed does
+            // not, and says so. The distinction reaches a union, which takes
+            // the nullability of either branch — so `SELECT id FROM t UNION
+            // SELECT 1` must not be told the `1` might be missing.
+            let mut column = OutColumn::new(alias, wire_type(&value));
+            column.nullable = !never_null(e);
+            columns.push(column);
             row.push(value);
         }
 
@@ -2116,10 +2130,14 @@ impl Engine {
         }
 
         let name = alias.unwrap_or_else(|| render_expr(e));
-        Ok((
-            OutColumn::new(name, ColumnType::VarString),
-            Projection::Expr(Box::new(e.clone())),
-        ))
+        // A computed column is nullable because nothing here knows better —
+        // except for a literal, which knows exactly. That distinction is not
+        // cosmetic: a union takes the nullability of either branch, so
+        // `SELECT id FROM t UNION SELECT 1` would report a NOT NULL column as
+        // nullable on the strength of a `1` that can never be NULL.
+        let mut column = OutColumn::new(name, ColumnType::VarString);
+        column.nullable = !never_null(e);
+        Ok((column, Projection::Expr(Box::new(e.clone()))))
     }
 
     /// Evaluates a grouped query: GROUP BY, HAVING, and aggregates.
@@ -5076,6 +5094,28 @@ fn literal_expr(value: &Value) -> Expr {
 /// `refs` carries the input columns so an aggregate over one can keep its type:
 /// `SUM(views)` of an integer column is an integer, and reporting it as a
 /// string makes a typed client hand back `"120"` where MySQL hands back `120`.
+/// Whether an expression can be shown never to produce NULL.
+///
+/// Deliberately small: a literal, and arithmetic over things that are
+/// themselves never NULL. Division is excluded because MySQL answers NULL for
+/// division by zero, and a function is excluded because almost any of them can
+/// return NULL. Everything else is "unknown", which is reported as nullable.
+///
+/// It matters because a union takes the nullability of either branch, so
+/// `SELECT id FROM t UNION SELECT 1 + 1` would otherwise describe a NOT NULL
+/// column as nullable on the strength of an expression that cannot be NULL.
+fn never_null(e: &Expr) -> bool {
+    match e {
+        Expr::Value(v) => !matches!(v.value, sqlparser::ast::Value::Null),
+        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => never_null(inner),
+        Expr::BinaryOp { left, op, right } => {
+            use sqlparser::ast::BinaryOperator as B;
+            matches!(op, B::Plus | B::Minus | B::Multiply) && never_null(left) && never_null(right)
+        }
+        _ => false,
+    }
+}
+
 /// The input column an expression names outright, if it names one.
 ///
 /// A bare reference carries the type it was declared with; anything computed
