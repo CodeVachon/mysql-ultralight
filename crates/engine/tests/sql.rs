@@ -6762,3 +6762,127 @@ fn a_view_describes_its_columns_exactly_as_the_table_does() {
         vec![vec!["id", "int"], vec!["name", "varchar(40)"]]
     );
 }
+
+#[test]
+fn a_null_argument_makes_the_answer_null() {
+    let (engine, mut session) = engine();
+
+    // MySQL returns NULL from a scalar function if any argument is NULL. This
+    // engine read the NULL as an empty string in most of them, so `UPPER(NULL)`
+    // was `''` — and `WHERE UPPER(t) = ''` then matched rows MySQL does not
+    // return, which is a filter quietly keeping the wrong set.
+    let nulls = vec![vec!["NULL"; 5]];
+    for sql in [
+        "SELECT UPPER(NULL), LOWER(NULL), UCASE(NULL), LCASE(NULL), REVERSE(NULL)",
+        "SELECT TRIM(NULL), LTRIM(NULL), RTRIM(NULL), SPACE(NULL), MD5(NULL)",
+        "SELECT LENGTH(NULL), CHAR_LENGTH(NULL), OCTET_LENGTH(NULL), INSTR(NULL, 'a'), \
+         LOCATE('a', NULL)",
+        "SELECT LEFT(NULL, 2), RIGHT(NULL, 2), SUBSTRING(NULL, 1, 2), MID(NULL, 1, 2), \
+         REPLACE(NULL, 'a', 'b')",
+        "SELECT LPAD(NULL, 3, 'x'), RPAD(NULL, 3, 'x'), CONCAT(NULL, 'a'), \
+         DATE(NULL), DATE_FORMAT(NULL, '%Y')",
+        "SELECT YEAR(NULL), MONTH(NULL), DAY(NULL), HOUR(NULL), QUARTER(NULL)",
+        "SELECT ABS(NULL), ROUND(NULL, 1), MOD(NULL, 2), GREATEST(NULL, 1), LEAST(NULL, 1)",
+        "SELECT JSON_VALID(NULL), JSON_TYPE(NULL), JSON_QUOTE(NULL), JSON_LENGTH(NULL), \
+         DATEDIFF(NULL, '2026-01-01')",
+    ] {
+        assert_eq!(rows(&engine, &mut session, sql), nulls, "{sql}");
+    }
+
+    // The rule keys on having a NULL argument rather than on the name, so a
+    // function called with none is untouched: `UNIX_TIMESTAMP()` still means
+    // now, where `UNIX_TIMESTAMP(NULL)` used to answer with the current time.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT UNIX_TIMESTAMP(NULL), UNIX_TIMESTAMP() > 0"
+        ),
+        vec![vec!["NULL", "1"]]
+    );
+
+    // And the exceptions, each of which means something with a NULL: a test
+    // for one, a function documented to skip them, and the JSON constructors,
+    // which store a JSON null rather than becoming one.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COALESCE(NULL, 1), IFNULL(NULL, 1), IF(NULL, 1, 2), ISNULL(NULL),
+                    NULLIF(NULL, 1), NULLIF(1, NULL), CONCAT_WS('-', NULL, 'a')"
+        ),
+        vec![vec!["1", "1", "2", "1", "NULL", "1", "a"]]
+    );
+    // CONCAT_WS skips NULL *values*; a NULL separator is still NULL. Exempting
+    // the function from the rule wholesale answered 'ab' here.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CONCAT_WS(NULL, 'a', 'b'), IF(1, NULL, 2), COALESCE(NULL, NULL)"
+        ),
+        vec![vec!["NULL", "NULL", "NULL"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_ARRAY(NULL), JSON_OBJECT('k', NULL),
+                    JSON_SET('{}', '$.k', NULL), JSON_ARRAY_APPEND('[1]', '$', NULL)"
+        ),
+        vec![vec!["[null]", r#"{"k":null}"#, r#"{"k":null}"#, "[1,null]"]]
+    );
+    // A NULL *path* is not a NULL value: it makes the call NULL, where the
+    // value above is stored as a JSON null. Exempting the function wholesale
+    // sent the NULL to the path parser and failed with 3143.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            r#"SELECT JSON_SET('{"a":1}', NULL, 2), JSON_ARRAY_APPEND('[1]', NULL, 2)"#
+        ),
+        vec![vec!["NULL", "NULL"]]
+    );
+
+    // A function this engine does not implement still says so. Short-circuiting
+    // on the NULL before recognising the name let `SELECT NOT_A_FUNCTION(NULL)`
+    // answer, and a query over an all-NULL column would then succeed until the
+    // day one row had a value in it.
+    for sql in [
+        "SELECT NOT_A_FUNCTION(NULL)",
+        "SELECT SOUNDEX(NULL)",
+        "SELECT FROM_UNIXTIME(NULL)",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1235, "{sql}");
+    }
+
+    // The shape that motivated it: a filter over a function of a NULL column
+    // must not match, and the row must not vanish from an unfiltered read.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N (id INT, t VARCHAR(20))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO N VALUES (1, 'Hello'), (2, NULL)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM N WHERE UPPER(t) = ''"
+        ),
+        Vec::<Vec<String>>::new()
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, UPPER(t), LENGTH(t) FROM N ORDER BY id"
+        ),
+        vec![vec!["1", "HELLO", "5"], vec!["2", "NULL", "NULL"]]
+    );
+}

@@ -75,16 +75,50 @@ json :: SELECT JSON_SET(doc, '$.c', 3) FROM J :: type of column 0
 json :: SELECT JSON_UNQUOTE(JSON_EXTRACT(doc, '$.b')) FROM J :: type of column 0
 json :: SELECT JSON_VALID(doc), JSON_TYPE(doc), JSON_LENGTH(doc) FROM J :: type of column 0
 json :: SELECT JSON_VALID(doc), JSON_TYPE(doc), JSON_LENGTH(doc) FROM J :: type of column 2
+null propagates through functions :: SELECT ABS(NULL), ROUND(NULL, 1), MOD(NULL, 2), GREATEST(NULL, 1), LEAST(NULL, 1) :: type of column 0
+null propagates through functions :: SELECT ABS(NULL), ROUND(NULL, 1), MOD(NULL, 2), GREATEST(NULL, 1), LEAST(NULL, 1) :: type of column 1
+null propagates through functions :: SELECT ABS(NULL), ROUND(NULL, 1), MOD(NULL, 2), GREATEST(NULL, 1), LEAST(NULL, 1) :: type of column 2
+null propagates through functions :: SELECT ABS(NULL), ROUND(NULL, 1), MOD(NULL, 2), GREATEST(NULL, 1), LEAST(NULL, 1) :: type of column 3
+null propagates through functions :: SELECT ABS(NULL), ROUND(NULL, 1), MOD(NULL, 2), GREATEST(NULL, 1), LEAST(NULL, 1) :: type of column 4
+null propagates through functions :: SELECT COALESCE(NULL, 1), IFNULL(NULL, 1), IF(NULL, 1, 2), ISNULL(NULL) :: nullability of column 0
+null propagates through functions :: SELECT COALESCE(NULL, 1), IFNULL(NULL, 1), IF(NULL, 1, 2), ISNULL(NULL) :: nullability of column 1
+null propagates through functions :: SELECT COALESCE(NULL, 1), IFNULL(NULL, 1), IF(NULL, 1, 2), ISNULL(NULL) :: nullability of column 2
+null propagates through functions :: SELECT COALESCE(NULL, 1), IFNULL(NULL, 1), IF(NULL, 1, 2), ISNULL(NULL) :: nullability of column 3
+null propagates through functions :: SELECT CONCAT_WS(NULL, 'a', 'b'), IF(1, NULL, 2), COALESCE(NULL, NULL) :: type of column 1
+null propagates through functions :: SELECT CONCAT_WS(NULL, 'a', 'b'), IF(1, NULL, 2), COALESCE(NULL, NULL) :: type of column 2
+null propagates through functions :: SELECT INSTR(NULL, 'a'), LOCATE('a', NULL), CONCAT(NULL, 'a') :: type of column 0
+null propagates through functions :: SELECT INSTR(NULL, 'a'), LOCATE('a', NULL), CONCAT(NULL, 'a') :: type of column 1
+null propagates through functions :: SELECT JSON_ARRAY(NULL), JSON_OBJECT('k', NULL) :: row 0
+null propagates through functions :: SELECT JSON_ARRAY(NULL), JSON_OBJECT('k', NULL) :: type of column 0
+null propagates through functions :: SELECT JSON_ARRAY(NULL), JSON_OBJECT('k', NULL) :: type of column 1
+null propagates through functions :: SELECT JSON_SET('{"a":1}', NULL, 2), JSON_ARRAY_APPEND('[1]', NULL, 2) :: type of column 0
+null propagates through functions :: SELECT JSON_SET('{"a":1}', NULL, 2), JSON_ARRAY_APPEND('[1]', NULL, 2) :: type of column 1
+null propagates through functions :: SELECT JSON_SET('{}', '$.k', NULL), JSON_ARRAY_APPEND('[1]', '$', NULL) :: row 0
+null propagates through functions :: SELECT JSON_SET('{}', '$.k', NULL), JSON_ARRAY_APPEND('[1]', '$', NULL) :: type of column 0
+null propagates through functions :: SELECT JSON_SET('{}', '$.k', NULL), JSON_ARRAY_APPEND('[1]', '$', NULL) :: type of column 1
+null propagates through functions :: SELECT JSON_VALID(NULL), JSON_TYPE(NULL), JSON_QUOTE(NULL), JSON_LENGTH(NULL) :: type of column 0
+null propagates through functions :: SELECT JSON_VALID(NULL), JSON_TYPE(NULL), JSON_QUOTE(NULL), JSON_LENGTH(NULL) :: type of column 3
+null propagates through functions :: SELECT LENGTH(NULL), CHAR_LENGTH(NULL), OCTET_LENGTH(NULL) :: type of column 0
+null propagates through functions :: SELECT LENGTH(NULL), CHAR_LENGTH(NULL), OCTET_LENGTH(NULL) :: type of column 1
+null propagates through functions :: SELECT LENGTH(NULL), CHAR_LENGTH(NULL), OCTET_LENGTH(NULL) :: type of column 2
+null propagates through functions :: SELECT MD5(NULL), DATE(NULL), DATE_FORMAT(NULL, '%Y'), DATEDIFF(NULL, '2026-01-01') :: type of column 1
+null propagates through functions :: SELECT MD5(NULL), DATE(NULL), DATE_FORMAT(NULL, '%Y'), DATEDIFF(NULL, '2026-01-01') :: type of column 3
+null propagates through functions :: SELECT NULLIF(NULL, 1), NULLIF(1, NULL), CONCAT_WS('-', NULL, 'a') :: type of column 0
+null propagates through functions :: SELECT SOUNDEX(NULL) :: outcome
+null propagates through functions :: SELECT UNIX_TIMESTAMP(NULL), UNIX_TIMESTAMP() > 0 :: nullability of column 1
+null propagates through functions :: SELECT UNIX_TIMESTAMP(NULL), UNIX_TIMESTAMP() > 0 :: type of column 0
+null propagates through functions :: SELECT YEAR(NULL), MONTH(NULL), DAY(NULL), HOUR(NULL), QUARTER(NULL) :: type of column 0
+null propagates through functions :: SELECT YEAR(NULL), MONTH(NULL), DAY(NULL), HOUR(NULL), QUARTER(NULL) :: type of column 1
+null propagates through functions :: SELECT YEAR(NULL), MONTH(NULL), DAY(NULL), HOUR(NULL), QUARTER(NULL) :: type of column 2
+null propagates through functions :: SELECT YEAR(NULL), MONTH(NULL), DAY(NULL), HOUR(NULL), QUARTER(NULL) :: type of column 3
+null propagates through functions :: SELECT YEAR(NULL), MONTH(NULL), DAY(NULL), HOUR(NULL), QUARTER(NULL) :: type of column 4
 strings, numbers and null handling :: SELECT CAST(n AS CHAR), CAST(t AS UNSIGNED) FROM S ORDER BY id :: type of column 1
 strings, numbers and null handling :: SELECT COALESCE(t, 'none'), IFNULL(n, 0), NULLIF(n, 5) FROM S ORDER BY id :: nullability of column 0
 strings, numbers and null handling :: SELECT COALESCE(t, 'none'), IFNULL(n, 0), NULLIF(n, 5) FROM S ORDER BY id :: nullability of column 1
 strings, numbers and null handling :: SELECT COALESCE(t, 'none'), IFNULL(n, 0), NULLIF(n, 5) FROM S ORDER BY id :: type of column 1
 strings, numbers and null handling :: SELECT COALESCE(t, 'none'), IFNULL(n, 0), NULLIF(n, 5) FROM S ORDER BY id :: type of column 2
-strings, numbers and null handling :: SELECT CONCAT(t, '!'), UPPER(t), LOWER(t), LENGTH(t) FROM S ORDER BY id :: row 1
 strings, numbers and null handling :: SELECT CONCAT(t, '!'), UPPER(t), LOWER(t), LENGTH(t) FROM S ORDER BY id :: type of column 3
-strings, numbers and null handling :: SELECT MD5('x'), LEFT(t, 2), RIGHT(t, 2) FROM S ORDER BY id :: row 1
 strings, numbers and null handling :: SELECT ROUND(n / 3, 2), ABS(n), n DIV 2, n % 3 FROM S ORDER BY id :: outcome
-strings, numbers and null handling :: SELECT TRIM(t), SUBSTRING(t, 2, 3), REPLACE(t, 'l', 'L') FROM S ORDER BY id :: row 1
 strings, numbers and null handling :: SELECT id FROM S WHERE n > 0 ORDER BY id :: type of column 0
 strings, numbers and null handling :: SELECT id FROM S WHERE t = 'hello' ORDER BY id :: type of column 0
 strings, numbers and null handling :: SELECT t LIKE 'H%', t REGEXP '^H', t IS NULL FROM S ORDER BY id :: nullability of column 2

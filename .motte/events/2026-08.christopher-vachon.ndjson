@@ -101,3 +101,5 @@
 {"at":"2026-08-20T14:21:40Z","id":41,"by":"Christopher Vachon","as":"user","type":"created","title":"information_schema details that differ from MySQL","state":"Todo"}
 {"at":"2026-08-20T14:21:40Z","id":42,"by":"Christopher Vachon","as":"user","type":"created","title":"DIV and the arithmetic operators MySQL accepts","state":"Todo"}
 {"at":"2026-08-20T14:21:40Z","id":43,"by":"Christopher Vachon","as":"user","type":"created","title":"The arrow operators render with spaces in a column name","state":"Todo"}
+{"at":"2026-08-20T14:48:41Z","id":44,"by":"Christopher Vachon","as":"user","type":"created","title":"CEIL and FLOOR are unreachable and fail outright","state":"Todo"}
+{"at":"2026-08-20T15:12:38Z","id":36,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}

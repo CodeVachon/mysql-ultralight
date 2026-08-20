@@ -170,6 +170,48 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // MySQL returns NULL from a scalar function if any argument is NULL,
+        // and the exceptions are few enough to name. This engine used to read
+        // a NULL as an empty string in most of them, so `UPPER(NULL)` was `''`
+        // and `WHERE UPPER(t) = ''` matched rows MySQL does not return.
+        name: "null propagates through functions",
+        setup: &[],
+        cases: &[
+            same("SELECT UPPER(NULL), LOWER(NULL), UCASE(NULL), LCASE(NULL)"),
+            same("SELECT TRIM(NULL), LTRIM(NULL), RTRIM(NULL), REVERSE(NULL), SPACE(NULL)"),
+            same("SELECT LENGTH(NULL), CHAR_LENGTH(NULL), OCTET_LENGTH(NULL)"),
+            same("SELECT LEFT(NULL, 2), RIGHT(NULL, 2), SUBSTRING(NULL, 1, 2), MID(NULL, 1, 2)"),
+            same("SELECT LPAD(NULL, 3, 'x'), RPAD(NULL, 3, 'x'), REPLACE(NULL, 'a', 'b')"),
+            same("SELECT INSTR(NULL, 'a'), LOCATE('a', NULL), CONCAT(NULL, 'a')"),
+            same("SELECT MD5(NULL), DATE(NULL), DATE_FORMAT(NULL, '%Y'), DATEDIFF(NULL, '2026-01-01')"),
+            same("SELECT YEAR(NULL), MONTH(NULL), DAY(NULL), HOUR(NULL), QUARTER(NULL)"),
+            same("SELECT ABS(NULL), ROUND(NULL, 1), MOD(NULL, 2), GREATEST(NULL, 1), LEAST(NULL, 1)"),
+            same("SELECT JSON_VALID(NULL), JSON_TYPE(NULL), JSON_QUOTE(NULL), JSON_LENGTH(NULL)"),
+            // `UNIX_TIMESTAMP()` means now and `UNIX_TIMESTAMP(NULL)` means
+            // NULL: the rule keys on having a NULL argument, not on the name,
+            // so the no-argument form is untouched. This one used to answer
+            // with the current time.
+            same("SELECT UNIX_TIMESTAMP(NULL), UNIX_TIMESTAMP() > 0"),
+            // The exceptions. Each of these means something with a NULL, and
+            // propagating would break it.
+            same("SELECT COALESCE(NULL, 1), IFNULL(NULL, 1), IF(NULL, 1, 2), ISNULL(NULL)"),
+            same("SELECT NULLIF(NULL, 1), NULLIF(1, NULL), CONCAT_WS('-', NULL, 'a')"),
+            // CONCAT_WS skips NULL *values*, but a NULL separator makes the
+            // whole call NULL — exempting the function wholesale got this
+            // wrong and answered 'ab'.
+            same("SELECT CONCAT_WS(NULL, 'a', 'b'), IF(1, NULL, 2), COALESCE(NULL, NULL)"),
+            same("SELECT JSON_ARRAY(NULL), JSON_OBJECT('k', NULL)"),
+            same("SELECT JSON_SET('{}', '$.k', NULL), JSON_ARRAY_APPEND('[1]', '$', NULL)"),
+            // A NULL *path* is not a NULL value: these are NULL, where the two
+            // above store a JSON null. Exempting the function wholesale sent
+            // the NULL to the path parser and failed with 3143.
+            same("SELECT JSON_SET('{\"a\":1}', NULL, 2), JSON_ARRAY_APPEND('[1]', NULL, 2)"),
+            // A function this engine does not implement has to say so, even
+            // when the rule above would otherwise answer for it.
+            same("SELECT SOUNDEX(NULL)"),
+        ],
+    },
+    Group {
         name: "strings, numbers and null handling",
         setup: &[
             "CREATE TABLE S (id INT NOT NULL, t VARCHAR(30) NULL, n INT NULL, PRIMARY KEY (id))",

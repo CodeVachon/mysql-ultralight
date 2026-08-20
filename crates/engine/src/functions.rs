@@ -11,10 +11,164 @@ use crate::session::Session;
 use crate::temporal;
 use crate::value::Value;
 
+/// The functions that mean something when handed a NULL.
+///
+/// Everything else propagates: MySQL returns NULL from a scalar function if any
+/// argument is NULL, and the list of exceptions is short enough to write down.
+/// Keeping it as a list of *exceptions* rather than a check inside each
+/// function is what makes the rule hold for the next function added — the safe
+/// answer is the one you get by not thinking about it.
+///
+/// Three kinds are here. Those whose whole purpose is a NULL test
+/// (`COALESCE`, `IFNULL`, `NVL`, `IF`, `ISNULL`, `NULLIF`); `CONCAT_WS`, which
+/// documents that it skips NULL arguments where `CONCAT` propagates them; and
+/// the JSON constructors, which store a JSON null rather than becoming one —
+/// `JSON_ARRAY(NULL)` is `[null]`, not NULL.
+const NULL_TOLERANT: &[&str] = &[
+    "coalesce",
+    "ifnull",
+    "nvl",
+    "if",
+    "isnull",
+    "nullif",
+    "concat_ws",
+    "json_array",
+    "json_object",
+    "json_array_append",
+    "json_set",
+];
+
+/// Every function `call` dispatches, in sorted order.
+///
+/// A second list of the names the match below already spells out, which is a
+/// cost worth naming. It exists so the NULL rule can recognise a function
+/// before short-circuiting it: without it, `SELECT NOT_A_FUNCTION(NULL)`
+/// answers NULL instead of saying the function does not exist, and a query
+/// over a column that happens to be all NULL succeeds until the day a row has
+/// a value in it.
+///
+/// The two are held together by `every_known_name_dispatches`. A name in the
+/// match and missing here fails as unsupported rather than answering wrongly,
+/// which is the direction to drift in.
+const KNOWN: &[&str] = &[
+    "abs",
+    "ceil",
+    "ceiling",
+    "char_length",
+    "character_length",
+    "coalesce",
+    "concat",
+    "concat_ws",
+    "connection_id",
+    "curdate",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "curtime",
+    "database",
+    "date",
+    "date_format",
+    "datediff",
+    "day",
+    "dayofmonth",
+    "dayofweek",
+    "dayofyear",
+    "floor",
+    "greatest",
+    "hour",
+    "if",
+    "ifnull",
+    "instr",
+    "isnull",
+    "json_array",
+    "json_array_append",
+    "json_contains",
+    "json_extract",
+    "json_keys",
+    "json_length",
+    "json_merge_patch",
+    "json_object",
+    "json_quote",
+    "json_set",
+    "json_type",
+    "json_unquote",
+    "json_valid",
+    "last_day",
+    "last_insert_id",
+    "lcase",
+    "least",
+    "left",
+    "length",
+    "localtime",
+    "localtimestamp",
+    "locate",
+    "lower",
+    "lpad",
+    "ltrim",
+    "md5",
+    "microsecond",
+    "mid",
+    "minute",
+    "mod",
+    "month",
+    "now",
+    "nullif",
+    "nvl",
+    "octet_length",
+    "point",
+    "position",
+    "quarter",
+    "regexp_instr",
+    "regexp_like",
+    "regexp_replace",
+    "regexp_substr",
+    "replace",
+    "reverse",
+    "right",
+    "round",
+    "row_count",
+    "rpad",
+    "rtrim",
+    "schema",
+    "second",
+    "session_user",
+    "space",
+    "st_distance_sphere",
+    "substr",
+    "substring",
+    "sysdate",
+    "system_user",
+    "trim",
+    "ucase",
+    "unix_timestamp",
+    "upper",
+    "user",
+    "version",
+    "weekday",
+    "year",
+];
+
 /// Dispatches a scalar function call.
 pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Value> {
     let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
     let text = |i: usize| arg(i).as_text();
+
+    // A NULL argument makes the answer NULL, before the function is reached.
+    //
+    // Checked here rather than in each function because the functions that got
+    // it wrong were the ones that never thought about it: `UPPER(NULL)` read
+    // the NULL as an empty string and answered `''`, so `WHERE UPPER(t) = ''`
+    // matched rows MySQL does not return. A statement with no arguments at all
+    // is unaffected, which is how `UNIX_TIMESTAMP()` keeps meaning now while
+    // `UNIX_TIMESTAMP(NULL)` becomes NULL.
+    if !args.is_empty()
+        && args.iter().any(Value::is_null)
+        && !NULL_TOLERANT.contains(&name)
+        && KNOWN.binary_search(&name).is_ok()
+    {
+        return Ok(Value::Null);
+    }
 
     Ok(match name {
         // -- dates and times ---------------------------------------------------
@@ -280,6 +434,14 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
                     format!("Incorrect parameter count in the call to native function '{name}'"),
                 ));
             }
+            // A NULL *path* makes the whole call NULL, where a NULL *value* is
+            // stored as a JSON null — which is why these cannot simply be
+            // exempted from the rule above. Without this the NULL reaches
+            // `parse_path` as an empty string and the statement fails with
+            // 3143 where MySQL answers NULL.
+            if args[1..].chunks(2).any(|pair| pair[0].is_null()) {
+                return Ok(Value::Null);
+            }
             let mut document = json::parse(&arg(0))?;
             for pair in args[1..].chunks(2) {
                 let path = json::parse_path(&pair[0].as_text())?;
@@ -453,6 +615,13 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
             }
         }
         "concat_ws" => {
+            // Only the *values* are skipped. A NULL separator makes the whole
+            // call NULL, which is why this cannot just be exempted from the
+            // rule above wholesale: `CONCAT_WS(NULL, 'a', 'b')` is NULL, not
+            // `'ab'`.
+            if arg(0).is_null() {
+                return Ok(Value::Null);
+            }
             let sep = text(0);
             let joined: Vec<String> = args
                 .iter()
@@ -967,6 +1136,61 @@ fn distance_on_sphere((lon_a, lat_a): (f64, f64), (lon_b, lat_b): (f64, f64)) ->
     // very nearly antipodal points would report a distance of NaN rather than
     // half the circumference. Clamping costs nothing and removes that entirely.
     2.0 * RADIUS * h.min(1.0).sqrt().asin()
+}
+
+#[cfg(test)]
+mod known_names {
+    use super::*;
+
+    /// `KNOWN` must agree with the match, or the NULL rule stops firing for a
+    /// function that has one and the engine answers `''` again.
+    #[test]
+    fn every_known_name_dispatches() {
+        let session = Session::new(crate::session::ServerConfig::default(), 1);
+        let mut missing = Vec::new();
+        for name in KNOWN {
+            // Two arguments is enough for every arity here; a function wanting
+            // more reads `Value::Null` for the rest, which is not what is
+            // under test.
+            let args = vec![Value::Int(1), Value::Int(1)];
+            if let Err(e) = call(name, args, &session) {
+                if e.code == 1235 {
+                    missing.push(*name);
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "listed in KNOWN but not dispatched: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn the_list_is_sorted_because_it_is_searched_that_way() {
+        let mut sorted = KNOWN.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(KNOWN, sorted.as_slice());
+    }
+
+    /// The reason `KNOWN` exists: a function the engine does not implement has
+    /// to say so, even when its argument is NULL and the rule would otherwise
+    /// answer for it.
+    #[test]
+    fn an_unknown_function_still_errors_on_a_null_argument() {
+        let session = Session::new(crate::session::ServerConfig::default(), 1);
+        for name in ["not_a_function", "soundex"] {
+            let err = call(name, vec![Value::Null], &session).unwrap_err();
+            assert_eq!(err.code, 1235, "{name}");
+        }
+    }
+
+    /// And every name that opts out of the rule has to be one that exists.
+    #[test]
+    fn every_tolerant_name_is_known() {
+        for name in NULL_TOLERANT {
+            assert!(KNOWN.binary_search(name).is_ok(), "{name} is not in KNOWN");
+        }
+    }
 }
 
 #[cfg(test)]
