@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [executor, compat]
 created: 2026-08-20T17:57:30Z
-updated: 2026-08-20T17:57:30Z
+updated: 2026-08-20T18:56:49Z
 ---
 
 ## Description
@@ -17,3 +17,9 @@ MySQL keeps a DECIMAL's scale through an aggregate: SUM over a DECIMAL(10,2) of 
 Visible in the harness as row divergences on SELECT k, COUNT(*), SUM(v), MIN(s), MAX(v), AVG(v) FROM G GROUP BY k, in both protocols.
 
 Separate from #0040 because describing the column as NEWDECIMAL - which it now is - does not make the value right, and fixing the value does not need the type work. It probably needs decimal arithmetic that tracks scale rather than going through a float, which is its own piece of work.
+
+## Notes
+
+### 2026-08-20T18:56:49Z — Christopher Vachon (user)
+
+Wider than the title: a plain stored DECIMAL loses its scale too, not only one through an aggregate. INSERT 1.5 into DECIMAL(6,2) reads back 1.5 where MySQL says 1.50, and 2 reads back 2 where MySQL says 2.00. Found while fixing #0041.

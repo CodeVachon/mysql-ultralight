@@ -71,12 +71,21 @@ impl SqlType {
                 int_type("int", *n, true)
             }
             D::BigInt(n) | D::Int8(n) => int_type("bigint", *n, false),
-            D::BigIntUnsigned(n) => int_type("bigint", *n, true),
-            D::Float(_) | D::Real | D::Float4 => Self::simple(TypeKind::Float, "float"),
-            D::Double(_) | D::DoublePrecision | D::Float8 => {
-                Self::simple(TypeKind::Float, "double")
+            D::BigIntUnsigned(n) | D::Int8Unsigned(n) => int_type("bigint", *n, true),
+            // `REAL` is a synonym for DOUBLE in MySQL, not for FLOAT — only
+            // `FLOAT4` is the narrow one.
+            D::Float4 => Self::simple(TypeKind::Float, "float"),
+            D::Real => Self::simple(TypeKind::Float, "double"),
+            D::RealUnsigned | D::DoublePrecisionUnsigned => {
+                float_type("double", &sqlparser::ast::ExactNumberInfo::None, true)
             }
-            D::Decimal(info) | D::Numeric(info) | D::Dec(info) => decimal_type(info),
+            D::Float(info) => float_type("float", info, false),
+            D::FloatUnsigned(info) => float_type("float", info, true),
+            D::DoublePrecision | D::Float8 => Self::simple(TypeKind::Float, "double"),
+            D::Double(info) => float_type("double", info, false),
+            D::DoubleUnsigned(info) => float_type("double", info, true),
+            D::Decimal(info) | D::Numeric(info) | D::Dec(info) => decimal_type(info, false),
+            D::DecimalUnsigned(info) | D::DecUnsigned(info) => decimal_type(info, true),
             D::Char(n) | D::Character(n) => char_type("char", n.as_ref().map(character_len)),
             D::Varchar(n) | D::CharacterVarying(n) | D::CharVarying(n) => {
                 char_type("varchar", n.as_ref().map(character_len))
@@ -89,15 +98,24 @@ impl SqlType {
             D::TinyBlob => Self::simple(TypeKind::Blob, "tinyblob"),
             D::MediumBlob => Self::simple(TypeKind::Blob, "mediumblob"),
             D::LongBlob | D::Bytea => Self::simple(TypeKind::Blob, "longblob"),
+            // A bare `BINARY` is `BINARY(1)` to MySQL, which reports the 1.
             D::Binary(n) => {
+                let length = n.unwrap_or(1);
                 let mut t = Self::simple(TypeKind::Blob, "binary");
-                if let Some(n) = n {
-                    t.declared = format!("binary({n})");
-                    t.length = Some(*n);
+                t.declared = format!("binary({length})");
+                t.length = Some(length);
+                t
+            }
+            // The length is the whole difference between `VARBINARY(9)` and
+            // a 64KB blob, and `CHARACTER_MAXIMUM_LENGTH` is read from it.
+            D::Varbinary(n) => {
+                let mut t = Self::simple(TypeKind::Blob, "varbinary");
+                if let Some(sqlparser::ast::BinaryLength::IntegerLength { length }) = n {
+                    t.declared = format!("varbinary({length})");
+                    t.length = Some(*length);
                 }
                 t
             }
-            D::Varbinary(_) => Self::simple(TypeKind::Blob, "varbinary"),
             D::Date => Self::simple(TypeKind::Date, "date"),
             D::Datetime(n) => datetime_type("datetime", *n),
             D::Timestamp(n, _) => datetime_type("timestamp", *n),
@@ -112,24 +130,21 @@ impl SqlType {
                     })
                     .collect();
                 let mut t = Self::simple(TypeKind::Enum, "enum");
-                t.declared = format!(
-                    "enum({})",
-                    variants
-                        .iter()
-                        .map(|v| format!("'{v}'"))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
+                t.declared = format!("enum({})", quoted_members(&variants));
                 t.variants = variants;
                 t
             }
             D::Set(values) => {
                 let mut t = Self::simple(TypeKind::Set, "set");
-                t.declared = format!("set({})", values.join(","));
-                t.variants = values
-                    .iter()
-                    .map(|v| v.trim_matches('\'').to_owned())
-                    .collect();
+                // Not trimmed: `sqlparser` has already unquoted these, so
+                // a trim only reaches a member whose own text begins or
+                // ends with a quote, and strips the member's own quotes.
+                let variants: Vec<String> = values.clone();
+                // `sqlparser` hands the members over unquoted, and MySQL
+                // reports them quoted: `set(x,y)` is not what any client that
+                // parses `COLUMN_TYPE` expects to read.
+                t.declared = format!("set({})", quoted_members(&variants));
+                t.variants = variants;
                 t
             }
             D::Custom(name, _) => {
@@ -252,12 +267,19 @@ impl SqlType {
     }
 
     /// The `data_type` column of `information_schema.columns`: the bare name,
-    /// without length or precision.
+    /// without length, precision or signedness.
+    ///
+    /// `declared` holds what MySQL reports as `COLUMN_TYPE`, which for an
+    /// integer carries a trailing ` unsigned` — so the cut is at the first
+    /// space as well as the first parenthesis. Everything that dispatches on
+    /// the spelling comes through here, so missing the space would make
+    /// `bigint unsigned` an unrecognised type rather than a `bigint`.
     pub fn base_name(&self) -> String {
-        match self.declared.split_once('(') {
-            Some((base, _)) => base.trim().to_owned(),
-            None => self.declared.clone(),
-        }
+        let end = self
+            .declared
+            .find(['(', ' '])
+            .unwrap_or(self.declared.len());
+        self.declared[..end].to_owned()
     }
 
     /// Converts a value to this column's type, or explains why it cannot.
@@ -334,16 +356,20 @@ impl SqlType {
             )
         };
 
+        let out_of_range = || {
+            EngineError::new(
+                1264,
+                "22003",
+                format!("Out of range value for column '{column}' at row 1"),
+            )
+        };
+
         Ok(match self.kind {
             TypeKind::Bool | TypeKind::Int => {
                 let n = value.as_int().ok_or_else(mismatch)?;
                 let (low, high) = self.integer_range();
                 if n < low || n > high {
-                    return Err(EngineError::new(
-                        1264,
-                        "22003",
-                        format!("Out of range value for column '{column}' at row 1"),
-                    ));
+                    return Err(out_of_range());
                 }
                 Value::Int(n)
             }
@@ -354,18 +380,35 @@ impl SqlType {
             TypeKind::Year => {
                 let n = value.as_int().ok_or_else(mismatch)?;
                 if n != 0 && !(1901..=2155).contains(&n) {
-                    return Err(EngineError::new(
-                        1264,
-                        "22003",
-                        format!("Out of range value for column '{column}' at row 1"),
-                    ));
+                    return Err(out_of_range());
                 }
                 Value::Int(n)
             }
-            TypeKind::Float => Value::Float(value.as_float().ok_or_else(mismatch)?),
+            TypeKind::Float => {
+                let n = value.as_float().ok_or_else(mismatch)?;
+                if self.unsigned && n < 0.0 {
+                    return Err(out_of_range());
+                }
+                Value::Float(n)
+            }
             // Decimals keep their text form so no precision is lost on the way
             // through, which is the whole reason MySQL transmits them as text.
-            TypeKind::Decimal => Value::Text(value.as_text()),
+            TypeKind::Decimal => {
+                let text = value.as_text();
+                // By the text rather than a parsed float: the point of keeping
+                // the text is that parsing loses precision, and the sign is
+                // readable without it.
+                match text.strip_prefix('-') {
+                    // `-0.00` is not below zero, so MySQL takes it — and
+                    // stores it without the sign, which is why the digits
+                    // decide rather than the sign character.
+                    Some(digits) if digits.chars().all(|c| c == '0' || c == '.') => {
+                        Value::Text(digits.to_owned())
+                    }
+                    Some(_) if self.unsigned => return Err(out_of_range()),
+                    _ => Value::Text(text),
+                }
+            }
             TypeKind::Blob => match value {
                 Value::Bytes(b) => Value::Bytes(b),
                 other => Value::Bytes(other.as_text().into_bytes()),
@@ -410,10 +453,19 @@ impl SqlType {
 }
 
 fn int_type(name: &str, display: Option<u64>, unsigned: bool) -> SqlType {
-    let declared = match display {
-        Some(n) => format!("{name}({n})"),
-        None => name.to_owned(),
+    // MySQL 8 deprecated the display width and stopped reporting it: `INT(11)`
+    // reads back as `int`. The one survivor is a signed `TINYINT(1)`, because
+    // that spelling is how a boolean is written and every client that maps one
+    // reads `COLUMN_TYPE` to find it — `TINYINT(1) UNSIGNED` is not that, and
+    // MySQL reports it as plain `tinyint unsigned`.
+    let mut declared = if name == "tinyint" && display == Some(1) && !unsigned {
+        "tinyint(1)".to_owned()
+    } else {
+        name.to_owned()
     };
+    if unsigned {
+        declared.push_str(" unsigned");
+    }
     SqlType {
         kind: TypeKind::Int,
         declared,
@@ -424,27 +476,97 @@ fn int_type(name: &str, display: Option<u64>, unsigned: bool) -> SqlType {
     }
 }
 
-fn decimal_type(info: &sqlparser::ast::ExactNumberInfo) -> SqlType {
+/// The `(M)` or `(M,D)` a numeric type was declared with.
+fn exact_number(info: &sqlparser::ast::ExactNumberInfo) -> (Option<u64>, Option<u64>) {
     use sqlparser::ast::ExactNumberInfo as E;
-    let (precision, scale) = match info {
+    match info {
         E::None => (None, None),
         E::Precision(p) => (Some(*p), None),
         // sqlparser models scale as signed; MySQL scales are non-negative.
         E::PrecisionAndScale(p, s) => (Some(*p), Some((*s).max(0) as u64)),
+    }
+}
+
+/// `COLUMN_TYPE` for a numeric: the name, what the DDL wrote, and the sign.
+fn numeric_declared(
+    name: &str,
+    precision: Option<u64>,
+    scale: Option<u64>,
+    unsigned: bool,
+) -> String {
+    let mut declared = match (precision, scale) {
+        (Some(p), Some(s)) => format!("{name}({p},{s})"),
+        (Some(p), None) => format!("{name}({p})"),
+        _ => name.to_owned(),
     };
-    let declared = match (precision, scale) {
-        (Some(p), Some(s)) => format!("decimal({p},{s})"),
-        (Some(p), None) => format!("decimal({p})"),
-        _ => "decimal".to_owned(),
-    };
+    if unsigned {
+        declared.push_str(" unsigned");
+    }
+    declared
+}
+
+fn decimal_type(info: &sqlparser::ast::ExactNumberInfo, unsigned: bool) -> SqlType {
+    let (precision, scale) = exact_number(info);
+    // MySQL fills both in and reports them: a bare `DECIMAL` is `decimal(10,0)`
+    // and `DECIMAL(8)` is `decimal(8,0)`. Filling them here rather than at the
+    // point of display keeps `COLUMN_TYPE` and the precision and scale columns
+    // reading off the same numbers.
+    let precision = Some(precision.unwrap_or(10));
+    let scale = Some(scale.unwrap_or(0));
     SqlType {
         kind: TypeKind::Decimal,
-        declared,
+        declared: numeric_declared("decimal", precision, scale, unsigned),
         length: precision,
         scale,
-        unsigned: false,
+        unsigned,
         variants: Vec::new(),
     }
+}
+
+/// A `FLOAT` or `DOUBLE`.
+///
+/// Only the two-argument `(M,D)` form survives into `COLUMN_TYPE`, and it is
+/// the only one with a fixed number of decimal places — MySQL reports
+/// `NUMERIC_SCALE` as NULL for the rest, so the two cases have to stay
+/// distinguishable.
+///
+/// A precision on its own means something else entirely: `FLOAT(p)` asks for
+/// at least `p` bits of mantissa, so MySQL answers with whichever of the two
+/// storage sizes provides it and reports *that* type, with no `(p)`. The
+/// boundary is measured rather than taken from the manual, which says 24 where
+/// 8.3 promotes at 25.
+fn float_type(name: &str, info: &sqlparser::ast::ExactNumberInfo, unsigned: bool) -> SqlType {
+    let (precision, scale) = exact_number(info);
+    let (name, precision, scale) = match (precision, scale) {
+        (Some(_), Some(_)) => (name, precision, scale),
+        // Only `FLOAT` is asked for in bits. A single-argument `DOUBLE` is not
+        // legal MySQL at all, so there is no width to promote to and no name
+        // to change — answering `float` there would report a narrower type
+        // than the DDL asked for, which is the failure this file exists to
+        // stop.
+        (Some(bits), None) if name == "float" => {
+            (if bits >= 25 { "double" } else { "float" }, None, None)
+        }
+        _ => (name, None, None),
+    };
+    SqlType {
+        kind: TypeKind::Float,
+        declared: numeric_declared(name, precision, scale, unsigned),
+        length: precision,
+        scale,
+        unsigned,
+        variants: Vec::new(),
+    }
+}
+
+/// ENUM and SET members as MySQL reports them: quoted, with any quote inside
+/// one doubled, which is the same escaping the DDL that declared them used.
+fn quoted_members(variants: &[String]) -> String {
+    variants
+        .iter()
+        .map(|v| format!("'{}'", v.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn char_type(name: &str, length: Option<u64>) -> SqlType {

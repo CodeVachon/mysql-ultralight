@@ -5246,10 +5246,251 @@ fn a_view_column_is_described_like_a_table_column() {
             // text.
             vec!["id", "NULL", "10", "NULL"],
             vec!["label", "40", "NULL", "NULL"],
-            // A DATE has no fractional seconds, which MySQL reports as 0
-            // rather than NULL: the precision exists and it is zero.
-            vec!["at", "NULL", "NULL", "0"],
+            // A DATE has no fractional seconds and MySQL reports NULL — not
+            // 0, which is what a TIMESTAMP with none reports. This asserted 0
+            // on the strength of a comment written from memory, and stayed
+            // green until the differential harness asked MySQL.
+            vec!["at", "NULL", "NULL", "NULL"],
         ]
+    );
+}
+
+#[test]
+fn column_type_is_spelled_the_way_mysql_spells_it() {
+    // `COLUMN_TYPE` is not the DDL echoed back — it is rebuilt from the parsed
+    // type, and every field it forgets is a silent difference from MySQL. Each
+    // row here was read off MySQL 8.3 rather than reasoned about.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Shapes (
+            big BIGINT UNSIGNED, wide INT(11), flag TINYINT(1),
+            uflag TINYINT(1) UNSIGNED, money DECIMAL(10,2) UNSIGNED,
+            vb VARBINARY(9), b BINARY(4), pick SET('a b','c''d'),
+            one ENUM('p','q''r'), d DATE, ts TIMESTAMP NULL, dt DATETIME(3),
+            approx FLOAT(7,3), big_approx DOUBLE UNSIGNED
+        )",
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, CHARACTER_MAXIMUM_LENGTH, \
+                    NUMERIC_PRECISION, NUMERIC_SCALE, DATETIME_PRECISION \
+             FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Shapes' \
+             ORDER BY ORDINAL_POSITION"
+        ),
+        vec![
+            // The signedness belongs to COLUMN_TYPE and DATA_TYPE stays bare,
+            // so everything that dispatches on the spelling still sees a
+            // `bigint`.
+            vec![
+                "big",
+                "bigint",
+                "bigint unsigned",
+                "NULL",
+                "20",
+                "0",
+                "NULL"
+            ],
+            // MySQL 8 deprecated the display width and stopped reporting it.
+            vec!["wide", "int", "int", "NULL", "10", "0", "NULL"],
+            // Except for a signed TINYINT(1), which is how a boolean is
+            // spelled — an unsigned one is not that, and loses the width.
+            vec!["flag", "tinyint", "tinyint(1)", "NULL", "3", "0", "NULL"],
+            vec![
+                "uflag",
+                "tinyint",
+                "tinyint unsigned",
+                "NULL",
+                "3",
+                "0",
+                "NULL"
+            ],
+            vec![
+                "money",
+                "decimal",
+                "decimal(10,2) unsigned",
+                "NULL",
+                "10",
+                "2",
+                "NULL",
+            ],
+            // A VARBINARY's length is the whole difference between it and a
+            // 64KB blob, and it reached CHARACTER_MAXIMUM_LENGTH as 65535.
+            vec![
+                "vb",
+                "varbinary",
+                "varbinary(9)",
+                "9",
+                "NULL",
+                "NULL",
+                "NULL"
+            ],
+            vec!["b", "binary", "binary(4)", "4", "NULL", "NULL", "NULL"],
+            // Members are quoted, and a quote inside one is doubled.
+            vec![
+                "pick",
+                "set",
+                "set('a b','c''d')",
+                "7",
+                "NULL",
+                "NULL",
+                "NULL",
+            ],
+            vec![
+                "one",
+                "enum",
+                "enum('p','q''r')",
+                "3",
+                "NULL",
+                "NULL",
+                "NULL"
+            ],
+            // A DATE carries no fractional seconds at all, where a TIMESTAMP
+            // carries zero of them — NULL and 0 are different answers.
+            vec!["d", "date", "date", "NULL", "NULL", "NULL", "NULL"],
+            vec!["ts", "timestamp", "timestamp", "NULL", "NULL", "NULL", "0"],
+            vec!["dt", "datetime", "datetime(3)", "NULL", "NULL", "NULL", "3"],
+            // A FLOAT declared with (M,D) reports that M, where a bare one
+            // reports the width of its storage.
+            vec!["approx", "float", "float(7,3)", "NULL", "7", "3", "NULL"],
+            vec![
+                "big_approx",
+                "double",
+                "double unsigned",
+                "NULL",
+                "22",
+                "NULL",
+                "NULL",
+            ],
+        ]
+    );
+}
+
+#[test]
+fn a_numeric_precision_is_reported_the_way_mysql_reports_it() {
+    // The `(M)` and `(M,D)` forms are not the same question, and MySQL answers
+    // them differently: it fills a DECIMAL's scale in, and reads a lone
+    // precision on a FLOAT as a request for mantissa bits — which selects the
+    // storage size and then is not reported at all. Every row measured.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Nums (
+            bare DECIMAL, p_only DECIMAL(8), both DECIMAL(8,3), num NUMERIC(5),
+            f FLOAT, f_small FLOAT(24), f_big FLOAT(25), f_both FLOAT(7,3),
+            d DOUBLE, d_both DOUBLE(10,2)
+        )",
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE \
+             FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Nums' \
+             ORDER BY ORDINAL_POSITION"
+        ),
+        vec![
+            // A DECIMAL always reports both, defaulting to MySQL's 10 and 0.
+            vec!["bare", "decimal", "decimal(10,0)", "10", "0"],
+            vec!["p_only", "decimal", "decimal(8,0)", "8", "0"],
+            vec!["both", "decimal", "decimal(8,3)", "8", "3"],
+            vec!["num", "decimal", "decimal(5,0)", "5", "0"],
+            // A FLOAT reports the width of its storage and no scale.
+            vec!["f", "float", "float", "12", "NULL"],
+            // `FLOAT(p)` asks for p bits of mantissa; MySQL picks the storage
+            // that provides them, reports that type, and drops the p. The
+            // manual puts the boundary at 24 and 8.3 promotes at 25.
+            vec!["f_small", "float", "float", "12", "NULL"],
+            vec!["f_big", "double", "double", "22", "NULL"],
+            // Only the two-argument form is echoed, and only it has a scale.
+            vec!["f_both", "float", "float(7,3)", "7", "3"],
+            vec!["d", "double", "double", "22", "NULL"],
+            vec!["d_both", "double", "double(10,2)", "10", "2"],
+        ]
+    );
+}
+
+#[test]
+fn a_type_synonym_is_the_type_it_is_a_synonym_for() {
+    // Each of these is a spelling MySQL accepts for a type it already has, and
+    // each was either the wrong type or no type at all. Measured on 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Syn (
+            r REAL, r4 FLOAT4, ru REAL UNSIGNED, dp DOUBLE PRECISION,
+            dpu DOUBLE PRECISION UNSIGNED, du DEC(10,2) UNSIGNED,
+            i8u BIGINT UNSIGNED, b BINARY, quoted SET('''a''','b')
+        )",
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLUMN_TYPE, CHARACTER_MAXIMUM_LENGTH \
+             FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Syn' \
+             ORDER BY ORDINAL_POSITION"
+        ),
+        vec![
+            // REAL is a synonym for DOUBLE, not for FLOAT. Only FLOAT4 is the
+            // narrow one, and the two shared an arm.
+            vec!["r", "double", "NULL"],
+            vec!["r4", "float", "NULL"],
+            vec!["ru", "double unsigned", "NULL"],
+            vec!["dp", "double", "NULL"],
+            vec!["dpu", "double unsigned", "NULL"],
+            vec!["du", "decimal(10,2) unsigned", "NULL"],
+            vec!["i8u", "bigint unsigned", "NULL"],
+            // A bare BINARY is BINARY(1), and reported 65535 as its length.
+            vec!["b", "binary(1)", "1"],
+            // The parser hands members over already unquoted, so trimming
+            // quotes off them only ever reached a member made of quotes.
+            vec!["quoted", "set('''a''','b')", "5"],
+        ]
+    );
+}
+
+#[test]
+fn an_unsigned_decimal_refuses_a_negative() {
+    // Accepting `UNSIGNED` on a DECIMAL or a DOUBLE without enforcing it would
+    // store a value MySQL rejects — a wrong answer rather than a gap, which is
+    // the one outcome this engine may not produce.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Money (d DECIMAL(6,2) UNSIGNED, f DOUBLE UNSIGNED)",
+    );
+    run(&engine, &mut session, "INSERT INTO Money VALUES (1.5, 1.5)");
+
+    for (sql, column) in [
+        ("INSERT INTO Money VALUES (-1.5, 1.5)", "d"),
+        ("INSERT INTO Money VALUES (1.5, -1.5)", "f"),
+    ] {
+        let error = engine
+            .execute(&mut session, sql, &[])
+            .expect_err("a negative belongs in neither column");
+        assert_eq!(error.code, 1264, "{sql}");
+        assert!(error.message.contains(column), "{sql}: {}", error.message);
+    }
+
+    // Negative zero is not below zero, and MySQL takes it — reading the sign
+    // character alone turned a value it stores into an error.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Money VALUES (-0.00, -0.0)",
     );
 }
 

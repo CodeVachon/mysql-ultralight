@@ -402,11 +402,16 @@ fn character_maximum_length(ty: &crate::types::SqlType) -> Value {
                 _ => 65_535,
             },
         },
-        TypeKind::Blob => match ty.base_name().as_str() {
-            "tinyblob" => 255,
-            "mediumblob" => 16_777_215,
-            "longblob" => 4_294_967_295,
-            _ => 65_535,
+        TypeKind::Blob => match ty.length {
+            // `BINARY(4)` and `VARBINARY(9)` are blobs here, and their length
+            // is the declared one rather than the width of the spelling.
+            Some(length) => length,
+            None => match ty.base_name().as_str() {
+                "tinyblob" => 255,
+                "mediumblob" => 16_777_215,
+                "longblob" => 4_294_967_295,
+                _ => 65_535,
+            },
         },
         // The longest value it can hold, which for a SET is every member plus
         // the commas between them.
@@ -428,12 +433,13 @@ fn character_maximum_length(ty: &crate::types::SqlType) -> Value {
 
 /// `DATETIME_PRECISION`, the fractional-second digits a temporal type carries.
 ///
-/// A `DATE` has none, which MySQL reports as 0 rather than NULL — the column
-/// exists and its precision is zero, which is not the same as "not applicable".
+/// A `DATE` has none, and MySQL reports NULL rather than 0 — it carries no
+/// fractional seconds at all, where a `TIMESTAMP` carries zero of them. This
+/// said 0 for both, on the strength of a comment written from memory; the
+/// differential harness asked MySQL.
 fn datetime_precision(ty: &crate::types::SqlType) -> Value {
     match ty.kind {
         TypeKind::DateTime | TypeKind::Time => Value::Int(ty.length.unwrap_or(0) as i64),
-        TypeKind::Date => Value::Int(0),
         _ => Value::Null,
     }
 }
@@ -469,13 +475,13 @@ fn numeric_precision(ty: &crate::types::SqlType) -> Value {
     let precision = match ty.kind {
         // A DECIMAL carries its own, and defaults to MySQL's 10 without one.
         TypeKind::Decimal => ty.length.unwrap_or(10),
-        TypeKind::Float => {
-            if ty.base_name() == "float" {
-                12
-            } else {
-                22
-            }
-        }
+        // A `FLOAT(7,3)` reports the 7 it was declared with; only a bare
+        // `FLOAT` or `DOUBLE` falls back to the width of the storage.
+        TypeKind::Float => match ty.length {
+            Some(precision) => precision,
+            None if ty.base_name() == "float" => 12,
+            None => 22,
+        },
         TypeKind::Int => match ty.base_name().as_str() {
             "tinyint" => 3,
             "smallint" => 5,

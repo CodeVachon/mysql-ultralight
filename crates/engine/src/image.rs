@@ -20,12 +20,22 @@ use crate::value::Value;
 /// Identifies the file at a glance, and stops a wrong file being read as one.
 const MAGIC: &[u8; 4] = b"MULi";
 
-/// Bumped whenever the layout below changes in any way.
+/// Bumped whenever the layout below changes in any way, or whenever what a
+/// field *means* changes.
 ///
 /// A mismatch is refused rather than guessed at: reading a v1 image as v2 would
 /// not fail cleanly, it would silently produce a catalog with the wrong shape,
 /// and every test running against it would be wrong in a way nothing reports.
-pub const FORMAT_VERSION: u32 = 2;
+///
+/// v3 is a meaning change, not a layout one. `SqlType::declared` now holds what
+/// MySQL reports as `COLUMN_TYPE` — `bigint unsigned` where a v2 image says
+/// `bigint`, `int` where it says `int(11)`, `set('x','y')` where it says
+/// `set(x,y)`. A v2 image parses cleanly as v3 and would answer
+/// `information_schema` exactly the way this build was written to stop
+/// answering it, which is the wrong answer the version check exists to
+/// prevent. An image is a file a user keeps and boots from with `--state`, so
+/// the stale one has to fail rather than mislead.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Writes the whole catalog.
 pub fn encode(catalog: &Catalog) -> Vec<u8> {
