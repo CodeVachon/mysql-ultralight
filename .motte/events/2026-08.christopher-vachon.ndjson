@@ -103,3 +103,6 @@
 {"at":"2026-08-20T14:21:40Z","id":43,"by":"Christopher Vachon","as":"user","type":"created","title":"The arrow operators render with spaces in a column name","state":"Todo"}
 {"at":"2026-08-20T14:48:41Z","id":44,"by":"Christopher Vachon","as":"user","type":"created","title":"CEIL and FLOOR are unreachable and fail outright","state":"Todo"}
 {"at":"2026-08-20T15:12:38Z","id":36,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-20T15:26:03Z","id":45,"by":"Christopher Vachon","as":"user","type":"created","title":"A JSON column compares as text, not as a document","state":"Todo"}
+{"at":"2026-08-20T15:42:50Z","id":46,"by":"Christopher Vachon","as":"user","type":"created","title":"JSON doubles outside a middling range are written differently","state":"Todo"}
+{"at":"2026-08-20T15:46:23Z","id":37,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}

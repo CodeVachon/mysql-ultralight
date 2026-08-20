@@ -187,7 +187,66 @@ pub fn parse(value: &Value) -> EngineResult<Json> {
 /// present and holds null" and "there is no such key" are different answers,
 /// and collapsing them makes `IS NULL` true for both.
 pub fn render(json: &Json) -> Value {
-    Value::Json(json.to_string())
+    Value::Json(render_text(json))
+}
+
+/// A document as MySQL writes it.
+///
+/// Not `serde_json::to_string`, which differs in two ways that both reach a
+/// test as a different string. MySQL puts a space after every comma and every
+/// colon; and it orders an object's keys by *byte length first*, then
+/// bytewise, where serde_json's map is ordered lexicographically. So
+/// `JSON_OBJECT('z',1,'a',2,'yy',3)` is `{"a": 2, "z": 1, "yy": 3}` there and
+/// was `{"a":2,"yy":3,"z":1}` here — a different order, not just a different
+/// spacing.
+///
+/// Strings are delegated to serde_json, whose escaping matches MySQL's —
+/// checked against it, including `/`, `"` and `\`.
+///
+/// Numbers are delegated too and do *not* always match: serde writes an
+/// exponent as `1e+30` where MySQL writes `1e30`, and switches to exponent
+/// form earlier, so `1e-7` is `1e-7` here and `0.0000001` there. MySQL stays
+/// in fixed notation for exponents in [-15, 14]. Every number the target
+/// codebase stores is inside that range, so it is recorded in #0046 rather
+/// than guessed at.
+pub fn render_text(json: &Json) -> String {
+    let mut out = String::new();
+    write_json(&mut out, json);
+    out
+}
+
+fn write_json(out: &mut String, json: &Json) {
+    match json {
+        Json::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_json(out, item);
+            }
+            out.push(']');
+        }
+        Json::Object(members) => {
+            let mut keys: Vec<&String> = members.keys().collect();
+            keys.sort_by(|a, b| {
+                a.len()
+                    .cmp(&b.len())
+                    .then_with(|| a.as_bytes().cmp(b.as_bytes()))
+            });
+            out.push('{');
+            for (i, key) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&Json::String((*key).clone()).to_string());
+                out.push_str(": ");
+                write_json(out, &members[*key]);
+            }
+            out.push('}');
+        }
+        scalar => out.push_str(&scalar.to_string()),
+    }
 }
 
 /// A JSON value as SQL sees it once the quotes come off.
@@ -198,8 +257,12 @@ pub fn unquote(json: &Json) -> Value {
     match json {
         Json::String(s) => Value::text(s),
         // JSON null unquotes to the text `null`, as MySQL does — it is a value
-        // that was there, not a value that was missing.
-        other => Value::text(other.to_string()),
+        // that was there, not a value that was missing. Anything else keeps
+        // its document form, written the same way `render_text` writes one:
+        // `JSON_UNQUOTE` on an object is still that object's text, and having
+        // it spelled compactly here put two spellings in one row for
+        // `SELECT doc, doc->>'$.a'`.
+        other => Value::text(render_text(other)),
     }
 }
 

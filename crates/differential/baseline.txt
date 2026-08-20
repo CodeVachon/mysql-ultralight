@@ -34,7 +34,6 @@ answers I got wrong :: SELECT DATE_ADD('2026-01-01', INTERVAL NULL DAY) :: type 
 answers I got wrong :: SELECT DATE_ADD('2026-01-31', INTERVAL 1 MONTH) :: type of column 0
 answers I got wrong :: SELECT DATE_ADD('2026-13-45', INTERVAL 1 DAY), YEAR('2026-13-45') :: type of column 0
 answers I got wrong :: SELECT DATE_ADD('2026-13-45', INTERVAL 1 DAY), YEAR('2026-13-45') :: type of column 1
-answers I got wrong :: SELECT JSON_OBJECT('q', JSON_QUOTE('hi')) :: row 0
 answers I got wrong :: SELECT JSON_OBJECT('q', JSON_QUOTE('hi')) :: type of column 0
 answers I got wrong :: SELECT approx + 0, approx * 2 FROM W :: type of column 0
 answers I got wrong :: SELECT approx + 0, approx * 2 FROM W :: type of column 1
@@ -49,32 +48,40 @@ joins and set operators :: SELECT id FROM A INTERSECT SELECT id FROM B ORDER BY 
 joins and set operators :: SELECT id FROM A UNION ALL SELECT id FROM B ORDER BY id :: type of column 0
 joins and set operators :: SELECT id FROM A UNION SELECT id FROM B ORDER BY id :: type of column 0
 joins and set operators :: WITH c AS (SELECT id FROM A) SELECT id FROM c ORDER BY id :: type of column 0
-json :: SELECT CAST('[1,2]' AS JSON) :: row 0
 json :: SELECT CAST('[1,2]' AS JSON) :: type of column 0
-json :: SELECT JSON_ARRAY(1, 'x', NULL) :: row 0
+json :: SELECT CAST('[1.5, 2.0, 1e10, -0.0]' AS JSON) :: type of column 0
+json :: SELECT CAST('[1e-7, 1e15, 1e30]' AS JSON) :: row 0
+json :: SELECT CAST('[1e-7, 1e15, 1e30]' AS JSON) :: type of column 0
+json :: SELECT CAST('{"b":1,"a":2,"aa":3,"A":4}' AS JSON) :: type of column 0
+json :: SELECT CAST('{}' AS JSON), CAST('[]' AS JSON), CAST('[[],{}]' AS JSON) :: type of column 0
+json :: SELECT CAST('{}' AS JSON), CAST('[]' AS JSON), CAST('[[],{}]' AS JSON) :: type of column 1
+json :: SELECT CAST('{}' AS JSON), CAST('[]' AS JSON), CAST('[[],{}]' AS JSON) :: type of column 2
+json :: SELECT JSON_ARRAY('a/b', 'x"y', 'a\\b') :: name of column 0
+json :: SELECT JSON_ARRAY('a/b', 'x"y', 'a\\b') :: type of column 0
 json :: SELECT JSON_ARRAY(1, 'x', NULL) :: type of column 0
 json :: SELECT JSON_ARRAYAGG(id) FROM J :: type of column 0
 json :: SELECT JSON_CONTAINS(doc, '1', '$.a') FROM J :: type of column 0
 json :: SELECT JSON_EXTRACT(doc, '$.a'), doc->'$.a', doc->>'$.b' FROM J :: name of column 1
 json :: SELECT JSON_EXTRACT(doc, '$.a'), doc->'$.a', doc->>'$.b' FROM J :: name of column 2
-json :: SELECT JSON_EXTRACT(doc, '$.a'), doc->'$.a', doc->>'$.b' FROM J :: row 0
 json :: SELECT JSON_EXTRACT(doc, '$.a'), doc->'$.a', doc->>'$.b' FROM J :: type of column 0
 json :: SELECT JSON_EXTRACT(doc, '$.a'), doc->'$.a', doc->>'$.b' FROM J :: type of column 1
 json :: SELECT JSON_EXTRACT(doc, '$.a'), doc->'$.a', doc->>'$.b' FROM J :: type of column 2
-json :: SELECT JSON_KEYS(doc) FROM J :: row 0
 json :: SELECT JSON_KEYS(doc) FROM J :: type of column 0
-json :: SELECT JSON_MERGE_PATCH(doc, JSON_OBJECT('a', 1)) FROM J :: row 0
 json :: SELECT JSON_MERGE_PATCH(doc, JSON_OBJECT('a', 1)) FROM J :: type of column 0
-json :: SELECT JSON_OBJECT('a', JSON_ARRAY(1, 2)) :: row 0
 json :: SELECT JSON_OBJECT('a', JSON_ARRAY(1, 2)) :: type of column 0
-json :: SELECT JSON_OBJECT('d', doc), JSON_OBJECT('t', txt) FROM J :: row 0
 json :: SELECT JSON_OBJECT('d', doc), JSON_OBJECT('t', txt) FROM J :: type of column 0
 json :: SELECT JSON_OBJECT('d', doc), JSON_OBJECT('t', txt) FROM J :: type of column 1
-json :: SELECT JSON_SET(doc, '$.c', 3) FROM J :: row 0
+json :: SELECT JSON_OBJECT('z', 1, 'a', 2, 'yy', 3, 'A', 4) :: type of column 0
 json :: SELECT JSON_SET(doc, '$.c', 3) FROM J :: type of column 0
+json :: SELECT JSON_UNQUOTE(CAST('{"a":1}' AS JSON)), doc->>'$.a' FROM J :: name of column 1
+json :: SELECT JSON_UNQUOTE(CAST('{"a":1}' AS JSON)), doc->>'$.a' FROM J :: type of column 0
+json :: SELECT JSON_UNQUOTE(CAST('{"a":1}' AS JSON)), doc->>'$.a' FROM J :: type of column 1
 json :: SELECT JSON_UNQUOTE(JSON_EXTRACT(doc, '$.b')) FROM J :: type of column 0
 json :: SELECT JSON_VALID(doc), JSON_TYPE(doc), JSON_LENGTH(doc) FROM J :: type of column 0
 json :: SELECT JSON_VALID(doc), JSON_TYPE(doc), JSON_LENGTH(doc) FROM J :: type of column 2
+json :: SELECT kept = '{"a": 2, "b": 1}', kept = '{"b":1,"a":2}' FROM Norm WHERE id = 1 :: row 0
+json :: SELECT kept = '{"a": 2, "b": 1}', kept = '{"b":1,"a":2}' FROM Norm WHERE id = 1 :: type of column 0
+json :: SELECT kept = '{"a": 2, "b": 1}', kept = '{"b":1,"a":2}' FROM Norm WHERE id = 1 :: type of column 1
 null propagates through functions :: SELECT ABS(NULL), ROUND(NULL, 1), MOD(NULL, 2), GREATEST(NULL, 1), LEAST(NULL, 1) :: type of column 0
 null propagates through functions :: SELECT ABS(NULL), ROUND(NULL, 1), MOD(NULL, 2), GREATEST(NULL, 1), LEAST(NULL, 1) :: type of column 1
 null propagates through functions :: SELECT ABS(NULL), ROUND(NULL, 1), MOD(NULL, 2), GREATEST(NULL, 1), LEAST(NULL, 1) :: type of column 2
@@ -88,12 +95,10 @@ null propagates through functions :: SELECT CONCAT_WS(NULL, 'a', 'b'), IF(1, NUL
 null propagates through functions :: SELECT CONCAT_WS(NULL, 'a', 'b'), IF(1, NULL, 2), COALESCE(NULL, NULL) :: type of column 2
 null propagates through functions :: SELECT INSTR(NULL, 'a'), LOCATE('a', NULL), CONCAT(NULL, 'a') :: type of column 0
 null propagates through functions :: SELECT INSTR(NULL, 'a'), LOCATE('a', NULL), CONCAT(NULL, 'a') :: type of column 1
-null propagates through functions :: SELECT JSON_ARRAY(NULL), JSON_OBJECT('k', NULL) :: row 0
 null propagates through functions :: SELECT JSON_ARRAY(NULL), JSON_OBJECT('k', NULL) :: type of column 0
 null propagates through functions :: SELECT JSON_ARRAY(NULL), JSON_OBJECT('k', NULL) :: type of column 1
 null propagates through functions :: SELECT JSON_SET('{"a":1}', NULL, 2), JSON_ARRAY_APPEND('[1]', NULL, 2) :: type of column 0
 null propagates through functions :: SELECT JSON_SET('{"a":1}', NULL, 2), JSON_ARRAY_APPEND('[1]', NULL, 2) :: type of column 1
-null propagates through functions :: SELECT JSON_SET('{}', '$.k', NULL), JSON_ARRAY_APPEND('[1]', '$', NULL) :: row 0
 null propagates through functions :: SELECT JSON_SET('{}', '$.k', NULL), JSON_ARRAY_APPEND('[1]', '$', NULL) :: type of column 0
 null propagates through functions :: SELECT JSON_SET('{}', '$.k', NULL), JSON_ARRAY_APPEND('[1]', '$', NULL) :: type of column 1
 null propagates through functions :: SELECT JSON_VALID(NULL), JSON_TYPE(NULL), JSON_QUOTE(NULL), JSON_LENGTH(NULL) :: type of column 0

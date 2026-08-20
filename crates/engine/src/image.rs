@@ -461,12 +461,17 @@ fn read_value(r: &mut Reader<'_>) -> EngineResult<Value> {
             // and comparison, which is a wrong answer where the rest of the
             // engine raises 3140 or 3141.
             let text = r.str()?;
-            if serde_json::from_str::<serde_json::Value>(&text).is_err() {
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
                 return Err(malformed(format!(
                     "value is tagged JSON but is not: {text:?}"
                 )));
-            }
-            Value::Json(text)
+            };
+            // Rendered rather than taken as written, so an image made before
+            // documents were stored in MySQL's own form loads as though it had
+            // not been. Otherwise the same data reads back differently
+            // depending on whether it arrived through an INSERT or a reload,
+            // which is the kind of difference nothing would think to look for.
+            Value::Json(crate::json::render_text(&parsed))
         }
         other => return Err(malformed(format!("unknown value tag {other}"))),
     })

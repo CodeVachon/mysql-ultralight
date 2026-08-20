@@ -4595,7 +4595,7 @@ fn describing_leaves_the_session_alone() {
 #[test]
 fn json_paths_extract_and_unquote() {
     let (engine, mut session) = engine();
-    let doc = r#"{"id": 7, "label": "seven", "tags": ["a", "b"], "nested": {"k": 1}}"#;
+    let doc = r#"{"id": 7, "tags": ["a", "b"], "label": "seven", "nested": {"k": 1}}"#;
 
     assert_eq!(
         rows(
@@ -4621,7 +4621,7 @@ fn json_paths_extract_and_unquote() {
             &mut session,
             &format!("SELECT JSON_EXTRACT('{doc}', '$.tags[*]')")
         ),
-        vec![vec!["[\"a\",\"b\"]"]]
+        vec![vec!["[\"a\", \"b\"]"]]
     );
 }
 
@@ -4659,7 +4659,7 @@ fn json_documents_are_built_and_merged() {
             &mut session,
             "SELECT JSON_OBJECT('a', 1, 'b', 'two'), JSON_ARRAY(1, 'x', NULL)"
         ),
-        vec![vec!["{\"a\":1,\"b\":\"two\"}", "[1,\"x\",null]"]]
+        vec![vec!["{\"a\": 1, \"b\": \"two\"}", "[1, \"x\", null]"]]
     );
 
     assert_eq!(
@@ -4671,9 +4671,9 @@ fn json_documents_are_built_and_merged() {
                       JSON_ARRAY_APPEND('{"xs":[1]}', '$.xs', 2)"#
         ),
         vec![vec![
-            "{\"a\":1,\"b\":3,\"c\":4}",
-            "{\"a\":9,\"b\":2}",
-            "{\"xs\":[1,2]}"
+            "{\"a\": 1, \"b\": 3, \"c\": 4}",
+            "{\"a\": 9, \"b\": 2}",
+            "{\"xs\": [1, 2]}"
         ]]
     );
 
@@ -4684,7 +4684,7 @@ fn json_documents_are_built_and_merged() {
             &mut session,
             r#"SELECT JSON_MERGE_PATCH('{"a":1,"b":2}', '{"b":null}')"#
         ),
-        vec![vec!["{\"a\":1}"]]
+        vec![vec!["{\"a\": 1}"]]
     );
 }
 
@@ -4707,7 +4707,7 @@ fn json_is_inspected_and_validated() {
             "STRING",
             "DOUBLE",
             "3",
-            "[\"a\",\"b\"]",
+            "[\"a\", \"b\"]",
             "1"
         ]]
     );
@@ -4737,7 +4737,7 @@ fn json_arrayagg_keeps_each_value_s_type() {
             &mut session,
             "SELECT JSON_ARRAYAGG(count) FROM Widget"
         ),
-        vec![vec!["[3,1,2]"]]
+        vec![vec!["[3, 1, 2]"]]
     );
     assert_eq!(
         rows(
@@ -4745,7 +4745,7 @@ fn json_arrayagg_keeps_each_value_s_type() {
             &mut session,
             "SELECT JSON_ARRAYAGG(name) FROM Widget WHERE count > 1"
         ),
-        vec![vec!["[\"alpha\",\"gamma\"]"]]
+        vec![vec!["[\"alpha\", \"gamma\"]"]]
     );
 }
 
@@ -4988,7 +4988,7 @@ fn a_wildcard_wraps_a_document_that_is_not_an_array() {
             &mut session,
             r#"SELECT JSON_EXTRACT('{"a":1}', '$[*]'), JSON_EXTRACT('7', '$[*]')"#
         ),
-        vec![vec!["[{\"a\":1}]", "[7]"]]
+        vec![vec!["[{\"a\": 1}]", "[7]"]]
     );
     assert_eq!(
         rows(
@@ -5049,7 +5049,7 @@ fn json_arrayagg_keeps_nulls_and_is_null_when_empty() {
 
     assert_eq!(
         rows(&engine, &mut session, "SELECT JSON_ARRAYAGG(v) FROM N2"),
-        vec![vec!["[1,null,2]"]]
+        vec![vec!["[1, null, 2]"]]
     );
     // No rows is NULL, not an empty array.
     assert_eq!(
@@ -6261,9 +6261,9 @@ fn a_nested_json_constructor_builds_a_document_not_a_string() {
                     JSON_OBJECT('a', JSON_OBJECT('b', JSON_ARRAY(1)))"
         ),
         vec![vec![
-            r#"{"a":[1,2]}"#,
-            r#"[[1],{"k":1}]"#,
-            r#"{"a":{"b":[1]}}"#
+            r#"{"a": [1, 2]}"#,
+            r#"[[1], {"k": 1}]"#,
+            r#"{"a": {"b": [1]}}"#
         ]]
     );
 
@@ -6285,7 +6285,10 @@ fn a_nested_json_constructor_builds_a_document_not_a_string() {
             &mut session,
             "SELECT JSON_OBJECT('d', doc), JSON_OBJECT('t', txt) FROM Doc"
         ),
-        vec![vec![r#"{"d":{"a":[1,2],"b":"s"}}"#, r#"{"t":"[9,9]"}"#]]
+        vec![vec![
+            r#"{"d": {"a": [1, 2], "b": "s"}}"#,
+            r#"{"t": "[9,9]"}"#
+        ]]
     );
 
     // Every other producer of a document nests too.
@@ -6301,14 +6304,14 @@ fn a_nested_json_constructor_builds_a_document_not_a_string() {
              FROM Doc"
         ),
         vec![vec![
-            r#"{"e":[1,2]}"#,
-            r#"{"c":[1,2]}"#,
+            r#"{"e": [1, 2]}"#,
+            r#"{"c": [1, 2]}"#,
             // JSON_QUOTE produces the *text* of a JSON string, so nesting it
             // quotes it again — which is what MySQL does, because that text is
             // the only thing the function is for.
-            r#"{"q":"\"hi\""}"#,
-            r#"{"s":{"a":[1,2],"b":"s","c":3}}"#,
-            r#"{"m":{"a":[1,2],"b":2}}"#
+            r#"{"q": "\"hi\""}"#,
+            r#"{"s": {"a": [1, 2], "b": "s", "c": 3}}"#,
+            r#"{"m": {"a": [1, 2], "b": 2}}"#
         ]]
     );
 
@@ -6320,7 +6323,7 @@ fn a_nested_json_constructor_builds_a_document_not_a_string() {
             &mut session,
             "SELECT JSON_OBJECT('n', JSON_ARRAYAGG(id)) FROM Doc"
         ),
-        vec![vec![r#"{"n":[1]}"#]]
+        vec![vec![r#"{"n": [1]}"#]]
     );
 
     // JSON_UNQUOTE and ->> return text by definition, so they nest as strings.
@@ -6332,7 +6335,7 @@ fn a_nested_json_constructor_builds_a_document_not_a_string() {
                     JSON_OBJECT('v', doc->>'$.b')
              FROM Doc"
         ),
-        vec![vec![r#"{"u":"s"}"#, r#"{"v":"s"}"#]]
+        vec![vec![r#"{"u": "s"}"#, r#"{"v": "s"}"#]]
     );
 }
 
@@ -6354,7 +6357,7 @@ fn a_json_column_refuses_text_that_is_not_a_document() {
     }
 
     // The shapes that are documents are all accepted, including the scalars.
-    for literal in [r#"{"a":1}"#, "[1,2]", "null", "true", "3", r#""s""#] {
+    for literal in [r#"{"a": 1}"#, "[1,2]", "null", "true", "3", r#""s""#] {
         run(
             &engine,
             &mut session,
@@ -6401,7 +6404,7 @@ fn a_document_read_back_is_still_a_document() {
             &mut session,
             "SELECT JSON_OBJECT('z', doc) FROM Doc WHERE id = 2"
         ),
-        vec![vec![r#"{"z":{"w":{"a":1}}}"#]]
+        vec![vec![r#"{"z": {"w": {"a": 1}}}"#]]
     );
 
     // And it is still text everywhere text is what was asked for: comparison,
@@ -6413,7 +6416,12 @@ fn a_document_read_back_is_still_a_document() {
             "SELECT CONCAT('<', doc, '>'), doc = '{\"a\":1}', LENGTH(doc)
              FROM Doc WHERE id = 1"
         ),
-        vec![vec![r#"<{"a":1}>"#, "1", "7"]]
+        // The document is stored in its own form, so its length is the
+        // length of that. And `doc = '{"a":1}'` is *false* in MySQL whichever
+        // way the text is spelled: a JSON object never equals a string
+        // operand, because the string is read as a JSON string rather than
+        // parsed. #0045.
+        vec![vec![r#"<{"a": 1}>"#, "0", "8"]]
     );
 
     // Including arithmetic. Tagging a value must not change what reading it as
@@ -6472,7 +6480,9 @@ fn a_document_read_back_is_still_a_document() {
              FROM Def"
         ),
         // Keys come out sorted, which is how the document is serialised.
-        vec![vec![r#"{"a":[7],"d":[],"l":[1],"m":null,"x":[2]}"#]]
+        vec![vec![
+            r#"{"a": [7], "d": [], "l": [1], "m": null, "x": [2]}"#
+        ]]
     );
 
     // A default is checked by the statement that declares it, not by the first
@@ -6830,7 +6840,12 @@ fn a_null_argument_makes_the_answer_null() {
             "SELECT JSON_ARRAY(NULL), JSON_OBJECT('k', NULL),
                     JSON_SET('{}', '$.k', NULL), JSON_ARRAY_APPEND('[1]', '$', NULL)"
         ),
-        vec![vec!["[null]", r#"{"k":null}"#, r#"{"k":null}"#, "[1,null]"]]
+        vec![vec![
+            "[null]",
+            r#"{"k": null}"#,
+            r#"{"k": null}"#,
+            "[1, null]"
+        ]]
     );
     // A NULL *path* is not a NULL value: it makes the call NULL, where the
     // value above is stored as a JSON null. Exempting the function wholesale
@@ -6884,5 +6899,83 @@ fn a_null_argument_makes_the_answer_null() {
             "SELECT id, UPPER(t), LENGTH(t) FROM N ORDER BY id"
         ),
         vec![vec!["1", "HELLO", "5"], vec!["2", "NULL", "NULL"]]
+    );
+}
+
+#[test]
+fn a_document_is_written_the_way_mysql_writes_one() {
+    let (engine, mut session) = engine();
+
+    // A space after every comma and every colon, and an object's keys ordered
+    // by byte length first and then bytewise — which is not the lexicographic
+    // order a Rust map iterates in. `{"a": 2, "z": 1, "yy": 3}`, not
+    // `{"a":2,"yy":3,"z":1}`: a different order, not only a different spacing.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_OBJECT('z', 1, 'a', 2, 'yy', 3, 'A', 4)"
+        ),
+        vec![vec![r#"{"A": 4, "a": 2, "z": 1, "yy": 3}"#]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            r#"SELECT CAST('{"b":1,"a":2,"aa":3,"A":4}' AS JSON)"#
+        ),
+        vec![vec![r#"{"A": 4, "a": 2, "b": 1, "aa": 3}"#]]
+    );
+
+    // Empty containers, nesting, and the scalars serde already renders the way
+    // MySQL does — checked against it rather than assumed.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            r#"SELECT CAST('{}' AS JSON), CAST('[]' AS JSON), CAST('[[],{}]' AS JSON),
+                      CAST('[1.5, 2.0, 1e10, -0.0]' AS JSON),
+                      CAST('[true,false,null]' AS JSON)"#
+        ),
+        vec![vec![
+            "{}",
+            "[]",
+            "[[], {}]",
+            "[1.5, 2.0, 10000000000.0, -0.0]",
+            "[true, false, null]"
+        ]]
+    );
+
+    // JSON_UNQUOTE of a document is still that document's text, so it is
+    // written the same way. Rendering it compactly here put two spellings of
+    // the same shape in one row: `SELECT doc, doc->>'$.a'`.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            r#"SELECT JSON_UNQUOTE(CAST('{"a":1}' AS JSON)),
+                      JSON_UNQUOTE(CAST('[1,2]' AS JSON)),
+                      JSON_UNQUOTE(CAST('"s"' AS JSON))"#
+        ),
+        vec![vec![r#"{"a": 1}"#, "[1, 2]", "s"]]
+    );
+
+    // A JSON column holds the document rather than the text it was written as,
+    // so the spacing and the key order come back MySQL's way whatever was
+    // typed. Keeping the input verbatim made every column a record of how it
+    // happened to be spelled.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Norm (id INT, kept JSON)",
+    );
+    run(
+        &engine,
+        &mut session,
+        r#"INSERT INTO Norm VALUES (1, '{"b":1,  "a":2}'), (2, '[ 1 , 2 ]')"#,
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT kept FROM Norm ORDER BY id"),
+        vec![vec![r#"{"a": 2, "b": 1}"#], vec!["[1, 2]"]]
     );
 }

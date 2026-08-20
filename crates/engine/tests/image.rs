@@ -640,7 +640,7 @@ fn a_document_survives_as_a_document() {
     // like one, so an image that dropped it would reload a catalog whose JSON
     // columns nest as strings — a wrong answer a reload away from its cause.
     assert!(
-        matches!(&table.rows[0][1], Value::Json(s) if s == r#"{"a":[1,2]}"#),
+        matches!(&table.rows[0][1], Value::Json(s) if s == r#"{"a": [1, 2]}"#),
         "{:?}",
         table.rows[0][1]
     );
@@ -660,7 +660,7 @@ fn a_document_survives_as_a_document() {
             &mut session,
             "SELECT JSON_OBJECT('w', doc), JSON_OBJECT('w', txt) FROM D"
         ),
-        vec![vec![r#"{"w":{"a":[1,2]}}"#, r#"{"w":"[9,9]"}"#]]
+        vec![vec![r#"{"w": {"a": [1, 2]}}"#, r#"{"w": "[9,9]"}"#]]
     );
 }
 
@@ -748,5 +748,40 @@ fn a_view_keeps_its_column_types_through_an_image() {
     assert_eq!(
         rows(&reloaded, &mut session, "SELECT id, name FROM Mirror"),
         vec![vec!["1", "a"]]
+    );
+}
+
+#[test]
+fn an_older_image_s_documents_are_canonicalised_on_load() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE D (id INT NOT NULL, doc JSON NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        r#"INSERT INTO D VALUES (1, '{"a": 1}')"#,
+    );
+
+    // An image written before documents were stored in MySQL's own form holds
+    // whatever text was typed. Forged here by rewriting the value in place,
+    // because the point is what happens to a file this build did not write.
+    let mut encoded = image::encode(&engine.catalog_snapshot().unwrap());
+    let at = encoded
+        .windows(8)
+        .position(|w| w == br#"{"a": 1}"#)
+        .expect("the document is in the image");
+    encoded[at..at + 8].copy_from_slice(br#"{"a":1} "#);
+
+    // Reading it back gives the canonical form, so the same data cannot read
+    // one way through an INSERT and another through a reload.
+    let decoded = image::decode(&encoded).unwrap();
+    let table = decoded.database("testdb").unwrap().table("D").unwrap();
+    assert!(
+        matches!(&table.rows[0][1], Value::Json(s) if s == r#"{"a": 1}"#),
+        "{:?}",
+        table.rows[0][1]
     );
 }

@@ -300,14 +300,19 @@ impl SqlType {
                 // Serde's own message, because "invalid" without a position is
                 // no help against a document of any size — and the sibling
                 // 3141 raised by `json::parse` already says where.
-                if let Err(e) = serde_json::from_str::<serde_json::Value>(&text) {
-                    return Err(EngineError::new(
+                let parsed = serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+                    EngineError::new(
                         3140,
                         "22032",
                         format!("Invalid JSON text: \"{e}\" in column '{column}'"),
-                    ));
-                }
-                Value::Json(text)
+                    )
+                })?;
+                // Stored as the document, not as the text that was written.
+                // MySQL holds JSON in a parsed form, so `{"b":1,  "a":2}` reads
+                // back as `{"a": 2, "b": 1}` — whitespace gone and keys in its
+                // own order. Keeping the input verbatim made every column a
+                // record of how it happened to be typed.
+                Value::Json(crate::json::render_text(&parsed))
             }
             _ => Value::Text(value.as_text()),
         })

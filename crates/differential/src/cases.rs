@@ -54,6 +54,8 @@ pub const GROUPS: &[Group] = &[
             "CREATE TABLE J (id INT NOT NULL, doc JSON NULL, txt VARCHAR(40) NULL, \
              PRIMARY KEY (id))",
             "INSERT INTO J VALUES (1, '{\"a\":[1,2],\"b\":\"s\"}', '[9,9]')",
+            "CREATE TABLE Norm (id INT, kept JSON)",
+            "INSERT INTO Norm VALUES (1, '{\"b\":1,  \"a\":2}'), (2, '[ 1 , 2 ]')",
         ],
         cases: &[
             same("SELECT JSON_OBJECT('a', JSON_ARRAY(1, 2))"),
@@ -68,6 +70,29 @@ pub const GROUPS: &[Group] = &[
             same("SELECT CAST('[1,2]' AS JSON)"),
             same("SELECT JSON_KEYS(doc) FROM J"),
             same("SELECT JSON_ARRAYAGG(id) FROM J"),
+            // MySQL orders an object's keys by byte length first and then
+            // bytewise, where serde_json's map is lexicographic. So this is
+            // `{"a": 2, "z": 1, "yy": 3}` and not `{"a":2,"yy":3,"z":1}` — a
+            // different order, not only a different spacing.
+            same("SELECT JSON_OBJECT('z', 1, 'a', 2, 'yy', 3, 'A', 4)"),
+            same("SELECT CAST('{\"b\":1,\"a\":2,\"aa\":3,\"A\":4}' AS JSON)"),
+            same("SELECT CAST('{}' AS JSON), CAST('[]' AS JSON), CAST('[[],{}]' AS JSON)"),
+            same("SELECT CAST('[1.5, 2.0, 1e10, -0.0]' AS JSON)"),
+            // Outside a middling exponent range the two disagree, and this is
+            // here to keep that visible rather than to pass. #0046.
+            same("SELECT CAST('[1e-7, 1e15, 1e30]' AS JSON)"),
+            // JSON_UNQUOTE of a document is still that document's text, so it
+            // has to be written the same way the document is.
+            same("SELECT JSON_UNQUOTE(CAST('{\"a\":1}' AS JSON)), doc->>'$.a' FROM J"),
+            // A JSON value compared with a string is false in MySQL whatever
+            // the spelling: the string is read as a JSON string rather than
+            // parsed, and an object never equals one. Here it is a text
+            // comparison, so the canonical spelling wrongly matches. #0045.
+            same("SELECT kept = '{\"a\": 2, \"b\": 1}', kept = '{\"b\":1,\"a\":2}' FROM Norm WHERE id = 1"),
+            same("SELECT JSON_ARRAY('a/b', 'x\"y', 'a\\\\b')"),
+            // A JSON column holds the document, not the text it was written
+            // as, so reading it back normalises the spacing and the key order.
+            same("SELECT kept FROM Norm ORDER BY id"),
         ],
     },
     Group {
