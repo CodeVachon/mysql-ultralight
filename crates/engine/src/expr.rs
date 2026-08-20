@@ -275,7 +275,7 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
         Expr::BinaryOp { left, op, right } => {
             // `DIV` reaches us mis-associated, so the shape is corrected before
             // it is read rather than evaluated as parsed.
-            if let Some(fixed) = reassociated_div(op, left, right) {
+            if let Some(fixed) = reassociated(op, left, right) {
                 return eval(&fixed, ctx);
             }
             binary(op, eval(left, ctx)?, eval(right, ctx)?, ctx)
@@ -854,55 +854,84 @@ fn binary(
     })
 }
 
-/// Re-associates a `DIV` to the precedence MySQL gives it.
+/// How tightly an operator binds, for the ones sqlparser binds too loosely.
 ///
-/// sqlparser parses `DIV` in a dialect hook that reads its right operand with
-/// `parse_expr`, which takes everything to the end of the expression: it builds
-/// `7 DIV (2 + 1)` where MySQL means `(7 DIV 2) + 1`, and answers 2 where MySQL
-/// answers 4. A wrapper `Dialect` that fixed this at the source is not an
-/// option here — see `crate::dialect` for why — so the shape is corrected after
-/// parsing, wherever the tree is read.
+/// Zero means sqlparser already agrees with MySQL and nothing needs moving.
+/// The order among the rest is MySQL's: a path extraction is a primary, then
+/// `^`, then `||` where it concatenates, then `DIV`.
+fn tightness(op: &BinaryOperator) -> u8 {
+    use BinaryOperator as B;
+    match op {
+        B::Arrow | B::LongArrow => 4,
+        B::BitwiseXor => 3,
+        // Two operators wearing one token: concatenating it binds tighter than
+        // `DIV`, and meaning OR it binds looser than everything here.
+        B::StringConcat if crate::exec::pipes_as_concat() => 2,
+        B::MyIntegerDivide => 1,
+        _ => 0,
+    }
+}
+
+/// Re-associates an operator sqlparser binds more loosely than MySQL does.
 ///
-/// `DIV` binds tighter than everything the hook can swallow, so it takes the
-/// leftmost operand of whatever came back and the rest stays outside it. That
-/// is not only other binary operators: `7 DIV 2 IS NULL` comes back as
-/// `IsNull(7 DIV 2)`'s *argument*, so reading only `Expr::BinaryOp` left
-/// `DIV(7, IsNull(2))` — NULL, where MySQL says 0.
+/// Two of them are wrong in different ways. `DIV` is parsed by a dialect hook
+/// that reads its right operand with `parse_expr`, which takes everything to
+/// the end of the expression: `7 DIV 2 + 1` arrives as `7 DIV (2 + 1)` and
+/// answers 2 where MySQL answers 4. `->` and `->>` are given nearly the
+/// loosest precedence there is, where MySQL treats a path extraction as a
+/// primary: `doc->'$.b' = 6` arrives as `doc -> ('$.b' = 6)` and asks for the
+/// path `0`. Both are silent — a `WHERE` over either matches the wrong rows.
 ///
-/// Returns `None` when there is nothing to move, which is also what stops the
-/// caller recursing forever.
-pub(crate) fn reassociated_div(op: &BinaryOperator, left: &Expr, right: &Expr) -> Option<Expr> {
-    if !matches!(op, BinaryOperator::MyIntegerDivide) {
+/// A wrapper `Dialect` that fixed this at the source is not an option here —
+/// see `crate::dialect` for why — so the shape is corrected after parsing,
+/// wherever the tree is read.
+///
+/// The operator keeps only the leftmost operand of whatever it swallowed and
+/// the rest stays outside it. Anything bound tighter is a unit it cannot reach
+/// into, so that unit is corrected first and then stepped through.
+///
+/// `None` when nothing needs moving, which is also what stops the caller
+/// recursing forever.
+pub(crate) fn reassociated(op: &BinaryOperator, left: &Expr, right: &Expr) -> Option<Expr> {
+    let level = tightness(op);
+    if level == 0 {
         return None;
     }
     let mut fixed = right.clone();
-    divide_leftmost(&mut fixed, left).then_some(fixed)
+    take_leftmost(&mut fixed, left, op, level).then_some(fixed)
 }
 
-/// The operand a mis-associated `DIV` should have taken, in place.
+/// Puts `left <op> …` around the operand `op` should have taken, in place.
 ///
-/// Walks down the left spine of what the hook swallowed. Every construct here
-/// is one that extends an expression to its *left* — a binary operator, a
-/// postfix test, an `IN` list — so its leftmost descendant is the operand that
-/// was really adjacent to the `DIV`. A prefix or a parenthesised group is not
-/// on that list and ends the walk, which is why `7 DIV (2 + 1)` keeps its
-/// parentheses.
+/// Walks down the left spine of what was swallowed. Every construct here is
+/// one that extends an expression to its *left* — a binary operator, a postfix
+/// test, an `IN` list — so its leftmost descendant is the operand that was
+/// really adjacent. A prefix or a parenthesised group is not on that list and
+/// ends the walk, which is why `7 DIV (2 + 1)` keeps its parentheses.
 ///
-/// `false` when the node *is* the operand, so nothing needs moving — which is
-/// what stops the caller recursing forever.
-fn divide_leftmost(e: &mut Expr, divisor_of: &Expr) -> bool {
+/// `false` when the node *is* the operand, so nothing needs moving.
+fn take_leftmost(e: &mut Expr, left: &Expr, op: &BinaryOperator, level: u8) -> bool {
     use Expr as E;
+
+    // Something bound tighter than `op` is a unit, but it may have swallowed
+    // too much of its own. Correcting it first leaves a looser operator at the
+    // top, which is what the walk below can then step through; if there was
+    // nothing to correct, the unit is complete and is the operand.
+    if let E::BinaryOp {
+        left: inner_left,
+        op: inner,
+        right: inner_right,
+    } = e
+    {
+        if tightness(inner) > level {
+            match reassociated(inner, inner_left, inner_right) {
+                Some(corrected) => *e = corrected,
+                None => return false,
+            }
+        }
+    }
+
     let child: &mut Expr = match e {
-        // `^` binds tighter than `DIV` in MySQL, so what it built really is
-        // the divisor and nothing moves out of it. This is right for a bare
-        // `a DIV b ^ c` and wrong for `a DIV b ^ c + d`, because sqlparser
-        // gives `^` a *looser* precedence than `+` and over-swallows there
-        // too. Unreachable while the evaluator rejects `^` outright; #0052
-        // has to fix that precedence before it can be reached.
-        E::BinaryOp {
-            op: BinaryOperator::BitwiseXor,
-            ..
-        } => return false,
         E::BinaryOp { left, .. } => left,
         E::IsNull(x)
         | E::IsNotNull(x)
@@ -921,15 +950,20 @@ fn divide_leftmost(e: &mut Expr, divisor_of: &Expr) -> bool {
         E::IsDistinctFrom(x, _) | E::IsNotDistinctFrom(x, _) => x,
         _ => return false,
     };
-    if !divide_leftmost(child, divisor_of) {
+    if !take_leftmost(child, left, op, level) {
         let operand = child.clone();
-        *child = Expr::BinaryOp {
-            left: Box::new(divisor_of.clone()),
-            op: BinaryOperator::MyIntegerDivide,
+        *child = E::BinaryOp {
+            left: Box::new(left.clone()),
+            op: op.clone(),
             right: Box::new(operand),
         };
     }
     true
+}
+
+/// MySQL's refusal when an integer result will not fit.
+fn bigint_out_of_range() -> EngineError {
+    EngineError::new(1690, "22003", "BIGINT value is out of range")
 }
 
 fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> EngineResult<Value> {
@@ -968,7 +1002,10 @@ fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> EngineResult<
                 if *b == 0 {
                     Value::Null
                 } else {
-                    Value::Int(a.wrapping_div(*b))
+                    // The one quotient that does not fit, and MySQL refuses it
+                    // rather than wrapping — unlike the additions above, which
+                    // it lets wrap.
+                    Value::Int(a.checked_div(*b).ok_or_else(bigint_out_of_range)?)
                 }
             }
             _ => unreachable!("caller restricts the operator set"),
@@ -990,7 +1027,20 @@ fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> EngineResult<
         // Integral however it was reached: `7.5 DIV 2` is 3, not 3.75, and
         // MySQL types the column LONGLONG whatever it divided.
         B::MyIntegerDivide if b == 0.0 => Value::Null,
-        B::MyIntegerDivide => Value::Int((a / b).trunc() as i64),
+        B::MyIntegerDivide => {
+            // Checked rather than cast: a float-to-integer cast saturates in
+            // Rust, so `'1e400' DIV 1` would answer i64::MAX where MySQL
+            // refuses the statement. Reachable from a plain string operand
+            // now that a string reads as a number up to DBL_MAX.
+            let quotient = (a / b).trunc();
+            // A strict upper bound: `i64::MAX as f64` rounds *up* to 2^63, so
+            // an inclusive range lets the one value that does not fit through,
+            // and the cast then saturates to i64::MAX instead of refusing.
+            if quotient < i64::MIN as f64 || quotient >= -(i64::MIN as f64) {
+                return Err(bigint_out_of_range());
+            }
+            Value::Int(quotient as i64)
+        }
         _ => unreachable!("caller restricts the operator set"),
     })
 }

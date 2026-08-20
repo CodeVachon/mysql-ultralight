@@ -121,3 +121,7 @@
 {"at":"2026-08-20T19:38:59Z","id":54,"by":"Christopher Vachon","as":"user","type":"created","title":"Temporal values read as their leading digits in arithmetic","state":"Todo"}
 {"at":"2026-08-20T19:38:59Z","id":55,"by":"Christopher Vachon","as":"user","type":"created","title":"format_float never uses exponent notation","state":"Todo"}
 {"at":"2026-08-20T19:42:30Z","id":42,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-20T20:16:48Z","id":56,"by":"Christopher Vachon","as":"user","type":"created","title":"XOR is unsupported","state":"Todo"}
+{"at":"2026-08-20T20:16:48Z","id":57,"by":"Christopher Vachon","as":"user","type":"created","title":"EXTRACT is unsupported","state":"Todo"}
+{"at":"2026-08-20T20:16:48Z","id":58,"by":"Christopher Vachon","as":"user","type":"created","title":"describe accepts a column reference execute rejects","state":"Todo"}
+{"at":"2026-08-20T20:44:40Z","id":43,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}

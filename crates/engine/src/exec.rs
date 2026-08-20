@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use mysql_ultralight_protocol::ColumnType;
+use sqlparser::ast::Spanned;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, Expr, GroupByExpr, Insert, JoinOperator, ObjectName, ObjectType,
     OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
@@ -95,6 +96,9 @@ impl Engine {
         }
 
         let normalised = rewrite::normalise(&bound, session.sql_mode());
+        // Held for the whole call: a computed column is named after the text
+        // it was written as, and that text is only available here.
+        let _source = Source::set(&normalised, session.sql_mode());
         let statements = Parser::parse_sql(&MySqlDialect {}, &normalised).ok()?;
         let [Statement::Query(query)] = statements.as_slice() else {
             return None;
@@ -415,6 +419,7 @@ impl Engine {
         }
 
         let normalised = rewrite::normalise(&bound, mode);
+        let _source = Source::set(&normalised, mode);
         let statements = Parser::parse_sql(&MySqlDialect {}, &normalised)
             .map_err(|e| EngineError::parse(format!("{e}")))?;
 
@@ -5416,10 +5421,11 @@ fn computed_column_type(
         | Expr::IsNotDistinctFrom(_, _) => ColumnType::LongLong,
         Expr::BinaryOp { left, op, right } => {
             use sqlparser::ast::BinaryOperator as B;
-            // The corrected shape of a `DIV` usually has some other operator at
-            // its root, and that root is what decides the type: `a DIV b * 1.5`
-            // is a decimal, not the integer the `DIV` alone would suggest.
-            if let Some(fixed) = crate::expr::reassociated_div(op, left, right) {
+            // The corrected shape usually has some other operator at its
+            // root, and that root is what decides the type: `a DIV b * 1.5` is
+            // a decimal, and `doc->'$.b' = 6` is a boolean rather than a
+            // document.
+            if let Some(fixed) = crate::expr::reassociated(op, left, right) {
                 return computed_column_type(&fixed, refs, input);
             }
             match op {
@@ -5974,15 +5980,231 @@ fn object_name(name: &ObjectName) -> String {
         .join(".")
 }
 
-/// The column name a client sees for an unaliased expression: MySQL echoes the
-/// expression text back.
+/// The name MySQL gives an unaliased select item.
+///
+/// For a computed column that is the *source text*, character for character:
+/// `SELECT 1!=2` is named `1!=2` and `SELECT ( 1 + 2 ) * 3` keeps every space
+/// it was written with. Rendering the parsed expression instead cannot be made
+/// to match, because the same tree comes from spellings MySQL names
+/// differently — `1!=2` and `1 <> 2` are one `NotEq`, and `doc->>'$.b'` and
+/// `doc ->> '$.b'` are one `LongArrow`. A client keys a row by this name, so a
+/// test reading the column back finds nothing.
 fn render_expr(e: &Expr) -> String {
     match e {
         Expr::Identifier(i) => i.value.clone(),
         Expr::CompoundIdentifier(parts) => {
             parts.last().map(|p| p.value.clone()).unwrap_or_default()
         }
-        other => other.to_string(),
+        other => source_text(other).unwrap_or_else(|| other.to_string()),
+    }
+}
+
+/// How far either side of its reported span an expression's text is looked for.
+///
+/// sqlparser reports a span narrower than the text on both sides, sometimes by
+/// a lot: `COUNT(*)` covers five of its eight characters, `( 1 + 2 ) * 3`
+/// starts at the `1`, and `SUBSTRING('abc',2)` starts at the `'abc'` because
+/// the parser gives it its own grammar and spans only the arguments. What is
+/// missing is a call's name and its delimiters, so this is a backstop against
+/// scanning a long statement when nothing will ever match.
+const SPAN_SLACK: usize = 64;
+
+/// The text an expression was written as, if it can be recovered exactly.
+///
+/// `None` rather than a guess: the caller falls back to rendering the tree,
+/// which is wrong about spacing but never about *which* expression it names.
+fn source_text(e: &Expr) -> Option<String> {
+    let sql = SOURCE.with(|s| s.borrow().as_ref().map(|c| c.sql.clone()))?;
+    let span = e.span();
+    let reported = byte_offset(&sql, span.start)?;
+    let from = byte_offset(&sql, span.end)
+        .unwrap_or(reported)
+        .max(reported);
+    let rendered = e.to_string();
+    let limit = (from + SPAN_SLACK).min(sql.len());
+
+    // Outward from the reported span, nearest first, so the answer is the
+    // tightest slice that parses back to this same expression. Anything longer
+    // would have to denote something else, and a comma or a clause keyword
+    // ends the run on its own by failing to parse.
+    //
+    // Backwards from the reported start, but only as far as the select item
+    // itself: a comma, a semicolon or a quote before it belongs to something
+    // else and ends the walk. Within that, only positions a token could begin
+    // at are tried, which is what keeps this to a handful of candidates rather
+    // than one per character.
+    let floor = reported.saturating_sub(SPAN_SLACK);
+    let starts = (floor..=reported)
+        .rev()
+        .take_while(|start| {
+            sql.get(*start..reported)
+                .is_some_and(|skipped| !skipped.contains([',', ';', '\'', '"', '`']))
+        })
+        .filter(|start| *start == reported || starts_a_token(&sql, *start));
+
+    for start in starts {
+        if !sql.is_char_boundary(start) {
+            continue;
+        }
+        let found = ends(&sql, start, from, limit)
+            .filter(|end| sql.is_char_boundary(*end))
+            .map(|end| sql[start..end].trim_end())
+            .find(|slice| !slice.is_empty() && parses_back_to(slice, &rendered));
+        if let Some(slice) = found {
+            return Some(slice.to_owned());
+        }
+    }
+    None
+}
+
+/// Where an expression's text could end, nearest first.
+///
+/// Stops at the comma that ends the select item and at the parenthesis that
+/// closes the one enclosing it, so a slice is never grown into the next item
+/// or past the list. Without that the search runs its whole budget every time
+/// nothing matches, on every prepare and every execute.
+///
+/// Counted from `start` rather than from `from`, because `from` is usually
+/// *inside* the expression — the reported end of `CONCAT('a','b')` falls
+/// between the parentheses, and a depth starting there reads the closing one
+/// as the end of an enclosing group.
+fn ends(sql: &str, start: usize, from: usize, limit: usize) -> impl Iterator<Item = usize> + '_ {
+    let mut depth = 0i32;
+    let mut quote = None;
+    let mut done = false;
+    (start..=limit)
+        .take_while(move |at| {
+            if done {
+                return false;
+            }
+            // The character *at* this position decides whether the next one is
+            // still inside the item; this one still is, so it is yielded first.
+            if let Some(c) = sql[*at..].chars().next() {
+                match quote {
+                    Some(q) if c == q => quote = None,
+                    Some(_) => {}
+                    None => match c {
+                        '\'' | '"' | '`' => quote = Some(c),
+                        '(' => depth += 1,
+                        ')' if depth == 0 => done = true,
+                        ')' => depth -= 1,
+                        ',' if depth == 0 => done = true,
+                        _ => {}
+                    },
+                }
+            }
+            true
+        })
+        .filter(move |at| *at >= from)
+}
+
+/// Whether `slice` is a complete expression rendering identically to `rendered`.
+///
+/// Compared through `Display` on both sides so the spans differ harmlessly; a
+/// structural comparison would never match, because the re-parsed copy carries
+/// offsets into a different string.
+fn parses_back_to(slice: &str, rendered: &str) -> bool {
+    let Ok(mut parser) = Parser::new(&MySqlDialect {}).try_with_sql(slice) else {
+        return false;
+    };
+    let Ok(parsed) = parser.parse_expr() else {
+        return false;
+    };
+    // The whole slice, not a prefix of it: `COUNT(*` stops early and would
+    // otherwise pass for `COUNT`.
+    parser.peek_token().token == sqlparser::tokenizer::Token::EOF && parsed.to_string() == rendered
+}
+
+/// Whether a token could begin at this offset.
+///
+/// A name runs together with what precedes it or it is not the same name, so
+/// only a boundary is worth trying: `SUBSTRING(` is reached in one step from
+/// the space before it rather than nine.
+fn starts_a_token(sql: &str, at: usize) -> bool {
+    if !sql.is_char_boundary(at) {
+        return false;
+    }
+    match sql[..at].chars().next_back() {
+        None => true,
+        Some(previous) => !previous.is_alphanumeric() && previous != '_',
+    }
+}
+
+/// A `Location` as an index into the statement it came from.
+fn byte_offset(sql: &str, at: sqlparser::tokenizer::Location) -> Option<usize> {
+    if at.line == 0 {
+        return None;
+    }
+    let mut offset = 0;
+    for line in sql.split_inclusive('\n').take((at.line - 1) as usize) {
+        offset += line.len();
+    }
+    let rest = sql.get(offset..)?;
+    let column = rest
+        .char_indices()
+        .nth((at.column - 1) as usize)
+        .map(|(i, _)| i)
+        .unwrap_or(rest.len());
+    Some(offset + column)
+}
+
+/// What the current parse tree came from, for the parts of it that the tree
+/// alone does not say.
+#[derive(Clone)]
+struct Origin {
+    /// The text, so a computed column can be named after what was written.
+    sql: std::rc::Rc<str>,
+    /// Whether `||` concatenates. It changes how tightly the operator binds
+    /// and therefore what `DIV` beside it divides, which is not recoverable
+    /// from the tree.
+    pipes_as_concat: bool,
+}
+
+thread_local! {
+    /// The statement being parsed or run on this thread.
+    ///
+    /// A thread-local for the same reason as `SHAPING` below: this is needed
+    /// deep inside projection and expression handling, several recursions down
+    /// from the only place that has it, and threading it through would put the
+    /// same argument in signatures that do not otherwise care. A statement
+    /// runs to completion on one thread, so this is exactly its scope.
+    static SOURCE: std::cell::RefCell<Option<Origin>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether `||` concatenates in the statement being handled.
+///
+/// `false` without one, which is MySQL's default: `||` is OR unless
+/// `PIPES_AS_CONCAT` says otherwise.
+pub(crate) fn pipes_as_concat() -> bool {
+    SOURCE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .is_some_and(|current| current.pipes_as_concat)
+    })
+}
+
+/// Publishes the statement text for the duration of a scope.
+///
+/// Restored through a guard rather than a trailing assignment: a stale text
+/// left behind would name columns after whatever the *previous* statement said
+/// at those offsets, which is a wrong answer that reads like a real one.
+struct Source(Option<Origin>);
+
+impl Source {
+    fn set(sql: &str, mode: crate::dialect::SqlMode) -> Self {
+        let current = Origin {
+            sql: std::rc::Rc::from(sql),
+            pipes_as_concat: mode.pipes_as_concat,
+        };
+        Self(SOURCE.with(|s| s.replace(Some(current))))
+    }
+}
+
+impl Drop for Source {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        SOURCE.with(|s| *s.borrow_mut() = previous);
     }
 }
 

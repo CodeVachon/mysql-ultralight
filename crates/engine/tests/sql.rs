@@ -1027,9 +1027,25 @@ fn pipes_follow_sql_mode() {
     let as_or = rows(&engine, &mut session, "SELECT 1 || 0");
     assert_eq!(as_or, vec![vec!["1"]], "by default `||` is logical OR");
 
+    // Which it means also decides how tightly it binds, and therefore what a
+    // `DIV` beside it divides. As OR it is looser, so the divisor comes out of
+    // it and this is `(7 DIV 2) || 3`.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 7 DIV 2 || 3"),
+        vec![vec!["1"]]
+    );
+
     session.config.sql_mode.push_str(",PIPES_AS_CONCAT");
     let as_concat = rows(&engine, &mut session, "SELECT 'a' || 'b'");
     assert_eq!(as_concat, vec![vec!["ab"]]);
+
+    // Concatenating, it binds tighter than `DIV`, so the same text is
+    // `7 DIV '23'` — 0. The tree is identical either way; only the mode says
+    // which shape it should have.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 7 DIV 2 || 3"),
+        vec![vec!["0"]]
+    );
 }
 
 /// Under ANSI_QUOTES a double-quoted word is a column reference.
@@ -5419,6 +5435,103 @@ fn a_numeric_precision_is_reported_the_way_mysql_reports_it() {
 }
 
 #[test]
+fn a_path_extraction_binds_as_tightly_as_a_column_does() {
+    // MySQL treats `->` and `->>` as primaries; sqlparser gives them nearly
+    // the loosest precedence there is, so `doc->'$.b' = 6` arrives as
+    // `doc -> ('$.b' = 6)` and asks for the path `0`. Silent wherever it is not
+    // an outright error: a WHERE over an extraction matched nothing.
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE JJ (id INT, doc JSON)");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO JJ VALUES (1, '{\"a\":6,\"b\":2}')",
+    );
+
+    for (sql, expected) in [
+        ("SELECT doc->'$.b' = 2 FROM JJ", "1"),
+        ("SELECT doc->>'$.a' = '6' FROM JJ", "1"),
+        ("SELECT doc->'$.b' IS NULL FROM JJ", "0"),
+        ("SELECT doc->'$.b' IN (2, 3) FROM JJ", "1"),
+        ("SELECT doc->'$.b' + 1 FROM JJ", "3"),
+        // Left-associative, like every other chain.
+        ("SELECT doc->'$.a'->>'$' FROM JJ", "6"),
+        // A path extraction binds tighter than DIV, so it is the divisor
+        // rather than the thing divided.
+        ("SELECT 12 DIV doc->'$.b' FROM JJ", "6"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // The whole point: a filter over an extraction finds its row.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM JJ WHERE 12 DIV doc->'$.b' = 6"
+        ),
+        vec![vec!["1"]]
+    );
+}
+
+#[test]
+fn a_computed_column_is_named_after_the_text_it_was_written_as() {
+    // MySQL names an unaliased select item with its source text, character for
+    // character — it does not canonicalise. Rendering the parsed tree instead
+    // cannot be made to agree, because spellings MySQL names differently share
+    // one tree: `1!=2` and `1 <> 2` are both `NotEq`. A client keys a row by
+    // this name, so a test reading the column back finds nothing.
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE J (doc JSON)");
+
+    for sql in [
+        // The arrows, which the renderer spaced out every time.
+        "SELECT doc->>'$.b' FROM J",
+        "SELECT doc ->> '$.b' FROM J",
+        "SELECT doc->'$.a' FROM J",
+        // Spellings that share a tree with another spelling.
+        "SELECT 1!=2",
+        "SELECT 1 <> 2",
+        // Spacing the renderer normalises away, or invents.
+        "SELECT 1  +  2",
+        "SELECT ( 1 + 2 ) * 3",
+        "SELECT (1+2)*3",
+        "SELECT CONCAT('a','b')",
+        "SELECT CONCAT('a', 'b')",
+        "SELECT IF(1,2,3)",
+        // The parser reports a span covering only the arguments for these,
+        // because it gives them their own grammar rather than a call.
+        "SELECT SUBSTRING('abc',2)",
+        "SELECT TRIM(' a ')",
+        // And a span short of the closing delimiters for these.
+        "SELECT COUNT(*) FROM J",
+        "SELECT CAST(1 AS CHAR)",
+        "SELECT JSON_EXTRACT('{}','$.a')",
+        "SELECT DATE_ADD(NOW(), INTERVAL 1 DAY)",
+        "SELECT CASE WHEN 1 THEN 2 ELSE 3 END",
+        "SELECT 1 BETWEEN 1 AND 2",
+        "SELECT doc IS NOT NULL FROM J",
+        "SELECT -(1+2)",
+    ] {
+        let written = sql.strip_prefix("SELECT ").unwrap();
+        let written = written.strip_suffix(" FROM J").unwrap_or(written);
+        let described = engine.describe(&session, sql, 0).unwrap();
+        assert_eq!(described[0].name, written, "{sql}");
+    }
+
+    // An alias still wins, and a plain column is named without its table.
+    let described = engine
+        .describe(&session, "SELECT 1 + 1 AS total, J.doc FROM J", 0)
+        .unwrap();
+    let names: Vec<&str> = described.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["total", "doc"]);
+}
+
+#[test]
 fn integer_division_binds_as_tightly_as_multiplication() {
     // `DIV` reaches the engine mis-associated: sqlparser's dialect hook reads
     // its right operand with `parse_expr`, which takes the rest of the
@@ -5448,6 +5561,11 @@ fn integer_division_binds_as_tightly_as_multiplication() {
         ("SELECT 7 DIV 2 BETWEEN 1 AND 5", "1"),
         ("SELECT 7 DIV 2 LIKE '3'", "1"),
         ("SELECT 7 DIV 2 REGEXP '1'", "0"),
+        // `||` is two operators wearing one token. Meaning OR it binds looser
+        // than DIV, so the divisor comes out of it: `(7 DIV 2) || 3` is 1.
+        // Under PIPES_AS_CONCAT it binds tighter and this is `7 DIV '23'`,
+        // which the mode's own test covers.
+        ("SELECT 7 DIV 2 || 3", "1"),
         // Parentheses are their own node, so nothing rotates through them.
         ("SELECT 7 DIV (2 + 1)", "2"),
         ("SELECT (7 DIV 2) + 1", "4"),
@@ -5465,6 +5583,17 @@ fn integer_division_binds_as_tightly_as_multiplication() {
             vec![vec![expected]],
             "{sql}"
         );
+    }
+
+    // A quotient that will not fit is refused rather than saturated: a
+    // float-to-integer cast in Rust clamps, so this answered i64::MAX where
+    // MySQL refuses the statement. Reachable from a plain string now that one
+    // reads as a number up to DBL_MAX.
+    for sql in ["SELECT '1e400' DIV 1", "SELECT -9223372036854775808 DIV -1"] {
+        let error = engine
+            .execute(&mut session, sql, &[])
+            .expect_err("the quotient does not fit");
+        assert_eq!(error.code, 1690, "{sql}");
     }
 
     // The type follows the corrected shape, whose root is usually not the DIV:
