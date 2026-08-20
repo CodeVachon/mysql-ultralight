@@ -272,7 +272,14 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             }
         }
 
-        Expr::BinaryOp { left, op, right } => binary(op, eval(left, ctx)?, eval(right, ctx)?, ctx),
+        Expr::BinaryOp { left, op, right } => {
+            // `DIV` reaches us mis-associated, so the shape is corrected before
+            // it is read rather than evaluated as parsed.
+            if let Some(fixed) = reassociated_div(op, left, right) {
+                return eval(&fixed, ctx);
+            }
+            binary(op, eval(left, ctx)?, eval(right, ctx)?, ctx)
+        }
 
         Expr::Between {
             expr,
@@ -808,7 +815,9 @@ fn binary(
             _ => Value::Null,
         },
 
-        B::Plus | B::Minus | B::Multiply | B::Divide | B::Modulo => arithmetic(op, &left, &right)?,
+        B::Plus | B::Minus | B::Multiply | B::Divide | B::Modulo | B::MyIntegerDivide => {
+            arithmetic(op, &left, &right)?
+        }
 
         // The tokenizer always produces StringConcat for `||`, but what it
         // means depends on sql_mode: concatenation under PIPES_AS_CONCAT, and
@@ -845,6 +854,84 @@ fn binary(
     })
 }
 
+/// Re-associates a `DIV` to the precedence MySQL gives it.
+///
+/// sqlparser parses `DIV` in a dialect hook that reads its right operand with
+/// `parse_expr`, which takes everything to the end of the expression: it builds
+/// `7 DIV (2 + 1)` where MySQL means `(7 DIV 2) + 1`, and answers 2 where MySQL
+/// answers 4. A wrapper `Dialect` that fixed this at the source is not an
+/// option here — see `crate::dialect` for why — so the shape is corrected after
+/// parsing, wherever the tree is read.
+///
+/// `DIV` binds tighter than everything the hook can swallow, so it takes the
+/// leftmost operand of whatever came back and the rest stays outside it. That
+/// is not only other binary operators: `7 DIV 2 IS NULL` comes back as
+/// `IsNull(7 DIV 2)`'s *argument*, so reading only `Expr::BinaryOp` left
+/// `DIV(7, IsNull(2))` — NULL, where MySQL says 0.
+///
+/// Returns `None` when there is nothing to move, which is also what stops the
+/// caller recursing forever.
+pub(crate) fn reassociated_div(op: &BinaryOperator, left: &Expr, right: &Expr) -> Option<Expr> {
+    if !matches!(op, BinaryOperator::MyIntegerDivide) {
+        return None;
+    }
+    let mut fixed = right.clone();
+    divide_leftmost(&mut fixed, left).then_some(fixed)
+}
+
+/// The operand a mis-associated `DIV` should have taken, in place.
+///
+/// Walks down the left spine of what the hook swallowed. Every construct here
+/// is one that extends an expression to its *left* — a binary operator, a
+/// postfix test, an `IN` list — so its leftmost descendant is the operand that
+/// was really adjacent to the `DIV`. A prefix or a parenthesised group is not
+/// on that list and ends the walk, which is why `7 DIV (2 + 1)` keeps its
+/// parentheses.
+///
+/// `false` when the node *is* the operand, so nothing needs moving — which is
+/// what stops the caller recursing forever.
+fn divide_leftmost(e: &mut Expr, divisor_of: &Expr) -> bool {
+    use Expr as E;
+    let child: &mut Expr = match e {
+        // `^` binds tighter than `DIV` in MySQL, so what it built really is
+        // the divisor and nothing moves out of it. This is right for a bare
+        // `a DIV b ^ c` and wrong for `a DIV b ^ c + d`, because sqlparser
+        // gives `^` a *looser* precedence than `+` and over-swallows there
+        // too. Unreachable while the evaluator rejects `^` outright; #0052
+        // has to fix that precedence before it can be reached.
+        E::BinaryOp {
+            op: BinaryOperator::BitwiseXor,
+            ..
+        } => return false,
+        E::BinaryOp { left, .. } => left,
+        E::IsNull(x)
+        | E::IsNotNull(x)
+        | E::IsTrue(x)
+        | E::IsFalse(x)
+        | E::IsNotTrue(x)
+        | E::IsNotFalse(x)
+        | E::IsUnknown(x)
+        | E::IsNotUnknown(x) => x,
+        E::InList { expr, .. } | E::InSubquery { expr, .. } | E::InUnnest { expr, .. } => expr,
+        E::Between { expr, .. } => expr,
+        E::Like { expr, .. }
+        | E::ILike { expr, .. }
+        | E::SimilarTo { expr, .. }
+        | E::RLike { expr, .. } => expr,
+        E::IsDistinctFrom(x, _) | E::IsNotDistinctFrom(x, _) => x,
+        _ => return false,
+    };
+    if !divide_leftmost(child, divisor_of) {
+        let operand = child.clone();
+        *child = Expr::BinaryOp {
+            left: Box::new(divisor_of.clone()),
+            op: BinaryOperator::MyIntegerDivide,
+            right: Box::new(operand),
+        };
+    }
+    true
+}
+
 fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> EngineResult<Value> {
     use BinaryOperator as B;
 
@@ -874,13 +961,23 @@ fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> EngineResult<
                     Value::Int(a.wrapping_rem(*b))
                 }
             }
+            // `DIV` truncates toward zero rather than flooring: MySQL answers
+            // -3 for `-7 DIV 2`, where a floor would say -4. Rust's integer
+            // division truncates the same way.
+            B::MyIntegerDivide => {
+                if *b == 0 {
+                    Value::Null
+                } else {
+                    Value::Int(a.wrapping_div(*b))
+                }
+            }
             _ => unreachable!("caller restricts the operator set"),
         });
     }
 
-    let (Some(a), Some(b)) = (left.as_float(), right.as_float()) else {
-        return Ok(Value::Null);
-    };
+    // Every non-NULL operand reads as some number, which is why there is no
+    // failure case here: MySQL answers `'x' + 1` with 1, not NULL.
+    let (a, b) = (left.as_number(), right.as_number());
 
     Ok(match op {
         B::Plus => Value::Float(a + b),
@@ -890,6 +987,10 @@ fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> EngineResult<
         B::Divide => Value::Float(a / b),
         B::Modulo if b == 0.0 => Value::Null,
         B::Modulo => Value::Float(a % b),
+        // Integral however it was reached: `7.5 DIV 2` is 3, not 3.75, and
+        // MySQL types the column LONGLONG whatever it divided.
+        B::MyIntegerDivide if b == 0.0 => Value::Null,
+        B::MyIntegerDivide => Value::Int((a / b).trunc() as i64),
         _ => unreachable!("caller restricts the operator set"),
     })
 }

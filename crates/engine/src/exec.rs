@@ -5330,16 +5330,30 @@ fn computed_column_type(
                             .map(|a| computed_column_type(a, refs, input)),
                     )
                 }
-                // Typed by what they were given rather than fixed: `ABS` and
-                // `ROUND` hand back a decimal for a decimal, and `GREATEST`
-                // hands back whichever argument won — including a string.
-                // Declaring these LONGLONG had the binary protocol send 0 for
-                // a string and truncate a decimal to its integer part.
-                "abs" | "round" | "greatest" | "least" => combined(
+                // These hand back one of their arguments unchanged, so they
+                // keep its width: `GREATEST(tinyint, smallint)` really is a
+                // SMALLINT to MySQL, and a string argument makes the answer a
+                // string. Declaring them LONGLONG had the binary protocol
+                // send 0 for the string.
+                "greatest" | "least" => combined(
                     function_arguments(f)
                         .iter()
                         .map(|a| computed_column_type(a, refs, input)),
                 ),
+                // These keep the *kind* of what they were given but not its
+                // width — MySQL answers LONGLONG for every integer argument,
+                // however narrow, and a decimal or a double for those.
+                // Fixing them at LONGLONG truncated a decimal to its integer
+                // part; typing them by the argument sent `ABS(tinyint)` as one
+                // byte, which is a value the answer can outgrow.
+                "abs" | "round" => match combined(
+                    function_arguments(f)
+                        .iter()
+                        .map(|a| computed_column_type(a, refs, input)),
+                ) {
+                    t if is_integer(t) => ColumnType::LongLong,
+                    t => t,
+                },
                 // `NULLIF` answers its first argument or NULL, and both fit
                 // that argument's own width.
                 "nullif" => function_arguments(f)
@@ -5402,14 +5416,22 @@ fn computed_column_type(
         | Expr::IsNotDistinctFrom(_, _) => ColumnType::LongLong,
         Expr::BinaryOp { left, op, right } => {
             use sqlparser::ast::BinaryOperator as B;
+            // The corrected shape of a `DIV` usually has some other operator at
+            // its root, and that root is what decides the type: `a DIV b * 1.5`
+            // is a decimal, not the integer the `DIV` alone would suggest.
+            if let Some(fixed) = crate::expr::reassociated_div(op, left, right) {
+                return computed_column_type(&fixed, refs, input);
+            }
             match op {
                 // A comparison or a logical connective is 0 or 1.
                 B::Eq | B::NotEq | B::Lt | B::LtEq | B::Gt | B::GtEq | B::And | B::Or | B::Xor => {
                     ColumnType::LongLong
                 }
                 // Division is exact in MySQL, so it answers a decimal even
-                // over two integers.
+                // over two integers — where `DIV` is integer division and is a
+                // LONGLONG whatever it divided, including two decimals.
                 B::Divide => ColumnType::NewDecimal,
+                B::MyIntegerDivide => ColumnType::LongLong,
                 B::Plus | B::Minus | B::Multiply | B::Modulo => arithmetic_type(
                     computed_column_type(left, refs, input),
                     computed_column_type(right, refs, input),

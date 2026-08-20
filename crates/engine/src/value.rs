@@ -64,6 +64,22 @@ impl Value {
         }
     }
 
+    /// The number MySQL reads out of any non-NULL value.
+    ///
+    /// Every type answers, because MySQL's arithmetic has no "this is not a
+    /// number" case: `'x' + 1` is 1 and `'x' * 2` is 0, where returning NULL
+    /// for anything unparseable made both of those NULL. NULL itself is
+    /// handled before an operand reaches this.
+    pub fn as_number(&self) -> f64 {
+        match self {
+            Value::Null => 0.0,
+            Value::Int(v) => *v as f64,
+            Value::Float(v) => *v,
+            Value::Text(v) | Value::Json(v) => numeric_prefix(v),
+            Value::Bytes(v) => numeric_prefix(&String::from_utf8_lossy(v)),
+        }
+    }
+
     /// The value's string form, as MySQL would render it.
     pub fn as_text(&self) -> String {
         match self {
@@ -211,18 +227,46 @@ fn format_float(v: f64) -> String {
 /// string has to answer a numeric question, which includes being true or false.
 fn numeric_prefix(text: &str) -> f64 {
     let trimmed = text.trim_start();
-    let mut end = 0;
-    let mut seen_dot = false;
-    for (i, c) in trimmed.char_indices() {
-        let acceptable =
-            c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+')) || (c == '.' && !seen_dot);
-        if !acceptable {
-            break;
-        }
-        seen_dot |= c == '.';
-        end = i + c.len_utf8();
+    let bytes = trimmed.as_bytes();
+    let digit = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_digit);
+    let sign = |i: usize| matches!(bytes.get(i), Some(b'-' | b'+'));
+
+    let mut end = usize::from(sign(0));
+    let mut digits = 0;
+    while digit(end) {
+        end += 1;
+        digits += 1;
     }
-    trimmed[..end].parse().unwrap_or(0.0)
+    if bytes.get(end) == Some(&b'.') {
+        end += 1;
+        while digit(end) {
+            end += 1;
+            digits += 1;
+        }
+    }
+    if digits == 0 {
+        return 0.0;
+    }
+
+    // An exponent counts only when it is complete, so `'1e2'` is 100 and `'1e'`
+    // is 1 — reading the `e` and stopping there made `'1e2' + 1` answer 2.
+    if matches!(bytes.get(end), Some(b'e' | b'E')) {
+        let mut after = end + 1 + usize::from(sign(end + 1));
+        if digit(after) {
+            while digit(after) {
+                after += 1;
+            }
+            end = after;
+        }
+    }
+    // Clamped rather than left infinite: MySQL stops a string conversion at
+    // DBL_MAX, and an infinity renders as the token `Inf`, which is not a
+    // number any client can read back.
+    match trimmed[..end].parse().unwrap_or(0.0) {
+        v if v == f64::INFINITY => f64::MAX,
+        v if v == f64::NEG_INFINITY => f64::MIN,
+        v => v,
+    }
 }
 
 #[cfg(test)]

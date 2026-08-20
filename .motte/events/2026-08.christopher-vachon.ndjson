@@ -115,3 +115,9 @@
 {"at":"2026-08-20T18:33:08Z","id":40,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-20T18:45:13Z","id":50,"by":"Christopher Vachon","as":"user","type":"created","title":"information_schema describes its own columns differently","state":"Todo"}
 {"at":"2026-08-20T19:00:26Z","id":41,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-20T19:24:50Z","id":51,"by":"Christopher Vachon","as":"user","type":"created","title":"MOD as an infix operator does not parse","state":"Todo"}
+{"at":"2026-08-20T19:24:50Z","id":52,"by":"Christopher Vachon","as":"user","type":"created","title":"The bitwise operators are unsupported","state":"Todo"}
+{"at":"2026-08-20T19:24:50Z","id":53,"by":"Christopher Vachon","as":"user","type":"created","title":"REAL_AS_FLOAT is parsed and never applied","state":"Todo"}
+{"at":"2026-08-20T19:38:59Z","id":54,"by":"Christopher Vachon","as":"user","type":"created","title":"Temporal values read as their leading digits in arithmetic","state":"Todo"}
+{"at":"2026-08-20T19:38:59Z","id":55,"by":"Christopher Vachon","as":"user","type":"created","title":"format_float never uses exponent notation","state":"Todo"}
+{"at":"2026-08-20T19:42:30Z","id":42,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}

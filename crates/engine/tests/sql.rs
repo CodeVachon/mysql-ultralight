@@ -5419,6 +5419,118 @@ fn a_numeric_precision_is_reported_the_way_mysql_reports_it() {
 }
 
 #[test]
+fn integer_division_binds_as_tightly_as_multiplication() {
+    // `DIV` reaches the engine mis-associated: sqlparser's dialect hook reads
+    // its right operand with `parse_expr`, which takes the rest of the
+    // expression, so `7 DIV 2 + 1` arrives as `7 DIV (2 + 1)`. Every answer
+    // here was read off MySQL 8.3.
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        ("SELECT 7 DIV 2 + 1", "4"),
+        ("SELECT 1 + 7 DIV 2", "4"),
+        // Left-associative, so this is `(7 DIV 2) DIV 2` and not `7 DIV 1`.
+        ("SELECT 7 DIV 2 DIV 2", "1"),
+        ("SELECT 20 DIV 2 * 5", "50"),
+        // Two rotations: the corrected shape is `((7 DIV 2) * 3) + 1`.
+        ("SELECT 7 DIV 2 * 3 + 1", "10"),
+        ("SELECT 2 + 100 DIV 3 * 2", "68"),
+        ("SELECT 100 DIV 3 - 1", "32"),
+        ("SELECT 7 DIV 2 = 3", "1"),
+        // Not only other operators: the hook swallows every postfix test too,
+        // so reading just `Expr::BinaryOp` left `7 DIV (2 IS NULL)` — NULL,
+        // where MySQL says 0. `WHERE x DIV 2 IS NULL` matched the wrong rows
+        // with no error at all.
+        ("SELECT 7 DIV 2 IS NULL", "0"),
+        ("SELECT 7 DIV 2 IS NOT NULL", "1"),
+        ("SELECT 7 DIV 2 IS TRUE", "1"),
+        ("SELECT 7 DIV 2 IN (3)", "1"),
+        ("SELECT 7 DIV 2 NOT IN (3)", "0"),
+        ("SELECT 7 DIV 2 BETWEEN 1 AND 5", "1"),
+        ("SELECT 7 DIV 2 LIKE '3'", "1"),
+        ("SELECT 7 DIV 2 REGEXP '1'", "0"),
+        // Parentheses are their own node, so nothing rotates through them.
+        ("SELECT 7 DIV (2 + 1)", "2"),
+        ("SELECT (7 DIV 2) + 1", "4"),
+        // Truncation toward zero, not a floor: a floor would say -4.
+        ("SELECT -7 DIV 2", "-3"),
+        // Integral whatever it divided, and a zero divisor is NULL rather
+        // than an error.
+        ("SELECT 7.5 DIV 2", "3"),
+        ("SELECT 7 DIV 2.5", "2"),
+        ("SELECT 7 DIV 0", "NULL"),
+        ("SELECT NULL DIV 2", "NULL"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // The type follows the corrected shape, whose root is usually not the DIV:
+    // a DIV is a LONGLONG whatever it divided, but a DIV inside a decimal
+    // multiply is a decimal.
+    let described = engine
+        .describe(&session, "SELECT 7 DIV 2, 7.5 DIV 2, 7 DIV 2 * 1.5", 0)
+        .unwrap();
+    let codes: Vec<String> = described.iter().map(|c| format!("{:?}", c.ty)).collect();
+    assert_eq!(codes, vec!["LongLong", "LongLong", "NewDecimal"]);
+}
+
+#[test]
+fn arithmetic_reads_a_number_out_of_anything_it_is_given() {
+    // MySQL's arithmetic has no "not a number" case — it reads the leading
+    // numeric part and calls the rest zero. Answering NULL instead made every
+    // one of these NULL, which is a wrong answer rather than a missing one.
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        ("SELECT 'x' + 1", "1"),
+        ("SELECT 'x' * 2", "0"),
+        ("SELECT 'x' - 1", "-1"),
+        ("SELECT '' + 1", "1"),
+        ("SELECT '12abc' + 1", "13"),
+        ("SELECT '-3abc' * 2", "-6"),
+        ("SELECT 'x' DIV 2", "0"),
+        // An exponent counts when it is complete and not otherwise, which is
+        // the one part the leading-number reader used to stop short of.
+        ("SELECT '1e2' + 1", "101"),
+        ("SELECT '2e-1' + 0", "0.2"),
+        ("SELECT '1e' + 1", "2"),
+        ("SELECT '.5' + 1", "1.5"),
+        ("SELECT ' 5 ' + 1", "6"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // NULL is still NULL: it is not a value with a numeric reading.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT NULL + 1, 1 + NULL"),
+        vec![vec!["NULL", "NULL"]]
+    );
+
+    // Reading the exponent made overflow reachable where stopping at the `e`
+    // never could. MySQL stops a string conversion at DBL_MAX, and an infinity
+    // renders as the token `Inf`, which is not a number a client can read back.
+    // The leading digits rather than the whole rendering, because a double this
+    // large is printed in full here and in exponent form by MySQL — #0055.
+    let huge = rows(&engine, &mut session, "SELECT '1e400' + 0, '-1e400' + 0");
+    assert!(
+        huge[0][0].starts_with("17976931348623157"),
+        "expected DBL_MAX, got {}",
+        huge[0][0]
+    );
+    assert!(
+        huge[0][1].starts_with("-17976931348623157"),
+        "expected -DBL_MAX, got {}",
+        huge[0][1]
+    );
+}
+
+#[test]
 fn a_type_synonym_is_the_type_it_is_a_synonym_for() {
     // Each of these is a spelling MySQL accepts for a type it already has, and
     // each was either the wrong type or no type at all. Measured on 8.3.
@@ -7665,6 +7777,14 @@ fn a_computed_column_is_described_by_its_expression() {
         (
             "SELECT ABS(d), ROUND(d,1), GREATEST(s,'z'), LEAST(s,'z') FROM E",
             vec!["NewDecimal", "NewDecimal", "VarString", "VarString"],
+        ),
+        // ABS and ROUND keep the kind but not the width: every integer
+        // argument answers LONGLONG however narrow, because the answer can
+        // outgrow it. GREATEST and LEAST are the other way round — they hand
+        // back an argument unchanged, so its own width is the answer.
+        (
+            "SELECT ABS(i), ROUND(i), GREATEST(i, i), LEAST(i, i) FROM E",
+            vec!["LongLong", "LongLong", "Long", "Long"],
         ),
         // Arithmetic over something that is not known to be a number is a
         // double, because that is what the evaluator produces: `'3.5' + 1` is
