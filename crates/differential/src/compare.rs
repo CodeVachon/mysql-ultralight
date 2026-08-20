@@ -80,6 +80,16 @@ pub fn differences(reference: &Answer, engine: &Answer) -> Vec<Difference> {
                         nullable(b.nullable),
                     );
                 }
+                // Not cosmetic: the binary protocol reads the bytes back as a
+                // signed number unless this says otherwise, so an UNSIGNED
+                // column without the flag comes out negative.
+                if a.unsigned != b.unsigned {
+                    note(
+                        &format!("signedness of column {i}"),
+                        signed(a.unsigned),
+                        signed(b.unsigned),
+                    );
+                }
             }
             if ra.len() != rb.len() {
                 note("row count", ra.len().to_string(), rb.len().to_string());
@@ -96,6 +106,10 @@ pub fn differences(reference: &Answer, engine: &Answer) -> Vec<Difference> {
     }
 
     found
+}
+
+fn signed(unsigned: bool) -> String {
+    if unsigned { "UNSIGNED" } else { "signed" }.to_owned()
 }
 
 fn nullable(v: bool) -> String {

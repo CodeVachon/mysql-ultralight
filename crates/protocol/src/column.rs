@@ -103,6 +103,19 @@ impl ColumnDef {
             | ColumnType::LongBlob
             | ColumnType::MediumBlob
             | ColumnType::TinyBlob => (charset::BINARY, u32::MAX, flags::BLOB),
+            // A date is not text, and neither is a JSON document — MySQL
+            // reports the binary collation for both. Only the string types
+            // default to a character set, and a `BLOB` that turns out to be a
+            // `TEXT` is corrected by `as_text`.
+            ColumnType::Date
+            | ColumnType::DateTime
+            | ColumnType::Timestamp
+            | ColumnType::Time
+            | ColumnType::Json
+            | ColumnType::Null => (charset::BINARY, 20, 0),
+            // A year has no negative half, and MySQL says so — without the
+            // flag the binary protocol reads its two bytes back signed.
+            ColumnType::Year => (charset::BINARY, 20, flags::UNSIGNED),
             _ => (charset::UTF8MB4_0900_AI_CI, 4096, 0),
         };
 
@@ -129,6 +142,31 @@ impl ColumnDef {
 
     pub fn with_schema(mut self, schema: impl Into<String>) -> Self {
         self.schema = schema.into();
+        self
+    }
+
+    /// Marks the column as holding an unsigned number.
+    ///
+    /// The binary protocol reads a column's bytes back as a signed number
+    /// unless this says otherwise, so an `INT UNSIGNED` holding three billion
+    /// arrives negative without it.
+    pub fn unsigned(mut self) -> Self {
+        self.flags |= flags::UNSIGNED;
+        self
+    }
+
+    /// Marks the column as carrying text, or as carrying bytes.
+    ///
+    /// The only thing on the wire that tells a `TEXT` column from a `BLOB`
+    /// one: both are `MYSQL_TYPE_BLOB`, and the charset is what says which. A
+    /// text column sent with the binary charset arrives as bytes — Prisma
+    /// base64s it and then refuses to convert it to a String.
+    pub fn as_text(mut self, textual: bool) -> Self {
+        self.charset = if textual {
+            charset::UTF8MB4_0900_AI_CI
+        } else {
+            charset::BINARY
+        };
         self
     }
 

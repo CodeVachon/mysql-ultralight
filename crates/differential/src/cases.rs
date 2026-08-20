@@ -114,6 +114,32 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // Everything here is about what the *binary* protocol sends, which the
+        // harness could not see until it started asking both ways. Each case
+        // is one where a declared type code narrower than the value it carries
+        // would put the wrong bytes on the wire.
+        name: "a type code has to hold its values",
+        setup: &[
+            "CREATE TABLE Q (t TINYINT, s SMALLINT, i INT, iu INT UNSIGNED, \
+             bu BIGINT UNSIGNED, y YEAR)",
+            "INSERT INTO Q VALUES (100, 30000, 2000000000, 4000000000, 9000000000, 2026)",
+            "INSERT INTO Q VALUES (100, 30000, 2000000000, 4000000000, 9000000000, 1901)",
+            "INSERT INTO Q VALUES (100, 30000, 2000000000, 4000000000, 9000000000, 2155)",
+        ],
+        cases: &[
+            // A total outgrows what it totals: three TINYINTs of 100 make 300,
+            // and announcing the column as one byte sends 44.
+            same("SELECT SUM(t), SUM(s), SUM(i) FROM Q"),
+            same("SELECT AVG(t), MIN(t), MAX(t), COUNT(t) FROM Q"),
+            // An unsigned column read back signed comes out negative.
+            same("SELECT iu, bu FROM Q LIMIT 1"),
+            same("SELECT y FROM Q ORDER BY y"),
+            // A union of the same width and different signs holds neither
+            // branch's range.
+            same("SELECT i FROM Q UNION SELECT iu FROM Q ORDER BY 1"),
+        ],
+    },
+    Group {
         name: "types and description",
         setup: &[
             "CREATE TABLE T (

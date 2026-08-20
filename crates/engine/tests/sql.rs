@@ -5268,9 +5268,14 @@ fn an_aggregate_keeps_the_type_of_what_it_folds() {
         )
         .unwrap();
     let types: Vec<String> = described.iter().map(|c| format!("{:?}", c.ty)).collect();
+    // MIN and MAX keep the argument's type, so folding an INTEGER gives
+    // MySQL's `LONG` rather than the `LONGLONG` every integer used to be. SUM
+    // and AVG do not: a total outgrows what it totals, which is why MySQL
+    // answers NEWDECIMAL and why announcing the argument's width would have
+    // the binary protocol send too few bytes for it.
     assert_eq!(
         types,
-        vec!["LongLong", "LongLong", "LongLong", "VarString", "VarString"],
+        vec!["LongLong", "NewDecimal", "Long", "VarString", "NewDecimal"],
         "an aggregate should carry its argument's type"
     );
 }
@@ -6732,13 +6737,12 @@ fn a_view_describes_its_columns_exactly_as_the_table_does() {
         types(&engine, &mut session, "Joined"),
         vec![vec!["id", "int"], vec!["label", "varchar(12)"]]
     );
-    // A union keeps the type only where both branches declared the same one.
-    // `Side.bid` is an `INT` like `Base.id`, so `id` survives; `label` is a
-    // `VARCHAR(12)` against a `VARCHAR(40)`, and describing the column as
-    // either one is narrower than the values it holds.
+    // A union takes the wider of the two declarations, whichever side it is
+    // on: `Side.bid` is an `INT` like `Base.id`, and `label` is a
+    // `VARCHAR(12)` against `name`'s `VARCHAR(40)`.
     assert_eq!(
         types(&engine, &mut session, "United"),
-        vec![vec!["id", "int"], vec!["name", "varchar(512)"]]
+        vec![vec!["id", "int"], vec!["name", "varchar(40)"]]
     );
 
     // Which matters most where the two branches are different widths of the
@@ -6759,6 +6763,9 @@ fn a_view_describes_its_columns_exactly_as_the_table_does() {
         &mut session,
         "CREATE VIEW Same AS SELECT small FROM Wide UNION SELECT small FROM Wide",
     );
+    // Widened to what holds both, which is MySQL's rule: describing the
+    // column as the left branch's SMALLINT would have the binary protocol
+    // write two bytes for a value that needs eight.
     assert_eq!(
         types(&engine, &mut session, "Mixed"),
         vec![vec!["small", "bigint"]]
@@ -6978,4 +6985,231 @@ fn a_document_is_written_the_way_mysql_writes_one() {
         rows(&engine, &mut session, "SELECT kept FROM Norm ORDER BY id"),
         vec![vec![r#"{"a": 2, "b": 1}"#], vec!["[1, 2]"]]
     );
+}
+
+#[test]
+fn a_column_is_described_with_the_type_code_its_width_earns() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE W (
+            t TINYINT, s SMALLINT, m MEDIUMINT, i INT, b BIGINT,
+            c CHAR(5), v VARCHAR(40), x TEXT, bl BLOB, vb VARBINARY(10),
+            ts TIMESTAMP NULL, dt DATETIME, e ENUM('a','b')
+        )",
+    );
+    // MySQL's codes are finer than this engine's kinds, and describing a whole
+    // kind with one code told a typed client the wrong width for nearly every
+    // column. Each of these was checked against MySQL 8.3 rather than read off
+    // a table.
+    let described = engine.describe(&session, "SELECT * FROM W", 0).unwrap();
+    let codes: Vec<String> = described.iter().map(|c| format!("{:?}", c.ty)).collect();
+    assert_eq!(
+        codes,
+        vec![
+            "Tiny",
+            "Short",
+            "Int24",
+            "Long",
+            "LongLong",
+            "String",
+            "VarString",
+            "Blob",
+            "Blob",
+            "VarString",
+            "Timestamp",
+            "DateTime",
+            "String",
+        ]
+    );
+
+    // A `TEXT` and a `BLOB` share a code, and only the charset says which is
+    // which. Getting that wrong sent a text column as bytes, which Prisma
+    // base64s and then refuses to read as a String.
+    let textual: Vec<bool> = described
+        .iter()
+        .map(|c| c.to_wire().charset != 63)
+        .collect();
+    assert_eq!(
+        textual,
+        vec![
+            false, false, false, false, false, // the integers are binary
+            true, true, true, // char, varchar, text carry text
+            false, false, // blob and varbinary carry bytes
+            false, false, // the temporals are binary
+            true,  // an enum carries text
+        ]
+    );
+}
+
+#[test]
+fn a_column_refuses_a_value_its_width_cannot_hold() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE R (t TINYINT, tu TINYINT UNSIGNED, s SMALLINT, m MEDIUMINT, i INT)",
+    );
+
+    // Every boundary is accepted on both sides.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO R VALUES (127, 255, 32767, 8388607, 2147483647)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO R VALUES (-128, 0, -32768, -8388608, -2147483648)",
+    );
+
+    // And a step past any of them is refused. Not a formality: the binary
+    // protocol encodes by the declared type, so a TINYINT allowed to hold 999
+    // would reach a client as 231. Describing a column honestly is only safe
+    // once it cannot hold something wider.
+    for (sql, what) in [
+        ("INSERT INTO R (t) VALUES (128)", "tinyint high"),
+        ("INSERT INTO R (t) VALUES (-129)", "tinyint low"),
+        ("INSERT INTO R (tu) VALUES (256)", "unsigned tinyint high"),
+        ("INSERT INTO R (tu) VALUES (-1)", "unsigned tinyint low"),
+        ("INSERT INTO R (s) VALUES (32768)", "smallint"),
+        ("INSERT INTO R (m) VALUES (8388608)", "mediumint"),
+        ("INSERT INTO R (i) VALUES (2147483648)", "int"),
+        ("UPDATE R SET t = 999", "update"),
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1264, "{what}: {sql}");
+    }
+
+    // Nothing that was refused was written, and nothing that was accepted was
+    // lost.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM R"),
+        vec![vec!["2"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT t FROM R ORDER BY t"),
+        vec![vec!["-128"], vec!["127"]]
+    );
+}
+
+#[test]
+fn a_column_that_cannot_hold_a_value_is_not_described_as_if_it_could() {
+    let (engine, mut session) = engine();
+
+    // The invariant the narrow type codes rest on. The binary protocol encodes
+    // by the declared code, so anything that can produce a value wider than
+    // the code it is announced under sends the wrong bytes — the client reads
+    // 300 as 44 and never knows.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Q (t TINYINT, iu INT UNSIGNED, y YEAR, id TINYINT AUTO_INCREMENT PRIMARY KEY)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Q (t) VALUES (100), (100), (100)",
+    );
+
+    // A total outgrows what it totals, so SUM and AVG are decimals rather than
+    // the argument's width. MIN and MAX stay, because they are values of it.
+    let described = engine
+        .describe(
+            &session,
+            "SELECT SUM(t), AVG(t), MIN(t), MAX(t), COUNT(t) FROM Q",
+            0,
+        )
+        .unwrap();
+    let codes: Vec<String> = described.iter().map(|c| format!("{:?}", c.ty)).collect();
+    assert_eq!(
+        codes,
+        vec!["NewDecimal", "NewDecimal", "Tiny", "Tiny", "LongLong"]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT SUM(t) FROM Q"),
+        vec![vec!["300"]]
+    );
+
+    // An UNSIGNED column has to say so, or the binary protocol reads its bytes
+    // back signed and three billion arrives negative.
+    let described = engine.describe(&session, "SELECT iu FROM Q", 0).unwrap();
+    assert!(described[0].to_wire().flags & 0x0020 != 0, "UNSIGNED_FLAG");
+
+    // A YEAR is two bytes, and was the one integer still able to outgrow its
+    // code: 99999 reached a binary client as 34463.
+    for sql in [
+        "INSERT INTO Q (y) VALUES (99999)",
+        "INSERT INTO Q (y) VALUES (1900)",
+        "INSERT INTO Q (y) VALUES (2156)",
+    ] {
+        assert_eq!(
+            engine.execute(&mut session, sql, &[]).unwrap_err().code,
+            1264,
+            "{sql}"
+        );
+    }
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Q (y) VALUES (1901), (2155), (0)",
+    );
+
+    // And a generated id is subject to the width like any other value: a
+    // TINYINT AUTO_INCREMENT counting past 127 was stored and sent as one
+    // byte, arriving as -128.
+    run(&engine, &mut session, "DELETE FROM Q");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Q (id, t) VALUES (127, 1)",
+    );
+    assert_eq!(
+        engine
+            .execute(&mut session, "INSERT INTO Q (t) VALUES (2)", &[])
+            .unwrap_err()
+            .code,
+        1264
+    );
+}
+
+#[test]
+fn a_union_is_described_as_what_holds_both_branches() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE U (
+            i INT, iu INT UNSIGNED, s SMALLINT, b BIGINT,
+            d DECIMAL(10,2), db DOUBLE, dt DATE, dtm DATETIME,
+            t TEXT, lt LONGTEXT
+        )",
+    );
+
+    // Each pair checked against MySQL 8.3 rather than reasoned about. The
+    // signed/unsigned pair is the one that looks like it needs no widening:
+    // both are `LONG`, and neither range holds the other's.
+    let code = |engine: &Engine, session: &mut Session, sql: &str| {
+        format!("{:?}", engine.describe(session, sql, 0).unwrap()[0].ty)
+    };
+    for (sql, expected) in [
+        ("SELECT s FROM U UNION SELECT b FROM U", "LongLong"),
+        ("SELECT i FROM U UNION SELECT iu FROM U", "LongLong"),
+        ("SELECT i FROM U UNION SELECT d FROM U", "NewDecimal"),
+        ("SELECT db FROM U UNION SELECT i FROM U", "Double"),
+        ("SELECT dt FROM U UNION SELECT dtm FROM U", "DateTime"),
+        ("SELECT i FROM U UNION SELECT t FROM U", "VarString"),
+    ] {
+        assert_eq!(code(&engine, &mut session, sql), expected, "{sql}");
+    }
+
+    // A `TEXT` and a `LONGTEXT` share a code, so the union keeps a declared
+    // type — which is the only thing saying the blob carries text. Losing it
+    // here announced the column as binary and Prisma base64'd it.
+    let described = engine
+        .describe(&session, "SELECT t FROM U UNION SELECT lt FROM U", 0)
+        .unwrap();
+    assert_eq!(format!("{:?}", described[0].ty), "Blob");
+    assert_ne!(described[0].to_wire().charset, 63, "should carry text");
 }

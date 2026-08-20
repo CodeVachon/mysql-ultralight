@@ -191,17 +191,60 @@ impl SqlType {
         }
     }
 
+    /// Whether values of this type are text rather than bytes.
+    ///
+    /// Not derivable from the type code: `TEXT` and `BLOB` are both
+    /// `MYSQL_TYPE_BLOB` and only the charset separates them. JSON travels as
+    /// bytes, which is what MySQL reports for it too.
+    pub fn is_textual(&self) -> bool {
+        matches!(self.kind, TypeKind::Text | TypeKind::Enum | TypeKind::Set)
+    }
+
     /// The MySQL type code reported in result set metadata.
+    ///
+    /// By the declared type rather than the kind, because MySQL's codes are
+    /// finer than this engine's kinds: an `INT` is `LONG` and a `BIGINT` is
+    /// `LONGLONG`, a `CHAR` is `STRING` where a `VARCHAR` is `VAR_STRING`, and
+    /// every `TEXT` is a `BLOB`. Reporting one code for a whole kind told a
+    /// typed client the wrong width for nearly every column.
+    ///
+    /// This is what the binary protocol encodes by, so the code and what the
+    /// column can hold have to agree — an `INT` may say `LONG` only because
+    /// `coerce` refuses anything four bytes cannot hold.
     pub fn column_type(&self) -> ColumnType {
         match self.kind {
             TypeKind::Bool => ColumnType::Tiny,
-            TypeKind::Int => ColumnType::LongLong,
+            TypeKind::Int => match self.base_name().as_str() {
+                "tinyint" => ColumnType::Tiny,
+                "smallint" => ColumnType::Short,
+                "mediumint" => ColumnType::Int24,
+                "bigint" => ColumnType::LongLong,
+                _ => ColumnType::Long,
+            },
+            // FLOAT stays a double: the engine holds one, and saying `FLOAT`
+            // would have the binary protocol write four bytes for it. #0048.
             TypeKind::Float => ColumnType::Double,
             TypeKind::Decimal => ColumnType::NewDecimal,
-            TypeKind::Text | TypeKind::Enum | TypeKind::Set => ColumnType::VarString,
-            TypeKind::Blob => ColumnType::Blob,
+            // A fixed-width string is `STRING`, a varying one `VAR_STRING`,
+            // and every size of TEXT is a `BLOB` — MySQL does not distinguish
+            // the text blobs from the binary ones in the type code, only in
+            // the charset.
+            TypeKind::Text => match self.base_name().as_str() {
+                "char" => ColumnType::String,
+                "tinytext" | "text" | "mediumtext" | "longtext" => ColumnType::Blob,
+                _ => ColumnType::VarString,
+            },
+            TypeKind::Enum | TypeKind::Set => ColumnType::String,
+            TypeKind::Blob => match self.base_name().as_str() {
+                "binary" => ColumnType::String,
+                "varbinary" => ColumnType::VarString,
+                _ => ColumnType::Blob,
+            },
             TypeKind::Date => ColumnType::Date,
-            TypeKind::DateTime => ColumnType::DateTime,
+            TypeKind::DateTime => match self.base_name().as_str() {
+                "timestamp" => ColumnType::Timestamp,
+                _ => ColumnType::DateTime,
+            },
             TypeKind::Time => ColumnType::Time,
             TypeKind::Year => ColumnType::Year,
             TypeKind::Json => ColumnType::Json,
@@ -251,6 +294,29 @@ impl SqlType {
         }
     }
 
+    /// The values this integer column can hold.
+    ///
+    /// MySQL sizes an integer by its declared width and refuses anything
+    /// outside it, which is not a formality here: the binary protocol encodes
+    /// by the declared type, so a `TINYINT` that had been allowed to hold 999
+    /// would reach a client as 231.
+    fn integer_range(&self) -> (i64, i64) {
+        let (signed_low, signed_high, unsigned_high) = match self.base_name().as_str() {
+            "tinyint" => (-128, 127, 255),
+            "smallint" => (-32_768, 32_767, 65_535),
+            "mediumint" => (-8_388_608, 8_388_607, 16_777_215),
+            "int" | "integer" => (-2_147_483_648, 2_147_483_647, 4_294_967_295),
+            // The engine holds an `i64`, so an UNSIGNED BIGINT above
+            // `i64::MAX` is out of reach whatever this says.
+            _ => (i64::MIN, i64::MAX, i64::MAX),
+        };
+        if self.unsigned {
+            (0, unsigned_high)
+        } else {
+            (signed_low, signed_high)
+        }
+    }
+
     pub fn coerce(&self, value: Value, column: &str) -> EngineResult<Value> {
         if value.is_null() {
             return Ok(Value::Null);
@@ -269,8 +335,32 @@ impl SqlType {
         };
 
         Ok(match self.kind {
-            TypeKind::Bool | TypeKind::Int | TypeKind::Year => {
-                Value::Int(value.as_int().ok_or_else(mismatch)?)
+            TypeKind::Bool | TypeKind::Int => {
+                let n = value.as_int().ok_or_else(mismatch)?;
+                let (low, high) = self.integer_range();
+                if n < low || n > high {
+                    return Err(EngineError::new(
+                        1264,
+                        "22003",
+                        format!("Out of range value for column '{column}' at row 1"),
+                    ));
+                }
+                Value::Int(n)
+            }
+            // A YEAR is two bytes on the wire, and MySQL's range for it is
+            // 1901 to 2155 with zero for "none". Left unchecked it was the one
+            // integer that could still outgrow the code describing it: 99999
+            // reaches a binary client as 34463.
+            TypeKind::Year => {
+                let n = value.as_int().ok_or_else(mismatch)?;
+                if n != 0 && !(1901..=2155).contains(&n) {
+                    return Err(EngineError::new(
+                        1264,
+                        "22003",
+                        format!("Out of range value for column '{column}' at row 1"),
+                    ));
+                }
+                Value::Int(n)
             }
             TypeKind::Float => Value::Float(value.as_float().ok_or_else(mismatch)?),
             // Decimals keep their text form so no precision is lost on the way

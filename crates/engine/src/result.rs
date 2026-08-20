@@ -69,9 +69,23 @@ impl OutColumn {
 
     /// The wire-protocol column definition.
     pub fn to_wire(&self) -> ColumnDef {
-        let def = ColumnDef::new(self.name.clone(), self.ty)
+        let mut def = ColumnDef::new(self.name.clone(), self.ty)
             .with_schema(self.schema.clone())
             .with_table(self.table.clone());
+        // Only a declared type knows whether a `MYSQL_TYPE_BLOB` is a `TEXT`
+        // or a `BLOB`; the code is the same and the charset is the difference.
+        // A computed column keeps whatever its type code implies, which is
+        // what it had before there was a declared type to ask.
+        if let Some(declared) = &self.declared {
+            def = def.as_text(declared.is_textual());
+            // Without this the binary protocol reads the bytes back signed, so
+            // an `INT UNSIGNED` holding three billion arrives as a negative
+            // number. It only became reachable once the column stopped being
+            // described as a `LONGLONG`, where the value still fit.
+            if declared.unsigned {
+                def = def.unsigned();
+            }
+        }
         if self.nullable {
             def.nullable()
         } else {

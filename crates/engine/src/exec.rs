@@ -956,13 +956,50 @@ impl Engine {
                 // the widening the wire type implies is the honest version of
                 // that without a type lattice.
                 for (i, column) in left.columns.iter_mut().enumerate() {
-                    let same = right
-                        .columns
-                        .get(i)
-                        .is_some_and(|r| r.declared == column.declared);
-                    if !same {
-                        column.declared = None;
+                    let Some(right) = right.columns.get(i) else {
+                        continue;
+                    };
+                    let unsigned =
+                        |c: &Option<crate::types::SqlType>| c.as_ref().is_some_and(|d| d.unsigned);
+                    // Signedness counts as a difference even when the codes
+                    // agree: an `INT` and an `INT UNSIGNED` are both `LONG`
+                    // and neither range holds the other's.
+                    if right.ty == column.ty
+                        && unsigned(&right.declared) == unsigned(&column.declared)
+                    {
+                        // Same code on both sides, so the column keeps it —
+                        // and keeps a declared type, which is the only thing
+                        // that says whether a `BLOB` carries text. Clearing it
+                        // here made `TEXT UNION LONGTEXT` a *binary* blob, the
+                        // very failure the type codes were narrowed to fix.
+                        //
+                        // The wider of the two declarations, because MySQL
+                        // takes the wider whichever side it is on: a
+                        // `VARCHAR(12) UNION VARCHAR(40)` is a `varchar(40)`
+                        // read in either order.
+                        let width = |c: &Option<crate::types::SqlType>| {
+                            c.as_ref().and_then(|d| d.length).unwrap_or(0)
+                        };
+                        if width(&right.declared) > width(&column.declared) {
+                            column.declared = right.declared.clone();
+                        }
+                        continue;
                     }
+                    // Widened, not taken from the left. The column holds
+                    // values from both branches, and the binary protocol
+                    // encodes by the declared code — so calling a
+                    // `SMALLINT UNION BIGINT` a SMALLINT would write two bytes
+                    // for an eight-byte value. MySQL aggregates the two into
+                    // the wider type and this does the same, falling back to a
+                    // string where there is no wider number, which is what it
+                    // does for `SMALLINT UNION VARCHAR`.
+                    column.ty = widen(
+                        column.ty,
+                        unsigned(&column.declared),
+                        right.ty,
+                        unsigned(&right.declared),
+                    );
+                    column.declared = None;
                 }
 
                 let all = matches!(
@@ -2716,7 +2753,16 @@ impl Engine {
             let mut generated_id = None;
             for slot in auto_increment {
                 if row[slot].is_null() {
-                    row[slot] = Value::Int(table.next_auto_increment);
+                    // Through `coerce` like any other value, because a
+                    // generated id is subject to the column's width too. The
+                    // doc on `column_type` rests on nothing outliving the
+                    // declared code, and a `TINYINT AUTO_INCREMENT` counting
+                    // past 127 would otherwise be sent as one byte and read
+                    // back negative.
+                    row[slot] = table.columns[slot].ty.coerce(
+                        Value::Int(table.next_auto_increment),
+                        &table.columns[slot].name,
+                    )?;
                     // Recorded rather than reported: an `ON DUPLICATE KEY
                     // UPDATE` that updates instead of inserting must not hand
                     // back an id for a row that does not exist. MySQL still
@@ -4403,6 +4449,80 @@ fn target_name(item: &TableWithJoins) -> EngineResult<String> {
         .unwrap_or_else(|| object_name_tail(name)))
 }
 
+/// The narrowest type that can hold what either branch of a set operation
+/// produces.
+///
+/// MySQL's own aggregation, checked against 8.3 pair by pair: two integers
+/// give the wider integer, and two of the *same* width with different
+/// signedness give the next size up, because neither can hold the other's
+/// range. A decimal anywhere among numbers gives a decimal, an approximate one
+/// gives a double, and a date beside a datetime gives a datetime. Anything
+/// else falls back to a string, which is what MySQL does for `SMALLINT UNION
+/// VARCHAR`.
+///
+/// Getting this wrong is not cosmetic: the binary protocol encodes by the
+/// declared code, so a union announced as the narrower of its two branches
+/// sends too few bytes for the other one's values.
+fn widen(a: ColumnType, a_unsigned: bool, b: ColumnType, b_unsigned: bool) -> ColumnType {
+    // Integers, in the order they can hold each other.
+    let integer = |t: ColumnType| match t {
+        ColumnType::Tiny => Some(1u8),
+        ColumnType::Short | ColumnType::Year => Some(2),
+        ColumnType::Int24 => Some(3),
+        ColumnType::Long => Some(4),
+        ColumnType::LongLong => Some(5),
+        _ => None,
+    };
+    let from_rank = |r: u8| match r {
+        1 => ColumnType::Tiny,
+        2 => ColumnType::Short,
+        3 => ColumnType::Int24,
+        4 => ColumnType::Long,
+        _ => ColumnType::LongLong,
+    };
+    let approximate = |t: ColumnType| matches!(t, ColumnType::Float | ColumnType::Double);
+    let exact = |t: ColumnType| matches!(t, ColumnType::Decimal | ColumnType::NewDecimal);
+    let temporal = |t: ColumnType| {
+        matches!(
+            t,
+            ColumnType::Date | ColumnType::Time | ColumnType::DateTime | ColumnType::Timestamp
+        )
+    };
+
+    // The integers first, because two of them can be the same code and still
+    // need widening: an `INT` and an `INT UNSIGNED` are both `LONG`, and an
+    // early "same code, same answer" return would miss exactly that.
+    if let (Some(x), Some(y)) = (integer(a), integer(b)) {
+        // Same width, different sign: neither range covers the other, so the
+        // answer is the next size that covers both.
+        if x == y && a_unsigned != b_unsigned {
+            return from_rank(x.saturating_add(1).min(5));
+        }
+        return from_rank(x.max(y));
+    }
+    if a == b {
+        return a;
+    }
+    let numeric = |t: ColumnType| integer(t).is_some() || approximate(t) || exact(t);
+    if numeric(a) && numeric(b) {
+        return if approximate(a) || approximate(b) {
+            ColumnType::Double
+        } else {
+            ColumnType::NewDecimal
+        };
+    }
+    if temporal(a) && temporal(b) {
+        return if matches!(a, ColumnType::DateTime | ColumnType::Timestamp)
+            || matches!(b, ColumnType::DateTime | ColumnType::Timestamp)
+        {
+            ColumnType::DateTime
+        } else {
+            ColumnType::VarString
+        };
+    }
+    ColumnType::VarString
+}
+
 /// MySQL refuses a join in which two sources answer to the same name, because
 /// a qualified reference could not say which one it meant. Without this check
 /// `source_index` silently resolves to the first, so a write can land on a
@@ -4986,11 +5106,24 @@ fn computed_column_type(
             let name = f.name.to_string().to_ascii_lowercase();
             match name.as_str() {
                 "count" | "row_number" | "rank" | "dense_rank" => ColumnType::LongLong,
-                // MIN and MAX keep the type of what they fold; a SUM of
-                // integers is an integer.
-                "sum" | "min" | "max" => aggregate_argument(f)
+                // MIN and MAX keep the type of what they fold, because the
+                // smallest and largest of a column are values of that column.
+                "min" | "max" => aggregate_argument(f)
                     .map(|argument| computed_column_type(&argument, refs, input))
                     .unwrap_or(ColumnType::VarString),
+                // A total is not. `SUM` over a TINYINT reaches 300, and
+                // announcing the column as one byte makes the binary protocol
+                // send one byte — the client reads 44. MySQL answers
+                // NEWDECIMAL for every exact type for exactly this reason,
+                // and DOUBLE where the argument was already approximate.
+                "sum" | "avg" => {
+                    let argument = aggregate_argument(f)
+                        .map(|argument| computed_column_type(&argument, refs, input));
+                    match argument {
+                        Some(ColumnType::Float | ColumnType::Double) => ColumnType::Double,
+                        _ => ColumnType::NewDecimal,
+                    }
+                }
                 _ => ColumnType::VarString,
             }
         }

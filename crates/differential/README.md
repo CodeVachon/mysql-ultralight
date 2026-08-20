@@ -21,6 +21,21 @@ of an argument that sounded right, and MySQL returns a string.
 The harness asks MySQL instead. Its first run found 108 divergences across 66
 statements, in eight classes, none of which anything else had noticed.
 
+## Both protocols
+
+Every case runs twice, through the text protocol and through the binary one,
+and the baseline records which. They are not the same question. The text
+protocol sends every value as a string, so a column's declared type affects
+nothing about the bytes; the binary protocol — the one a prepared statement,
+and therefore Prisma, uses — encodes *by* that type, so a column announced as
+one byte is sent as one byte whatever it holds.
+
+The harness spoke only the text protocol at first, and could not see any of it.
+Narrowing the type codes in #0038 to match MySQL exactly turned "too wide" into
+"too narrow" in five places — `SUM` over a `TINYINT` announced as one byte, an
+`UNSIGNED` column read back signed, a union of the same width and different
+signs — and the text-only harness reported nothing but progress.
+
 ## The baseline
 
 `baseline.txt` holds the divergences already known about, one per line as

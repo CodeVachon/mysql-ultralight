@@ -21,6 +21,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use answer::Answer;
+use answer::Protocol;
 use cases::GROUPS;
 use mysql::prelude::Queryable;
 use mysql::Conn;
@@ -65,7 +66,8 @@ fn main() {
         }
         for statement in group.setup {
             for (which, conn) in [("reference", &mut reference), ("engine", &mut engine)] {
-                if let Answer::Failed { code, state } = Answer::of(conn, statement) {
+                if let Answer::Failed { code, state } = Answer::of(conn, statement, Protocol::Text)
+                {
                     // Counted, not just printed. A setup that fails on *both*
                     // servers leaves every case in the group failing
                     // identically, which compares equal and reports a group
@@ -77,22 +79,31 @@ fn main() {
         }
 
         for case in group.cases {
-            compared += 1;
-            let r = Answer::of(&mut reference, case.sql);
-            let e = Answer::of(&mut engine, case.sql);
+            // Both protocols, because they are not the same question. The text
+            // one sends every value as a string, so a column's declared type
+            // changes nothing about the bytes. The binary one encodes *by*
+            // that type — a column announced as one byte is sent as one byte
+            // whatever it holds — and that is where narrowing a type code can
+            // turn 300 into 44. Asking only the first missed a whole class.
+            for protocol in [Protocol::Text, Protocol::Binary] {
+                compared += 1;
+                let r = Answer::of(&mut reference, case.sql, protocol);
+                let e = Answer::of(&mut engine, case.sql, protocol);
 
-            for d in compare::differences(&r, &e) {
-                let entry = baseline::entry(group.name, case.sql, &d.what);
-                seen.insert(entry.clone());
-                if !known.contains(&entry) {
-                    fresh.push(format!(
-                        "{}\n    {}\n    {:<22} mysql {:<26} engine {}",
-                        group.name,
-                        flat(case.sql),
-                        d.what,
-                        d.reference,
-                        d.engine
-                    ));
+                for d in compare::differences(&r, &e) {
+                    let what = format!("{} [{}]", d.what, protocol.name());
+                    let entry = baseline::entry(group.name, case.sql, &what);
+                    seen.insert(entry.clone());
+                    if !known.contains(&entry) {
+                        fresh.push(format!(
+                            "{}\n    {}\n    {:<28} mysql {:<26} engine {}",
+                            group.name,
+                            flat(case.sql),
+                            what,
+                            d.reference,
+                            d.engine
+                        ));
+                    }
                 }
             }
         }

@@ -106,3 +106,7 @@
 {"at":"2026-08-20T15:26:03Z","id":45,"by":"Christopher Vachon","as":"user","type":"created","title":"A JSON column compares as text, not as a document","state":"Todo"}
 {"at":"2026-08-20T15:42:50Z","id":46,"by":"Christopher Vachon","as":"user","type":"created","title":"JSON doubles outside a middling range are written differently","state":"Todo"}
 {"at":"2026-08-20T15:46:23Z","id":37,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-20T15:55:53Z","id":47,"by":"Christopher Vachon","as":"user","type":"created","title":"Integer columns accept values their width cannot hold","state":"Todo"}
+{"at":"2026-08-20T15:57:59Z","id":48,"by":"Christopher Vachon","as":"user","type":"created","title":"A FLOAT column keeps and prints double precision","state":"Todo"}
+{"at":"2026-08-20T16:36:46Z","id":47,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-20T16:36:46Z","id":38,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
