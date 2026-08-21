@@ -5435,6 +5435,82 @@ fn a_numeric_precision_is_reported_the_way_mysql_reports_it() {
 }
 
 #[test]
+fn information_schema_declares_its_own_columns() {
+    // These columns were typed by looking at the rows a query happened to
+    // return: all-integers meant a signed BIGINT and anything else meant a
+    // VARCHAR, so a column's type moved with the data and could never be one
+    // of the codes MySQL actually sends. Each expectation below was read off
+    // MySQL 8.3's own declaration of the column.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (id INT NOT NULL, big BIGINT UNSIGNED, s VARCHAR(9), d DATE)",
+    );
+
+    let described = engine
+        .describe(
+            &session,
+            "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, \
+                    CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, \
+                    DATETIME_PRECISION, ORDINAL_POSITION, COLUMN_KEY \
+             FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'T' ORDER BY ORDINAL_POSITION",
+            0,
+        )
+        .unwrap();
+    let shape: Vec<(String, bool, bool)> = described
+        .iter()
+        .map(|c| (format!("{:?}", c.ty), !c.nullable, c.unsigned))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            // A varchar MySQL leaves nullable, where the three catalogue names
+            // beside it are NOT NULL.
+            ("VarString".to_owned(), false, false),
+            // Text, which MySQL sends as a blob — never a VAR_STRING.
+            ("Blob".to_owned(), false, false),
+            ("Blob".to_owned(), true, false),
+            ("VarString".to_owned(), true, false),
+            // The four numerics, none of them the signed BIGINT they all were.
+            ("LongLong".to_owned(), false, false),
+            ("LongLong".to_owned(), false, true),
+            ("LongLong".to_owned(), false, true),
+            ("Long".to_owned(), false, true),
+            ("Long".to_owned(), true, true),
+            // An ENUM, which is a fixed-width STRING and not a VAR_STRING.
+            ("String".to_owned(), true, false),
+        ]
+    );
+
+    // A table the corpus does not reach, to show the spec is not just the one
+    // query: `SEQ_IN_INDEX` is what Prisma unwraps as an integer.
+    let stats = engine
+        .describe(
+            &session,
+            "SELECT TABLE_NAME, NON_UNIQUE, SEQ_IN_INDEX, INDEX_NAME \
+             FROM information_schema.statistics WHERE TABLE_SCHEMA = 'testdb'",
+            0,
+        )
+        .unwrap();
+    let codes: Vec<(String, bool)> = stats
+        .iter()
+        .map(|c| (format!("{:?}", c.ty), c.unsigned))
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            ("VarString".to_owned(), false),
+            // `int`, not the `bigint` every integer here used to be.
+            ("Long".to_owned(), false),
+            ("Long".to_owned(), true),
+            ("VarString".to_owned(), false),
+        ]
+    );
+}
+
+#[test]
 fn a_computed_column_keeps_the_unsigned_flag() {
     // A computed column had nowhere to carry the flag, so `ROW_NUMBER()` and
     // `CAST(x AS UNSIGNED)` went out signed. Measured against MySQL 8.3, and
@@ -5482,8 +5558,15 @@ fn a_computed_column_keeps_the_unsigned_flag() {
             // 1690 where this engine answers -93, and flagging the column
             // UNSIGNED would have the two protocols disagree with each other.
             // #0069.
-            "SELECT u, u+1, u*2, u+u, u DIV 2, u%2, u-1, -u, u/2, u+1.5 FROM G",
-            vec![true, true, true, true, true, true, false, false, false, false],
+            // Every operand has to be one that cannot be negative, not just
+            // the operator: `u + -100` and `u * -1` go negative exactly as
+            // `u - 100` does, and MySQL refuses all three with 1690. #0069.
+            "SELECT u, u+1, u*2, u+u, u DIV 2, u%2, u-1, u+(-100), u*(-1), \
+                    u+id, -u, u/2, u+1.5 FROM G",
+            vec![
+                true, true, true, true, true, true, false, false, false, false, false, false,
+                false,
+            ],
         ),
         // MIN and MAX answer one of the rows they folded; SUM and AVG widen
         // past the column and come back signed.
@@ -5549,6 +5632,19 @@ fn a_computed_column_keeps_the_unsigned_flag() {
             "SELECT CAST(s AS DOUBLE), CAST(s AS DECIMAL), CAST(s AS SIGNED) FROM C"
         ),
         vec![vec!["0", "0", "0"]]
+    );
+    // A decimal keeps its text only where the text really is one. Testing
+    // whether it parses as a float also takes `inf` and `1e3` and hands them
+    // straight back under a NEWDECIMAL, which is not a decimal any client can
+    // read; MySQL answers 0 and 1000.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('inf' AS DECIMAL), CAST('1e3' AS DECIMAL), \
+                    CAST('nan' AS DECIMAL), CAST('-2.5' AS DECIMAL)"
+        ),
+        vec![vec!["0", "1000", "0", "-2.5"]]
     );
 
     // A union is unsigned only if both branches are, in either order — the

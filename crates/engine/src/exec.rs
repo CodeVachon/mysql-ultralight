@@ -5205,6 +5205,23 @@ fn numeric_cast(data_type: &sqlparser::ast::DataType) -> bool {
     )
 }
 
+/// Whether an operand can be shown not to be negative.
+///
+/// Unsigned answers itself, and so does a literal that is written without a
+/// sign. Anything else — a signed column, a subtraction, a call — is unknown
+/// and therefore assumed able to go below zero, which is the direction that
+/// keeps a wrong flag off the wire.
+fn never_negative(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]) -> bool {
+    match e {
+        Expr::Nested(inner) => never_negative(inner, refs, input),
+        Expr::Value(v) => match &v.value {
+            sqlparser::ast::Value::Number(text, _) => !text.starts_with('-'),
+            _ => false,
+        },
+        other => unsigned_answer(other, refs, input),
+    }
+}
+
 /// Whether an expression's values are unsigned on the wire.
 ///
 /// Measured against MySQL 8.3, and the families do not agree with each other:
@@ -5231,16 +5248,21 @@ fn unsigned_answer(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelCo
         }
         Expr::BinaryOp { left, op, right } => {
             use sqlparser::ast::BinaryOperator as B;
-            // `Minus` is deliberately absent. MySQL calls `u - 1` unsigned
-            // and *refuses* `u - 100` with 1690 rather than answering; this
-            // engine holds an i64 and answers -93, so flagging the column
-            // UNSIGNED would have the two protocols disagree with each other —
-            // the text one sending -93 and the binary one the same bytes for a
-            // client that reads 18446744073709551523. Under-reporting the flag
-            // is the safe half of a case neither answer gets right. See #0069.
+            // Only where the answer cannot come out negative. MySQL calls
+            // `u - 1` unsigned and *refuses* `u - 100` with 1690 rather than
+            // answering; this engine holds an i64 and answers -93, so a column
+            // flagged UNSIGNED would have the two protocols disagree with each
+            // other — the text one sending -93 and the binary one the same
+            // bytes for a client that reads 18446744073709551523. `u + -100`
+            // and `u * -1` do the same thing, so it is not enough to leave out
+            // subtraction: every operand has to be one that cannot be
+            // negative. See #0069.
             matches!(op, B::Plus | B::Multiply | B::Modulo | B::MyIntegerDivide)
                 && integral(e)
                 && (recur(left) || recur(right))
+                && [left, right]
+                    .iter()
+                    .all(|side| never_negative(side, refs, input))
         }
         // `CEIL` and `FLOOR` arrive as their own nodes rather than as calls.
         Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => recur(expr),

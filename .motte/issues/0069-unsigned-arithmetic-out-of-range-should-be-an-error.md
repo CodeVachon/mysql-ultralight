@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [executor]
 created: 2026-08-21T14:04:47Z
-updated: 2026-08-21T14:04:47Z
+updated: 2026-08-21T15:12:48Z
 ---
 
 ## Description
@@ -21,3 +21,9 @@ Found by review during #0064. The engine holds an i64 and answers, which is why 
 The same applies to a sum or a product that wraps, which crates/engine/src/expr.rs does deliberately with wrapping_add and wrapping_mul.
 
 Doing this properly needs the evaluator to know an operand is unsigned, which it does not: arithmetic sees only Values and the sign lives on the column. The same shape as #0054 and #0068. Once it lands, `Minus` belongs back in the list in `unsigned_answer`.
+
+## Notes
+
+### 2026-08-21T15:12:48Z — Christopher Vachon (user)
+
+Wider than subtraction: iu + -100 and iu * -1 raise 1690 in MySQL just as iu - 100 does, so unsigned_answer requires every operand to be provably non-negative rather than just excluding Minus. Once this lands, that whole guard comes off.

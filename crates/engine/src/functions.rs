@@ -922,7 +922,18 @@ pub fn cast(value: Value, ty: &DataType) -> EngineResult<Value> {
         // handing back `abc` contradicted the NOT NULL this is described with.
         D::Decimal(_) | D::Numeric(_) | D::Dec(_) => {
             let text = value.as_text();
-            if text.trim().parse::<f64>().is_ok() {
+            // Digits and an optional point, which is what a decimal is. A
+            // parse as a float would also take `inf` and `1e3` and hand them
+            // back untouched under a NEWDECIMAL, where MySQL answers 0 and
+            // 1000 — neither of them something a client can read as a decimal.
+            let plain = {
+                let digits = text.trim().strip_prefix(['-', '+']).unwrap_or(text.trim());
+                !digits.is_empty()
+                    && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
+                    && digits.chars().filter(|c| *c == '.').count() <= 1
+                    && digits.chars().any(|c| c.is_ascii_digit())
+            };
+            if plain {
                 Value::Text(text)
             } else {
                 Value::Text(Value::Float(value.as_number()).as_text())

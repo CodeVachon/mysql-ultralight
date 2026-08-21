@@ -73,7 +73,14 @@ impl OutColumn {
     pub fn sql_type(&self) -> SqlType {
         self.declared.clone().unwrap_or_else(|| {
             let mut widened = SqlType::from_column_type(self.ty);
-            widened.unsigned = self.unsigned;
+            if self.unsigned {
+                widened.unsigned = true;
+                // The spelling too, not only the flag: `declared` *is*
+                // `COLUMN_TYPE`, so a view built from this reported a `bigint`
+                // whose precision was the unsigned one, and Prisma reads that
+                // column to decide whether a field is unsigned.
+                widened.declared.push_str(" unsigned");
+            }
             widened
         })
     }

@@ -94,42 +94,297 @@ pub fn table(catalog: &Catalog, session: &Session, name: &str) -> EngineResult<T
     })
 }
 
-/// A table of all-text columns with the given names.
+/// One `information_schema` table, with each column declared the way MySQL
+/// declares it where [`COLUMN_SPEC`] records that.
 fn build(name: &str, headers: &[&str], rows: Vec<Vec<Value>>) -> Table {
     let mut table = Table::new(name);
     table.columns = headers
         .iter()
         .enumerate()
         .map(|(i, header)| {
-            // Typed from the data rather than declared text for everything.
+            // Declared as MySQL declares it, where that has been measured.
             // These columns are read by tools, not people: Prisma's schema
             // describer asks `information_schema.statistics` for
             // `seq_in_index` and unwraps it as an integer, so handing back the
             // string "1" crashes `prisma db pull` and `prisma migrate dev`.
-            let numeric = rows
-                .iter()
-                .filter_map(|row| row.get(i))
-                .filter(|value| !value.is_null())
-                .all(|value| matches!(value, Value::Int(_)));
-            let has_values = rows
-                .iter()
-                .filter_map(|row| row.get(i))
-                .any(|value| !value.is_null());
+            let (ty, not_null) = match specified(name, header) {
+                Some(found) => found,
+                // Inference for anything not measured: a column whose values
+                // are all integers is an integer. It is what every column used
+                // to get, and it makes a column's type depend on the rows a
+                // particular query happened to select.
+                None => {
+                    let numeric = rows
+                        .iter()
+                        .filter_map(|row| row.get(i))
+                        .filter(|value| !value.is_null())
+                        .all(|value| matches!(value, Value::Int(_)));
+                    let has_values = rows
+                        .iter()
+                        .filter_map(|row| row.get(i))
+                        .any(|value| !value.is_null());
+                    let inferred = if numeric && has_values {
+                        integer_type()
+                    } else {
+                        text_type()
+                    };
+                    (inferred, false)
+                }
+            };
 
-            let mut column = Column::new(
-                *header,
-                if numeric && has_values {
-                    integer_type()
-                } else {
-                    text_type()
-                },
-            );
+            let mut column = Column::new(*header, ty);
+            column.nullable = !not_null;
             column.position = i + 1;
             column
         })
         .collect();
     table.rows = rows;
     table
+}
+
+/// How MySQL describes each `information_schema` column on the wire.
+///
+type ColumnSpec = (&'static str, &'static str, bool);
+
+/// One `information_schema` table and the columns this engine serves from it.
+type TableSpec = (&'static str, &'static [ColumnSpec]);
+
+/// Taken from what MySQL 8.3 declares its own columns as, rather than inferred
+/// from the rows — which is what this used to do. Inference is wrong twice
+/// over: it calls a column an integer because the rows a particular query
+/// happened to select are integers, so the type moves with the data, and it can
+/// only ever produce the two types it knows. `NUMERIC_PRECISION` is a
+/// `bigint unsigned` where every integer here was a signed one, and
+/// `COLUMN_TYPE` is text that MySQL sends as a blob.
+///
+/// MySQL does not answer this consistently itself, so exact agreement is not
+/// available: reading `information_schema` narrows a column to the smallest
+/// type its rows need, and materialising the result — which `ORDER BY
+/// ORDINAL_POSITION` forces, and which every introspection query does — falls
+/// back to the declared one. `NUMERIC_PRECISION` is a `LONG` under a plain
+/// scan and a `LONGLONG` under that `ORDER BY`. The declared type is what a
+/// describing tool sees, so it is what is recorded here; the two text columns
+/// that narrow even when materialised are spelled as they arrive.
+///
+/// The spelling carries the sign, as a declared type does everywhere else, and
+/// the flag is NOT NULL. Only the columns this engine actually serves are
+/// here; a name absent from the table falls back to inference rather than
+/// being invented.
+/// One column: its name, the type MySQL declares it with, and whether MySQL
+/// marks it NOT NULL.
+const COLUMN_SPEC: &[TableSpec] = &[
+    (
+        "CHARACTER_SETS",
+        &[
+            ("CHARACTER_SET_NAME", "varchar(64)", true),
+            ("DEFAULT_COLLATE_NAME", "varchar(64)", true),
+            ("DESCRIPTION", "varchar(2048)", true),
+            ("MAXLEN", "int unsigned", true),
+        ],
+    ),
+    (
+        "COLLATIONS",
+        &[
+            ("COLLATION_NAME", "varchar(64)", true),
+            ("CHARACTER_SET_NAME", "varchar(64)", true),
+            ("ID", "bigint unsigned", true),
+            ("IS_DEFAULT", "varchar(3)", true),
+            ("IS_COMPILED", "varchar(3)", true),
+            ("SORTLEN", "int unsigned", true),
+        ],
+    ),
+    (
+        "COLUMNS",
+        &[
+            ("TABLE_CATALOG", "varchar(64)", true),
+            ("TABLE_SCHEMA", "varchar(64)", true),
+            ("TABLE_NAME", "varchar(64)", true),
+            ("COLUMN_NAME", "varchar(64)", false),
+            ("ORDINAL_POSITION", "int unsigned", true),
+            ("COLUMN_DEFAULT", "text", false),
+            ("IS_NULLABLE", "varchar(3)", true),
+            ("DATA_TYPE", "text", false),
+            ("CHARACTER_MAXIMUM_LENGTH", "bigint", false),
+            ("NUMERIC_PRECISION", "bigint unsigned", false),
+            ("NUMERIC_SCALE", "bigint unsigned", false),
+            ("DATETIME_PRECISION", "int unsigned", false),
+            ("COLUMN_TYPE", "text", true),
+            ("COLUMN_KEY", "char(3)", true),
+            ("EXTRA", "varchar(256)", false),
+            ("COLLATION_NAME", "varchar(64)", false),
+            ("COLUMN_COMMENT", "text", true),
+        ],
+    ),
+    (
+        "ENGINES",
+        &[
+            ("ENGINE", "varchar(64)", true),
+            ("SUPPORT", "varchar(8)", true),
+            ("COMMENT", "varchar(80)", true),
+            ("TRANSACTIONS", "varchar(3)", false),
+            ("XA", "varchar(3)", false),
+            ("SAVEPOINTS", "varchar(3)", false),
+        ],
+    ),
+    (
+        "KEY_COLUMN_USAGE",
+        &[
+            ("CONSTRAINT_CATALOG", "varchar(64)", true),
+            ("CONSTRAINT_SCHEMA", "varchar(64)", true),
+            ("CONSTRAINT_NAME", "varchar(64)", false),
+            ("TABLE_SCHEMA", "varchar(64)", true),
+            ("TABLE_NAME", "varchar(64)", true),
+            ("COLUMN_NAME", "varchar(64)", false),
+            ("ORDINAL_POSITION", "int unsigned", true),
+            ("POSITION_IN_UNIQUE_CONSTRAINT", "int unsigned", false),
+            ("REFERENCED_TABLE_SCHEMA", "varchar(64)", false),
+            ("REFERENCED_TABLE_NAME", "varchar(64)", false),
+            ("REFERENCED_COLUMN_NAME", "varchar(64)", false),
+        ],
+    ),
+    (
+        "PROCESSLIST",
+        &[
+            ("ID", "bigint unsigned", true),
+            ("USER", "varchar(32)", true),
+            ("HOST", "varchar(261)", true),
+            ("DB", "varchar(64)", false),
+            ("COMMAND", "varchar(16)", true),
+            ("TIME", "int", true),
+            ("STATE", "varchar(64)", false),
+            ("INFO", "varchar(65535)", false),
+        ],
+    ),
+    (
+        "REFERENTIAL_CONSTRAINTS",
+        &[
+            ("CONSTRAINT_CATALOG", "varchar(64)", true),
+            ("CONSTRAINT_SCHEMA", "varchar(64)", true),
+            ("CONSTRAINT_NAME", "varchar(64)", false),
+            ("UNIQUE_CONSTRAINT_CATALOG", "varchar(64)", true),
+            ("UNIQUE_CONSTRAINT_SCHEMA", "varchar(64)", true),
+            ("UNIQUE_CONSTRAINT_NAME", "varchar(64)", false),
+            ("MATCH_OPTION", "char(7)", true),
+            ("UPDATE_RULE", "char(11)", true),
+            ("DELETE_RULE", "char(11)", true),
+            ("TABLE_NAME", "varchar(64)", true),
+            ("REFERENCED_TABLE_NAME", "varchar(64)", true),
+        ],
+    ),
+    (
+        "SCHEMATA",
+        &[
+            ("CATALOG_NAME", "varchar(64)", true),
+            ("SCHEMA_NAME", "varchar(64)", true),
+            ("DEFAULT_CHARACTER_SET_NAME", "varchar(64)", true),
+            ("DEFAULT_COLLATION_NAME", "varchar(64)", true),
+            ("SQL_PATH", "binary(0)", false),
+        ],
+    ),
+    (
+        "STATISTICS",
+        &[
+            ("TABLE_CATALOG", "varchar(64)", true),
+            ("TABLE_SCHEMA", "varchar(64)", true),
+            ("TABLE_NAME", "varchar(64)", true),
+            ("NON_UNIQUE", "int", true),
+            ("INDEX_SCHEMA", "varchar(64)", true),
+            ("INDEX_NAME", "varchar(64)", false),
+            ("SEQ_IN_INDEX", "int unsigned", true),
+            ("COLUMN_NAME", "varchar(64)", false),
+            ("COLLATION", "varchar(1)", false),
+            ("CARDINALITY", "bigint", false),
+            ("SUB_PART", "bigint", false),
+            ("INDEX_TYPE", "varchar(11)", true),
+        ],
+    ),
+    (
+        "TABLES",
+        &[
+            ("TABLE_CATALOG", "varchar(64)", true),
+            ("TABLE_SCHEMA", "varchar(64)", true),
+            ("TABLE_NAME", "varchar(64)", true),
+            ("TABLE_TYPE", "char(11)", true),
+            ("ENGINE", "varchar(64)", false),
+            ("VERSION", "int", false),
+            ("ROW_FORMAT", "char(10)", false),
+            ("TABLE_ROWS", "bigint unsigned", false),
+            ("TABLE_COLLATION", "varchar(64)", false),
+            ("TABLE_COMMENT", "text", false),
+            ("CREATE_OPTIONS", "varchar(256)", false),
+        ],
+    ),
+    (
+        "TABLE_CONSTRAINTS",
+        &[
+            ("CONSTRAINT_CATALOG", "varchar(64)", true),
+            ("CONSTRAINT_SCHEMA", "varchar(64)", true),
+            ("CONSTRAINT_NAME", "varchar(64)", false),
+            ("TABLE_SCHEMA", "varchar(64)", true),
+            ("TABLE_NAME", "varchar(64)", true),
+            ("CONSTRAINT_TYPE", "varchar(11)", true),
+            ("ENFORCED", "varchar(3)", true),
+        ],
+    ),
+    (
+        "VIEWS",
+        &[
+            ("TABLE_CATALOG", "varchar(64)", true),
+            ("TABLE_SCHEMA", "varchar(64)", true),
+            ("TABLE_NAME", "varchar(64)", true),
+            ("VIEW_DEFINITION", "longtext", false),
+            ("CHECK_OPTION", "char(8)", false),
+            ("IS_UPDATABLE", "char(3)", false),
+            ("DEFINER", "varchar(288)", false),
+            ("SECURITY_TYPE", "varchar(7)", false),
+            ("CHARACTER_SET_CLIENT", "varchar(64)", true),
+            ("COLLATION_CONNECTION", "varchar(64)", true),
+        ],
+    ),
+];
+
+/// The declared type and nullability MySQL gives one `information_schema`
+/// column, if this is one it describes.
+fn specified(table: &str, column: &str) -> Option<(SqlType, bool)> {
+    let columns = COLUMN_SPEC
+        .iter()
+        .find(|(name, _)| *name == table)
+        .map(|(_, columns)| *columns)?;
+    let (_, spelling, not_null) = columns.iter().find(|(name, ..)| *name == column)?;
+    Some((spec_type(spelling)?, *not_null))
+}
+
+/// A declared type from the spelling the spec writes it as.
+///
+/// The same spellings a `CREATE TABLE` would use, so `SqlType` reports them the
+/// way it reports any other column — including `int unsigned`, which is the
+/// form `COLUMN_TYPE` itself uses.
+fn spec_type(spelling: &str) -> Option<SqlType> {
+    let (base, unsigned) = match spelling.strip_suffix(" unsigned") {
+        Some(base) => (base, true),
+        None => (spelling, false),
+    };
+    let (name, length) = match base.split_once('(') {
+        Some((name, rest)) => (name, rest.trim_end_matches(')').parse().ok()),
+        None => (base, None),
+    };
+    let kind = match name {
+        "int" | "bigint" => TypeKind::Int,
+        "varchar" | "char" | "text" | "longtext" | "mediumtext" => TypeKind::Text,
+        // `SCHEMATA.SQL_PATH`, which MySQL declares `binary(0)` and always
+        // answers NULL for.
+        "binary" => TypeKind::Blob,
+        "timestamp" | "datetime" => TypeKind::DateTime,
+        _ => return None,
+    };
+    Some(SqlType {
+        kind,
+        declared: spelling.to_owned(),
+        length,
+        scale: None,
+        unsigned,
+        variants: Vec::new(),
+    })
 }
 
 fn integer_type() -> SqlType {
@@ -869,4 +1124,26 @@ fn processlist(session: &Session) -> Table {
             Value::Null,
         ]],
     )
+}
+
+#[cfg(test)]
+mod spec_tests {
+    use super::{spec_type, COLUMN_SPEC};
+
+    /// Every spelling in the table has to parse.
+    ///
+    /// `specified` falls back to inference when one does not, which is silent:
+    /// a typo would put that column back on the type-from-the-rows guessing
+    /// this table exists to replace, and nothing would report it.
+    #[test]
+    fn every_spelling_is_understood() {
+        for (table, columns) in COLUMN_SPEC {
+            for (column, spelling, _) in *columns {
+                assert!(
+                    spec_type(spelling).is_some(),
+                    "{table}.{column} is spelled `{spelling}`, which spec_type does not read"
+                );
+            }
+        }
+    }
 }
