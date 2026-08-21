@@ -328,9 +328,13 @@ pub const GROUPS: &[Group] = &[
             // above store a JSON null. Exempting the function wholesale sent
             // the NULL to the path parser and failed with 3143.
             same("SELECT JSON_SET('{\"a\":1}', NULL, 2), JSON_ARRAY_APPEND('[1]', NULL, 2)"),
-            // A function this engine does not implement has to say so, even
-            // when the rule above would otherwise answer for it.
             same("SELECT SOUNDEX(NULL)"),
+            // That a function this engine does not implement *says so* rather
+            // than answering NULL is checked in `crates/engine/tests/sql.rs`
+            // and not here: MySQL implements it, so a case for one could only
+            // ever be a divergence. This line read `SOUNDEX(NULL)` for that
+            // purpose until soundex was implemented, at which point it stopped
+            // asking anything — it is kept for the NULL rule itself.
         ],
     },
     Group {
@@ -342,6 +346,11 @@ pub const GROUPS: &[Group] = &[
         cases: &[
             same("SELECT CONCAT(t, '!'), UPPER(t), LOWER(t), LENGTH(t) FROM S ORDER BY id"),
             same("SELECT TRIM(t), SUBSTRING(t, 2, 3), REPLACE(t, 'l', 'L') FROM S ORDER BY id"),
+            // Where MySQL's Soundex parts company with the description of it:
+            // a vowel does not break a run, the first letter seeds that run,
+            // and the answer is not truncated to four.
+            same("SELECT SOUNDEX('Tymczak'), SOUNDEX('Pfister'), SOUNDEX('Ashcraft')"),
+            same("SELECT SOUNDEX('Robert'), SOUNDEX('Bhbb'), SOUNDEX(''), SOUNDEX(123)"),
             same("SELECT COALESCE(t, 'none'), IFNULL(n, 0), NULLIF(n, 5) FROM S ORDER BY id"),
             same("SELECT ROUND(n / 3, 2), ABS(n), n DIV 2, n % 3 FROM S ORDER BY id"),
             same("SELECT t LIKE 'H%', t REGEXP '^H', t IS NULL FROM S ORDER BY id"),

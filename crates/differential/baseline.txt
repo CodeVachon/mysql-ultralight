@@ -6,5 +6,3 @@
 # harness fails if a line here no longer differs so the file cannot
 # quietly describe a state that has passed.
 
-null propagates through functions :: SELECT SOUNDEX(NULL) :: outcome [binary]
-null propagates through functions :: SELECT SOUNDEX(NULL) :: outcome [text]

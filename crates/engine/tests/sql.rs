@@ -5435,6 +5435,78 @@ fn a_numeric_precision_is_reported_the_way_mysql_reports_it() {
 }
 
 #[test]
+fn soundex_answers_what_mysql_answers() {
+    // The classic algorithm, with three of its own answers to the places the
+    // variants disagree — each measured on 8.3 rather than taken from a
+    // description of Soundex.
+    let (engine, mut session) = engine();
+
+    for (sql, expected) in [
+        ("SELECT SOUNDEX('Robert')", "R163"),
+        ("SELECT SOUNDEX('Rupert')", "R163"),
+        // Not truncated to four. This is where most descriptions stop.
+        ("SELECT SOUNDEX('Ashcraft')", "A2613"),
+        ("SELECT SOUNDEX('Washington')", "W25235"),
+        // A vowel does not break a run: the K still reads as a repeat of the
+        // Z across the A between them, so this is T520 and not T522.
+        ("SELECT SOUNDEX('Tymczak')", "T520"),
+        // The first letter seeds that run, so the F is swallowed by the P.
+        ("SELECT SOUNDEX('Pfister')", "P236"),
+        ("SELECT SOUNDEX('Honeyman')", "H500"),
+        ("SELECT SOUNDEX('Smith')", "S530"),
+        ("SELECT SOUNDEX('Smythe')", "S530"),
+        ("SELECT SOUNDEX('Tomorrow')", "T560"),
+        ("SELECT SOUNDEX('Lukasiewicz')", "L200"),
+        ("SELECT SOUNDEX('bcdl')", "B234"),
+        // H, W and Y behave like vowels — none of these gets past its B.
+        ("SELECT SOUNDEX('Bhbb')", "B000"),
+        ("SELECT SOUNDEX('Bwb')", "B000"),
+        // Case is folded and everything that is not a letter is skipped,
+        // including before the first one.
+        ("SELECT SOUNDEX('robert')", "R163"),
+        ("SELECT SOUNDEX('  $$ Robert 99')", "R163"),
+        ("SELECT SOUNDEX('9abc')", "A120"),
+        // A letter outside ASCII counts as a letter and codes as zero.
+        ("SELECT SOUNDEX('café')", "C100"),
+        // Padded only when short, and the first letter stands even when its
+        // own code is zero.
+        ("SELECT SOUNDEX('a')", "A000"),
+        ("SELECT SOUNDEX('h')", "H000"),
+        // Nothing to work with gives the empty string, not NULL.
+        ("SELECT SOUNDEX('')", ""),
+        ("SELECT SOUNDEX('   ')", ""),
+        ("SELECT SOUNDEX('123')", ""),
+        // NULL is the one thing that gives NULL.
+        ("SELECT SOUNDEX(NULL)", "NULL"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // These two are *not* MySQL's answers. They pin a deliberate
+    // approximation, which is why they are kept apart from the measurements
+    // above. MySQL's letter test is a range rather than a Unicode property —
+    // ASCII, or a byte at or above 0xC0 — and it applies it to *bytes*, so
+    // `SOUNDEX('µabc')` there is the lead byte 0xC2 followed by `120`, which
+    // is not a string a client can read. This applies the same threshold to
+    // whole characters, so `µ` is not a letter and the `A` becomes the first.
+    // #0074 has the measurements.
+    for (sql, approximated) in [
+        ("SELECT SOUNDEX('µabc')", "A120"),
+        ("SELECT SOUNDEX('ªabc')", "A120"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![approximated]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn a_json_double_is_written_the_way_mysql_writes_one() {
     // Three formatters disagree here and only one is MySQL's. serde switches
     // to exponent form earlier than MySQL and writes the sign — `1e+30` where
@@ -8536,9 +8608,12 @@ fn a_null_argument_makes_the_answer_null() {
     // on the NULL before recognising the name let `SELECT NOT_A_FUNCTION(NULL)`
     // answer, and a query over an all-NULL column would then succeed until the
     // day one row had a value in it.
+    // The two real ones have to stay unimplemented for this to mean anything:
+    // it read `SOUNDEX` until soundex was implemented, and then failed for
+    // being out of date rather than for finding something.
     for sql in [
         "SELECT NOT_A_FUNCTION(NULL)",
-        "SELECT SOUNDEX(NULL)",
+        "SELECT SHA1(NULL)",
         "SELECT FROM_UNIXTIME(NULL)",
     ] {
         let err = engine.execute(&mut session, sql, &[]).unwrap_err();

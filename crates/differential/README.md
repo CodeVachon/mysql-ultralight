@@ -50,17 +50,23 @@ Two things fail a run:
 - a line in the baseline that **no longer differs** — the file is describing a
   state that has passed, and a stale claim is worse than none
 
-So the file only ever shrinks, and it shrinks by fixing things. Each line is
-covered by an issue under [#0009](../../.motte/issues), and the whole file is
-accounted for — 2 lines at the last audit, across 240 statements:
+So the file only ever shrinks, and it shrinks by fixing things.
 
-| Lines | Issue |
-|---|---|
-| 2 | #0066 SOUNDEX unsupported |
+**It is empty.** All 244 statements answer exactly as MySQL 8.3 answers them,
+in both protocols — the rows, the column names, the type codes, and the
+nullability and signedness flags. It started at 108 divergences across 66
+statements.
 
-Worth re-deriving rather than trusting after a run that fixes anything: five of
-those issues were written only once the file was counted against the issue list,
-because the harness reports what is *new*, never what is unclaimed.
+That is a statement about the corpus, not about the engine: it means every
+question this file knows how to ask now gets MySQL's answer. The way to find
+the next divergence is to add a case, which is why the file below is worth
+more than the count above.
+
+While the file has lines in it, each is covered by an issue under
+[#0009](../../.motte/issues), and the count is worth re-deriving rather than
+trusting after a run that fixes anything — five of those issues were written
+only once the file was counted against the issue list, because the harness
+reports what is *new* and never what is unclaimed.
 
 ## Writing a case
 

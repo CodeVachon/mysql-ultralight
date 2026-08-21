@@ -149,3 +149,5 @@
 {"at":"2026-08-21T18:07:21Z","id":46,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-21T18:23:38Z","id":72,"by":"Christopher Vachon","as":"user","type":"created","title":"serde and MySQL round a JSON literal tie differently","state":"Todo"}
 {"at":"2026-08-21T18:26:27Z","id":73,"by":"Christopher Vachon","as":"user","type":"created","title":"An all-NULL union is typed two ways by MySQL","state":"Todo"}
+{"at":"2026-08-21T18:43:39Z","id":66,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-21T18:55:46Z","id":74,"by":"Christopher Vachon","as":"user","type":"created","title":"SOUNDEX of non-ASCII text works on bytes in MySQL","state":"Todo"}

@@ -133,6 +133,7 @@ const KNOWN: &[&str] = &[
     "schema",
     "second",
     "session_user",
+    "soundex",
     "space",
     "st_distance_sphere",
     "substr",
@@ -150,7 +151,71 @@ const KNOWN: &[&str] = &[
     "year",
 ];
 
-/// Dispatches a scalar function call.
+/// MySQL's SOUNDEX, which is the classic algorithm with three of its own
+/// answers to the places the variants disagree.
+///
+/// Measured against 8.3 rather than taken from a description of Soundex:
+///
+/// - A vowel does *not* break a run of one code. `TYMCZAK` is `T520` and not
+///   `T522`, because the `K` is still reading as a repeat of the `Z` across
+///   the `A` between them. `H`, `W` and `Y` behave the same way.
+/// - The first letter seeds that run, so a second letter sharing its code is
+///   dropped: `PFISTER` is `P236`, the `F` swallowed by the `P`.
+/// - The result is *not* truncated to four. `ASHCRAFT` is `A2613` and
+///   `WASHINGTON` is `W25235`. Only a short one is padded.
+///
+/// A string with no letter in it gives the empty string, not NULL — NULL is
+/// only for a NULL argument, which is answered before this is reached.
+fn soundex(text: &str) -> String {
+    // Zero for a vowel and for the letters that behave like one, and for any
+    // letter outside ASCII: `CAFÉ` is `C100`, the accent contributing nothing
+    // while still being a letter.
+    let code = |c: char| match c.to_ascii_uppercase() {
+        'B' | 'F' | 'P' | 'V' => b'1',
+        'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => b'2',
+        'D' | 'T' => b'3',
+        'L' => b'4',
+        'M' | 'N' => b'5',
+        'R' => b'6',
+        _ => b'0',
+    };
+
+    // MySQL's letter test is a range and not a Unicode property: ASCII, or a
+    // codepoint at or above U+00C0. `µ` and `ª` are alphabetic to Rust and not
+    // to MySQL, and `×` is the reverse.
+    //
+    // Only an approximation past ASCII, because MySQL runs this over *bytes*:
+    // it reads the lead byte of a multi-byte character, finds it above 0xC0,
+    // and emits that byte alone as the first character of the answer —
+    // `SOUNDEX('€abc')` is 0xE2 followed by `120`, which is not a string at
+    // all. This reads whole characters, so `é` stays `é`. See #0074.
+    let mut letters = text
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic() || (*c as u32) >= 0xC0);
+    let Some(first) = letters.next() else {
+        return String::new();
+    };
+
+    let mut out = String::new();
+    out.push(first.to_ascii_uppercase());
+    let mut last = code(first);
+    for c in letters {
+        let this = code(c);
+        if this == b'0' {
+            // A zero neither writes nor resets: the run carries across it.
+            continue;
+        }
+        if this != last {
+            out.push(this as char);
+        }
+        last = this;
+    }
+    while out.chars().count() < 4 {
+        out.push('0');
+    }
+    out
+}
+
 /// A value with no fractional part, as an integer where one will hold it.
 ///
 /// Not a bare `as i64`: that cast saturates in Rust, so `FLOOR(1e30)` answered
@@ -165,6 +230,7 @@ fn whole(n: f64) -> Value {
     }
 }
 
+/// Dispatches a scalar function call.
 pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Value> {
     let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
     let text = |i: usize| arg(i).as_text();
@@ -737,6 +803,7 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         "mod" => {
             crate::expr::arithmetic(&sqlparser::ast::BinaryOperator::Modulo, &arg(0), &arg(1))?
         }
+        "soundex" => Value::text(soundex(&text(0))),
         // Toward zero at the given number of places, which may be negative:
         // `TRUNCATE(15.6, -1)` is 10. Not rounding — `TRUNCATE(1.567, 1)` is
         // 1.5 where `ROUND` would say 1.6.
@@ -1223,10 +1290,20 @@ mod known_names {
     /// The reason `KNOWN` exists: a function the engine does not implement has
     /// to say so, even when its argument is NULL and the rule would otherwise
     /// answer for it.
+    ///
+    /// `sha1` is a real MySQL function this engine has not got, which is the
+    /// case that matters — a made-up name would pass whatever the rule did.
+    /// It has to stay one that is absent: this read `soundex` until soundex
+    /// was implemented, and then the test failed for being out of date rather
+    /// than for finding anything. Any name missing from `KNOWN` will do.
     #[test]
     fn an_unknown_function_still_errors_on_a_null_argument() {
         let session = Session::new(crate::session::ServerConfig::default(), 1);
-        for name in ["not_a_function", "soundex"] {
+        for name in ["not_a_function", "sha1"] {
+            assert!(
+                KNOWN.binary_search(&name).is_err(),
+                "{name} is implemented now; pick another absent one"
+            );
             let err = call(name, vec![Value::Null], &session).unwrap_err();
             assert_eq!(err.code, 1235, "{name}");
         }
