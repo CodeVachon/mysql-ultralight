@@ -87,6 +87,9 @@ pub fn literal(value: &Value) -> String {
     match value {
         Value::Null => "NULL".to_owned(),
         Value::Int(v) => v.to_string(),
+        // Unquoted, so it re-parses as the number it is rather than as the
+        // characters that spell it.
+        Value::Decimal(v) => v.clone(),
         Value::Float(v) => {
             // A bare `inf` or `nan` would not re-parse.
             if v.is_finite() {

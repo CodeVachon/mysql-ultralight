@@ -2582,6 +2582,10 @@ impl Engine {
                     Value::Null
                 } else if present.iter().all(|v| matches!(v, Value::Int(_))) {
                     Value::Int(present.iter().filter_map(|v| v.as_int()).sum())
+                } else if let Some((total, scale)) = exact_total(&present) {
+                    // A total keeps the scale it added up, so `SUM` over a
+                    // `DECIMAL(10,2)` is a `DECIMAL(_,2)` — `4.00`, not `4`.
+                    Value::Decimal(crate::decimal::render(total, scale))
                 } else {
                     Value::Float(present.iter().filter_map(|v| v.as_float()).sum())
                 }
@@ -2589,6 +2593,23 @@ impl Engine {
             "avg" => {
                 if present.is_empty() {
                     Value::Null
+                } else if let Some((total, scale)) = exact_total(&present) {
+                    // An average gains four digits over what it averaged,
+                    // which is MySQL's `div_precision_increment`: `AVG` of an
+                    // integer column is a `DECIMAL(_,4)` and of a
+                    // `DECIMAL(_,2)` a `DECIMAL(_,6)`.
+                    let scale = scale + crate::decimal::AVERAGE_EXTRA_SCALE;
+                    let widened = 10i128.pow(crate::decimal::AVERAGE_EXTRA_SCALE as u32);
+                    match total
+                        .checked_mul(widened)
+                        .and_then(|n| crate::decimal::divide(n, present.len() as i128))
+                    {
+                        Some(mean) => Value::Decimal(crate::decimal::render(mean, scale)),
+                        None => Value::Float(
+                            present.iter().filter_map(|v| v.as_float()).sum::<f64>()
+                                / present.len() as f64,
+                        ),
+                    }
                 } else {
                     let total: f64 = present.iter().filter_map(|v| v.as_float()).sum();
                     Value::Float(total / present.len() as f64)
@@ -5053,6 +5074,38 @@ fn apply_distinct(
     }
 }
 
+/// The sum of values that are all exact, and the scale it is counted at.
+///
+/// `None` as soon as one of them is approximate — a `DOUBLE` column, or a
+/// string with no decimal reading — because MySQL only promises a scale for
+/// the exact types, and a `SUM` over a `DOUBLE` is a `DOUBLE`.
+///
+/// The widest scale present, so a column and a literal beside it agree: MySQL
+/// takes the larger of the two rather than the first it sees.
+fn exact_total(values: &[&Value]) -> Option<(i128, usize)> {
+    let scale = values
+        .iter()
+        .map(|v| match v {
+            Value::Int(_) => Some(0),
+            Value::Decimal(text) => Some(crate::decimal::scale_of(text)),
+            _ => None,
+        })
+        .try_fold(0usize, |widest, scale| Some(widest.max(scale?)))?;
+
+    let mut total: i128 = 0;
+    for value in values {
+        let units = match value {
+            // Checked, because `scale` comes from a value's own text and
+            // nothing bounds how many digits that has.
+            Value::Int(n) => i128::from(*n).checked_mul(10i128.checked_pow(scale as u32)?)?,
+            Value::Decimal(text) => crate::decimal::units(text, scale)?,
+            _ => return None,
+        };
+        total = total.checked_add(units)?;
+    }
+    Some((total, scale))
+}
+
 /// The name of the hidden column a folded aggregate is bound to.
 ///
 /// A NUL prefix keeps it out of any namespace a query could reference.
@@ -5153,6 +5206,10 @@ fn literal_expr(value: &Value) -> Expr {
         Value::Float(v) if v.is_finite() => wrap(AstValue::Number(format!("{v:?}"), false)),
         Value::Float(_) => wrap(AstValue::Null),
         Value::Text(v) => wrap(AstValue::SingleQuotedString(v.clone())),
+        // As a number, not a quoted string: a decimal that went back through
+        // here as text would be compared by its characters, which is the whole
+        // thing the tag exists to prevent.
+        Value::Decimal(v) => wrap(AstValue::Number(v.clone(), false)),
         Value::Bytes(v) => wrap(AstValue::SingleQuotedString(
             String::from_utf8_lossy(v).into_owned(),
         )),

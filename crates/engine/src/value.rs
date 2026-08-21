@@ -25,6 +25,16 @@ pub enum Value {
     /// Nothing about the string itself says which was meant, so the tag is the
     /// only thing that can tell them apart.
     Json(String),
+    /// A fixed-point decimal, held as its text at the column's scale.
+    ///
+    /// Tagged for the same reason as `Json` above: nothing about `"2.50"` says
+    /// whether it is a number or the characters someone stored in a VARCHAR,
+    /// and the two are compared differently. A decimal compares by value, so
+    /// `2.50` equals `2.5` and sorts below `10.00`; two strings compare by
+    /// their characters, so `'2.5'` and `'2.50'` are *not* equal and `'10.00'`
+    /// sorts first. Both of those are MySQL's answers, and only the tag can
+    /// pick between them.
+    Decimal(String),
 }
 
 impl Value {
@@ -45,7 +55,7 @@ impl Value {
         match self {
             Value::Int(v) => Some(*v),
             Value::Float(v) => Some(*v as i64),
-            Value::Text(v) | Value::Json(v) => {
+            Value::Text(v) | Value::Json(v) | Value::Decimal(v) => {
                 let t = v.trim();
                 t.parse::<i64>()
                     .ok()
@@ -59,7 +69,7 @@ impl Value {
         match self {
             Value::Int(v) => Some(*v as f64),
             Value::Float(v) => Some(*v),
-            Value::Text(v) | Value::Json(v) => v.trim().parse().ok(),
+            Value::Text(v) | Value::Json(v) | Value::Decimal(v) => v.trim().parse().ok(),
             _ => None,
         }
     }
@@ -75,7 +85,7 @@ impl Value {
             Value::Null => 0.0,
             Value::Int(v) => *v as f64,
             Value::Float(v) => *v,
-            Value::Text(v) | Value::Json(v) => numeric_prefix(v),
+            Value::Text(v) | Value::Json(v) | Value::Decimal(v) => numeric_prefix(v),
             Value::Bytes(v) => numeric_prefix(&String::from_utf8_lossy(v)),
         }
     }
@@ -90,7 +100,7 @@ impl Value {
             Value::Bytes(v) => String::from_utf8_lossy(v).into_owned(),
             // The document as it was serialised, which is what MySQL sends and
             // what a client reads back.
-            Value::Json(v) => v.clone(),
+            Value::Json(v) | Value::Decimal(v) => v.clone(),
         }
     }
 
@@ -109,7 +119,7 @@ impl Value {
             Value::Bytes(v) => Some(numeric_prefix(&String::from_utf8_lossy(v)) != 0.0),
             // Read like the text it used to be, so tagging a value changed
             // nothing about how a WHERE clause treats it.
-            Value::Json(v) => Some(numeric_prefix(v) != 0.0),
+            Value::Json(v) | Value::Decimal(v) => Some(numeric_prefix(v) != 0.0),
         }
     }
 
@@ -131,8 +141,10 @@ impl Value {
 
         // Numbers compare numerically even against numeric strings, which is
         // how MySQL behaves and what Prisma's generated comparisons rely on.
-        let both_numeric = matches!(self, Value::Int(_) | Value::Float(_))
-            || matches!(other, Value::Int(_) | Value::Float(_));
+        // A decimal is a number: `2.50` equals `2.5` and sorts below `10.00`,
+        // where two *strings* of those characters do neither.
+        let both_numeric = matches!(self, Value::Int(_) | Value::Float(_) | Value::Decimal(_))
+            || matches!(other, Value::Int(_) | Value::Float(_) | Value::Decimal(_));
 
         if both_numeric {
             if let (Some(a), Some(b)) = (self.as_float(), other.as_float()) {
@@ -182,6 +194,17 @@ impl Value {
             // documents where `'A'` and `'a'` are one string, and `1` and
             // `1.0` are one number where `'1'` and `'1.0'` are two strings.
             Value::Json(_) => crate::json::comparison_key(&self.as_json_operand()),
+            // By value, so `2.50` and `2.5` are one group and `10.00` sorts
+            // after `9.00` — the ordering `compare` gives them.
+            Value::Decimal(text) => {
+                let scale = crate::decimal::scale_of(text);
+                match crate::decimal::units(text, scale) {
+                    // Trailing zeros dropped, so every spelling of a number
+                    // reaches the same key.
+                    Some(units) => format!("{:+039}", units_at_no_scale(units, scale)),
+                    None => text.to_lowercase(),
+                }
+            }
             other => other.as_text().to_lowercase(),
         }
     }
@@ -195,7 +218,8 @@ impl Value {
             Value::Text(v) => WireValue::Str(v.clone()),
             Value::Bytes(v) => WireValue::Bytes(v.clone()),
             // JSON crosses the wire as text, which is how MySQL transmits it.
-            Value::Json(v) => WireValue::Str(v.clone()),
+            // A decimal travels as its text, which is how MySQL sends one.
+            Value::Json(v) | Value::Decimal(v) => WireValue::Str(v.clone()),
         }
     }
 
@@ -251,6 +275,16 @@ fn format_float(v: f64) -> String {
     }
     let s = v.to_string();
     s.strip_suffix(".0").map(str::to_owned).unwrap_or(s)
+}
+
+/// A count of units with its trailing zeros removed, so that `2.50` at scale
+/// two and `2.5` at scale one become the same number.
+fn units_at_no_scale(mut units: i128, mut scale: usize) -> i128 {
+    while scale > 0 && units % 10 == 0 {
+        units /= 10;
+        scale -= 1;
+    }
+    units
 }
 
 /// The number MySQL reads out of the front of a string.

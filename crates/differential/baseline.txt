@@ -6,10 +6,6 @@
 # harness fails if a line here no longer differs so the file cannot
 # quietly describe a state that has passed.
 
-a type code has to hold its values :: SELECT AVG(t), MIN(t), MAX(t), COUNT(t) FROM Q :: row 0 [binary]
-a type code has to hold its values :: SELECT AVG(t), MIN(t), MAX(t), COUNT(t) FROM Q :: row 0 [text]
-aggregates and grouping :: SELECT k, COUNT(*), SUM(v), MIN(s), MAX(v), AVG(v) FROM G GROUP BY k ORDER BY k :: row 0 [binary]
-aggregates and grouping :: SELECT k, COUNT(*), SUM(v), MIN(s), MAX(v), AVG(v) FROM G GROUP BY k ORDER BY k :: row 0 [text]
 json :: SELECT CAST('[1e-7, 1e15, 1e30]' AS JSON) :: row 0 [binary]
 json :: SELECT CAST('[1e-7, 1e15, 1e30]' AS JSON) :: row 0 [text]
 null propagates through functions :: SELECT ABS(NULL), ROUND(NULL, 1), MOD(NULL, 2), GREATEST(NULL, 1), LEAST(NULL, 1) :: type of column 1 [binary]

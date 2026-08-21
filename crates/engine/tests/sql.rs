@@ -5435,6 +5435,124 @@ fn a_numeric_precision_is_reported_the_way_mysql_reports_it() {
 }
 
 #[test]
+fn a_decimal_keeps_its_scale() {
+    // A DECIMAL is exact and carries a scale — `DECIMAL(10,2)` holding 1.5 *is*
+    // 1.50 — and folding one through an f64 loses both the digits and the
+    // count of them. Every answer measured against MySQL 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE D (k INT, a DECIMAL(10,2), b DECIMAL(8,3), c DECIMAL(6,0), t TINYINT)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO D VALUES (1,1.5,1.5,1.5,100),(1,2.5,2.5,2.5,100),\
+                              (2,-1.005,-1.0005,-1.5,100),(3,10,10,10,100)",
+    );
+
+    // Stored at the column's scale, rounding half *away from zero* — which is
+    // not what an f64 prints: -1.005 is -1.01, and 2.5 into a scale of nothing
+    // is 3 rather than the 2 a banker's rounding would give.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a, b, c FROM D"),
+        vec![
+            vec!["1.50", "1.500", "2"],
+            vec!["2.50", "2.500", "3"],
+            vec!["-1.01", "-1.001", "-2"],
+            vec!["10.00", "10.000", "10"],
+        ]
+    );
+
+    for (sql, expected) in [
+        // A total keeps the scale it added up.
+        ("SELECT SUM(a) FROM D", "12.99"),
+        ("SELECT SUM(b) FROM D", "12.999"),
+        ("SELECT SUM(c) FROM D", "13"),
+        // An average gains four digits over it, which is MySQL's
+        // div_precision_increment — including over an integer, where the
+        // scale it starts from is nothing.
+        ("SELECT AVG(a) FROM D", "3.247500"),
+        ("SELECT AVG(b) FROM D", "3.2497500"),
+        ("SELECT AVG(c) FROM D", "3.2500"),
+        ("SELECT AVG(t) FROM D", "100.0000"),
+        // By value and not by characters, which is the whole reason a decimal
+        // is tagged: as strings `10.00` is the smallest of these and `2.50`
+        // the largest.
+        ("SELECT MIN(a) FROM D", "-1.01"),
+        ("SELECT MAX(a) FROM D", "10.00"),
+        // An integer column still sums to an integer.
+        ("SELECT SUM(t) FROM D", "400"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // And through a group, which is where the harness saw it.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k, SUM(a), AVG(a) FROM D GROUP BY k ORDER BY k"
+        ),
+        vec![
+            vec!["1", "4.00", "2.000000"],
+            vec!["2", "-1.01", "-1.010000"],
+            vec!["3", "10.00", "10.000000"],
+        ]
+    );
+
+    // Ordering, equality and DISTINCT all read a decimal as a number. Held as
+    // plain text they read as characters instead, which puts `10.00` first and
+    // makes `a = '2.5'` match nothing.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a FROM D ORDER BY a")
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+        vec!["-1.01", "1.50", "2.50", "10.00"]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT k FROM D WHERE a = '2.5'"),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(DISTINCT a) FROM D"),
+        vec![vec!["4"]]
+    );
+
+    // A string is still a string: `'2.5'` and `'2.50'` are two different
+    // characters-long values to MySQL, and tagging decimals must not make
+    // them one.
+    run(&engine, &mut session, "CREATE TABLE S (s VARCHAR(10))");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO S VALUES ('2.5'),('2.50')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM S WHERE s = '2.5'"
+        ),
+        vec![vec!["1"]]
+    );
+
+    // A sum over a string column is a DOUBLE in MySQL, so it gets no scale —
+    // the tag is what separates the two, not the shape of the text.
+    run(&engine, &mut session, "INSERT INTO S VALUES ('1.5')");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT SUM(s) FROM S"),
+        vec![vec!["6.5"]]
+    );
+}
+
+#[test]
 fn information_schema_declares_its_own_columns() {
     // These columns were typed by looking at the rows a query happened to
     // return: all-integers meant a signed BIGINT and anything else meant a

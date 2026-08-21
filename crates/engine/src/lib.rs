@@ -5,6 +5,7 @@
 
 pub mod catalog;
 pub mod ddl;
+pub mod decimal;
 pub mod dialect;
 pub mod error;
 pub mod exec;

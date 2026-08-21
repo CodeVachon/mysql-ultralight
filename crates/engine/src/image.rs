@@ -27,6 +27,10 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// not fail cleanly, it would silently produce a catalog with the wrong shape,
 /// and every test running against it would be wrong in a way nothing reports.
 ///
+/// v4 adds a value tag: a decimal is written as its own kind rather than
+/// as text, because the two are compared differently — by value and by
+/// characters — and a v3 image would reload every decimal as a string.
+///
 /// v3 is a meaning change, not a layout one. `SqlType::declared` now holds what
 /// MySQL reports as `COLUMN_TYPE` — `bigint unsigned` where a v2 image says
 /// `bigint`, `int` where it says `int(11)`, `set('x','y')` where it says
@@ -35,7 +39,7 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// answering it, which is the wrong answer the version check exists to
 /// prevent. An image is a file a user keeps and boots from with `--state`, so
 /// the stale one has to fail rather than mislead.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Writes the whole catalog.
 pub fn encode(catalog: &Catalog) -> Vec<u8> {
@@ -451,6 +455,14 @@ fn write_value(w: &mut Writer, value: &Value) {
             w.u8(5);
             w.str(s);
         }
+        // Tag 6, appended for the same reason 5 was: a decimal's text is what
+        // it *is*, scale and all, and calling it a string on the way out would
+        // reload it as one — comparing by characters where MySQL compares by
+        // value.
+        Value::Decimal(s) => {
+            w.u8(6);
+            w.str(s);
+        }
     }
 }
 
@@ -483,6 +495,7 @@ fn read_value(r: &mut Reader<'_>) -> EngineResult<Value> {
             // which is the kind of difference nothing would think to look for.
             Value::Json(crate::json::render_text(&parsed))
         }
+        6 => Value::Decimal(r.str()?),
         other => return Err(malformed(format!("unknown value tag {other}"))),
     })
 }

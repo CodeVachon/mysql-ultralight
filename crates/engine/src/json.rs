@@ -447,6 +447,12 @@ pub fn from_value(value: &Value) -> Json {
         Value::Float(f) => serde_json::Number::from_f64(*f).map_or(Json::Null, Json::Number),
         Value::Text(s) => Json::String(s.clone()),
         Value::Bytes(b) => Json::String(String::from_utf8_lossy(b).into_owned()),
+        // A number, as MySQL embeds one: `JSON_OBJECT('a', decimal_column)`
+        // gives `{"a": 2.50}` and not `{"a": "2.50"}`. Parsed from the text,
+        // which is exact for anything serde reads back the same way.
+        Value::Decimal(s) => s
+            .parse::<serde_json::Number>()
+            .map_or_else(|_| Json::String(s.clone()), Json::Number),
         // Every route to a tagged value validates it first — a constructor
         // serialised it from a `Json`, a column coerced it, an image checked
         // it on load — so this parses what one of those wrote. The fallback is

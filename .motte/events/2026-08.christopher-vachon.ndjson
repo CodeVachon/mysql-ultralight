@@ -141,3 +141,5 @@
 {"at":"2026-08-21T13:53:17Z","id":64,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-21T14:04:47Z","id":69,"by":"Christopher Vachon","as":"user","type":"created","title":"Unsigned arithmetic out of range should be an error","state":"Todo"}
 {"at":"2026-08-21T14:59:11Z","id":50,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-21T15:21:46Z","id":49,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-21T15:22:20Z","id":70,"by":"Christopher Vachon","as":"user","type":"created","title":"Decimal arithmetic loses the scale","state":"Todo"}

@@ -398,16 +398,27 @@ impl SqlType {
                 // By the text rather than a parsed float: the point of keeping
                 // the text is that parsing loses precision, and the sign is
                 // readable without it.
-                match text.strip_prefix('-') {
+                let stored = match text.strip_prefix('-') {
                     // `-0.00` is not below zero, so MySQL takes it — and
                     // stores it without the sign, which is why the digits
                     // decide rather than the sign character.
                     Some(digits) if digits.chars().all(|c| c == '0' || c == '.') => {
-                        Value::Text(digits.to_owned())
+                        digits.to_owned()
                     }
                     Some(_) if self.unsigned => return Err(out_of_range()),
-                    _ => Value::Text(text),
-                }
+                    _ => text,
+                };
+                // At the column's own scale, which is what a DECIMAL *is*:
+                // 1.5 in a `DECIMAL(6,2)` is `1.50` and 1.005 is `1.01`.
+                // Keeping whatever the caller wrote made the scale a property
+                // of the statement rather than of the column.
+                let scale = self.scale.unwrap_or(0) as usize;
+                let digits = crate::decimal::rescale(&stored, scale).unwrap_or_else(|| {
+                    // Not a decimal at all, so the number MySQL reads out of
+                    // it — which is 0 for a name and clamped for an overflow.
+                    crate::decimal::from_f64(Value::text(&stored).as_number(), scale)
+                });
+                Value::Decimal(digits)
             }
             TypeKind::Blob => match value {
                 Value::Bytes(b) => Value::Bytes(b),
