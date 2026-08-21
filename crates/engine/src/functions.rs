@@ -140,6 +140,7 @@ const KNOWN: &[&str] = &[
     "sysdate",
     "system_user",
     "trim",
+    "truncate",
     "ucase",
     "unix_timestamp",
     "upper",
@@ -729,10 +730,26 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         // has already been answered above.
         "floor" => whole(arg(0).as_number().floor()),
         "ceil" | "ceiling" => whole(arg(0).as_number().ceil()),
-        "mod" => match (arg(0).as_int(), arg(1).as_int()) {
-            (Some(_), Some(0)) | (None, _) | (_, None) => Value::Null,
-            (Some(a), Some(b)) => Value::Int(a % b),
-        },
+        // Through the operator it is spelled as, so the two cannot drift:
+        // reading both sides as integers answered 1 for `MOD(1.500, 2)` under
+        // a column described NEWDECIMAL, which promises the fraction it had
+        // just thrown away.
+        "mod" => {
+            crate::expr::arithmetic(&sqlparser::ast::BinaryOperator::Modulo, &arg(0), &arg(1))?
+        }
+        // Toward zero at the given number of places, which may be negative:
+        // `TRUNCATE(15.6, -1)` is 10. Not rounding — `TRUNCATE(1.567, 1)` is
+        // 1.5 where `ROUND` would say 1.6.
+        "truncate" => {
+            let places = args.get(1).and_then(Value::as_int).unwrap_or(0);
+            let factor = 10f64.powi(places as i32);
+            let cut = (arg(0).as_number() * factor).trunc() / factor;
+            if places <= 0 {
+                whole(cut)
+            } else {
+                Value::Float(cut)
+            }
+        }
         "greatest" | "least" => {
             if args.iter().any(Value::is_null) {
                 Value::Null

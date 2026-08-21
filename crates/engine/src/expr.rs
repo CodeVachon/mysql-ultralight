@@ -1005,7 +1005,12 @@ fn bigint_out_of_range() -> EngineError {
     EngineError::new(1690, "22003", "BIGINT value is out of range")
 }
 
-fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> EngineResult<Value> {
+/// The value an arithmetic operator produces.
+///
+/// `pub(crate)` because `MOD` is the `%` operator spelled as a call and has to
+/// answer the same thing: typed alike and evaluated apart, `MOD(1.500, 2)`
+/// promised a decimal and handed back the integer 1.
+pub(crate) fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> EngineResult<Value> {
     use BinaryOperator as B;
 
     if left.is_null() || right.is_null() {

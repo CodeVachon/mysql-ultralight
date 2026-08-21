@@ -5553,12 +5553,6 @@ fn function_result_type(name: &str) -> Option<ColumnType> {
         "length" | "char_length" | "character_length" | "octet_length" | "instr" | "locate"
         | "field" | "count" | "row_number" | "rank" | "dense_rank" | "connection_id"
         | "last_insert_id" | "row_count" | "unix_timestamp" => ColumnType::LongLong,
-        // `MOD` of two integers is an integer. `CEILING` is *not* here even
-        // though its answer is always whole: MySQL keeps the argument's kind,
-        // so `CEILING(double)` is a DOUBLE holding a whole number. `ABS`,
-        // `ROUND`, `GREATEST` and `LEAST` are argument-typed for the same
-        // reason.
-        "mod" => ColumnType::LongLong,
         // The date parts, which are numbers rather than dates.
         "timestampdiff" | "datediff" | "hour" | "minute" | "second" | "microsecond" | "quarter"
         | "dayofweek" | "dayofyear" | "dayofmonth" | "day" | "month" | "weekday" => {
@@ -5783,14 +5777,32 @@ fn computed_column_type(
                 // Fixing them at LONGLONG truncated a decimal to its integer
                 // part; typing them by the argument sent `ABS(tinyint)` as one
                 // byte, which is a value the answer can outgrow.
-                "abs" | "round" => numeric_answer(
-                    combined(
-                        function_arguments(f)
-                            .iter()
-                            .map(|a| computed_column_type(a, refs, input)),
-                    ),
+                //
+                // The *first* argument, because the second of `ROUND(x, 2)`
+                // says how many places to keep and is not a value being
+                // rounded: reading both made `ROUND(NULL, 1)` a LONGLONG on
+                // the strength of the 1, where MySQL says DOUBLE. It ignores
+                // that argument entirely — `ROUND(1, NULL)` is a LONGLONG
+                // there.
+                "abs" | "round" | "truncate" => numeric_answer(
+                    function_arguments(f)
+                        .first()
+                        .map(|a| computed_column_type(a, refs, input))
+                        .unwrap_or(ColumnType::Null),
                     false,
                 ),
+                // `MOD` is the `%` operator spelled as a call, and MySQL types
+                // the two identically — including the DOUBLE it answers when
+                // either side has no numeric kind of its own.
+                "mod" => {
+                    let args = function_arguments(f);
+                    let side = |i: usize| {
+                        args.get(i)
+                            .map(|a| computed_column_type(a, refs, input))
+                            .unwrap_or(ColumnType::Null)
+                    };
+                    arithmetic_type(side(0), side(1))
+                }
                 // The same, except that the answer is whole, so an exact
                 // argument gives an integer rather than a decimal.
                 "ceiling" => numeric_answer(

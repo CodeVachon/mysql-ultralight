@@ -5435,6 +5435,125 @@ fn a_numeric_precision_is_reported_the_way_mysql_reports_it() {
 }
 
 #[test]
+fn a_scale_argument_is_not_a_value_being_measured() {
+    // `ROUND(x, 2)`'s second argument says how many places to keep. Reading it
+    // as if it were another value made `ROUND(NULL, 1)` a LONGLONG on the
+    // strength of the 1 — MySQL types these by the *first* argument alone and
+    // ignores the other entirely. Each expectation read off MySQL 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE E (i INT, d DECIMAL(10,3), f DOUBLE, s VARCHAR(20))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO E VALUES (2, 1.5, 1.5, '3')",
+    );
+
+    let codes = |session: &Session, sql: &str| -> Vec<String> {
+        engine
+            .describe(session, sql, 0)
+            .unwrap()
+            .iter()
+            .map(|c| format!("{:?}", c.ty))
+            .collect()
+    };
+
+    for (sql, expected) in [
+        (
+            "SELECT ROUND(NULL,1), ROUND(1,1), ROUND(i,1), ROUND(d,1), ROUND(f,1), \
+                    ROUND(s,1) FROM E",
+            vec![
+                "Double",
+                "LongLong",
+                "LongLong",
+                "NewDecimal",
+                "Double",
+                "Double",
+            ],
+        ),
+        // Not typed at all before: every one of these was a VAR_STRING.
+        (
+            "SELECT TRUNCATE(NULL,1), TRUNCATE(1,1), TRUNCATE(i,1), TRUNCATE(d,1), \
+                    TRUNCATE(f,1) FROM E",
+            vec!["Double", "LongLong", "LongLong", "NewDecimal", "Double"],
+        ),
+        // `MOD` is `%` spelled as a call, and the two type identically —
+        // including the DOUBLE for an operand with no numeric kind. It was
+        // fixed at LONGLONG whatever it was given.
+        (
+            "SELECT MOD(NULL,2), MOD(1,2), MOD(i,2), MOD(d,2), MOD(f,2), MOD(s,2) FROM E",
+            vec![
+                "Double",
+                "LongLong",
+                "LongLong",
+                "NewDecimal",
+                "Double",
+                "Double",
+            ],
+        ),
+        (
+            "SELECT NULL%2, 1%2, i%2, d%2, f%2, s%2 FROM E",
+            vec![
+                "Double",
+                "LongLong",
+                "LongLong",
+                "NewDecimal",
+                "Double",
+                "Double",
+            ],
+        ),
+        // The second argument is ignored, which `ROUND(1, NULL)` shows from
+        // the other side: a NULL there does not make the answer a DOUBLE.
+        (
+            "SELECT ROUND(d, i), ROUND(1, NULL), MOD(d, f), MOD(2, NULL) FROM E",
+            vec!["NewDecimal", "LongLong", "Double", "Double"],
+        ),
+    ] {
+        assert_eq!(codes(&session, sql), expected, "{sql}");
+    }
+
+    // The types are only half of it. `MOD` was typed like `%` while still
+    // reading both sides as integers, so a column described NEWDECIMAL handed
+    // back the 1 it got from truncating 1.5 — a type promising a fraction it
+    // had just thrown away. The two spellings have to answer the same thing.
+    for (call, operator) in [
+        ("SELECT MOD(1.500, 2)", "SELECT 1.500 % 2"),
+        ("SELECT MOD(1.5e0, 2)", "SELECT 1.5e0 % 2"),
+        ("SELECT MOD(-7, 3)", "SELECT -7 % 3"),
+        ("SELECT MOD(7, 0)", "SELECT 7 % 0"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, call),
+            rows(&engine, &mut session, operator),
+            "{call} and {operator} disagree"
+        );
+    }
+
+    // And `TRUNCATE` has to run at all: it was typed here while the evaluator
+    // had never heard of it, so every one of these was refused as unsupported.
+    // Toward zero rather than rounding, and the places may be negative.
+    for (sql, expected) in [
+        ("SELECT TRUNCATE(1.567, 1)", "1.5"),
+        ("SELECT TRUNCATE(1.567, 0)", "1"),
+        ("SELECT TRUNCATE(-1.567, 1)", "-1.5"),
+        ("SELECT TRUNCATE(1.567, -1)", "0"),
+        ("SELECT TRUNCATE(15.6, -1)", "10"),
+        ("SELECT TRUNCATE(7, 1)", "7"),
+        ("SELECT TRUNCATE('abc', 1)", "0"),
+        ("SELECT TRUNCATE(NULL, 1)", "NULL"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn a_decimal_keeps_its_scale() {
     // A DECIMAL is exact and carries a scale — `DECIMAL(10,2)` holding 1.5 *is*
     // 1.50 — and folding one through an f64 loses both the digits and the
