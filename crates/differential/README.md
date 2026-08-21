@@ -52,11 +52,10 @@ Two things fail a run:
 
 So the file only ever shrinks, and it shrinks by fixing things. Each line is
 covered by an issue under [#0009](../../.motte/issues), and the whole file is
-accounted for — 75 lines at the last audit:
+accounted for — 41 lines at the last audit:
 
 | Lines | Issue |
 |---|---|
-| 34 | #0063 a computed column reported nullable when it cannot be NULL |
 | 22 | #0050 information_schema describing its own columns |
 | 4 | #0049 DECIMAL losing its scale through an aggregate |
 | 4 | #0064 a computed column losing the UNSIGNED flag |

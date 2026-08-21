@@ -1,11 +1,11 @@
 ---
 id: 63
 title: A computed column is reported nullable when it cannot be NULL
-state: Todo
+state: Done
 parent: 9
 labels: [compat]
 created: 2026-08-21T13:08:38Z
-updated: 2026-08-21T13:08:38Z
+updated: 2026-08-21T13:22:33Z
 ---
 
 ## Description
@@ -31,3 +31,9 @@ There are several rules underneath, not one:
 - A no-argument function like UNIX_TIMESTAMP() has nothing to be NULL from.
 
 Nullability is not cosmetic here: crates/engine/src/exec.rs already relies on it for the set-operation merge, where a branch that can produce NULL relaxes the other, and a describing client may map a NOT NULL column to a non-optional type.
+
+## Notes
+
+### 2026-08-21T13:22:33Z — Christopher Vachon (user)
+
+All 34 lines fixed; baseline 75 to 41. Every rule measured rather than reasoned, and the split is not the obvious one: LENGTH('a') is NOT NULL where UPPER('a') is not, ABS(1) is where SQRT(4) is not, and MOD is nullable like the % it spells. Aggregates and window functions needed the rule applying on two more paths that build their own OutColumn. The UNSIGNED flag on ROW_NUMBER is all that remains on those statements, under #0064.

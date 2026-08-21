@@ -259,13 +259,15 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
                     Some(b) => bool_value(!b),
                     None => Value::Null,
                 }),
+                // By the number MySQL reads out of the operand, like the
+                // binary arithmetic below: `-'abc'` is -0, not NULL. Answering
+                // NULL here became a wrong answer rather than a poor one once
+                // the column was described NOT NULL — the flag promised a
+                // value the evaluator would not produce.
                 UnaryOperator::Minus => Ok(match value {
                     Value::Null => Value::Null,
                     Value::Int(v) => Value::Int(-v),
-                    other => other
-                        .as_float()
-                        .map(|f| Value::Float(-f))
-                        .unwrap_or(Value::Null),
+                    other => Value::Float(-other.as_number()),
                 }),
                 UnaryOperator::Plus => Ok(value),
                 other => Err(unsupported(format!("unary operator `{other}`"))),

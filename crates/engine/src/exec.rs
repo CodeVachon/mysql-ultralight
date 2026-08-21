@@ -1788,7 +1788,7 @@ impl Engine {
             // statement binds its parameters to NULL so there is often no
             // value worth reading.
             let mut column = OutColumn::new(alias, computed_column_type(e, &[], &[]));
-            column.nullable = !never_null(e);
+            column.nullable = !never_null(e, &[], &[]);
             columns.push(column);
             row.push(value);
         }
@@ -1847,10 +1847,15 @@ impl Engine {
                             // Typed from the function, not the first value: a
                             // later row may differ, and the binary protocol
                             // encodes by the declared type.
-                            columns.push(OutColumn::new(
+                            let mut column = OutColumn::new(
                                 alias.unwrap_or_else(|| render_expr(e)),
                                 computed_column_type(e, refs, &relation.columns),
-                            ));
+                            );
+                            // A ranking window numbers its rows and always has
+                            // an answer; one that reaches past the frame has
+                            // one only if it was given a default.
+                            column.nullable = !never_null(e, refs, &relation.columns);
+                            columns.push(column);
                             plan.push(Projection::Window(windows.len()));
                             windows.push(values);
                             continue;
@@ -2152,7 +2157,7 @@ impl Engine {
             name,
             computed_column_type(e, &relation.refs(), &relation.columns),
         );
-        column.nullable = !never_null(e);
+        column.nullable = !never_null(e, &relation.refs(), &relation.columns);
         Ok((column, Projection::Expr(Box::new(e.clone()))))
     }
 
@@ -2252,7 +2257,15 @@ impl Engine {
             .iter()
             .map(|(alias, e)| match direct_column(e, refs, input_columns) {
                 Some(column) => OutColumn::from_sql_type(alias, &column.ty, column.nullable),
-                None => OutColumn::new(alias.clone(), computed_column_type(e, refs, input_columns)),
+                None => {
+                    let mut column =
+                        OutColumn::new(alias.clone(), computed_column_type(e, refs, input_columns));
+                    // `COUNT` always has an answer, including zero for a group
+                    // with nothing in it. Every other aggregate is nullable,
+                    // even `SUM(1)`: an empty group has nothing to sum.
+                    column.nullable = !never_null(e, refs, input_columns);
+                    column
+                }
             })
             .collect();
 
@@ -5149,35 +5162,166 @@ fn literal_expr(value: &Value) -> Expr {
     }
 }
 
-/// The declared type of a computed column.
+/// Functions whose answer cannot be NULL when their arguments cannot.
 ///
-/// A grouped projection cannot be typed from the first group's value: a later
-/// group may produce a different type, and the binary protocol encodes by the
-/// declared type, so the client would decode the wrong thing. Only the shapes
-/// that are always integral are claimed as such.
-/// The type to declare for an expression, before any row has been evaluated.
+/// Measured by calling each with a constant, and the split is not the obvious
+/// one: `LENGTH('a')` is NOT NULL where `UPPER('a')` is not, and `ABS(1)` is
+/// where `SQRT(4)` is not. A function that can fail on a bad domain or a zero
+/// divisor stays nullable however it was called, which is why `MOD` is absent
+/// and `%` is not an operator here either.
+const ARGUMENT_FOLLOWING: &[&str] = &[
+    "abs",
+    "ascii",
+    "ceil",
+    "ceiling",
+    "char_length",
+    "character_length",
+    "field",
+    "floor",
+    "greatest",
+    "instr",
+    "least",
+    "length",
+    "locate",
+    "octet_length",
+    "ord",
+    "round",
+    "sign",
+    "truncate",
+];
+
+/// Functions whose answer is never NULL whatever they were given.
 ///
-/// `refs` carries the input columns so an aggregate over one can keep its type:
-/// `SUM(views)` of an integer column is an integer, and reporting it as a
-/// string makes a typed client hand back `"120"` where MySQL hands back `120`.
-/// Whether an expression can be shown never to produce NULL.
+/// `COUNT` counts, and counts nothing as zero. The ranking window functions
+/// number their rows from one. Every other aggregate — `SUM`, `MIN`, `AVG`,
+/// even `SUM(1)` — is nullable, because an empty group has no answer.
+const ALWAYS_NOT_NULL: &[&str] = &["count", "dense_rank", "isnull", "rank", "row_number"];
+
+/// Functions that answer with the moment or the connection, and only when
+/// asked for nothing.
 ///
-/// Deliberately small: a literal, and arithmetic over things that are
-/// themselves never NULL. Division is excluded because MySQL answers NULL for
-/// division by zero, and a function is excluded because almost any of them can
-/// return NULL. Everything else is "unknown", which is reported as nullable.
+/// `UNIX_TIMESTAMP()` is NOT NULL where `UNIX_TIMESTAMP(NULL)` is NULL, so the
+/// argument count is the rule rather than the name. `DATABASE()`, `USER()` and
+/// `UUID()` are measured nullable and are deliberately not here.
+const NULLARY_NOT_NULL: &[&str] = &[
+    "connection_id",
+    "curdate",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "curtime",
+    "last_insert_id",
+    "localtime",
+    "localtimestamp",
+    "now",
+    "pi",
+    "rand",
+    "row_count",
+    "sysdate",
+    "unix_timestamp",
+    "version",
+];
+
+/// Whether an expression can be said to be NOT NULL on the wire.
 ///
-/// It matters because a union takes the nullability of either branch, so
-/// `SELECT id FROM t UNION SELECT 1 + 1` would otherwise describe a NOT NULL
-/// column as nullable on the strength of an expression that cannot be NULL.
-fn never_null(e: &Expr) -> bool {
+/// Under-reporting is safe and over-reporting is not: a column described
+/// nullable can still carry values, where a NOT NULL flag is a promise a client
+/// acts on — Prisma maps it to a non-optional field. So every rule here was
+/// measured against MySQL 8.3, and anything unmeasured falls through to
+/// nullable rather than being reasoned about.
+fn never_null(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]) -> bool {
+    let recur = |inner: &Expr| never_null(inner, refs, input);
     match e {
         Expr::Value(v) => !matches!(v.value, sqlparser::ast::Value::Null),
-        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => never_null(inner),
+        // A column carries its own answer, which is the whole reason this
+        // takes the relation: `id + 1` over a NOT NULL column is NOT NULL, and
+        // reading the identifier as unknown made every arithmetic column
+        // nullable.
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            direct_column(e, refs, input).is_some_and(|column| !column.nullable)
+        }
+        Expr::Nested(inner) => recur(inner),
+        // `NOT` and a sign propagate; a cast does not — `CAST(1 AS CHAR)` is
+        // nullable to MySQL even though nothing about it can fail.
+        Expr::UnaryOp { op, expr } => {
+            use sqlparser::ast::UnaryOperator as U;
+            matches!(op, U::Minus | U::Plus | U::Not) && recur(expr)
+        }
+        // Asking whether something is NULL always has an answer, whatever the
+        // something is.
+        Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsNotFalse(_)
+        | Expr::Exists { .. } => true,
         Expr::BinaryOp { left, op, right } => {
             use sqlparser::ast::BinaryOperator as B;
-            matches!(op, B::Plus | B::Minus | B::Multiply) && never_null(left) && never_null(right)
+            match op {
+                // Division and the remainder answer NULL for a zero divisor,
+                // so they are nullable however sound their operands are.
+                B::Plus
+                | B::Minus
+                | B::Multiply
+                | B::Eq
+                | B::NotEq
+                | B::Lt
+                | B::LtEq
+                | B::Gt
+                | B::GtEq
+                | B::And
+                | B::Or
+                | B::Xor => recur(left) && recur(right),
+                _ => false,
+            }
         }
+        Expr::InList { expr, list, .. } => recur(expr) && list.iter().all(recur),
+        Expr::Between {
+            expr, low, high, ..
+        } => recur(expr) && recur(low) && recur(high),
+        Expr::Like { expr, pattern, .. }
+        | Expr::ILike { expr, pattern, .. }
+        | Expr::RLike { expr, pattern, .. } => recur(expr) && recur(pattern),
+        // Only the results decide, and only with an `ELSE`: without one a
+        // statement that matches no branch answers NULL.
+        Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => {
+            else_result.as_deref().is_some_and(&recur)
+                && conditions.iter().all(|w| recur(&w.result))
+        }
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_ascii_lowercase();
+            let args = function_arguments(f);
+            if ALWAYS_NOT_NULL.contains(&name.as_str()) {
+                return true;
+            }
+            if args.is_empty() {
+                return NULLARY_NOT_NULL.contains(&name.as_str());
+            }
+            match name.as_str() {
+                // These hand back whichever argument was not NULL, so one that
+                // cannot be is enough.
+                "coalesce" | "ifnull" | "nvl" => args.iter().any(&recur),
+                // `IF` picks between the second and the third; the condition
+                // decides nothing, so `IF(v, 1, 2)` is NOT NULL for a nullable
+                // `v`. Only at that arity — `all` over the empty slice `IF(v)`
+                // leaves is true, which would promise NOT NULL for a call that
+                // answers NULL.
+                "if" => args.len() == 3 && args[1..].iter().all(&recur),
+                // A window function reaching past the frame answers its
+                // default, and has none unless one was given.
+                "lag" | "lead" => args.len() >= 3 && args.iter().all(&recur),
+                _ => ARGUMENT_FOLLOWING.contains(&name.as_str()) && args.iter().all(&recur),
+            }
+        }
+        // `CEIL` and `FLOOR` arrive as their own nodes rather than as calls,
+        // and follow their argument like the `CEILING` spelling of the same
+        // function.
+        Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => recur(expr),
         _ => false,
     }
 }
@@ -5317,6 +5461,15 @@ fn direct_column<'a>(
     }
 }
 
+/// The type to declare for an expression, before any row has been evaluated.
+///
+/// A grouped projection cannot be typed from the first group's value: a later
+/// group may produce a different one, and the binary protocol encodes by the
+/// declared type, so the client would decode the wrong thing.
+///
+/// `refs` carries the input columns so an aggregate over one can keep its type:
+/// `SUM(views)` of an integer column is an integer, and reporting it as a
+/// string makes a typed client hand back `"120"` where MySQL hands back `120`.
 fn computed_column_type(
     e: &Expr,
     refs: &[ColumnRef],

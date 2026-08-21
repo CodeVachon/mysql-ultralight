@@ -5435,6 +5435,123 @@ fn a_numeric_precision_is_reported_the_way_mysql_reports_it() {
 }
 
 #[test]
+fn a_column_that_cannot_be_null_is_described_that_way() {
+    // Under-reporting here is safe and over-reporting is not — a NOT NULL flag
+    // is a promise a client acts on, and Prisma maps it to a non-optional
+    // field. So every rule is measured against MySQL 8.3, and the pairs below
+    // are chosen to sit either side of each one.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE G (id INT NOT NULL, k INT NOT NULL, v INT NULL, s VARCHAR(20) NULL)",
+    );
+    run(&engine, &mut session, "INSERT INTO G VALUES (1,1,1,'a')");
+
+    let flags = |session: &Session, sql: &str| -> Vec<bool> {
+        engine
+            .describe(session, sql, 0)
+            .unwrap()
+            .iter()
+            .map(|c| !c.nullable)
+            .collect()
+    };
+
+    for (sql, expected) in [
+        // COUNT counts, and counts nothing as zero. Every other aggregate is
+        // nullable — even `SUM(1)`, because an empty group has nothing to sum.
+        (
+            "SELECT COUNT(*), COUNT(v), COUNT(DISTINCT v), SUM(v), SUM(1), MIN(v), AVG(v) FROM G",
+            vec![true, true, true, false, false, false, false],
+        ),
+        (
+            "SELECT k, COUNT(*), SUM(v) FROM G GROUP BY k",
+            vec![true, true, false],
+        ),
+        // A ranking window numbers its rows; one that reaches past the frame
+        // answers its default, and has none unless it was given one.
+        (
+            "SELECT ROW_NUMBER() OVER (ORDER BY id), RANK() OVER (ORDER BY id), \
+                    LAG(id,1,0) OVER (ORDER BY id), LAG(id) OVER (ORDER BY id), \
+                    LAG(v,1,0) OVER (ORDER BY id) FROM G",
+            vec![true, true, true, false, false],
+        ),
+        // COALESCE takes the first argument that is not NULL, so one that
+        // cannot be is enough. IF picks between its second and third and the
+        // condition decides nothing, so both results have to hold.
+        (
+            "SELECT COALESCE(NULL,1), COALESCE(s,'x'), COALESCE(s,v), IFNULL(v,0), \
+                    IF(v,1,2), IF(1,s,'x'), ISNULL(NULL), NULLIF(1,2) FROM G",
+            vec![true, true, false, true, true, false, true, false],
+        ),
+        // Asking whether something is NULL always has an answer. A comparison
+        // does not: NULL in, NULL out.
+        (
+            "SELECT v IS NULL, v IS NOT NULL, EXISTS(SELECT 1), v = 1, id = 1, \
+                    'a' LIKE 'a', s LIKE 'a%', 1 IN (1,2), v IN (1,2) FROM G",
+            vec![true, true, true, false, true, true, false, true, false],
+        ),
+        // A column carries its own answer, which is why arithmetic over a
+        // NOT NULL column is NOT NULL. Division is not: a zero divisor is NULL
+        // however sound the operands are.
+        (
+            "SELECT 1, NULL, id, v, id+1, v+1, id*2, id/2, -id, -v FROM G",
+            vec![
+                true, false, true, false, true, false, true, false, true, false,
+            ],
+        ),
+        // The function split is not the obvious one, and neither half was
+        // guessed: `LENGTH('a')` holds where `UPPER('a')` does not, and
+        // `UNIX_TIMESTAMP()` holds where `UNIX_TIMESTAMP(NULL)` cannot.
+        (
+            "SELECT LENGTH('a'), LENGTH(s), ABS(1), ABS(v), CEIL(1), CEIL(v), \
+                    UPPER('a'), CONCAT('a','b'), MOD(4,2) FROM G",
+            vec![true, false, true, false, true, false, false, false, false],
+        ),
+        (
+            "SELECT NOW(), UNIX_TIMESTAMP(), VERSION(), UNIX_TIMESTAMP(NULL), DATABASE() FROM G",
+            vec![true, true, true, false, false],
+        ),
+        // Only a CASE's results decide, and only with an ELSE: matching no
+        // branch answers NULL. A CAST is nullable whatever it casts.
+        (
+            "SELECT CASE WHEN 1 THEN 1 ELSE 2 END, CASE WHEN 1 THEN v ELSE 2 END, \
+                    CASE WHEN 1 THEN 1 END, CAST(1 AS CHAR) FROM G",
+            vec![true, false, false, false],
+        ),
+    ] {
+        assert_eq!(flags(&session, sql), expected, "{sql}");
+    }
+
+    // The flag is a promise the evaluator has to keep. Describing `-s` over a
+    // NOT NULL column as NOT NULL and then answering NULL puts a NULL in a
+    // field a client has been told is not optional — so unary minus reads the
+    // number out of its operand, as the binary arithmetic beside it does.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE U (s VARCHAR(20) NOT NULL, b BLOB NOT NULL, n INT NOT NULL)",
+    );
+    run(&engine, &mut session, "INSERT INTO U VALUES ('abc','xx',5)");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT -s, -b, -n, +s FROM U"),
+        vec![vec!["-0", "-0", "-5", "abc"]]
+    );
+    assert_eq!(
+        flags(&session, "SELECT -s, -b, -n FROM U"),
+        vec![true, true, true],
+        "the promise and the value have to agree"
+    );
+
+    // `IF` at the wrong arity has no branches to check, and "every one of
+    // none" is true — which promised NOT NULL for a call that answers NULL.
+    assert_eq!(
+        flags(&session, "SELECT IF(v), IF(v,1) FROM G"),
+        vec![false, false]
+    );
+}
+
+#[test]
 fn a_document_compares_as_a_document() {
     // The engine compared JSON by its rendering, which is wrong in both
     // directions: `doc = '{"a": 1}'` came out true whenever the literal
