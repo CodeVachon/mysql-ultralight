@@ -968,7 +968,7 @@ pub fn format_unix(secs: u64) -> String {
 }
 
 /// Applies a CAST.
-pub fn cast(value: Value, ty: &DataType) -> EngineResult<Value> {
+pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
     use DataType as D;
     if value.is_null() {
         return Ok(Value::Null);
@@ -997,8 +997,25 @@ pub fn cast(value: Value, ty: &DataType) -> EngineResult<Value> {
         // By the number MySQL reads out of the value: `CAST('abc' AS DOUBLE)`
         // is 0 there, not NULL. Answering NULL made the cast contradict the
         // NOT NULL a numeric target is described with.
-        D::Float(_) | D::Double(_) | D::DoublePrecision | D::Real => {
-            Value::Float(value.as_number())
+        D::Double(_) | D::DoublePrecision | D::Real => Value::Float(value.as_number()),
+        // A cast to FLOAT narrows, or the cast is only a relabelling: the
+        // column is described FLOAT and a binary client decodes four bytes,
+        // so the value has to be the one those four bytes hold.
+        D::Float(_) => {
+            let n = value.as_number();
+            let narrowed = n as f32;
+            // `as f32` saturates, so `CAST(1e300 AS FLOAT)` came back an
+            // infinity. MySQL refuses it, which is the answer that stays true.
+            if narrowed.is_infinite() && n.is_finite() {
+                return Err(EngineError::new(
+                    1690,
+                    "22003",
+                    // Naming the operand the way MySQL does, which spells the
+                    // cast in lower case and leaves the operand as written.
+                    format!("DOUBLE value is out of range in 'cast({source} as float)'"),
+                ));
+            }
+            Value::Float32(narrowed)
         }
         // Kept as text where it really is a number, because that is how a
         // decimal holds digits an f64 would lose. Where it is not, the number

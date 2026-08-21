@@ -5435,6 +5435,246 @@ fn a_numeric_precision_is_reported_the_way_mysql_reports_it() {
 }
 
 #[test]
+fn a_float_column_holds_and_prints_four_bytes() {
+    // A FLOAT is four bytes in MySQL and shows six significant digits. Keeping
+    // the double made it a DOUBLE that happened to be declared narrower, and
+    // rounding the value without fixing the rendering would have been *worse*
+    // — 1.2345678806304932 is further from what MySQL prints than the
+    // unrounded value was. Both halves measured on 8.3.
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE F (f FLOAT, d DOUBLE)");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO F VALUES (1.234567890123, 1.234567890123),(0.1,0.1),(1e20,1e20),\
+                              (1.5,1.5),(16777217,16777217)",
+    );
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT f, d FROM F"),
+        vec![
+            vec!["1.23457", "1.234567890123"],
+            vec!["0.1", "0.1"],
+            vec!["1e20", "1e20"],
+            vec!["1.5", "1.5"],
+            // Four bytes cannot hold 16777217, and six digits cannot show
+            // 16777216.
+            vec!["16777200", "16777217"],
+        ]
+    );
+
+    // The narrowing does not survive arithmetic: MySQL reads `f + 0` as a
+    // double and shows every digit of the widened value.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT f + 0 FROM F LIMIT 1"),
+        vec![vec!["1.2345678806304932"]]
+    );
+
+    // And it says so on the wire, which is what makes the binary protocol send
+    // four bytes rather than eight.
+    let described = engine.describe(&session, "SELECT f, d FROM F", 0).unwrap();
+    let codes: Vec<String> = described.iter().map(|c| format!("{:?}", c.ty)).collect();
+    assert_eq!(codes, vec!["Float", "Double"]);
+
+    // Both renderings, because there are two: `rows` above reads the engine's,
+    // and a client reads the protocol's. They were written apart and only one
+    // of them knew about the six digits, so the value a test saw and the value
+    // a client saw disagreed.
+    let Outcome::Rows(result) = run(&engine, &mut session, "SELECT f, d FROM F LIMIT 1") else {
+        panic!("expected rows")
+    };
+    let mut text = mysql_ultralight_protocol::BufWriter::new();
+    result.rows[0][0].to_wire().encode_text(&mut text);
+    // A length-encoded string: one byte of length, then the digits.
+    assert_eq!(
+        String::from_utf8_lossy(&text.into_inner()[1..]),
+        "1.23457",
+        "the protocol renders a FLOAT at six digits too"
+    );
+
+    // Four bytes, not eight.
+    let mut binary = mysql_ultralight_protocol::BufWriter::new();
+    result.rows[0][0]
+        .to_wire()
+        .encode_binary(&mut binary, described[0].ty);
+    assert_eq!(binary.into_inner().len(), 4);
+}
+
+#[test]
+fn a_float_expression_is_typed_the_way_its_value_is_tagged() {
+    // Whether a FLOAT survives an expression is decided per function, and
+    // MySQL is not uniform about it: `-f`, `ABS(f)` and `ROUND(f, 2)` widen to
+    // a double and show every digit, while `COALESCE(f, 0)`, `LEAST(f, 9)` and
+    // a cast back to FLOAT stay six digits wide. All measured on 8.3.
+    //
+    // The type and the value are decided in different code — the type in
+    // `computed_column_type`, the tag in the evaluator — so this reads both
+    // for every expression. Where they disagree the two protocols answer
+    // differently for the same row, which is the bug that is worth a test:
+    // the text one prints seventeen digits and the binary one writes four
+    // bytes of something else.
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE F (f FLOAT)");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO F VALUES (1.234567890123)",
+    );
+
+    let cases = [
+        ("-f", "Double", "-1.2345678806304932"),
+        ("ABS(f)", "Double", "1.2345678806304932"),
+        ("ROUND(f, 2)", "Double", "1.23"),
+        ("f + 0", "Double", "1.2345678806304932"),
+        ("COALESCE(f, 0)", "Float", "1.23457"),
+        ("LEAST(f, 9)", "Float", "1.23457"),
+        ("GREATEST(f, 0)", "Float", "1.23457"),
+        ("CAST(f AS FLOAT)", "Float", "1.23457"),
+    ];
+    for (expression, expected_type, expected_text) in cases {
+        let sql = format!("SELECT {expression} AS v FROM F");
+        let described = engine.describe(&session, &sql, 0).unwrap();
+        assert_eq!(
+            format!("{:?}", described[0].ty),
+            expected_type,
+            "{expression} is described as the wrong type"
+        );
+        assert_eq!(
+            rows(&engine, &mut session, &sql),
+            vec![vec![expected_text]],
+            "{expression} answers the wrong value"
+        );
+        // The declared code decides how many bytes the binary protocol writes,
+        // so a value tagged the other way sends a different number entirely.
+        let Outcome::Rows(result) = run(&engine, &mut session, &sql) else {
+            panic!("expected rows")
+        };
+        let mut binary = mysql_ultralight_protocol::BufWriter::new();
+        result.rows[0][0]
+            .to_wire()
+            .encode_binary(&mut binary, described[0].ty);
+        let expected_width = if expected_type == "Float" { 4 } else { 8 };
+        assert_eq!(
+            binary.into_inner().len(),
+            expected_width,
+            "{expression} encodes to the wrong width"
+        );
+    }
+}
+
+#[test]
+fn a_float_that_four_bytes_cannot_hold_is_refused() {
+    // `as f32` saturates rather than failing, so the column stored an infinity
+    // and answered the token `Inf` — and kept it, because the image writes the
+    // bits. MySQL refuses the statement: 1264, the same code the unsigned
+    // guard beside it uses.
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE F (f FLOAT)");
+
+    for sql in [
+        "INSERT INTO F VALUES (3.5e38)",
+        "INSERT INTO F VALUES (-3.5e38)",
+    ] {
+        let error = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(error.code, 1264, "{sql}");
+    }
+
+    run(&engine, &mut session, "INSERT INTO F VALUES (1)");
+    let error = engine
+        .execute(&mut session, "UPDATE F SET f = 1e300", &[])
+        .unwrap_err();
+    assert_eq!(error.code, 1264);
+
+    // A cast is refused too, and MySQL uses a different code for it because
+    // there is no column to name.
+    let error = engine
+        .execute(&mut session, "SELECT CAST(1e300 AS FLOAT)", &[])
+        .unwrap_err();
+    assert_eq!(error.code, 1690);
+    assert!(
+        error.message.contains("cast(1e300 as float)"),
+        "the operand is named the way MySQL names it: {}",
+        error.message
+    );
+
+    // What four bytes *can* hold still goes in.
+    run(&engine, &mut session, "UPDATE F SET f = 3.4e38");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT f FROM F"),
+        vec![vec!["3.4e38"]]
+    );
+}
+
+#[test]
+fn a_decimal_column_never_answers_in_exponent_notation() {
+    // All non-integer arithmetic evaluates to a float while the column is
+    // declared NEWDECIMAL, so a sum over a wide decimal reached the float
+    // formatter and came back `4e16` once that formatter learned about
+    // exponents. MySQL never sends a NEWDECIMAL that way, and a driver handing
+    // the text to a decimal parser has no reason to accept it.
+    //
+    // The scale is still the f64's rather than the one MySQL computes — that
+    // is #0070, and this only pins the form.
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE D (amt DECIMAL(30,2))");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO D VALUES (20000000000000000.00)",
+    );
+
+    for row in rows(&engine, &mut session, "SELECT amt + amt, amt * 2 FROM D") {
+        for value in row {
+            assert!(
+                !value.contains('e') && !value.contains('E'),
+                "a decimal column answered `{value}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_double_is_printed_the_way_mysql_prints_one() {
+    // Rust's `Display` never reaches for an exponent, so `1e20` was written as
+    // twenty-one digits and DBL_MAX as three hundred and nine. The rule is
+    // `my_gcvt`'s, the same one a document's numbers go through — and a column
+    // drops the trailing `.0` a document keeps.
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE D2 (n INT, d DOUBLE)");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO D2 VALUES (14,1e14),(15,1e15),(16,1e16),(20,1e20),(-15,1e-15),\
+                               (-16,1e-16),(1,0.1),(2,1.5),(3,-2.0),(4,1.234567890123),\
+                               (5,123456789012345678),(6,1e308)",
+    );
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT d FROM D2 ORDER BY n")
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+        vec![
+            "1e-16",
+            "0.000000000000001",
+            "0.1",
+            "1.5",
+            // A column drops the `.0`; a document would keep it.
+            "-2",
+            "1.234567890123",
+            // Seventeen digits do not fit in eighteen places, so this one
+            // takes the exponent even though the digits reach past the point.
+            "1.2345678901234568e17",
+            "1e308",
+            "100000000000000",
+            "1e15",
+            "1e16",
+            "1e20",
+        ]
+    );
+}
+
+#[test]
 fn soundex_answers_what_mysql_answers() {
     // The classic algorithm, with three of its own answers to the places the
     // variants disagree — each measured on 8.3 rather than taken from a
@@ -6894,18 +7134,12 @@ fn arithmetic_reads_a_number_out_of_anything_it_is_given() {
     // Reading the exponent made overflow reachable where stopping at the `e`
     // never could. MySQL stops a string conversion at DBL_MAX, and an infinity
     // renders as the token `Inf`, which is not a number a client can read back.
-    // The leading digits rather than the whole rendering, because a double this
-    // large is printed in full here and in exponent form by MySQL — #0055.
-    let huge = rows(&engine, &mut session, "SELECT '1e400' + 0, '-1e400' + 0");
-    assert!(
-        huge[0][0].starts_with("17976931348623157"),
-        "expected DBL_MAX, got {}",
-        huge[0][0]
-    );
-    assert!(
-        huge[0][1].starts_with("-17976931348623157"),
-        "expected -DBL_MAX, got {}",
-        huge[0][1]
+    // This asserted the leading digits only, because the whole rendering used
+    // to be 309 of them where MySQL writes an exponent — it can say what MySQL
+    // says now.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT '1e400' + 0, '-1e400' + 0"),
+        vec![vec!["1.7976931348623157e308", "-1.7976931348623157e308"]]
     );
 }
 

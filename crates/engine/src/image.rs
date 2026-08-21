@@ -27,6 +27,9 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// not fail cleanly, it would silently produce a catalog with the wrong shape,
 /// and every test running against it would be wrong in a way nothing reports.
 ///
+/// v5 adds another: a four-byte float, which a v4 image would reload as a
+/// double and print to seventeen digits where MySQL shows six.
+///
 /// v4 adds a value tag: a decimal is written as its own kind rather than
 /// as text, because the two are compared differently — by value and by
 /// characters — and a v3 image would reload every decimal as a string.
@@ -39,7 +42,7 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// answering it, which is the wrong answer the version check exists to
 /// prevent. An image is a file a user keeps and boots from with `--state`, so
 /// the stale one has to fail rather than mislead.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// Writes the whole catalog.
 pub fn encode(catalog: &Catalog) -> Vec<u8> {
@@ -463,6 +466,12 @@ fn write_value(w: &mut Writer, value: &Value) {
             w.u8(6);
             w.str(s);
         }
+        // Tag 7. Four bytes, because that is the whole point of the tag: a
+        // reload as a double would print every digit of the widening.
+        Value::Float32(f) => {
+            w.u8(7);
+            w.u32(f.to_bits());
+        }
     }
 }
 
@@ -496,6 +505,7 @@ fn read_value(r: &mut Reader<'_>) -> EngineResult<Value> {
             Value::Json(crate::json::render_text(&parsed))
         }
         6 => Value::Decimal(r.str()?),
+        7 => Value::Float32(f32::from_bits(r.u32()?)),
         other => return Err(malformed(format!("unknown value tag {other}"))),
     })
 }

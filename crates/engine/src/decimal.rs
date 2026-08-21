@@ -119,6 +119,25 @@ pub const AVERAGE_EXTRA_SCALE: usize = 4;
 /// this saturates instead of wrapping and answers zero for a non-finite value —
 /// `'1e400'` into a `DECIMAL(6,2)` is not a number that column can hold, and
 /// `Inf` is not a decimal any client can read.
+/// A float's digits with no exponent, for a column described as a decimal.
+///
+/// All non-integer arithmetic evaluates to a float while `arithmetic_type`
+/// declares the column NEWDECIMAL, so a sum over a `DECIMAL(30,2)` reaches the
+/// float formatter — which reaches for an exponent past fifteen digits, as
+/// MySQL does for a double. MySQL never sends a NEWDECIMAL that way, and a
+/// driver handing the text to a decimal parser has no reason to accept `4e16`.
+/// The scale is still the f64's rather than the one MySQL computes; that is
+/// #0070, and this only keeps the form readable.
+pub fn plain(value: f64) -> String {
+    if !value.is_finite() {
+        return "0".to_owned();
+    }
+    // Rust's `Display` for an f64 is always positional, however many digits
+    // that takes, which is exactly what is wanted here.
+    let text = value.to_string();
+    text.strip_suffix(".0").map(str::to_owned).unwrap_or(text)
+}
+
 pub fn from_f64(value: f64, scale: usize) -> String {
     if !value.is_finite() {
         return render(0, scale);

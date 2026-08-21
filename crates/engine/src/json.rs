@@ -496,6 +496,12 @@ pub fn from_value(value: &Value) -> Json {
         Value::Null => Json::Null,
         Value::Int(n) => Json::from(*n),
         Value::Float(f) => serde_json::Number::from_f64(*f).map_or(Json::Null, Json::Number),
+        // Widened, not through the six digits a FLOAT column displays:
+        // MySQL's JSON number is a double, and `JSON_OBJECT('a', f)` over a
+        // float holding 1.234567890123 gives `{"a": 1.2345678806304932}`.
+        Value::Float32(f) => {
+            serde_json::Number::from_f64(f64::from(*f)).map_or(Json::Null, Json::Number)
+        }
         Value::Text(s) => Json::String(s.clone()),
         Value::Bytes(b) => Json::String(String::from_utf8_lossy(b).into_owned()),
         // A number rather than a string: `JSON_OBJECT('a', decimal_column)`

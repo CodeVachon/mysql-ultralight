@@ -381,7 +381,7 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             expr, data_type, ..
         } => {
             let value = eval(expr, ctx)?;
-            functions::cast(value, data_type)
+            functions::cast(value, data_type, &expr.to_string())
         }
 
         // A scalar subquery: one row, one column.

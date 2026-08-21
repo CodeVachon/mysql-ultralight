@@ -35,6 +35,18 @@ pub enum Value {
     /// sorts first. Both of those are MySQL's answers, and only the tag can
     /// pick between them.
     Decimal(String),
+    /// A four-byte float, held widened but remembered as four bytes.
+    ///
+    /// Tagged for the same reason `Decimal` above is: the value alone does not
+    /// say how wide the column that produced it was, and MySQL shows a FLOAT
+    /// at six significant digits where a DOUBLE gets as many as it needs. A
+    /// column holding 1.234567890123 reads back `1.23457` there and would read
+    /// back `1.2345678806304932` from a bare double — which is *further* from
+    /// the truth than the unrounded value it replaced.
+    ///
+    /// It does not survive arithmetic, which is right: `f + 0` in MySQL is a
+    /// double and shows every digit of the widened value.
+    Float32(f32),
 }
 
 impl Value {
@@ -55,6 +67,7 @@ impl Value {
         match self {
             Value::Int(v) => Some(*v),
             Value::Float(v) => Some(*v as i64),
+            Value::Float32(v) => Some(*v as i64),
             Value::Text(v) | Value::Json(v) | Value::Decimal(v) => {
                 let t = v.trim();
                 t.parse::<i64>()
@@ -69,6 +82,7 @@ impl Value {
         match self {
             Value::Int(v) => Some(*v as f64),
             Value::Float(v) => Some(*v),
+            Value::Float32(v) => Some(*v as f64),
             Value::Text(v) | Value::Json(v) | Value::Decimal(v) => v.trim().parse().ok(),
             _ => None,
         }
@@ -85,6 +99,7 @@ impl Value {
             Value::Null => 0.0,
             Value::Int(v) => *v as f64,
             Value::Float(v) => *v,
+            Value::Float32(v) => *v as f64,
             Value::Text(v) | Value::Json(v) | Value::Decimal(v) => numeric_prefix(v),
             Value::Bytes(v) => numeric_prefix(&String::from_utf8_lossy(v)),
         }
@@ -96,6 +111,11 @@ impl Value {
             Value::Null => String::new(),
             Value::Int(v) => v.to_string(),
             Value::Float(v) => format_float(*v),
+            // Six significant digits, which is what MySQL shows for a FLOAT.
+            Value::Float32(v) => mysql_ultralight_protocol::value::format_float(
+                *v as f64,
+                Some(mysql_ultralight_protocol::value::FLOAT_DIGITS),
+            ),
             Value::Text(v) => v.clone(),
             Value::Bytes(v) => String::from_utf8_lossy(v).into_owned(),
             // The document as it was serialised, which is what MySQL sends and
@@ -110,6 +130,7 @@ impl Value {
             Value::Null => None,
             Value::Int(v) => Some(*v != 0),
             Value::Float(v) => Some(*v != 0.0),
+            Value::Float32(v) => Some(*v != 0.0),
             // A string is read for its leading number, so '0' and 'abc' are
             // both false and '1abc' is true. A binary string is read the same
             // way: treating it as "true when non-empty" made `WHERE BINARY x`
@@ -143,8 +164,13 @@ impl Value {
         // how MySQL behaves and what Prisma's generated comparisons rely on.
         // A decimal is a number: `2.50` equals `2.5` and sorts below `10.00`,
         // where two *strings* of those characters do neither.
-        let both_numeric = matches!(self, Value::Int(_) | Value::Float(_) | Value::Decimal(_))
-            || matches!(other, Value::Int(_) | Value::Float(_) | Value::Decimal(_));
+        let both_numeric = matches!(
+            self,
+            Value::Int(_) | Value::Float(_) | Value::Decimal(_) | Value::Float32(_)
+        ) || matches!(
+            other,
+            Value::Int(_) | Value::Float(_) | Value::Decimal(_) | Value::Float32(_)
+        );
 
         if both_numeric {
             if let (Some(a), Some(b)) = (self.as_float(), other.as_float()) {
@@ -223,6 +249,9 @@ impl Value {
             Value::Null => WireValue::Null,
             Value::Int(v) => WireValue::I64(*v),
             Value::Float(v) => WireValue::F64(*v),
+            // Four bytes on the wire as well as in the column, which is the
+            // other half of the same promise.
+            Value::Float32(v) => WireValue::F32(*v),
             Value::Text(v) => WireValue::Str(v.clone()),
             Value::Bytes(v) => WireValue::Bytes(v.clone()),
             // JSON crosses the wire as text, which is how MySQL transmits it.
@@ -271,18 +300,11 @@ fn collate(a: &str, b: &str) -> Ordering {
 /// Renders a float the way MySQL does: no trailing `.0`, no exponent for
 /// ordinary magnitudes.
 fn format_float(v: f64) -> String {
-    if v.is_nan() {
-        return "NaN".to_owned();
-    }
-    if v.is_infinite() {
-        return if v < 0.0 {
-            "-Inf".to_owned()
-        } else {
-            "Inf".to_owned()
-        };
-    }
-    let s = v.to_string();
-    s.strip_suffix(".0").map(str::to_owned).unwrap_or(s)
+    // One formatter for both crates: a value rendered here and the same value
+    // rendered on its way out have to agree, and they did not — this dropped a
+    // trailing `.0` and never reached for an exponent, so `1e20` was twenty-one
+    // digits where MySQL writes `1e20`.
+    mysql_ultralight_protocol::value::format_float(v, None)
 }
 
 /// The number MySQL reads out of the front of a string.

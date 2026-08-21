@@ -126,10 +126,13 @@ pub const GROUPS: &[Group] = &[
         name: "a type code has to hold its values",
         setup: &[
             "CREATE TABLE Q (t TINYINT, s SMALLINT, i INT, iu INT UNSIGNED, \
-             bu BIGINT UNSIGNED, y YEAR)",
-            "INSERT INTO Q VALUES (100, 30000, 2000000000, 4000000000, 9000000000, 2026)",
-            "INSERT INTO Q VALUES (100, 30000, 2000000000, 4000000000, 9000000000, 1901)",
-            "INSERT INTO Q VALUES (100, 30000, 2000000000, 4000000000, 9000000000, 2155)",
+             bu BIGINT UNSIGNED, y YEAR, f FLOAT, d DOUBLE)",
+            "INSERT INTO Q VALUES (100, 30000, 2000000000, 4000000000, 9000000000, 2026, \
+             1.234567890123, 1.234567890123)",
+            "INSERT INTO Q VALUES (100, 30000, 2000000000, 4000000000, 9000000000, 1901, \
+             1e20, 1e20)",
+            "INSERT INTO Q VALUES (100, 30000, 2000000000, 4000000000, 9000000000, 2155, \
+             16777217, 16777217)",
         ],
         cases: &[
             // A total outgrows what it totals: three TINYINTs of 100 make 300,
@@ -138,6 +141,24 @@ pub const GROUPS: &[Group] = &[
             same("SELECT AVG(t), MIN(t), MAX(t), COUNT(t) FROM Q"),
             // An unsigned column read back signed comes out negative.
             same("SELECT iu, bu FROM Q LIMIT 1"),
+            // A FLOAT is four bytes and shows six significant digits; a DOUBLE
+            // shows as many as it takes to read the value back. Neither is
+            // what Rust prints, which never reaches for an exponent.
+            same("SELECT f, d FROM Q ORDER BY f"),
+            same("SELECT f + 0, d + 0 FROM Q ORDER BY f"),
+            // Whether a FLOAT survives an expression is decided per function,
+            // and the type and the value are decided in different code: MySQL
+            // widens `-f` and `ABS(f)` to a double and keeps `COALESCE(f, 0)`
+            // and `LEAST(f, 9)` a float. Every one of these is read twice
+            // here, once per protocol, which is what catches the two
+            // disagreeing.
+            same("SELECT -f, ABS(f), ROUND(f, 2) FROM Q ORDER BY f"),
+            same("SELECT COALESCE(f, 0), LEAST(f, 9), GREATEST(f, 0) FROM Q ORDER BY f"),
+            same("SELECT CAST(f AS FLOAT), CAST(d AS FLOAT) FROM Q ORDER BY f"),
+            // A float embeds in a document as the double it widens to, not as
+            // the six digits the column displays: MySQL's JSON number is a
+            // double.
+            same("SELECT JSON_OBJECT('f', f), JSON_OBJECT('d', d) FROM Q ORDER BY f"),
             same("SELECT y FROM Q ORDER BY y"),
             // A union of the same width and different signs holds neither
             // branch's range.

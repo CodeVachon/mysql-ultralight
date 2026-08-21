@@ -236,8 +236,10 @@ impl SqlType {
                 "bigint" => ColumnType::LongLong,
                 _ => ColumnType::Long,
             },
-            // FLOAT stays a double: the engine holds one, and saying `FLOAT`
-            // would have the binary protocol write four bytes for it. #0048.
+            // A `FLOAT` says so, which is what makes the binary protocol send
+            // four bytes rather than eight. It could not until the value was
+            // four bytes too, which is why this read `Double` before.
+            TypeKind::Float if self.base_name() == "float" => ColumnType::Float,
             TypeKind::Float => ColumnType::Double,
             TypeKind::Decimal => ColumnType::NewDecimal,
             // A fixed-width string is `STRING`, a varying one `VAR_STRING`,
@@ -295,6 +297,7 @@ impl SqlType {
     pub fn implicit_default(&self) -> Value {
         match self.kind {
             TypeKind::Bool | TypeKind::Int | TypeKind::Year => Value::Int(0),
+            TypeKind::Float if self.base_name() == "float" => Value::Float32(0.0),
             TypeKind::Float => Value::Float(0.0),
             // At the column's scale, and tagged, because this value goes into
             // a row without passing `coerce`. Left as plain text it was a
@@ -395,7 +398,23 @@ impl SqlType {
                 if self.unsigned && n < 0.0 {
                     return Err(out_of_range());
                 }
-                Value::Float(n)
+                // A `FLOAT` is four bytes in MySQL and holds what four bytes
+                // hold: 1.234567890123 comes back 1.23457. Keeping the double
+                // made the column a `DOUBLE` that happened to be declared
+                // narrower.
+                if self.base_name() == "float" {
+                    let narrowed = n as f32;
+                    // `as f32` saturates rather than failing, so 3.5e38 became
+                    // an infinity and the column answered the token `Inf` —
+                    // not a number any client reads back. MySQL refuses the
+                    // statement, which is the only answer that stays true.
+                    if narrowed.is_infinite() && n.is_finite() {
+                        return Err(out_of_range());
+                    }
+                    Value::Float32(narrowed)
+                } else {
+                    Value::Float(n)
+                }
             }
             // Decimals keep their text form so no precision is lost on the way
             // through, which is the whole reason MySQL transmits them as text.

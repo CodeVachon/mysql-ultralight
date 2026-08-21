@@ -129,6 +129,40 @@ impl ResultSet {
         }
     }
 
+    /// Makes every value agree with the type its column is described with.
+    ///
+    /// The type is decided in `computed_column_type` and the value is tagged
+    /// by the evaluator, in different code, for the same expression. Where
+    /// they disagree the two protocols answer differently for the same row:
+    /// the binary one encodes by the declared code, so a column described
+    /// FLOAT holding a widened double writes four bytes of a number the text
+    /// protocol printed to seventeen digits. That is a whole class of bug
+    /// rather than a list of functions to remember, so it is closed here
+    /// instead — every result passes through this on its way out.
+    ///
+    /// Only the approximate types, because they are the ones where the same
+    /// number has two spellings. Nothing else is touched: a wrongly *tagged*
+    /// value is a bug to find, not one to paper over.
+    pub fn reconcile(&mut self) {
+        for (index, column) in self.columns.iter().enumerate() {
+            for row in &mut self.rows {
+                let Some(value) = row.get_mut(index) else {
+                    continue;
+                };
+                match (column.ty, &value) {
+                    (ColumnType::Float, Value::Float(v)) => *value = Value::Float32(*v as f32),
+                    (ColumnType::Double, Value::Float32(v)) => *value = Value::Float(f64::from(*v)),
+                    // A decimal column never carries an exponent, whatever the
+                    // float behind it renders as. See `decimal::plain`.
+                    (ColumnType::NewDecimal | ColumnType::Decimal, Value::Float(v)) => {
+                        *value = Value::Decimal(crate::decimal::plain(*v));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// A single-column, single-row result, the shape most `SELECT @@var` and
     /// scalar function queries take.
     pub fn scalar(name: &str, ty: ColumnType, value: Value) -> Self {
@@ -163,5 +197,52 @@ impl Outcome {
             rows,
             last_insert_id: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `reconcile` is a backstop: the type rules already agree with the value
+    /// for every expression there is a case for, so nothing reaching it is a
+    /// path a query takes *today*. That is the point of it — it holds for the
+    /// function nobody has added yet — and it is why it is measured here
+    /// directly rather than through a statement that happens to trip it.
+    #[test]
+    fn a_value_is_made_to_agree_with_the_type_it_is_described_with() {
+        let mismatched = |ty, value| {
+            let mut result = ResultSet {
+                columns: vec![OutColumn::new("v", ty)],
+                rows: vec![vec![value]],
+            };
+            result.reconcile();
+            result.rows.remove(0).remove(0)
+        };
+
+        // A double under a FLOAT: the binary protocol writes four bytes, so
+        // the value has to be the one four bytes hold.
+        assert_eq!(
+            mismatched(ColumnType::Float, Value::Float(1.234_567_890_123)).as_text(),
+            "1.23457"
+        );
+        // And the other way: six digits in text beside sixteen in binary was
+        // the same disagreement read from the other side.
+        assert_eq!(
+            mismatched(ColumnType::Double, Value::Float32(1.234_567_9)).as_text(),
+            "1.2345678806304932"
+        );
+        // A decimal never carries an exponent, whatever the float renders as.
+        assert_eq!(
+            mismatched(ColumnType::NewDecimal, Value::Float(4e16)).as_text(),
+            "40000000000000000"
+        );
+
+        // Nothing else is touched: a wrongly tagged value elsewhere is a bug
+        // to find, not one to paper over.
+        assert_eq!(
+            mismatched(ColumnType::LongLong, Value::Text("7".to_owned())),
+            Value::Text("7".to_owned())
+        );
     }
 }

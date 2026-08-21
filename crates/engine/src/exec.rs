@@ -347,7 +347,14 @@ impl Engine {
         sql: &str,
         parameters: &[Value],
     ) -> EngineResult<Outcome> {
-        self.execute_at_depth(session, sql, parameters, 0)
+        let mut outcome = self.execute_at_depth(session, sql, parameters, 0)?;
+        // On the way out only: an intermediate result feeds another expression
+        // and should keep exactly the value it computed, where a result that
+        // is about to be sent has to match what the client will decode it by.
+        if let Outcome::Rows(rows) = &mut outcome {
+            rows.reconcile();
+        }
+        Ok(outcome)
     }
 
     /// Runs a command that may hold several statements, one outcome each.
@@ -4661,7 +4668,15 @@ fn widen(a: ColumnType, a_unsigned: bool, b: ColumnType, b_unsigned: bool) -> Co
     let numeric = |t: ColumnType| integer(t).is_some() || approximate(t) || exact(t);
     if numeric(a) && numeric(b) {
         return if approximate(a) || approximate(b) {
-            ColumnType::Double
+            // A float beside an integer is still a float — MySQL types
+            // `COALESCE(f, 0)` and `FLOAT UNION INT` FLOAT, and shows the six
+            // digits a float has. Only a double or a decimal alongside makes
+            // it a double; the decimal because a float cannot hold one.
+            if a == ColumnType::Double || b == ColumnType::Double || exact(a) || exact(b) {
+                ColumnType::Double
+            } else {
+                ColumnType::Float
+            }
         } else {
             ColumnType::NewDecimal
         };
@@ -5238,6 +5253,12 @@ fn literal_expr(value: &Value) -> Expr {
         Value::Null => wrap(AstValue::Null),
         Value::Int(v) => wrap(AstValue::Number(v.to_string(), false)),
         Value::Float(v) if v.is_finite() => wrap(AstValue::Number(format!("{v:?}"), false)),
+        // Widened, because that is what the value is once it stops being a
+        // column: MySQL reads `f + 0` as a double too.
+        Value::Float32(v) if v.is_finite() => {
+            wrap(AstValue::Number(format!("{:?}", *v as f64), false))
+        }
+        Value::Float32(_) => wrap(AstValue::Null),
         Value::Float(_) => wrap(AstValue::Null),
         Value::Text(v) => wrap(AstValue::SingleQuotedString(v.clone())),
         // As a number, not a quoted string: a decimal that went back through
@@ -5626,10 +5647,11 @@ fn numeric_answer(argument: ColumnType, whole: bool) -> ColumnType {
     match argument {
         t if is_integer(t) => ColumnType::LongLong,
         ColumnType::Decimal | ColumnType::NewDecimal if whole => ColumnType::LongLong,
-        t @ (ColumnType::Decimal
-        | ColumnType::NewDecimal
-        | ColumnType::Float
-        | ColumnType::Double) => t,
+        // Not FLOAT, which does not survive being computed with: MySQL types
+        // `ABS(f)` and `ROUND(f, 2)` DOUBLE and shows every digit of the
+        // widening, the same way `f + 0` does.
+        ColumnType::Float => ColumnType::Double,
+        t @ (ColumnType::Decimal | ColumnType::NewDecimal | ColumnType::Double) => t,
         _ => ColumnType::Double,
     }
 }
@@ -5946,6 +5968,9 @@ fn computed_column_type(
                 U::Not => ColumnType::LongLong,
                 U::Minus | U::Plus => match computed_column_type(expr, refs, input) {
                     t if is_integer(t) => ColumnType::LongLong,
+                    // As with `ABS`: computing with a float widens it, and
+                    // MySQL says so in the type as well as in the digits.
+                    ColumnType::Float => ColumnType::Double,
                     t => t,
                 },
                 _ => ColumnType::VarString,

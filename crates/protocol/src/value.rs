@@ -54,8 +54,12 @@ impl Value {
             Value::U64(v) => {
                 w.lenenc_str(&v.to_string());
             }
+            // Six significant digits, which is what MySQL shows for a FLOAT
+            // and is the reason the value is kept at four bytes at all: the
+            // widened double reads back 1.2345678806304932 for a column MySQL
+            // prints as 1.23457.
             Value::F32(v) => {
-                w.lenenc_str(&format_f64(*v as f64));
+                w.lenenc_str(&format_float(*v as f64, Some(FLOAT_DIGITS)));
             }
             Value::F64(v) => {
                 w.lenenc_str(&format_f64(*v));
@@ -232,21 +236,66 @@ impl Value {
 /// ordinary magnitudes; `{}` on an f64 is close enough for the values a test
 /// suite compares.
 fn format_f64(v: f64) -> String {
+    format_float(v, None)
+}
+
+/// How many significant digits MySQL shows for a four-byte float.
+///
+/// `FLT_DIG`, the same constant its own printer uses.
+pub const FLOAT_DIGITS: usize = 6;
+
+/// A float as MySQL prints one, at `digits` significant digits.
+///
+/// `None` for a DOUBLE, whose digits are however many it takes to read the
+/// value back — `Some(6)` for a FLOAT, which MySQL prints at `FLT_DIG` and so
+/// shows `1.23457` for a column holding 1.2345678806304932.
+///
+/// The choice between the two forms is `my_gcvt`'s, the same one a document's
+/// numbers go through:
+///
+/// ```text
+/// decpt >= -14 && (decpt <= 15 || len > decpt)
+/// ```
+///
+/// `decpt` is where the point falls, one past the exponent, and `len` is how
+/// many digits are being written. Rust's `Display` never picks the second form
+/// at all, so `1e20` came out as twenty-one digits where MySQL writes `1e20`.
+/// Unlike a document, a column drops a trailing `.0`: `-2.0` prints as `-2`.
+pub fn format_float(v: f64, digits: Option<usize>) -> String {
     if v.is_nan() {
-        "NaN".to_owned()
-    } else if v.is_infinite() {
-        if v.is_sign_negative() {
+        return "NaN".to_owned();
+    }
+    if v.is_infinite() {
+        return if v.is_sign_negative() {
             "-Inf".to_owned()
         } else {
             "Inf".to_owned()
-        }
-    } else {
-        let mut s = v.to_string();
-        if let Some(stripped) = s.strip_suffix(".0") {
-            s = stripped.to_owned();
-        }
-        s
+        };
     }
+
+    // Rounded first, so a FLOAT is measured and written at the width MySQL
+    // shows rather than at the width its double happens to need. Back through
+    // a parse, because the rounding changes which value is being printed:
+    // 16777216 at six digits *is* 16777200.
+    let (value, scientific) = match digits {
+        None => (v, format!("{v:e}")),
+        Some(digits) => {
+            let rounded = format!("{v:.*e}", digits.saturating_sub(1));
+            let value: f64 = rounded.parse().unwrap_or(v);
+            (value, format!("{value:e}"))
+        }
+    };
+
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let decpt = exponent + 1;
+    let len = mantissa.chars().filter(char::is_ascii_digit).count() as i32;
+
+    if decpt < -14 || (decpt > 15 && len <= decpt) {
+        return scientific;
+    }
+    let fixed = value.to_string();
+    fixed.strip_suffix(".0").map(str::to_owned).unwrap_or(fixed)
 }
 
 /// The binary DATE/DATETIME encoding: a length byte, then progressively more

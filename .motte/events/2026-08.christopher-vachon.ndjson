@@ -151,3 +151,6 @@
 {"at":"2026-08-21T18:26:27Z","id":73,"by":"Christopher Vachon","as":"user","type":"created","title":"An all-NULL union is typed two ways by MySQL","state":"Todo"}
 {"at":"2026-08-21T18:43:39Z","id":66,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-21T18:55:46Z","id":74,"by":"Christopher Vachon","as":"user","type":"created","title":"SOUNDEX of non-ASCII text works on bytes in MySQL","state":"Todo"}
+{"at":"2026-08-21T19:37:25Z","id":75,"by":"Christopher Vachon","as":"user","type":"created","title":"FLOAT(M,D) prints a fixed number of decimals","state":"Todo"}
+{"at":"2026-08-21T19:43:10Z","id":48,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-21T19:43:10Z","id":55,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
