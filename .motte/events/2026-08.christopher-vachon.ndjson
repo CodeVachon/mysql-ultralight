@@ -130,3 +130,9 @@
 {"at":"2026-08-21T02:28:39Z","id":44,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-21T12:40:09Z","id":61,"by":"Christopher Vachon","as":"user","type":"created","title":"A SQL boolean beside a document is read as a number","state":"Todo"}
 {"at":"2026-08-21T12:59:11Z","id":45,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-21T13:06:15Z","id":62,"by":"Christopher Vachon","as":"user","type":"created","title":"Publish v0.1.0 to npm","state":"Todo"}
+{"at":"2026-08-21T13:08:38Z","id":63,"by":"Christopher Vachon","as":"user","type":"created","title":"A computed column is reported nullable when it cannot be NULL","state":"Todo"}
+{"at":"2026-08-21T13:08:38Z","id":64,"by":"Christopher Vachon","as":"user","type":"created","title":"A computed column loses the UNSIGNED flag","state":"Todo"}
+{"at":"2026-08-21T13:08:59Z","id":65,"by":"Christopher Vachon","as":"user","type":"created","title":"A UNION with a NULL branch loses the column's type","state":"Todo"}
+{"at":"2026-08-21T13:08:59Z","id":66,"by":"Christopher Vachon","as":"user","type":"created","title":"SOUNDEX is unsupported","state":"Todo"}
+{"at":"2026-08-21T13:08:59Z","id":67,"by":"Christopher Vachon","as":"user","type":"created","title":"A function's scale argument is read as part of its type","state":"Todo"}

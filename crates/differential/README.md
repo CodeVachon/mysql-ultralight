@@ -51,7 +51,23 @@ Two things fail a run:
   state that has passed, and a stale claim is worse than none
 
 So the file only ever shrinks, and it shrinks by fixing things. Each line is
-covered by an issue under [#0009](../../.motte/issues).
+covered by an issue under [#0009](../../.motte/issues), and the whole file is
+accounted for — 75 lines at the last audit:
+
+| Lines | Issue |
+|---|---|
+| 34 | #0063 a computed column reported nullable when it cannot be NULL |
+| 22 | #0050 information_schema describing its own columns |
+| 4 | #0049 DECIMAL losing its scale through an aggregate |
+| 4 | #0064 a computed column losing the UNSIGNED flag |
+| 4 | #0067 a function's scale argument read as part of its type |
+| 3 | #0065 a UNION with a NULL branch losing the column's type |
+| 2 | #0046 JSON doubles outside a middling range |
+| 2 | #0066 SOUNDEX unsupported |
+
+Worth re-deriving rather than trusting after a run that fixes anything: five of
+those issues were written only once the file was counted against the issue list,
+because the harness reports what is *new*, never what is unclaimed.
 
 ## Writing a case
 
