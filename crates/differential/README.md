@@ -52,13 +52,12 @@ Two things fail a run:
 
 So the file only ever shrinks, and it shrinks by fixing things. Each line is
 covered by an issue under [#0009](../../.motte/issues), and the whole file is
-accounted for — 41 lines at the last audit:
+accounted for — 37 lines at the last audit:
 
 | Lines | Issue |
 |---|---|
 | 22 | #0050 information_schema describing its own columns |
 | 4 | #0049 DECIMAL losing its scale through an aggregate |
-| 4 | #0064 a computed column losing the UNSIGNED flag |
 | 4 | #0067 a function's scale argument read as part of its type |
 | 3 | #0065 a UNION with a NULL branch losing the column's type |
 | 2 | #0046 JSON doubles outside a middling range |

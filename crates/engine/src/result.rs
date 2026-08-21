@@ -25,6 +25,14 @@ pub struct OutColumn {
     /// `None` for a computed expression, which genuinely has no declared type:
     /// inventing one would be worse than widening it.
     pub declared: Option<SqlType>,
+    /// Whether the values are unsigned, for a column with no declared type to
+    /// say so.
+    ///
+    /// A separate field rather than a fabricated `declared`, because a view
+    /// stores its shape from these columns and would then record a column type
+    /// nothing declared. `ROW_NUMBER()` counts from one and MySQL marks it
+    /// UNSIGNED; so does `CAST(x AS UNSIGNED)`, which says so in the statement.
+    pub unsigned: bool,
 }
 
 impl OutColumn {
@@ -35,6 +43,7 @@ impl OutColumn {
             schema: String::new(),
             ty,
             nullable: true,
+            unsigned: false,
             declared: None,
         }
     }
@@ -46,6 +55,7 @@ impl OutColumn {
             schema: String::new(),
             ty: ty.column_type(),
             nullable,
+            unsigned: ty.unsigned,
             declared: Some(ty.clone()),
         }
     }
@@ -55,10 +65,17 @@ impl OutColumn {
     /// The declared type where there is one, and the widening the wire type
     /// implies where there is not — which is what every caller used to do
     /// unconditionally.
+    ///
+    /// The sign travels either way. A derived table, a CTE and a view are all
+    /// built from this, and the widened fallback is signed, so wrapping a
+    /// computed column in a subquery used to lose a flag the bare expression
+    /// had.
     pub fn sql_type(&self) -> SqlType {
-        self.declared
-            .clone()
-            .unwrap_or_else(|| SqlType::from_column_type(self.ty))
+        self.declared.clone().unwrap_or_else(|| {
+            let mut widened = SqlType::from_column_type(self.ty);
+            widened.unsigned = self.unsigned;
+            widened
+        })
     }
 
     pub fn in_table(mut self, schema: &str, table: &str) -> Self {
@@ -78,13 +95,13 @@ impl OutColumn {
         // what it had before there was a declared type to ask.
         if let Some(declared) = &self.declared {
             def = def.as_text(declared.is_textual());
-            // Without this the binary protocol reads the bytes back signed, so
-            // an `INT UNSIGNED` holding three billion arrives as a negative
-            // number. It only became reachable once the column stopped being
-            // described as a `LONGLONG`, where the value still fit.
-            if declared.unsigned {
-                def = def.unsigned();
-            }
+        }
+        // Without this the binary protocol reads the bytes back signed, so an
+        // `INT UNSIGNED` holding three billion arrives as a negative number. It
+        // only became reachable once the column stopped being described as a
+        // `LONGLONG`, where the value still fit.
+        if self.unsigned {
+            def = def.unsigned();
         }
         def.nullable(self.nullable)
     }

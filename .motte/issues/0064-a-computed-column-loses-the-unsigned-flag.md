@@ -1,11 +1,11 @@
 ---
 id: 64
 title: A computed column loses the UNSIGNED flag
-state: Todo
+state: Done
 parent: 9
 labels: [compat]
 created: 2026-08-21T13:08:38Z
-updated: 2026-08-21T13:08:38Z
+updated: 2026-08-21T13:53:17Z
 ---
 
 ## Description
@@ -20,3 +20,9 @@ ROW_NUMBER counts from one and MySQL says so. A CAST names the signedness in the
 Separate from the nullability of the same columns, which has its own issue, because the flag and the mechanism are different: OutColumn carries `declared` for the UNSIGNED flag and `nullable` for the other.
 
 Note that the UNSIGNED lines under `types and description` are not this — those belong to #0050, where information_schema describes its own columns.
+
+## Notes
+
+### 2026-08-21T13:53:17Z — Christopher Vachon (user)
+
+Both statements fixed; baseline 41 to 37. OutColumn gained its own unsigned flag rather than a fabricated declared type, which the field's own doc warns against. The families disagree and each was measured: arithmetic keeps the flag when either side has it, so u+1 is unsigned, where a conditional needs all its candidates and COALESCE(u,1) is not; -u drops it, and so does anything that stops being an integer. Also fixed a nullability case found alongside: a cast is NOT NULL only to a numeric target, where #0063 had made every cast nullable.

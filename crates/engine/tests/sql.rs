@@ -5435,6 +5435,145 @@ fn a_numeric_precision_is_reported_the_way_mysql_reports_it() {
 }
 
 #[test]
+fn a_computed_column_keeps_the_unsigned_flag() {
+    // A computed column had nowhere to carry the flag, so `ROW_NUMBER()` and
+    // `CAST(x AS UNSIGNED)` went out signed. Measured against MySQL 8.3, and
+    // the families disagree with each other on purpose — the pairs below sit
+    // either side of each rule.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE G (id INT NOT NULL, u INT UNSIGNED NOT NULL, v INT NULL)",
+    );
+    run(&engine, &mut session, "INSERT INTO G VALUES (1,7,NULL)");
+
+    let signs = |session: &Session, sql: &str| -> Vec<bool> {
+        engine
+            .describe(session, sql, 0)
+            .unwrap()
+            .iter()
+            .map(|c| c.unsigned)
+            .collect()
+    };
+
+    for (sql, expected) in [
+        // The counting windows number their rows from one.
+        (
+            "SELECT ROW_NUMBER() OVER (ORDER BY id), RANK() OVER (ORDER BY id), \
+                    DENSE_RANK() OVER (ORDER BY id) FROM G",
+            vec![true, true, true],
+        ),
+        // `ROW_COUNT()` answers -1 when there was nothing to report, so it is
+        // not in the list with the other two.
+        (
+            "SELECT CONNECTION_ID(), LAST_INSERT_ID(), ROW_COUNT(), YEAR(NOW()), MONTH(NOW()) FROM G",
+            vec![true, true, false, true, false],
+        ),
+        // A cast says the sign in the statement itself.
+        (
+            "SELECT CAST(1 AS UNSIGNED), CAST(1 AS SIGNED), CAST(u AS SIGNED) FROM G",
+            vec![true, false, false],
+        ),
+        // Arithmetic keeps the flag when *either* side has it — and loses it
+        // as soon as the answer stops being an integer, or is negated.
+        (
+            // Subtraction is left off on purpose: MySQL refuses `u - 100` with
+            // 1690 where this engine answers -93, and flagging the column
+            // UNSIGNED would have the two protocols disagree with each other.
+            // #0069.
+            "SELECT u, u+1, u*2, u+u, u DIV 2, u%2, u-1, -u, u/2, u+1.5 FROM G",
+            vec![true, true, true, true, true, true, false, false, false, false],
+        ),
+        // MIN and MAX answer one of the rows they folded; SUM and AVG widen
+        // past the column and come back signed.
+        (
+            "SELECT MAX(u), MIN(u), SUM(u), AVG(u), COUNT(u) FROM G",
+            vec![true, true, false, false, false],
+        ),
+        // A conditional needs *all* of its candidates, which is where it parts
+        // company with the arithmetic above: `u + 1` is unsigned and
+        // `COALESCE(u, 1)` is not.
+        (
+            "SELECT COALESCE(u,u), COALESCE(u,1), IF(1,u,u), IF(1,u,1), \
+                    GREATEST(u,u), GREATEST(u,1) FROM G",
+            vec![true, false, true, false, true, false],
+        ),
+        (
+            "SELECT ROUND(u), CEIL(u), FLOOR(u), TRUNCATE(u,0), LENGTH('a') FROM G",
+            vec![true, true, true, true, false],
+        ),
+        (
+            "SELECT CASE WHEN 1 THEN u ELSE u END, CASE WHEN 1 THEN u ELSE 1 END, u=1 FROM G",
+            vec![true, false, false],
+        ),
+        // A window reaching past its frame answers the default it was given,
+        // and that `0` is signed.
+        (
+            "SELECT LAG(u,1,0) OVER (ORDER BY id), FIRST_VALUE(u) OVER (ORDER BY id) FROM G",
+            vec![false, true],
+        ),
+    ] {
+        assert_eq!(signs(&session, sql), expected, "{sql}");
+    }
+
+    // Found while measuring the sign beside it: a cast is NOT NULL only to a
+    // numeric target. MySQL keeps the door open for a conversion to CHAR or
+    // DATE that cannot be made, and this described every cast as nullable.
+    let nulls: Vec<bool> = engine
+        .describe(
+            &session,
+            "SELECT CAST(1 AS UNSIGNED), CAST(1 AS DECIMAL), CAST(1 AS CHAR), \
+                    CAST(1 AS DATE), CAST(v AS SIGNED) FROM G",
+            0,
+        )
+        .unwrap()
+        .iter()
+        .map(|c| !c.nullable)
+        .collect();
+    assert_eq!(nulls, vec![true, true, false, false, false]);
+
+    // And the promise has to hold for a value the cast cannot parse. MySQL
+    // reads 0 out of it; answering NULL, or handing the text back unchanged,
+    // contradicted the NOT NULL those targets are described with.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C (s VARCHAR(20) NOT NULL)",
+    );
+    run(&engine, &mut session, "INSERT INTO C VALUES ('abc')");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(s AS DOUBLE), CAST(s AS DECIMAL), CAST(s AS SIGNED) FROM C"
+        ),
+        vec![vec!["0", "0", "0"]]
+    );
+
+    // A union is unsigned only if both branches are, in either order — the
+    // flag no longer travels with the declared type that the merge clears.
+    run(&engine, &mut session, "INSERT INTO G VALUES (-5, 3, NULL)");
+    for (sql, expected) in [
+        ("SELECT u FROM G UNION SELECT id FROM G", false),
+        ("SELECT id FROM G UNION SELECT u FROM G", false),
+        ("SELECT u FROM G UNION SELECT u FROM G", true),
+    ] {
+        assert_eq!(signs(&session, sql), vec![expected], "{sql}");
+    }
+
+    // A computed column keeps its sign through a derived table, which is
+    // rebuilt from these columns rather than from the expression.
+    assert_eq!(
+        signs(
+            &session,
+            "SELECT x FROM (SELECT CAST(u AS UNSIGNED) AS x FROM G) t"
+        ),
+        vec![true]
+    );
+}
+
+#[test]
 fn a_column_that_cannot_be_null_is_described_that_way() {
     // Under-reporting here is safe and over-reporting is not — a NOT NULL flag
     // is a promise a client acts on, and Prisma maps it to a non-optional

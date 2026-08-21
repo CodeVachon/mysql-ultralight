@@ -910,10 +910,24 @@ pub fn cast(value: Value, ty: &DataType) -> EngineResult<Value> {
             }
             Value::Int(n)
         }
+        // By the number MySQL reads out of the value: `CAST('abc' AS DOUBLE)`
+        // is 0 there, not NULL. Answering NULL made the cast contradict the
+        // NOT NULL a numeric target is described with.
         D::Float(_) | D::Double(_) | D::DoublePrecision | D::Real => {
-            value.as_float().map(Value::Float).unwrap_or(Value::Null)
+            Value::Float(value.as_number())
         }
-        D::Decimal(_) | D::Numeric(_) | D::Dec(_) => Value::Text(value.as_text()),
+        // Kept as text where it really is a number, because that is how a
+        // decimal holds digits an f64 would lose. Where it is not, the number
+        // MySQL reads out of it: `CAST('abc' AS DECIMAL)` is 0 there, and
+        // handing back `abc` contradicted the NOT NULL this is described with.
+        D::Decimal(_) | D::Numeric(_) | D::Dec(_) => {
+            let text = value.as_text();
+            if text.trim().parse::<f64>().is_ok() {
+                Value::Text(text)
+            } else {
+                Value::Text(Value::Float(value.as_number()).as_text())
+            }
+        }
         D::Char(_) | D::Varchar(_) | D::Text | D::CharacterVarying(_) | D::Character(_) => {
             Value::Text(value.as_text())
         }

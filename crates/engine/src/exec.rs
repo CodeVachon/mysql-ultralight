@@ -970,14 +970,18 @@ impl Engine {
                     // column was nullable this was right by accident.
                     column.nullable |= right.nullable;
 
-                    let unsigned =
-                        |c: &Option<crate::types::SqlType>| c.as_ref().is_some_and(|d| d.unsigned);
+                    // Read off the column rather than its declared type: a
+                    // computed branch has no declared type and still carries a
+                    // sign, and clearing `declared` no longer clears the flag
+                    // with it. Both branches have to be unsigned for the
+                    // column to be, or `SELECT iu FROM t UNION SELECT i FROM t`
+                    // goes out UNSIGNED and hands a binary client
+                    // 18446744073709551611 for -5.
+                    column.unsigned &= right.unsigned;
                     // Signedness counts as a difference even when the codes
                     // agree: an `INT` and an `INT UNSIGNED` are both `LONG`
                     // and neither range holds the other's.
-                    if right.ty == column.ty
-                        && unsigned(&right.declared) == unsigned(&column.declared)
-                    {
+                    if right.ty == column.ty && right.unsigned == column.unsigned {
                         // Same code on both sides, so the column keeps it —
                         // and keeps a declared type, which is the only thing
                         // that says whether a `BLOB` carries text. Clearing it
@@ -1004,12 +1008,7 @@ impl Engine {
                     // the wider type and this does the same, falling back to a
                     // string where there is no wider number, which is what it
                     // does for `SMALLINT UNION VARCHAR`.
-                    column.ty = widen(
-                        column.ty,
-                        unsigned(&column.declared),
-                        right.ty,
-                        unsigned(&right.declared),
-                    );
+                    column.ty = widen(column.ty, column.unsigned, right.ty, right.unsigned);
                     column.declared = None;
                 }
 
@@ -1789,6 +1788,7 @@ impl Engine {
             // value worth reading.
             let mut column = OutColumn::new(alias, computed_column_type(e, &[], &[]));
             column.nullable = !never_null(e, &[], &[]);
+            column.unsigned = unsigned_answer(e, &[], &[]);
             columns.push(column);
             row.push(value);
         }
@@ -1855,6 +1855,7 @@ impl Engine {
                             // an answer; one that reaches past the frame has
                             // one only if it was given a default.
                             column.nullable = !never_null(e, refs, &relation.columns);
+                            column.unsigned = unsigned_answer(e, refs, &relation.columns);
                             columns.push(column);
                             plan.push(Projection::Window(windows.len()));
                             windows.push(values);
@@ -2158,6 +2159,7 @@ impl Engine {
             computed_column_type(e, &relation.refs(), &relation.columns),
         );
         column.nullable = !never_null(e, &relation.refs(), &relation.columns);
+        column.unsigned = unsigned_answer(e, &relation.refs(), &relation.columns);
         Ok((column, Projection::Expr(Box::new(e.clone()))))
     }
 
@@ -2264,6 +2266,7 @@ impl Engine {
                     // with nothing in it. Every other aggregate is nullable,
                     // even `SUM(1)`: an empty group has nothing to sum.
                     column.nullable = !never_null(e, refs, input_columns);
+                    column.unsigned = unsigned_answer(e, refs, input_columns);
                     column
                 }
             })
@@ -5162,6 +5165,127 @@ fn literal_expr(value: &Value) -> Expr {
     }
 }
 
+/// Functions whose answer is unsigned whatever they were given.
+///
+/// The counting windows number their rows from one, and a connection id and an
+/// auto-increment cannot be negative. `ROW_COUNT()` is deliberately absent: it
+/// answers -1 when the last statement had nothing to report.
+const ALWAYS_UNSIGNED: &[&str] = &[
+    "connection_id",
+    "dense_rank",
+    "last_insert_id",
+    "ntile",
+    "rank",
+    "row_number",
+    "year",
+];
+
+/// Functions whose answer is unsigned when their first argument is.
+///
+/// The second argument of `TRUNCATE(u, 0)` says how many places to keep and
+/// says nothing about the sign, which is why this reads one argument where
+/// [`unsigned_answer`]'s other families read all of them.
+const UNSIGNED_FOLLOWS_FIRST: &[&str] = &["abs", "ceil", "ceiling", "floor", "round", "truncate"];
+
+/// Whether a cast names a target that keeps the argument's certainty.
+///
+/// `CAST(1 AS UNSIGNED)` cannot fail and MySQL says NOT NULL; `CAST(1 AS CHAR)`
+/// and `CAST(1 AS DATE)` are nullable there even for an argument that cannot
+/// be, because a conversion to those can have no answer.
+fn numeric_cast(data_type: &sqlparser::ast::DataType) -> bool {
+    use sqlparser::ast::DataType as D;
+    matches!(
+        data_type,
+        D::Signed | D::SignedInteger | D::Unsigned | D::UnsignedInteger
+    ) || matches!(
+        crate::types::SqlType::from_ast(data_type).map(|t| t.kind),
+        Ok(crate::types::TypeKind::Int
+            | crate::types::TypeKind::Decimal
+            | crate::types::TypeKind::Float)
+    )
+}
+
+/// Whether an expression's values are unsigned on the wire.
+///
+/// Measured against MySQL 8.3, and the families do not agree with each other:
+/// arithmetic keeps the flag when *either* side has it, so `u + 1` is unsigned,
+/// where `COALESCE(u, 1)` is signed because a conditional needs *all* of its
+/// candidates to be. `-u` drops it, and so does anything that is no longer an
+/// integer — `u + 1.5` and `u / 2` are both signed.
+///
+/// Defaults to signed, which is the safe direction: the engine holds an `i64`,
+/// so a value it can carry is one a signed reader can read, where an UNSIGNED
+/// flag on a negative number reads back as something enormous.
+fn unsigned_answer(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]) -> bool {
+    let recur = |inner: &Expr| unsigned_answer(inner, refs, input);
+    let integral = |e: &Expr| is_integer(computed_column_type(e, refs, input));
+    match e {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            direct_column(e, refs, input).is_some_and(|column| column.ty.unsigned)
+        }
+        Expr::Nested(inner) => recur(inner),
+        // A cast names the signedness in the statement itself.
+        Expr::Cast { data_type, .. } => {
+            matches!(data_type, sqlparser::ast::DataType::Unsigned)
+                || matches!(data_type, sqlparser::ast::DataType::UnsignedInteger)
+        }
+        Expr::BinaryOp { left, op, right } => {
+            use sqlparser::ast::BinaryOperator as B;
+            // `Minus` is deliberately absent. MySQL calls `u - 1` unsigned
+            // and *refuses* `u - 100` with 1690 rather than answering; this
+            // engine holds an i64 and answers -93, so flagging the column
+            // UNSIGNED would have the two protocols disagree with each other —
+            // the text one sending -93 and the binary one the same bytes for a
+            // client that reads 18446744073709551523. Under-reporting the flag
+            // is the safe half of a case neither answer gets right. See #0069.
+            matches!(op, B::Plus | B::Multiply | B::Modulo | B::MyIntegerDivide)
+                && integral(e)
+                && (recur(left) || recur(right))
+        }
+        // `CEIL` and `FLOOR` arrive as their own nodes rather than as calls.
+        Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => recur(expr),
+        // Every result has to be unsigned; a signed `ELSE` gives it away.
+        Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => {
+            else_result.as_deref().is_some_and(&recur)
+                && conditions.iter().all(|w| recur(&w.result))
+        }
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_ascii_lowercase();
+            if ALWAYS_UNSIGNED.contains(&name.as_str()) {
+                return true;
+            }
+            let args = function_arguments(f);
+            if args.is_empty() {
+                return false;
+            }
+            match name.as_str() {
+                // These hand back one of their arguments unchanged, so the
+                // flag survives only if every candidate carries it: MySQL
+                // makes `COALESCE(u, 1)` signed on the strength of the `1`.
+                "coalesce" | "ifnull" | "nvl" | "greatest" | "least" => args.iter().all(&recur),
+                "if" => args.len() == 3 && args[1..].iter().all(&recur),
+                // MIN and MAX answer one of the rows they folded; SUM and AVG
+                // widen past the column and come back signed.
+                "min" | "max" => args.iter().all(&recur),
+                // A window reaching past the frame answers its default, which
+                // is why `LAG(u, 1, 0)` is signed — the `0` is.
+                "lag" | "lead" | "first_value" | "last_value" | "nth_value" => {
+                    args.iter().all(&recur)
+                }
+                _ => {
+                    UNSIGNED_FOLLOWS_FIRST.contains(&name.as_str())
+                        && args.first().is_some_and(&recur)
+                }
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Functions whose answer cannot be NULL when their arguments cannot.
 ///
 /// Measured by calling each with a constant, and the split is not the obvious
@@ -5241,8 +5365,13 @@ fn never_null(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]
             direct_column(e, refs, input).is_some_and(|column| !column.nullable)
         }
         Expr::Nested(inner) => recur(inner),
-        // `NOT` and a sign propagate; a cast does not — `CAST(1 AS CHAR)` is
-        // nullable to MySQL even though nothing about it can fail.
+        // Only to a *numeric* target. `CAST(1 AS UNSIGNED)` is NOT NULL and
+        // `CAST(1 AS CHAR)` is not, and nor is a cast to DATE — MySQL keeps
+        // the door open for a conversion that cannot be made.
+        Expr::Cast {
+            data_type, expr, ..
+        } => numeric_cast(data_type) && recur(expr),
+        // `NOT` and a sign propagate.
         Expr::UnaryOp { op, expr } => {
             use sqlparser::ast::UnaryOperator as U;
             matches!(op, U::Minus | U::Plus | U::Not) && recur(expr)
