@@ -1,11 +1,11 @@
 ---
 id: 45
 title: A JSON column compares as text, not as a document
-state: Todo
+state: Done
 parent: 9
 labels: [compat]
 created: 2026-08-20T15:26:03Z
-updated: 2026-08-20T15:26:03Z
+updated: 2026-08-21T12:59:11Z
 ---
 
 ## Description
@@ -19,3 +19,9 @@ The engine answers by comparing text, so it is now accidentally right for the co
 The same applies to ordering and to DISTINCT over a JSON column, which use collation_key and so also compare text.
 
 Doing this properly means comparing two Value::Json operands as documents and treating a JSON-to-string comparison as MySQL does. The tag added in #0033 is what makes it possible.
+
+## Notes
+
+### 2026-08-21T12:59:11Z — Christopher Vachon (user)
+
+Comparison, ordering and DISTINCT all go through JSON semantics now. Review caught three things measurement had missed: two JSON integers must compare exactly (f64 cannot tell 9007199254740992 from the next one), objects compare member by member rather than all keys then all values, and the DISTINCT key has to fold -0.0 into 0. Split out #0061 for SQL TRUE, which the engine cannot tell from 1.

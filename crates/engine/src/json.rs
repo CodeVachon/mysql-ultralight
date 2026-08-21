@@ -228,12 +228,7 @@ fn write_json(out: &mut String, json: &Json) {
             out.push(']');
         }
         Json::Object(members) => {
-            let mut keys: Vec<&String> = members.keys().collect();
-            keys.sort_by(|a, b| {
-                a.len()
-                    .cmp(&b.len())
-                    .then_with(|| a.as_bytes().cmp(b.as_bytes()))
-            });
+            let keys = stored_keys(members);
             out.push('{');
             for (i, key) in keys.iter().enumerate() {
                 if i > 0 {
@@ -242,6 +237,178 @@ fn write_json(out: &mut String, json: &Json) {
                 out.push_str(&Json::String((*key).clone()).to_string());
                 out.push_str(": ");
                 write_json(out, &members[*key]);
+            }
+            out.push('}');
+        }
+        scalar => out.push_str(&scalar.to_string()),
+    }
+}
+
+/// The keys of an object in the order MySQL stores them: by byte length, then
+/// bytewise.
+///
+/// Both the rendering and the comparison want this order, and they want the
+/// *same* one — MySQL compares two objects key by key as stored, so
+/// `{"b":1,"c":1}` is less than `{"aa":9,"c":1}` even though `aa` sorts before
+/// `b` bytewise: stored, the second object begins with `c`.
+fn stored_keys(members: &serde_json::Map<String, Json>) -> Vec<&String> {
+    let mut keys: Vec<&String> = members.keys().collect();
+    keys.sort_by(|a, b| {
+        a.len()
+            .cmp(&b.len())
+            .then_with(|| a.as_bytes().cmp(b.as_bytes()))
+    });
+    keys
+}
+
+/// Where a document sits in MySQL's ordering of JSON types.
+///
+/// Ascending, and measured against 8.3 rather than taken from the manual,
+/// which lists the precedences the other way up. A boolean sorting *after* an
+/// array is the surprising one, and it is what MySQL does.
+fn type_rank(json: &Json) -> u8 {
+    match json {
+        Json::Null => 0,
+        Json::Number(_) => 1,
+        Json::String(_) => 2,
+        Json::Object(_) => 3,
+        Json::Array(_) => 4,
+        Json::Bool(_) => 5,
+    }
+}
+
+/// Two documents compared as MySQL compares them.
+///
+/// Not as text. The engine stored JSON as its rendering and compared the
+/// strings, which is wrong in both directions: `1` and `1.0` are the same
+/// number and compared unequal, and the ordering came out alphabetical rather
+/// than by JSON type.
+///
+/// `None` only for a number that is not comparable, which serde does not
+/// produce from parsing.
+pub fn compare(left: &Json, right: &Json) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+
+    let rank = type_rank(left).cmp(&type_rank(right));
+    if rank != Ordering::Equal {
+        return Some(rank);
+    }
+
+    Some(match (left, right) {
+        (Json::Null, Json::Null) => Ordering::Equal,
+        (Json::Bool(a), Json::Bool(b)) => a.cmp(b),
+        // Numerically, so `1` equals `1.0`. Exactly where both sides are
+        // integers, because f64 cannot tell 9007199254740992 from the number
+        // after it — sending both through it made two distinct documents
+        // compare equal, which loses a DISTINCT row and rejects a legitimate
+        // insert into a unique column.
+        (Json::Number(a), Json::Number(b)) => {
+            if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
+                return Some(x.cmp(&y));
+            }
+            if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64()) {
+                return Some(x.cmp(&y));
+            }
+            return a.as_f64()?.partial_cmp(&b.as_f64()?);
+        }
+        // Bytewise and case-sensitive, unlike a SQL string: `"Hi"` and `"hi"`
+        // are two documents to MySQL and two rows to DISTINCT.
+        (Json::String(a), Json::String(b)) => a.as_bytes().cmp(b.as_bytes()),
+        (Json::Array(a), Json::Array(b)) => {
+            for (x, y) in a.iter().zip(b) {
+                match compare(x, y)? {
+                    Ordering::Equal => {}
+                    other => return Some(other),
+                }
+            }
+            // A prefix is the smaller of the two.
+            a.len().cmp(&b.len())
+        }
+        (Json::Object(a), Json::Object(b)) => {
+            // The one with fewer keys first, whatever those keys are.
+            match a.len().cmp(&b.len()) {
+                Ordering::Equal => {}
+                other => return Some(other),
+            }
+            // Member by member, key *then* that member's value — not every key
+            // and then every value. The two disagree:
+            // `{"a":9,"b":1}` and `{"a":1,"z":2}` share their first key, so the
+            // 9 and the 1 decide and the left one is greater. Comparing all the
+            // keys first would have reached `b` against `z` and called it
+            // smaller.
+            for (x, y) in stored_keys(a).into_iter().zip(stored_keys(b)) {
+                match x.as_bytes().cmp(y.as_bytes()) {
+                    Ordering::Equal => {}
+                    other => return Some(other),
+                }
+                match compare(&a[x], &b[y])? {
+                    Ordering::Equal => {}
+                    other => return Some(other),
+                }
+            }
+            Ordering::Equal
+        }
+        // The ranks matched, so the variants did.
+        _ => Ordering::Equal,
+    })
+}
+
+/// A string that is equal for exactly the documents [`compare`] calls equal.
+///
+/// DISTINCT, GROUP BY and uniqueness all key on a string rather than a
+/// comparison, so they need one that agrees. The rendering nearly does — MySQL
+/// normalises a document on the way in, so key order and spacing are already
+/// settled — but it writes `1` and `1.0` differently where the comparison
+/// calls them the same number.
+pub fn comparison_key(json: &Json) -> String {
+    let mut out = String::new();
+    write_comparison_key(&mut out, json);
+    out
+}
+
+/// A number written so that exactly the numbers [`compare`] calls equal share
+/// a spelling.
+///
+/// Whole numbers key as integers however they were written, so `1` and `1.0`
+/// meet and `-0.0` meets `0` — and a big integer keys as itself rather than as
+/// the f64 it does not fit in.
+fn number_key(n: &serde_json::Number) -> String {
+    if let Some(i) = n.as_i64() {
+        return i.to_string();
+    }
+    if let Some(u) = n.as_u64() {
+        return u.to_string();
+    }
+    let f = n.as_f64().unwrap_or(f64::NAN);
+    // A whole double keys as the integer it is, which is what makes `1.0` meet
+    // `1` — and folds `-0.0` into `0`, where printing the double would have
+    // split a value the comparison calls equal.
+    if f.fract() == 0.0 && f.abs() < i64::MAX as f64 {
+        return (f as i64).to_string();
+    }
+    format!("{f:?}")
+}
+
+fn write_comparison_key(out: &mut String, json: &Json) {
+    out.push((b'0' + type_rank(json)) as char);
+    match json {
+        Json::Number(n) => out.push_str(&number_key(n)),
+        Json::Array(items) => {
+            out.push('[');
+            for item in items {
+                write_comparison_key(out, item);
+                out.push(',');
+            }
+            out.push(']');
+        }
+        Json::Object(members) => {
+            out.push('{');
+            for key in stored_keys(members) {
+                // Length-prefixed, so `{"ab":…}` and `{"a":"b…"}` cannot
+                // produce the same key by running together.
+                out.push_str(&format!("{}:{key}=", key.len()));
+                write_comparison_key(out, &members[key]);
+                out.push(',');
             }
             out.push('}');
         }

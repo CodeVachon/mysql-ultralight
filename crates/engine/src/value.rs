@@ -120,6 +120,15 @@ impl Value {
             return None;
         }
 
+        // A document compares as a document, not as its rendering. That is not
+        // a refinement: comparing the text made `doc = '{"a": 1}'` true when
+        // the literal happened to match MySQL's spacing, where MySQL reads the
+        // literal as a JSON *string* and answers 0 because an object is never
+        // a string. It also ordered by the alphabet instead of by JSON type.
+        if matches!(self, Value::Json(_)) || matches!(other, Value::Json(_)) {
+            return crate::json::compare(&self.as_json_operand(), &other.as_json_operand());
+        }
+
         // Numbers compare numerically even against numeric strings, which is
         // how MySQL behaves and what Prisma's generated comparisons rely on.
         let both_numeric = matches!(self, Value::Int(_) | Value::Float(_))
@@ -142,13 +151,37 @@ impl Value {
         }
     }
 
+    /// This value as the JSON operand MySQL would compare it as.
+    ///
+    /// A non-document beside a document becomes a JSON *scalar* of its own
+    /// type — a string becomes a JSON string, which is why `doc = '{"a": 1}'`
+    /// is false for every row: the literal is the string `{"a": 1}` and an
+    /// object never equals a string.
+    ///
+    /// One case is out of reach. MySQL reads the SQL keyword `TRUE` as JSON
+    /// `true` and the literal `1` as the number 1, and this engine evaluates
+    /// both to `Value::Int(1)` — there is no boolean here to tell them apart.
+    /// See #0061.
+    fn as_json_operand(&self) -> serde_json::Value {
+        crate::json::from_value(self)
+    }
+
     /// The key this value sorts and de-duplicates under.
     ///
     /// Shares the collation with `compare`, so DISTINCT and uniqueness agree
-    /// with what `WHERE` treats as equal.
+    /// with what `WHERE` treats as equal — for two values of the same kind.
+    /// Across the document boundary they do not: `compare` reads a string
+    /// beside a document as a JSON string and can call the two equal, where
+    /// the keys here stay a document key and a text key. Only a query that
+    /// de-duplicates a JSON column against a text one can see it.
     pub fn collation_key(&self) -> String {
         match self {
             Value::Bytes(v) => String::from_utf8_lossy(v).into_owned(),
+            // A document keeps its case and normalises its numbers, because
+            // that is what comparing it does: `{"A":1}` and `{"a":1}` are two
+            // documents where `'A'` and `'a'` are one string, and `1` and
+            // `1.0` are one number where `'1'` and `'1.0'` are two strings.
+            Value::Json(_) => crate::json::comparison_key(&self.as_json_operand()),
             other => other.as_text().to_lowercase(),
         }
     }

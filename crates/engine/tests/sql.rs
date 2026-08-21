@@ -5435,6 +5435,161 @@ fn a_numeric_precision_is_reported_the_way_mysql_reports_it() {
 }
 
 #[test]
+fn a_document_compares_as_a_document() {
+    // The engine compared JSON by its rendering, which is wrong in both
+    // directions: `doc = '{"a": 1}'` came out true whenever the literal
+    // happened to match MySQL's spacing, and the ordering was alphabetical
+    // rather than by JSON type. Every answer here measured on MySQL 8.3.
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE D (id INT, doc JSON)");
+    run(
+        &engine,
+        &mut session,
+        r#"INSERT INTO D VALUES (1,'{"a":1}'),(2,'{"b":2,"a":1}'),(3,'[1,2]'),
+                                (4,'"hi"'),(5,'7'),(6,'true'),(7,'null')"#,
+    );
+
+    // A string operand is a JSON *string*, so it never equals an object —
+    // whichever way the object is spelled. This was the headline of #0045.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            r#"SELECT id FROM D WHERE doc = '{"a": 1}'"#
+        ),
+        Vec::<Vec<String>>::new()
+    );
+    // Cast to a document it matches, and only the document that says the same
+    // thing — key order and spacing are settled on the way in.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            r#"SELECT id FROM D WHERE doc = CAST('{"a":1}' AS JSON)"#
+        ),
+        vec![vec!["1"]]
+    );
+
+    // A scalar operand becomes the JSON scalar of its own type.
+    for (sql, expected) in [
+        ("SELECT id FROM D WHERE doc = 'hi'", "4"),
+        ("SELECT id FROM D WHERE doc = 7", "5"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // Ascending by JSON type, not by the alphabet. A boolean sorting after an
+    // array is the surprising one, and it is what MySQL does.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM D ORDER BY doc, id")
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+        vec!["7", "5", "4", "1", "2", "3", "6"]
+    );
+
+    // Within a type: numerically, bytewise, element-wise, fewer keys first.
+    for (sql, expected) in [
+        ("SELECT CAST('1' AS JSON) = CAST('1.0' AS JSON)", "1"),
+        (
+            "SELECT CAST('\"Hi\"' AS JSON) = CAST('\"hi\"' AS JSON)",
+            "0",
+        ),
+        (
+            "SELECT CAST('{\"A\":1}' AS JSON) = CAST('{\"a\":1}' AS JSON)",
+            "0",
+        ),
+        (
+            "SELECT CAST('[1,2]' AS JSON) < CAST('[1,2,3]' AS JSON)",
+            "1",
+        ),
+        (
+            "SELECT CAST('{\"a\":1}' AS JSON) < CAST('{\"a\":1,\"b\":2}' AS JSON)",
+            "1",
+        ),
+        // Keys are compared as *stored* — by length then bytewise — so the
+        // second object begins with `c` and this is true even though `aa`
+        // sorts before `b`.
+        (
+            "SELECT CAST('{\"b\":1,\"c\":1}' AS JSON) < CAST('{\"aa\":9,\"c\":1}' AS JSON)",
+            "1",
+        ),
+        ("SELECT CAST('false' AS JSON) < CAST('true' AS JSON)", "1"),
+        // Member by member, key *then* that member's value. Comparing every
+        // key and only then every value reaches `b` against `z` and calls the
+        // left one smaller; MySQL stops at the shared first key and lets the
+        // 9 and the 1 decide.
+        (
+            r#"SELECT CAST('{"a":9,"b":1}' AS JSON) < CAST('{"a":1,"z":2}' AS JSON)"#,
+            "0",
+        ),
+        // Two integers compare exactly. Sent through f64 these are one number,
+        // which loses a DISTINCT row and rejects a good insert into a unique
+        // column.
+        (
+            "SELECT CAST('9007199254740993' AS JSON) = CAST('9007199254740992' AS JSON)",
+            "0",
+        ),
+        (
+            "SELECT CAST('9007199254740993' AS JSON) > CAST('9007199254740992' AS JSON)",
+            "1",
+        ),
+        // Negative zero is zero, and the key has to agree or DISTINCT splits
+        // what WHERE joins.
+        ("SELECT CAST('-0.0' AS JSON) = CAST('0' AS JSON)", "1"),
+        // A JSON null is a value that is present, not a missing one.
+        ("SELECT CAST('null' AS JSON) IS NULL", "0"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // DISTINCT keys on a string rather than a comparison, so it needs one that
+    // agrees: case is kept where a SQL string would fold it, and `1` and `1.0`
+    // are one number where `'1'` and `'1.0'` are two strings.
+    run(&engine, &mut session, "CREATE TABLE K (doc JSON)");
+    run(
+        &engine,
+        &mut session,
+        r#"INSERT INTO K VALUES ('{"A":1}'),('{"a":1}'),('1'),('1.0'),('"Hi"'),('"hi"')"#,
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM (SELECT DISTINCT doc FROM K) x"
+        ),
+        vec![vec!["5"]]
+    );
+
+    // The same key, on the two numeric cases the comparison had to be taught:
+    // every spelling of zero is one row, and two integers a double cannot tell
+    // apart are two.
+    run(&engine, &mut session, "CREATE TABLE N (doc JSON)");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO N VALUES ('-0.0'),('0'),('0.0'),\
+                              ('9007199254740993'),('9007199254740992')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM (SELECT DISTINCT doc FROM N) x"
+        ),
+        vec![vec!["3"]]
+    );
+}
+
+#[test]
 fn a_dedicated_node_is_visible_to_every_walk_over_an_expression() {
     // `references_column`, `contains_aggregate` and the ONLY_FULL_GROUP_BY
     // check each enumerated the variants they knew and ended in a catch-all,
@@ -7103,9 +7258,15 @@ fn a_document_read_back_is_still_a_document() {
         rows(
             &engine,
             &mut session,
-            "SELECT doc + 0, doc * 2, CAST(doc AS SIGNED), doc = txt FROM Num"
+            "SELECT doc + 0, doc * 2, CAST(doc AS SIGNED), doc = txt, doc = 3, doc = '3' \
+             FROM Num"
         ),
-        vec![vec!["3", "6", "3", "1"]]
+        // Read as a number it is 3, but *compared* it is the JSON number 3,
+        // and a string operand beside a document is read as a JSON string —
+        // so it equals the number 3 and not the text '3'. This asserted that
+        // `doc = txt` was true, from before the comparison was a comparison of
+        // documents; MySQL 8.3 says 0.
+        vec![vec!["3", "6", "3", "0", "1", "0"]]
     );
 
     // A column filled from a default holds a document too, so a defaulted row
