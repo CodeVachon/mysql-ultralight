@@ -137,6 +137,11 @@ pub const GROUPS: &[Group] = &[
             // A union of the same width and different signs holds neither
             // branch's range.
             same("SELECT i FROM Q UNION SELECT iu FROM Q ORDER BY 1"),
+            // The other order. Merging the two branches' signedness before
+            // comparing it made an unsigned-first union match itself and keep
+            // the narrower code, where this order never did — so the corpus
+            // was covering only the half that worked.
+            same("SELECT iu FROM Q UNION SELECT i FROM Q ORDER BY 1"),
         ],
     },
     Group {
@@ -215,6 +220,9 @@ pub const GROUPS: &[Group] = &[
             same("SELECT id FROM N UNION SELECT 1 + 1 ORDER BY 1"),
             same("SELECT id FROM N UNION ALL SELECT 2 ORDER BY 1"),
             same("SELECT id FROM N UNION SELECT NULL ORDER BY 1"),
+            // NULL on the left, which is the branch that has to *adopt* the
+            // other side's type rather than keep its own.
+            same("SELECT NULL UNION SELECT id FROM N ORDER BY 1"),
         ],
     },
     Group {

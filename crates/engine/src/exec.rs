@@ -970,17 +970,32 @@ impl Engine {
                     // column was nullable this was right by accident.
                     column.nullable |= right.nullable;
 
-                    // Read off the column rather than its declared type: a
-                    // computed branch has no declared type and still carries a
-                    // sign, and clearing `declared` no longer clears the flag
-                    // with it. Both branches have to be unsigned for the
-                    // column to be, or `SELECT iu FROM t UNION SELECT i FROM t`
-                    // goes out UNSIGNED and hands a binary client
-                    // 18446744073709551611 for -5.
-                    column.unsigned &= right.unsigned;
+                    // A NULL branch is the absence of a type, not a competing
+                    // one. MySQL keeps whatever the other branch is — its
+                    // width, its sign and its declared spelling — and relaxes
+                    // only the nullability, which the line above has done.
+                    // Widening against it instead fell through to the string
+                    // fallback, so `SELECT id FROM t UNION SELECT NULL` came
+                    // back a VAR_STRING and a binary client read "1" where
+                    // MySQL sends the integer 1.
+                    if right.ty == ColumnType::Null {
+                        continue;
+                    }
+                    if column.ty == ColumnType::Null {
+                        column.ty = right.ty;
+                        column.unsigned = right.unsigned;
+                        column.declared = right.declared.clone();
+                        continue;
+                    }
+
                     // Signedness counts as a difference even when the codes
                     // agree: an `INT` and an `INT UNSIGNED` are both `LONG`
                     // and neither range holds the other's.
+                    //
+                    // Read before the flags are merged, not after. Narrowing
+                    // the column to signed first made the two sides *match*,
+                    // so a mixed-sign union took the "same code, keep it" path
+                    // and stayed a LONG where MySQL widens to LONGLONG.
                     if right.ty == column.ty && right.unsigned == column.unsigned {
                         // Same code on both sides, so the column keeps it —
                         // and keeps a declared type, which is the only thing
@@ -1009,6 +1024,12 @@ impl Engine {
                     // string where there is no wider number, which is what it
                     // does for `SMALLINT UNION VARCHAR`.
                     column.ty = widen(column.ty, column.unsigned, right.ty, right.unsigned);
+                    // Both branches have to be unsigned for the column to be,
+                    // or `SELECT iu FROM t UNION SELECT i FROM t` goes out
+                    // UNSIGNED and hands a binary client 18446744073709551611
+                    // for -5. Only on this path: the branch above returns when
+                    // the two already agree.
+                    column.unsigned &= right.unsigned;
                     column.declared = None;
                 }
 
@@ -4614,12 +4635,25 @@ fn widen(a: ColumnType, a_unsigned: bool, b: ColumnType, b_unsigned: bool) -> Co
     // need widening: an `INT` and an `INT UNSIGNED` are both `LONG`, and an
     // early "same code, same answer" return would miss exactly that.
     if let (Some(x), Some(y)) = (integer(a), integer(b)) {
-        // Same width, different sign: neither range covers the other, so the
-        // answer is the next size that covers both.
-        if x == y && a_unsigned != b_unsigned {
-            return from_rank(x.saturating_add(1).min(5));
+        // Whichever is unsigned needs one size more than itself to be held
+        // signed — an `INT UNSIGNED` reaches 4294967295, which only a
+        // `BIGINT` covers — and the answer has to cover the other side too.
+        //
+        // Not only at equal widths, which is what this asked before:
+        // `INT UNSIGNED UNION SMALLINT` came back a signed `LONG` and handed
+        // a binary client -1 for 4294967295. And a `SMALLINT UNSIGNED` beside
+        // an `INT` needs nothing extra, because the `INT` already covers it.
+        let needed = match (a_unsigned, b_unsigned) {
+            (true, false) => x.saturating_add(1).max(y),
+            (false, true) => y.saturating_add(1).max(x),
+            _ => x.max(y),
+        };
+        // Past `BIGINT` there is no integer left: MySQL answers a DECIMAL,
+        // because nothing else holds both a u64 and a negative.
+        if needed > 5 {
+            return ColumnType::NewDecimal;
         }
-        return from_rank(x.max(y));
+        return from_rank(needed);
     }
     if a == b {
         return a;

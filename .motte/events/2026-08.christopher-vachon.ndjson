@@ -145,3 +145,4 @@
 {"at":"2026-08-21T15:22:20Z","id":70,"by":"Christopher Vachon","as":"user","type":"created","title":"Decimal arithmetic loses the scale","state":"Todo"}
 {"at":"2026-08-21T16:09:17Z","id":71,"by":"Christopher Vachon","as":"user","type":"created","title":"A decimal embedded in JSON loses its scale","state":"Todo"}
 {"at":"2026-08-21T17:15:44Z","id":67,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-21T17:37:13Z","id":65,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}

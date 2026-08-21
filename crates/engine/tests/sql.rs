@@ -5435,6 +5435,144 @@ fn a_numeric_precision_is_reported_the_way_mysql_reports_it() {
 }
 
 #[test]
+fn a_null_branch_of_a_union_contributes_no_type() {
+    // NULL is the absence of a type, not a competing one. Widening against it
+    // fell through to the string fallback, so `SELECT id FROM N UNION SELECT
+    // NULL` came back a VAR_STRING and a binary client read "1" where MySQL
+    // sends the integer. Measured against MySQL 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N (id INT NOT NULL, s VARCHAR(20) NOT NULL, \
+                         d DECIMAL(10,2) NOT NULL, dt DATE NOT NULL, u INT UNSIGNED NOT NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO N VALUES (1,'a',1.5,'2020-01-01',7)",
+    );
+
+    let shape = |session: &Session, sql: &str| -> Vec<(String, bool, bool)> {
+        engine
+            .describe(session, sql, 0)
+            .unwrap()
+            .iter()
+            .map(|c| (format!("{:?}", c.ty), !c.nullable, c.unsigned))
+            .collect()
+    };
+
+    for (sql, expected) in [
+        // The other branch stands, in either order, whatever kind it is —
+        // and the nullability relaxes, which is the only thing NULL changes.
+        (
+            "SELECT id FROM N UNION SELECT NULL",
+            ("Long".to_owned(), false, false),
+        ),
+        (
+            "SELECT NULL UNION SELECT id FROM N",
+            ("Long".to_owned(), false, false),
+        ),
+        (
+            "SELECT s FROM N UNION SELECT NULL",
+            ("VarString".to_owned(), false, false),
+        ),
+        (
+            "SELECT d FROM N UNION SELECT NULL",
+            ("NewDecimal".to_owned(), false, false),
+        ),
+        (
+            "SELECT dt FROM N UNION SELECT NULL",
+            ("Date".to_owned(), false, false),
+        ),
+        // The sign survives too.
+        (
+            "SELECT u FROM N UNION SELECT NULL",
+            ("Long".to_owned(), false, true),
+        ),
+        (
+            "SELECT NULL UNION SELECT u FROM N",
+            ("Long".to_owned(), false, true),
+        ),
+        // Nothing on either side leaves nothing.
+        (
+            "SELECT NULL UNION SELECT NULL",
+            ("Null".to_owned(), false, false),
+        ),
+        // Two real branches still widen, and two NOT NULL ones stay NOT NULL.
+        (
+            "SELECT id FROM N UNION SELECT s FROM N",
+            ("VarString".to_owned(), true, false),
+        ),
+        // An INT beside an INT UNSIGNED: the codes agree and neither range
+        // holds the other, so MySQL widens. Merging the sign *before* this
+        // comparison made the two sides match and left it a LONG.
+        (
+            "SELECT u FROM N UNION SELECT id FROM N",
+            ("LongLong".to_owned(), true, false),
+        ),
+    ] {
+        assert_eq!(shape(&session, sql), vec![expected], "{sql}");
+    }
+
+    // Mixed signs at *different* widths. Whichever side is unsigned needs one
+    // size more than itself to be held signed, and the answer has to cover the
+    // other side too — asking this only at equal widths described
+    // `INT UNSIGNED UNION SMALLINT` as a signed LONG, which hands a binary
+    // client -1 for 4294967295.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE W (i INT NOT NULL, sm SMALLINT NOT NULL, iu INT UNSIGNED NOT NULL, \
+                         su SMALLINT UNSIGNED NOT NULL, bu BIGINT UNSIGNED NOT NULL)",
+    );
+    for (sql, expected) in [
+        ("SELECT iu FROM W UNION SELECT sm FROM W", "LongLong"),
+        ("SELECT sm FROM W UNION SELECT iu FROM W", "LongLong"),
+        // A SMALLINT UNSIGNED needs nothing extra beside an INT, which already
+        // covers every value it can hold.
+        ("SELECT su FROM W UNION SELECT i FROM W", "Long"),
+        // Past BIGINT there is no integer left to widen to.
+        ("SELECT bu FROM W UNION SELECT i FROM W", "NewDecimal"),
+        ("SELECT i FROM W UNION SELECT bu FROM W", "NewDecimal"),
+        // Two of the same sign never need widening at all.
+        ("SELECT bu FROM W UNION SELECT bu FROM W", "LongLong"),
+    ] {
+        assert_eq!(shape(&session, sql)[0].0, expected, "{sql}");
+    }
+
+    // The value follows the type, and only the binary protocol can show it:
+    // `rows` renders every value through `as_text`, so it reads "1" whether
+    // the column is a LONG or the VAR_STRING this used to be. Four bytes of
+    // little-endian integer is the difference a client sees.
+    let described = engine
+        .describe(&session, "SELECT id FROM N UNION SELECT NULL ORDER BY 1", 0)
+        .unwrap();
+    let outcome = run(
+        &engine,
+        &mut session,
+        "SELECT id FROM N UNION SELECT NULL ORDER BY 1",
+    );
+    let Outcome::Rows(result) = outcome else {
+        panic!("expected rows")
+    };
+    let one = result
+        .rows
+        .iter()
+        .find(|row| !row[0].is_null())
+        .expect("the row from the non-NULL branch");
+    let mut encoded = mysql_ultralight_protocol::BufWriter::new();
+    one[0]
+        .to_wire()
+        .encode_binary(&mut encoded, described[0].ty);
+    assert_eq!(
+        encoded.into_inner(),
+        vec![1, 0, 0, 0],
+        "a LONG goes out as four bytes; a VAR_STRING would send the text \"1\""
+    );
+}
+
+#[test]
 fn a_scale_argument_is_not_a_value_being_measured() {
     // `ROUND(x, 2)`'s second argument says how many places to keep. Reading it
     // as if it were another value made `ROUND(NULL, 1)` a LONGLONG on the
