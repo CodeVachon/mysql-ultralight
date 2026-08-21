@@ -6,7 +6,5 @@
 # harness fails if a line here no longer differs so the file cannot
 # quietly describe a state that has passed.
 
-json :: SELECT CAST('[1e-7, 1e15, 1e30]' AS JSON) :: row 0 [binary]
-json :: SELECT CAST('[1e-7, 1e15, 1e30]' AS JSON) :: row 0 [text]
 null propagates through functions :: SELECT SOUNDEX(NULL) :: outcome [binary]
 null propagates through functions :: SELECT SOUNDEX(NULL) :: outcome [text]

@@ -52,11 +52,10 @@ Two things fail a run:
 
 So the file only ever shrinks, and it shrinks by fixing things. Each line is
 covered by an issue under [#0009](../../.motte/issues), and the whole file is
-accounted for — 4 lines at the last audit, across 224 statements:
+accounted for — 2 lines at the last audit, across 240 statements:
 
 | Lines | Issue |
 |---|---|
-| 2 | #0046 JSON doubles outside a middling range |
 | 2 | #0066 SOUNDEX unsupported |
 
 Worth re-deriving rather than trusting after a run that fixes anything: five of

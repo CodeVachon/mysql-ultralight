@@ -5435,6 +5435,61 @@ fn a_numeric_precision_is_reported_the_way_mysql_reports_it() {
 }
 
 #[test]
+fn a_json_double_is_written_the_way_mysql_writes_one() {
+    // Three formatters disagree here and only one is MySQL's. serde switches
+    // to exponent form earlier than MySQL and writes the sign — `1e+30` where
+    // MySQL writes `1e30`. Rust's own `Display` never switches at all, so
+    // `1e30` comes out as thirty-one digits. Every row measured on 8.3.
+    let (engine, mut session) = engine();
+
+    for (sql, expected) in [
+        // Fixed notation up to an exponent of 14, and exponent form from 15.
+        (
+            "SELECT CAST('[1e13, 1e14, 1e15, 1e16, 1e30, 1e308]' AS JSON)",
+            "[10000000000000.0, 100000000000000.0, 1e15, 1e16, 1e30, 1e308]",
+        ),
+        // And down to -15, with -16 the first to switch.
+        (
+            "SELECT CAST('[1e-1, 1e-7, 1e-15, 1e-16, 1e-308]' AS JSON)",
+            "[0.1, 0.0000001, 0.000000000000001, 1e-16, 1e-308]",
+        ),
+        // A whole double keeps its `.0` inside the window — that is what makes
+        // it a double rather than the integer beside it.
+        (
+            "SELECT CAST('[2.0, 2.5, -2.0, 0.0, -0.0]' AS JSON)",
+            "[2.0, 2.5, -2.0, 0.0, -0.0]",
+        ),
+        // An integer is not a double and gets none of this.
+        ("SELECT CAST('[1, 2, -3, 0]' AS JSON)", "[1, 2, -3, 0]"),
+        // The mantissa is carried across the threshold, not just the power.
+        (
+            "SELECT CAST('[1.5e14, 1.5e15, 1.23456789012345e20]' AS JSON)",
+            "[150000000000000.0, 1.5e15, 1.23456789012345e20]",
+        ),
+        // Above the threshold the exponent is not the whole test: a value
+        // whose digits reach past the point stays written out, because they
+        // do not fit in the places before it. `1e15` is exponential and
+        // `1000000000000000.5` is not, at the same exponent.
+        (
+            "SELECT CAST('[1000000000000000.5, 4000000000000000.5, 2000000000000000.3]' AS JSON)",
+            "[1000000000000000.4, 4.000000000000001e15, 2000000000000000.5]",
+        ),
+        // Built rather than parsed, so the rule is in the writer and not in
+        // whatever the source text happened to say.
+        (
+            "SELECT JSON_OBJECT('a', 1e15, 'b', 1e14, 'c', 2.0)",
+            r#"{"a": 1e15, "b": 100000000000000.0, "c": 2.0}"#,
+        ),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn a_null_branch_of_a_union_contributes_no_type() {
     // NULL is the absence of a type, not a competing one. Widening against it
     // fell through to the string fallback, so `SELECT id FROM N UNION SELECT

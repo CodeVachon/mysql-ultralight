@@ -203,12 +203,10 @@ pub fn render(json: &Json) -> Value {
 /// Strings are delegated to serde_json, whose escaping matches MySQL's —
 /// checked against it, including `/`, `"` and `\`.
 ///
-/// Numbers are delegated too and do *not* always match: serde writes an
-/// exponent as `1e+30` where MySQL writes `1e30`, and switches to exponent
-/// form earlier, so `1e-7` is `1e-7` here and `0.0000001` there. MySQL stays
-/// in fixed notation for exponents in [-15, 14]. Every number the target
-/// codebase stores is inside that range, so it is recorded in #0046 rather
-/// than guessed at.
+/// A double is *not* delegated — serde writes an exponent as `1e+30` where
+/// MySQL writes `1e30`, and switches to exponent form earlier — so it goes
+/// through [`double`] below, which follows MySQL's own rule. An integer is
+/// delegated, because there is nothing to choose.
 pub fn render_text(json: &Json) -> String {
     let mut out = String::new();
     write_json(&mut out, json);
@@ -240,8 +238,61 @@ fn write_json(out: &mut String, json: &Json) {
             }
             out.push('}');
         }
+        // A double is written by MySQL's rule rather than serde's, which
+        // differ on both the threshold and the sign.
+        Json::Number(n) if n.as_f64().is_some() && n.as_i64().is_none() && n.as_u64().is_none() => {
+            out.push_str(&double(n.as_f64().unwrap_or(f64::NAN)));
+        }
         scalar => out.push_str(&scalar.to_string()),
     }
+}
+
+/// A JSON double as MySQL writes one.
+///
+/// serde switches to exponent form earlier than MySQL and writes the sign —
+/// `1e+30` where MySQL writes `1e30` — and Rust's own `Display` never switches
+/// at all, so `1e30` comes out as thirty-one digits. Neither is the rule.
+///
+/// MySQL's is `my_gcvt`, which takes the fixed form when
+///
+/// ```text
+/// decpt >= -14 && (decpt <= 15 || len > decpt)
+/// ```
+///
+/// where `decpt` is where the point falls — one more than the exponent — and
+/// `len` is how many digits the shortest round-trip needs. The two halves are
+/// not symmetric, which is the part worth writing down: below, it is purely
+/// the exponent, so `1e-15` is `0.000000000000001` and `1e-16` is `1e-16`.
+/// Above, a value stays fixed past the threshold if its digits *reach past the
+/// point* — `1e15` is `1e15` but `1000000000000000.5` is written out in full,
+/// because seventeen digits do not fit in sixteen places. Treating the upper
+/// bound as an exponent test alone is right for every whole power and wrong
+/// for anything with a fraction between 1e15 and 4.5e15.
+///
+/// A whole number keeps a `.0` inside the fixed form, which is what makes a
+/// document's `2.0` a double rather than the integer `2`.
+fn double(value: f64) -> String {
+    if !value.is_finite() {
+        // Not representable in JSON at all; serde writes null and so does
+        // this, rather than a token no parser reads.
+        return "null".to_owned();
+    }
+    // `{:e}` is the shortest round-trip mantissa and a bare exponent, which is
+    // already the spelling MySQL uses outside the fixed form.
+    let scientific = format!("{value:e}");
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let decpt = exponent + 1;
+    let len = mantissa.chars().filter(char::is_ascii_digit).count() as i32;
+
+    if decpt < -14 || (decpt > 15 && len <= decpt) {
+        return scientific;
+    }
+    let mut fixed = format!("{value}");
+    if !fixed.contains('.') {
+        fixed.push_str(".0");
+    }
+    fixed
 }
 
 /// The keys of an object in the order MySQL stores them: by byte length, then

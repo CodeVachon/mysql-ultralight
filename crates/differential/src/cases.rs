@@ -78,9 +78,14 @@ pub const GROUPS: &[Group] = &[
             same("SELECT CAST('{\"b\":1,\"a\":2,\"aa\":3,\"A\":4}' AS JSON)"),
             same("SELECT CAST('{}' AS JSON), CAST('[]' AS JSON), CAST('[[],{}]' AS JSON)"),
             same("SELECT CAST('[1.5, 2.0, 1e10, -0.0]' AS JSON)"),
-            // Outside a middling exponent range the two disagree, and this is
-            // here to keep that visible rather than to pass. #0046.
+            // How a double is written, which is a rule rather than a range:
+            // fixed notation up to an exponent of 14 and from -15, and beyond
+            // that only while the digits reach past the point — which is why
+            // `1e15` is exponential and `1000000000000000.5` is not.
             same("SELECT CAST('[1e-7, 1e15, 1e30]' AS JSON)"),
+            same("SELECT CAST('[1e13, 1e14, 1e15, 1e16, 1e308]' AS JSON)"),
+            same("SELECT CAST('[1e-1, 1e-15, 1e-16, 1e-308]' AS JSON)"),
+            same("SELECT CAST('[1.5e14, 1.5e15, 1000000000000000.5]' AS JSON)"),
             // JSON_UNQUOTE of a document is still that document's text, so it
             // has to be written the same way the document is.
             same("SELECT JSON_UNQUOTE(CAST('{\"a\":1}' AS JSON)), doc->>'$.a' FROM J"),
@@ -137,6 +142,13 @@ pub const GROUPS: &[Group] = &[
             // A union of the same width and different signs holds neither
             // branch's range.
             same("SELECT i FROM Q UNION SELECT iu FROM Q ORDER BY 1"),
+            // And at *different* widths, which is the half the equal-width
+            // pair above cannot see: whichever side is unsigned needs one size
+            // more than itself to be held signed, and past BIGINT there is no
+            // integer left at all.
+            same("SELECT iu FROM Q UNION SELECT s FROM Q ORDER BY 1"),
+            same("SELECT s FROM Q UNION SELECT iu FROM Q ORDER BY 1"),
+            same("SELECT bu FROM Q UNION SELECT i FROM Q ORDER BY 1"),
             // The other order. Merging the two branches' signedness before
             // comparing it made an unsigned-first union match itself and keep
             // the narrower code, where this order never did — so the corpus
@@ -220,6 +232,16 @@ pub const GROUPS: &[Group] = &[
             same("SELECT id FROM N UNION SELECT 1 + 1 ORDER BY 1"),
             same("SELECT id FROM N UNION ALL SELECT 2 ORDER BY 1"),
             same("SELECT id FROM N UNION SELECT NULL ORDER BY 1"),
+            // Every kind, not just the integer: a NULL branch contributes no
+            // type at all, so whatever the other branch is has to survive it.
+            same("SELECT nn FROM N UNION SELECT NULL ORDER BY 1"),
+            same("SELECT dn FROM N UNION SELECT NULL ORDER BY 1"),
+            // `SELECT NULL UNION SELECT NULL` is deliberately absent. MySQL
+            // answers it two ways — `NULL` when the statement is prepared and
+            // `STRING` when it is run, because a materialised column cannot be
+            // the null type — so it cannot tell an engine bug from a MySQL
+            // inconsistency. The engine's answer is pinned by a unit test
+            // instead. #0073.
             // NULL on the left, which is the branch that has to *adopt* the
             // other side's type rather than keep its own.
             same("SELECT NULL UNION SELECT id FROM N ORDER BY 1"),

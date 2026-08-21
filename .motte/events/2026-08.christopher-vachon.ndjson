@@ -146,3 +146,6 @@
 {"at":"2026-08-21T16:09:17Z","id":71,"by":"Christopher Vachon","as":"user","type":"created","title":"A decimal embedded in JSON loses its scale","state":"Todo"}
 {"at":"2026-08-21T17:15:44Z","id":67,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-21T17:37:13Z","id":65,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-21T18:07:21Z","id":46,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-21T18:23:38Z","id":72,"by":"Christopher Vachon","as":"user","type":"created","title":"serde and MySQL round a JSON literal tie differently","state":"Todo"}
+{"at":"2026-08-21T18:26:27Z","id":73,"by":"Christopher Vachon","as":"user","type":"created","title":"An all-NULL union is typed two ways by MySQL","state":"Todo"}
