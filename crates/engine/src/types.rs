@@ -296,8 +296,14 @@ impl SqlType {
         match self.kind {
             TypeKind::Bool | TypeKind::Int | TypeKind::Year => Value::Int(0),
             TypeKind::Float => Value::Float(0.0),
-            // Kept as text: a DECIMAL carries a scale that a float would lose.
-            TypeKind::Decimal => Value::text("0"),
+            // At the column's scale, and tagged, because this value goes into
+            // a row without passing `coerce`. Left as plain text it was a
+            // second spelling of zero — a group of its own beside `0.00`, and
+            // one inexact value in the column, which sent `SUM` over *every*
+            // row back through the float path.
+            TypeKind::Decimal => {
+                Value::Decimal(crate::decimal::render(0, self.scale.unwrap_or(0) as usize))
+            }
             // The epoch rather than MySQL's `0000-00-00`, because the mode this
             // engine targets sets NO_ZERO_DATE and would reject that value.
             TypeKind::Date => Value::text("1970-01-01"),

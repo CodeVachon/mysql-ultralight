@@ -194,14 +194,22 @@ impl Value {
             // documents where `'A'` and `'a'` are one string, and `1` and
             // `1.0` are one number where `'1'` and `'1.0'` are two strings.
             Value::Json(_) => crate::json::comparison_key(&self.as_json_operand()),
-            // By value, so `2.50` and `2.5` are one group and `10.00` sorts
-            // after `9.00` — the ordering `compare` gives them.
+            // By value: every spelling of one number reaches one key, so
+            // `2.50` and `2.5` are one group — and, because the key is the
+            // number written back out, `2.50` is a *different* key from
+            // `25.00`. Dropping the trailing zeros without the scale that went
+            // with them made those two the same, and a GROUP BY over a money
+            // column silently merged rows.
+            //
+            // The bare integer, too, so `2.00` keys the same as the `2` a
+            // union might put beside it.
             Value::Decimal(text) => {
                 let scale = crate::decimal::scale_of(text);
                 match crate::decimal::units(text, scale) {
-                    // Trailing zeros dropped, so every spelling of a number
-                    // reaches the same key.
-                    Some(units) => format!("{:+039}", units_at_no_scale(units, scale)),
+                    Some(units) => {
+                        let (units, scale) = crate::decimal::shortest(units, scale);
+                        crate::decimal::render(units, scale)
+                    }
                     None => text.to_lowercase(),
                 }
             }
@@ -275,16 +283,6 @@ fn format_float(v: f64) -> String {
     }
     let s = v.to_string();
     s.strip_suffix(".0").map(str::to_owned).unwrap_or(s)
-}
-
-/// A count of units with its trailing zeros removed, so that `2.50` at scale
-/// two and `2.5` at scale one become the same number.
-fn units_at_no_scale(mut units: i128, mut scale: usize) -> i128 {
-    while scale > 0 && units % 10 == 0 {
-        units /= 10;
-        scale -= 1;
-    }
-    units
 }
 
 /// The number MySQL reads out of the front of a string.

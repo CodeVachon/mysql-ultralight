@@ -447,9 +447,11 @@ pub fn from_value(value: &Value) -> Json {
         Value::Float(f) => serde_json::Number::from_f64(*f).map_or(Json::Null, Json::Number),
         Value::Text(s) => Json::String(s.clone()),
         Value::Bytes(b) => Json::String(String::from_utf8_lossy(b).into_owned()),
-        // A number, as MySQL embeds one: `JSON_OBJECT('a', decimal_column)`
-        // gives `{"a": 2.50}` and not `{"a": "2.50"}`. Parsed from the text,
-        // which is exact for anything serde reads back the same way.
+        // A number rather than a string: `JSON_OBJECT('a', decimal_column)`
+        // gives `{"a": 2.5}` and not `{"a": "2.50"}`. The scale is lost on the
+        // way through, because `serde_json` is built without
+        // `arbitrary_precision` and reads every number into an f64 — MySQL
+        // keeps it and answers `{"a": 2.50}`. See #0071.
         Value::Decimal(s) => s
             .parse::<serde_json::Number>()
             .map_or_else(|_| Json::String(s.clone()), Json::Number),

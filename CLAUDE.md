@@ -46,6 +46,24 @@ suggestions first, `--require-tools` turns a missing tool into a failure rather 
 skip. CI sets that automatically via the `CI` environment variable, so a tool that fails
 to install fails the build instead of quietly reducing coverage.
 
+### Proving a test bites
+
+`scripts/mutate.sh` removes a piece of the implementation, runs a test, and puts it
+back. A passing test is only evidence if it would have failed without the code it
+covers, and several here did not: assertions that never ran, a test reading a struct
+field where the bug was in the wire flag, and one whose sample values sorted the same
+way whether the comparison was right or wrong.
+
+```sh
+scripts/mutate.sh <file> <expected-lines> <find> <replace> -- <command...>
+```
+
+It refuses unless the number of matching lines is the number given, which is the part
+that matters. The way this check fails is *under*-mutating — a replacement that hits
+one of two call sites leaves the mechanism working, so the test passes and reads
+exactly like a test that does not bite. Exits 0 when the command fails, because that
+is the outcome being looked for.
+
 ### Fallow applies to `packages/npm` only
 
 The user's other projects gate on [Fallow](https://docs.fallow.tools). **Fallow is

@@ -5550,6 +5550,71 @@ fn a_decimal_keeps_its_scale() {
         rows(&engine, &mut session, "SELECT SUM(s) FROM S"),
         vec![vec!["6.5"]]
     );
+
+    // Grouping and de-duplication key on a string rather than a comparison, so
+    // that string has to be one number written one way — and *only* that
+    // number. Dropping the trailing zeros without the scale they stood for
+    // gave 0.25, 2.50 and 25.00 all the key 25, and a GROUP BY over a money
+    // column merged rows that have nothing to do with each other.
+    run(&engine, &mut session, "CREATE TABLE M (a DECIMAL(10,2))");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO M VALUES (0.25),(2.50),(25.00),(2.00)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(DISTINCT a) FROM M"),
+        vec![vec!["4"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM (SELECT a, COUNT(*) FROM M GROUP BY a) g"
+        ),
+        vec![vec!["4"]]
+    );
+
+    // And one number written two ways is one key: `2.50` from a scale of two
+    // meets `2.5` from a scale of one, and `2.00` meets the integer 2.
+    run(&engine, &mut session, "CREATE TABLE W (a DECIMAL(8,1))");
+    run(&engine, &mut session, "INSERT INTO W VALUES (2.5)");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM (SELECT a FROM M UNION SELECT a FROM W) u"
+        ),
+        vec![vec!["4"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM (SELECT a FROM M UNION SELECT 2) u"
+        ),
+        vec![vec!["4"]]
+    );
+
+    // The value used to fill a column nobody supplied goes in without passing
+    // the coercion, so it needs the scale and the tag of its own accord — one
+    // untagged zero in the column is a second group, and it sends `SUM` over
+    // every row back through the float path.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE F (k INT, a DECIMAL(10,2) NOT NULL)",
+    );
+    run(&engine, &mut session, "INSERT IGNORE INTO F (k) VALUES (1)");
+    run(&engine, &mut session, "INSERT INTO F VALUES (2, 0)");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT k, a FROM F ORDER BY k"),
+        vec![vec!["1", "0.00"], vec!["2", "0.00"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT SUM(a) FROM F"),
+        vec![vec!["0.00"]]
+    );
 }
 
 #[test]

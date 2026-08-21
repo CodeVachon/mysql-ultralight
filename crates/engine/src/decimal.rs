@@ -133,3 +133,17 @@ pub fn from_f64(value: f64, scale: usize) -> String {
     };
     render(units, scale)
 }
+
+/// The same number with as few digits after the point as spell it.
+///
+/// `2.50` at scale two is `2.5` at scale one and `2` at scale zero is the same
+/// number as `2.00`, which is what lets one key stand for every spelling. The
+/// scale comes back with the units: dropping it would make `2.50` and `25.00`
+/// the same 25.
+pub fn shortest(mut units: i128, mut scale: usize) -> (i128, usize) {
+    while scale > 0 && units % 10 == 0 {
+        units /= 10;
+        scale -= 1;
+    }
+    (units, scale)
+}
