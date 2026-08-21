@@ -439,6 +439,16 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
         // calls, because SQL gives them keyword argument syntax. They are the
         // same functions, so they are routed to the same table rather than
         // reimplemented.
+        //
+        // `CEIL` and `FLOOR` are here for the same reason and had no arm at
+        // all, so `SELECT CEIL(1.5)` was refused outright while the `"ceil"`
+        // entry in the function table sat unreachable — the engine advertised
+        // a function no statement could call. `CEILING` is spelled the same
+        // way to MySQL and parses as an ordinary call, which is why only it
+        // worked.
+        Expr::Ceil { expr, field } => rounded_to_integer("ceil", expr, field, ctx),
+        Expr::Floor { expr, field } => rounded_to_integer("floor", expr, field, ctx),
+
         Expr::Substring {
             expr,
             substring_from,
@@ -866,6 +876,12 @@ fn tightness(op: &BinaryOperator) -> u8 {
         B::BitwiseXor => 3,
         // Two operators wearing one token: concatenating it binds tighter than
         // `DIV`, and meaning OR it binds looser than everything here.
+        //
+        // Read from the statement rather than from a session, which is where
+        // `binary` reads it to decide what `||` *does*. Two readings of one
+        // flag, so `eval` has to run inside a `crate::exec::Source` scope or
+        // they can disagree and `7 DIV 2 || 3` would be shaped as OR and then
+        // concatenated. Both entry points that parse set that scope.
         B::StringConcat if crate::exec::pipes_as_concat() => 2,
         B::MyIntegerDivide => 1,
         _ => 0,
@@ -959,6 +975,27 @@ fn take_leftmost(e: &mut Expr, left: &Expr, op: &BinaryOperator, level: u8) -> b
         };
     }
     true
+}
+
+/// `CEIL(x)` or `FLOOR(x)`, which arrive as their own node rather than a call.
+///
+/// The `TO <field>` and `(x, scale)` forms belong to other dialects; MySQL
+/// takes one argument and nothing else, so a parse carrying either is not SQL
+/// this engine should answer rather than refuse.
+fn rounded_to_integer(
+    name: &str,
+    expr: &Expr,
+    field: &sqlparser::ast::CeilFloorKind,
+    ctx: &Context<'_>,
+) -> EngineResult<Value> {
+    use sqlparser::ast::{CeilFloorKind, DateTimeField};
+    if !matches!(
+        field,
+        CeilFloorKind::DateTimeField(DateTimeField::NoDateTime)
+    ) {
+        return Err(unsupported(format!("{name} with a field or a scale")));
+    }
+    functions::call(name, vec![eval(expr, ctx)?], ctx.session)
 }
 
 /// MySQL's refusal when an integer result will not fit.

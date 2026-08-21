@@ -2227,7 +2227,7 @@ impl Engine {
         if session.sql_mode().only_full_group_by {
             let determined = determined_columns(select, refs, &group_exprs);
             for (_, e) in &items {
-                check_full_group_by(e, &group_exprs, refs, &determined)?;
+                check_full_group_by(e, e, &group_exprs, refs, &determined)?;
             }
         }
 
@@ -2396,6 +2396,56 @@ impl Engine {
                 expr: Box::new(recur(expr, folded)?),
             },
             Expr::Nested(inner) => Expr::Nested(Box::new(recur(inner, folded)?)),
+            // The nodes sqlparser gives their own grammar. Without these an
+            // aggregate inside one is found by `contains_aggregate` and then
+            // never folded, so the raw `sum()` reaches the function table and
+            // is reported as unsupported — `CEIL(SUM(x))` failed where
+            // `CEILING(SUM(x))`, the same function spelled as a call, worked.
+            Expr::Ceil { expr, field } => Expr::Ceil {
+                expr: Box::new(recur(expr, folded)?),
+                field: field.clone(),
+            },
+            Expr::Floor { expr, field } => Expr::Floor {
+                expr: Box::new(recur(expr, folded)?),
+                field: field.clone(),
+            },
+            Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                special,
+                shorthand,
+            } => Expr::Substring {
+                expr: Box::new(recur(expr, folded)?),
+                substring_from: match substring_from {
+                    Some(from) => Some(Box::new(recur(from, folded)?)),
+                    None => None,
+                },
+                substring_for: match substring_for {
+                    Some(count) => Some(Box::new(recur(count, folded)?)),
+                    None => None,
+                },
+                special: *special,
+                shorthand: *shorthand,
+            },
+            Expr::Trim {
+                expr,
+                trim_where,
+                trim_what,
+                trim_characters,
+            } => Expr::Trim {
+                expr: Box::new(recur(expr, folded)?),
+                trim_where: *trim_where,
+                trim_what: match trim_what {
+                    Some(what) => Some(Box::new(recur(what, folded)?)),
+                    None => None,
+                },
+                trim_characters: trim_characters.clone(),
+            },
+            Expr::Position { expr, r#in } => Expr::Position {
+                expr: Box::new(recur(expr, folded)?),
+                r#in: Box::new(recur(r#in, folded)?),
+            },
             Expr::IsNull(inner) => Expr::IsNull(Box::new(recur(inner, folded)?)),
             Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(recur(inner, folded)?)),
             Expr::Between {
@@ -5151,10 +5201,12 @@ fn function_result_type(name: &str) -> Option<ColumnType> {
         "length" | "char_length" | "character_length" | "octet_length" | "instr" | "locate"
         | "field" | "count" | "row_number" | "rank" | "dense_rank" | "connection_id"
         | "last_insert_id" | "row_count" | "unix_timestamp" => ColumnType::LongLong,
-        // `MOD` of two integers is an integer, and `CEILING` is integral by
-        // definition. `ABS`, `ROUND`, `GREATEST` and `LEAST` are *not* here:
-        // they answer whatever they were given.
-        "mod" | "ceiling" => ColumnType::LongLong,
+        // `MOD` of two integers is an integer. `CEILING` is *not* here even
+        // though its answer is always whole: MySQL keeps the argument's kind,
+        // so `CEILING(double)` is a DOUBLE holding a whole number. `ABS`,
+        // `ROUND`, `GREATEST` and `LEAST` are argument-typed for the same
+        // reason.
+        "mod" => ColumnType::LongLong,
         // The date parts, which are numbers rather than dates.
         "timestampdiff" | "datediff" | "hour" | "minute" | "second" | "microsecond" | "quarter"
         | "dayofweek" | "dayofyear" | "dayofmonth" | "day" | "month" | "weekday" => {
@@ -5181,6 +5233,25 @@ fn function_result_type(name: &str) -> Option<ColumnType> {
         }
         _ => return None,
     })
+}
+
+/// The type of a function that answers a number whatever it was given.
+///
+/// MySQL keeps the argument's kind and widens integers: `ABS(tinyint)` is a
+/// LONGLONG, `ABS(decimal)` a NEWDECIMAL, and anything with no numeric kind of
+/// its own — a string, a NULL — a DOUBLE. `whole` says the answer has no
+/// fraction, which turns an exact argument into an integer: `CEIL(decimal)` is
+/// a LONGLONG where `ABS(decimal)` is not.
+fn numeric_answer(argument: ColumnType, whole: bool) -> ColumnType {
+    match argument {
+        t if is_integer(t) => ColumnType::LongLong,
+        ColumnType::Decimal | ColumnType::NewDecimal if whole => ColumnType::LongLong,
+        t @ (ColumnType::Decimal
+        | ColumnType::NewDecimal
+        | ColumnType::Float
+        | ColumnType::Double) => t,
+        _ => ColumnType::Double,
+    }
 }
 
 /// The wider of two numeric codes, for an operator with two operands.
@@ -5351,14 +5422,24 @@ fn computed_column_type(
                 // Fixing them at LONGLONG truncated a decimal to its integer
                 // part; typing them by the argument sent `ABS(tinyint)` as one
                 // byte, which is a value the answer can outgrow.
-                "abs" | "round" => match combined(
-                    function_arguments(f)
-                        .iter()
-                        .map(|a| computed_column_type(a, refs, input)),
-                ) {
-                    t if is_integer(t) => ColumnType::LongLong,
-                    t => t,
-                },
+                "abs" | "round" => numeric_answer(
+                    combined(
+                        function_arguments(f)
+                            .iter()
+                            .map(|a| computed_column_type(a, refs, input)),
+                    ),
+                    false,
+                ),
+                // The same, except that the answer is whole, so an exact
+                // argument gives an integer rather than a decimal.
+                "ceiling" => numeric_answer(
+                    combined(
+                        function_arguments(f)
+                            .iter()
+                            .map(|a| computed_column_type(a, refs, input)),
+                    ),
+                    true,
+                ),
                 // `NULLIF` answers its first argument or NULL, and both fit
                 // that argument's own width.
                 "nullif" => function_arguments(f)
@@ -5398,8 +5479,12 @@ fn computed_column_type(
         // routing through `Expr::Function`, so `function_result_type` never
         // sees them. `POSITION` and `EXTRACT` answered `VAR_STRING` here until
         // this arm existed, where MySQL says `LONGLONG` both times.
-        Expr::Position { .. } | Expr::Extract { .. } | Expr::Floor { .. } | Expr::Ceil { .. } => {
-            ColumnType::LongLong
+        Expr::Position { .. } | Expr::Extract { .. } => ColumnType::LongLong,
+        // `CEIL` and `FLOOR` are typed like the `CEILING` spelling they are
+        // synonyms of, which is by their argument: whole, but a DOUBLE when
+        // what it rounded was one.
+        Expr::Floor { expr, .. } | Expr::Ceil { expr, .. } => {
+            numeric_answer(computed_column_type(expr, refs, input), true)
         }
         Expr::Substring { .. } | Expr::Trim { .. } | Expr::Overlay { .. } => ColumnType::VarString,
         // Anything that answers a yes-or-no question is an integer, which is
@@ -5725,6 +5810,7 @@ fn column_slot(refs: &[ColumnRef], e: &Expr) -> Option<usize> {
 /// returns an arbitrary value, where MySQL under ONLY_FULL_GROUP_BY errors.
 fn check_full_group_by(
     e: &Expr,
+    top: &Expr,
     group_exprs: &[Expr],
     refs: &[ColumnRef],
     determined: &[usize],
@@ -5744,24 +5830,39 @@ fn check_full_group_by(
         return Ok(());
     }
 
+    // Into every part of it, because the grouped column can be anywhere:
+    // `FLOOR(g)` is fine when `g` is grouped, and so is `UPPER(g)`. Recursing
+    // through a hand-picked four variants refused both — and refused them
+    // *only* once the variants above became visible to `references_column`,
+    // which is what a list that has to be kept in step with another one does.
     match e {
         Expr::Function(f) if f.over.is_some() => return Ok(()),
         Expr::Function(f) if is_aggregate(&f.name.to_string()) => return Ok(()),
-        Expr::BinaryOp { left, right, .. } => {
-            check_full_group_by(left, group_exprs, refs, determined)?;
-            return check_full_group_by(right, group_exprs, refs, determined);
+        Expr::Function(f) => {
+            for argument in value_arguments(f) {
+                check_full_group_by(&argument, top, group_exprs, refs, determined)?;
+            }
+            return Ok(());
         }
-        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) | Expr::Cast { expr, .. } => {
-            return check_full_group_by(expr, group_exprs, refs, determined)
+        other => {
+            let inner = subexpressions(other);
+            if !inner.is_empty() {
+                for part in inner {
+                    check_full_group_by(part, top, group_exprs, refs, determined)?;
+                }
+                return Ok(());
+            }
         }
-        _ => {}
     }
 
+    // The whole select item rather than the part of it that failed: the walk
+    // descends to a leaf, and naming that leaf would report `x` for
+    // `SUBSTRING(x, 1, 1)` — less than it knew before it started recursing.
     Err(EngineError::new(
         1055,
         "42000",
         format!(
-            "Expression '{rendered}' is not in GROUP BY clause and contains a nonaggregated \
+            "Expression '{top}' is not in GROUP BY clause and contains a nonaggregated \
              column; this is incompatible with sql_mode=only_full_group_by"
         ),
     ))
@@ -5814,43 +5915,98 @@ fn literal_text(value: &sqlparser::ast::ValueWithSpan) -> String {
     }
 }
 
-/// Whether an expression reads any column outside an aggregate.
+/// The sub-expressions an evaluator would read, for the walks that have to
+/// look inside one.
+///
+/// One list rather than a `match` in each walk. Every one of those matches
+/// ended in `_ => false`, so a variant missing from it was invisible rather
+/// than an error: `SELECT TRIM(x) FROM t GROUP BY g` passed ONLY_FULL_GROUP_BY
+/// and answered with an arbitrary row, and `SELECT CEIL(SUM(x))` reported
+/// `sum()` as unsupported because the aggregate inside was never found. Both
+/// walks had drifted behind `crate::expr::eval` by more than a dozen variants.
+///
+/// Anything `eval` can evaluate belongs here. Two deliberate omissions: a
+/// `Function`, because the walks disagree about what an aggregate's arguments
+/// mean, and a subquery, because its columns are resolved in its own scope
+/// rather than this one.
+fn subexpressions(e: &Expr) -> Vec<&Expr> {
+    match e {
+        Expr::BinaryOp { left, right, .. } => vec![left, right],
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsFalse(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr)
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::Ceil { expr, .. }
+        | Expr::Floor { expr, .. } => vec![expr],
+        Expr::Prefixed { value, .. } => vec![value],
+        Expr::Between {
+            expr, low, high, ..
+        } => vec![expr, low, high],
+        Expr::InList { expr, list, .. } => std::iter::once(&**expr).chain(list.iter()).collect(),
+        // The `expr` only: what the subquery selects is its own business.
+        Expr::InSubquery { expr, .. } => vec![expr],
+        Expr::Like { expr, pattern, .. }
+        | Expr::ILike { expr, pattern, .. }
+        | Expr::SimilarTo { expr, pattern, .. }
+        | Expr::RLike { expr, pattern, .. } => vec![expr, pattern],
+        Expr::Position { expr, r#in } => vec![expr, r#in],
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => std::iter::once(&**expr)
+            .chain(substring_from.as_deref())
+            .chain(substring_for.as_deref())
+            .collect(),
+        Expr::Trim {
+            expr,
+            trim_what,
+            trim_characters,
+            ..
+        } => std::iter::once(&**expr)
+            .chain(trim_what.as_deref())
+            .chain(trim_characters.iter().flatten())
+            .collect(),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => operand
+            .as_deref()
+            .into_iter()
+            .chain(
+                conditions
+                    .iter()
+                    .flat_map(|w| [&w.condition, &w.result].into_iter()),
+            )
+            .chain(else_result.as_deref())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether an expression reads a column, for ONLY_FULL_GROUP_BY.
 fn references_column(e: &Expr) -> bool {
     match e {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
         // An aggregate consumes its columns, so they are not loose references.
         Expr::Function(f) if f.over.is_none() && is_aggregate(&f.name.to_string()) => false,
         Expr::Function(f) => value_arguments(f).iter().any(references_column),
-        Expr::BinaryOp { left, right, .. } => references_column(left) || references_column(right),
-        Expr::UnaryOp { expr, .. }
-        | Expr::Nested(expr)
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::Cast { expr, .. } => references_column(expr),
-        Expr::Between {
-            expr, low, high, ..
-        } => references_column(expr) || references_column(low) || references_column(high),
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            operand.as_deref().is_some_and(references_column)
-                || conditions
-                    .iter()
-                    .any(|w| references_column(&w.condition) || references_column(&w.result))
-                || else_result.as_deref().is_some_and(references_column)
-        }
-        _ => false,
+        other => subexpressions(other).into_iter().any(references_column),
     }
 }
 
-/// True when a select item contains an aggregate anywhere inside it.
-///
-/// Matching only a bare `COUNT(*)` misses `SUM(a) / COUNT(*)` and
-/// `IFNULL(SUM(v), 0)`, which then take the per-row path and either fail
-/// outright or return no rows at all.
+/// True when a select item is or contains an aggregate call.
 fn select_item_aggregates(item: &SelectItem) -> bool {
     match item {
         SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
@@ -5867,37 +6023,7 @@ fn contains_aggregate(e: &Expr) -> bool {
             f.over.is_none() && is_aggregate(&f.name.to_string())
                 || function_arguments(f).iter().any(contains_aggregate)
         }
-        Expr::BinaryOp { left, right, .. } => contains_aggregate(left) || contains_aggregate(right),
-        Expr::UnaryOp { expr, .. } => contains_aggregate(expr),
-        Expr::Nested(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
-            contains_aggregate(inner)
-        }
-        Expr::Cast { expr, .. } => contains_aggregate(expr),
-        Expr::Between {
-            expr, low, high, ..
-        } => contains_aggregate(expr) || contains_aggregate(low) || contains_aggregate(high),
-        Expr::InList { expr, list, .. } => {
-            contains_aggregate(expr) || list.iter().any(contains_aggregate)
-        }
-        Expr::InSubquery { expr, .. } => contains_aggregate(expr),
-        Expr::Like { expr, pattern, .. } => contains_aggregate(expr) || contains_aggregate(pattern),
-        Expr::IsTrue(inner)
-        | Expr::IsFalse(inner)
-        | Expr::IsNotTrue(inner)
-        | Expr::IsNotFalse(inner) => contains_aggregate(inner),
-        Expr::Case {
-            operand,
-            conditions,
-            else_result,
-            ..
-        } => {
-            operand.as_deref().is_some_and(contains_aggregate)
-                || conditions
-                    .iter()
-                    .any(|w| contains_aggregate(&w.condition) || contains_aggregate(&w.result))
-                || else_result.as_deref().is_some_and(contains_aggregate)
-        }
-        _ => false,
+        other => subexpressions(other).into_iter().any(contains_aggregate),
     }
 }
 
@@ -6020,6 +6146,13 @@ fn source_text(e: &Expr) -> Option<String> {
     let from = byte_offset(&sql, span.end)
         .unwrap_or(reported)
         .max(reported);
+    if let Some(known) = SOURCE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .and_then(|c| c.names.borrow().get(&(reported, from)).cloned())
+    }) {
+        return known;
+    }
     let rendered = e.to_string();
     let limit = (from + SPAN_SLACK).min(sql.len());
 
@@ -6042,19 +6175,31 @@ fn source_text(e: &Expr) -> Option<String> {
         })
         .filter(|start| *start == reported || starts_a_token(&sql, *start));
 
+    let mut answer = None;
     for start in starts {
         if !sql.is_char_boundary(start) {
             continue;
         }
         let found = ends(&sql, start, from, limit)
-            .filter(|end| sql.is_char_boundary(*end))
+            .into_iter()
             .map(|end| sql[start..end].trim_end())
             .find(|slice| !slice.is_empty() && parses_back_to(slice, &rendered));
         if let Some(slice) = found {
-            return Some(slice.to_owned());
+            answer = Some(slice.to_owned());
+            break;
         }
     }
-    None
+    // Remembered either way: a failure costs the whole grid, and asking again
+    // would cost it again.
+    SOURCE.with(|s| {
+        if let Some(current) = s.borrow().as_ref() {
+            current
+                .names
+                .borrow_mut()
+                .insert((reported, from), answer.clone());
+        }
+    });
+    answer
 }
 
 /// Where an expression's text could end, nearest first.
@@ -6068,34 +6213,45 @@ fn source_text(e: &Expr) -> Option<String> {
 /// *inside* the expression — the reported end of `CONCAT('a','b')` falls
 /// between the parentheses, and a depth starting there reads the closing one
 /// as the end of an enclosing group.
-fn ends(sql: &str, start: usize, from: usize, limit: usize) -> impl Iterator<Item = usize> + '_ {
+///
+/// By characters, not bytes: stepping a byte at a time indexed into the middle
+/// of a multi-byte one, and `SELECT 'café'` aborted the process.
+fn ends(sql: &str, start: usize, from: usize, limit: usize) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut characters = sql[start..limit].chars();
+    let mut at = start;
     let mut depth = 0i32;
-    let mut quote = None;
-    let mut done = false;
-    (start..=limit)
-        .take_while(move |at| {
-            if done {
-                return false;
-            }
-            // The character *at* this position decides whether the next one is
-            // still inside the item; this one still is, so it is yielded first.
-            if let Some(c) = sql[*at..].chars().next() {
-                match quote {
-                    Some(q) if c == q => quote = None,
-                    Some(_) => {}
-                    None => match c {
-                        '\'' | '"' | '`' => quote = Some(c),
-                        '(' => depth += 1,
-                        ')' if depth == 0 => done = true,
-                        ')' => depth -= 1,
-                        ',' if depth == 0 => done = true,
-                        _ => {}
-                    },
-                }
-            }
-            true
-        })
-        .filter(move |at| *at >= from)
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    loop {
+        if at >= from {
+            out.push(at);
+        }
+        let Some(c) = characters.next() else { break };
+        match quote {
+            // A backslash hides the next character, so `'a\'b'` is one string
+            // and not two. Getting this wrong only costs a fallback to
+            // rendering, but it costs it on the literals most likely to hold
+            // punctuation.
+            Some(_) if escaped => escaped = false,
+            Some(_) if c == '\\' => escaped = true,
+            Some(open) if c == open => quote = None,
+            Some(_) => {}
+            None => match c {
+                '\'' | '"' | '`' => quote = Some(c),
+                '(' => depth += 1,
+                // The delimiter that ends the item: this position is already
+                // recorded, so the slice stops just before it.
+                ')' if depth == 0 => break,
+                ')' => depth -= 1,
+                ',' if depth == 0 => break,
+                _ => {}
+            },
+        }
+        at += c.len_utf8();
+    }
+    out
 }
 
 /// Whether `slice` is a complete expression rendering identically to `rendered`.
@@ -6150,10 +6306,15 @@ fn byte_offset(sql: &str, at: sqlparser::tokenizer::Location) -> Option<usize> {
 
 /// What the current parse tree came from, for the parts of it that the tree
 /// alone does not say.
-#[derive(Clone)]
 struct Origin {
     /// The text, so a computed column can be named after what was written.
     sql: std::rc::Rc<str>,
+    /// What each span has already been found to be called.
+    ///
+    /// A name is asked for at least twice per column — once to plan the
+    /// projection and once to describe it — and a miss costs a grid of parse
+    /// attempts rather than one.
+    names: std::cell::RefCell<std::collections::HashMap<(usize, usize), Option<String>>>,
     /// Whether `||` concatenates. It changes how tightly the operator binds
     /// and therefore what `DIV` beside it divides, which is not recoverable
     /// from the tree.
@@ -6195,6 +6356,7 @@ impl Source {
     fn set(sql: &str, mode: crate::dialect::SqlMode) -> Self {
         let current = Origin {
             sql: std::rc::Rc::from(sql),
+            names: std::cell::RefCell::new(std::collections::HashMap::new()),
             pipes_as_concat: mode.pipes_as_concat,
         };
         Self(SOURCE.with(|s| s.replace(Some(current))))

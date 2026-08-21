@@ -5435,6 +5435,182 @@ fn a_numeric_precision_is_reported_the_way_mysql_reports_it() {
 }
 
 #[test]
+fn a_dedicated_node_is_visible_to_every_walk_over_an_expression() {
+    // `references_column`, `contains_aggregate` and the ONLY_FULL_GROUP_BY
+    // check each enumerated the variants they knew and ended in a catch-all,
+    // so a variant missing from one was invisible rather than an error. They
+    // had drifted more than a dozen behind the evaluator: `TRIM(x)` passed
+    // ONLY_FULL_GROUP_BY and answered with an arbitrary row, and an aggregate
+    // inside one of these was found and then never folded, so the raw call
+    // reached the function table and was reported as unsupported.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE P (g INT, x VARCHAR(20))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO P VALUES (1,'aa'),(1,'bb'),(2,'cc')",
+    );
+
+    // A loose column inside one of these is still loose.
+    for sql in [
+        "SELECT SUBSTRING(x,1,1) FROM P GROUP BY g",
+        "SELECT TRIM(x) FROM P GROUP BY g",
+        "SELECT POSITION('a' IN x) FROM P GROUP BY g",
+        "SELECT CEIL(LENGTH(x)) FROM P GROUP BY g",
+        "SELECT x LIKE 'a%' FROM P GROUP BY g",
+        "SELECT x IN ('aa') FROM P GROUP BY g",
+    ] {
+        let error = engine
+            .execute(&mut session, sql, &[])
+            .expect_err("the column is not grouped");
+        assert_eq!(error.code, 1055, "{sql}");
+        // Names the whole select item, not the leaf the walk stopped at:
+        // recursing all the way down and then reporting from there said `x`
+        // for `SUBSTRING(x, 1, 1)`, less than the check knew before it started.
+        assert!(
+            !error.message.contains("Expression 'x' is"),
+            "{sql} reported only the leaf: {}",
+            error.message
+        );
+    }
+
+    // A grouped column is fine however deeply it is wrapped — recursing
+    // through a hand-picked few variants refused these.
+    for sql in [
+        "SELECT FLOOR(g) + 0 FROM P GROUP BY g",
+        "SELECT CEIL(g) FROM P GROUP BY g",
+        "SELECT UPPER(g) FROM P GROUP BY g",
+        "SELECT SUBSTRING(g,1,1) FROM P GROUP BY g",
+    ] {
+        assert!(engine.execute(&mut session, sql, &[]).is_ok(), "{sql}");
+    }
+
+    // An aggregate inside one is folded, so the two spellings of the same
+    // function agree rather than one reporting `sum()` as unsupported.
+    for sql in [
+        "SELECT CEIL(SUM(g)) FROM P",
+        "SELECT CEILING(SUM(g)) FROM P",
+    ] {
+        assert_eq!(rows(&engine, &mut session, sql), vec![vec!["4"]], "{sql}");
+    }
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT SUBSTRING(MAX(x),1,1) FROM P"),
+        vec![vec!["c"]]
+    );
+}
+
+#[test]
+fn a_non_ascii_literal_does_not_abort_the_process() {
+    // Naming a computed column walks the statement text looking for where the
+    // expression ends, and it walked it a byte at a time — so a multi-byte
+    // character was indexed into the middle of and the process aborted.
+    // `panic = "abort"` is in the release profile, so one accented literal
+    // from any client stopped the server for all of them.
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT CONCAT('café', 'ü')"),
+        vec![vec!["caféü"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 'naïve' = 'naïve', LENGTH('café')"
+        ),
+        vec![vec!["1", "5"]]
+    );
+}
+
+#[test]
+fn ceil_and_floor_are_reachable_from_sql() {
+    // sqlparser gives CEIL and FLOOR their own nodes rather than parsing them
+    // as calls, and nothing routed those nodes anywhere — so `SELECT CEIL(1.5)`
+    // was refused outright while the `"ceil"` entry in the function table sat
+    // unreachable. Code that reads as implemented but cannot be called is
+    // worse than an obvious gap. `CEILING` is the same function to MySQL and
+    // does parse as a call, which is why only it worked.
+    //
+    // Through SQL rather than `functions::call`, which is what let the gap
+    // hide: a test that calls the table directly passes either way.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE E (i INT, d DECIMAL(10,3), f DOUBLE, s VARCHAR(20))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO E VALUES (2, 1.500, 1.5, '3.2')",
+    );
+
+    for (sql, expected) in [
+        ("SELECT CEIL(1.5)", "2"),
+        ("SELECT CEILING(1.5)", "2"),
+        ("SELECT FLOOR(1.5)", "1"),
+        // Away from zero and toward it, which a truncation would get wrong.
+        ("SELECT CEIL(-1.5)", "-1"),
+        ("SELECT FLOOR(-1.5)", "-2"),
+        ("SELECT CEIL(2)", "2"),
+        ("SELECT CEIL(NULL)", "NULL"),
+        ("SELECT FLOOR(NULL)", "NULL"),
+        // The number MySQL reads out of the argument, so a string with no
+        // number in it is zero rather than NULL.
+        ("SELECT CEIL('3.2')", "4"),
+        ("SELECT FLOOR('abc')", "0"),
+        ("SELECT ABS('abc')", "0"),
+        ("SELECT ROUND('abc')", "0"),
+        ("SELECT CEIL(d) FROM E", "2"),
+        ("SELECT FLOOR(d) FROM E", "1"),
+        // Whole, but not always an integer: forcing the answer through an
+        // `as i64` saturated, so this said 9223372036854775807. MySQL types
+        // an approximate argument as a DOUBLE for exactly this reason.
+        ("SELECT FLOOR(1e30) > 1e29", "1"),
+        ("SELECT ROUND(1e30) > 1e29", "1"),
+        ("SELECT CEIL('1e400') > 1e307", "1"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // Typed by the argument, not fixed. The answer is whole, so an exact
+    // argument gives an integer — but a DOUBLE argument gives a DOUBLE holding
+    // a whole number, and anything with no numeric kind of its own is a DOUBLE
+    // too. `ABS` differs on the decimal because its answer keeps a fraction.
+    let described = engine
+        .describe(
+            &session,
+            "SELECT CEIL(i), CEIL(d), CEIL(f), CEIL(s), CEILING(f), FLOOR(d), \
+                    ABS(d), ABS(s), ROUND(d, 1), CEIL(NULL) FROM E",
+            0,
+        )
+        .unwrap();
+    let codes: Vec<String> = described.iter().map(|c| format!("{:?}", c.ty)).collect();
+    assert_eq!(
+        codes,
+        vec![
+            "LongLong",
+            "LongLong",
+            "Double",
+            "Double",
+            "Double",
+            "LongLong",
+            "NewDecimal",
+            "Double",
+            "NewDecimal",
+            "Double",
+        ]
+    );
+}
+
+#[test]
 fn a_path_extraction_binds_as_tightly_as_a_column_does() {
     // MySQL treats `->` and `->>` as primaries; sqlparser gives them nearly
     // the loosest precedence there is, so `doc->'$.b' = 6` arrives as

@@ -125,3 +125,6 @@
 {"at":"2026-08-20T20:16:48Z","id":57,"by":"Christopher Vachon","as":"user","type":"created","title":"EXTRACT is unsupported","state":"Todo"}
 {"at":"2026-08-20T20:16:48Z","id":58,"by":"Christopher Vachon","as":"user","type":"created","title":"describe accepts a column reference execute rejects","state":"Todo"}
 {"at":"2026-08-20T20:44:40Z","id":43,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-21T02:24:55Z","id":59,"by":"Christopher Vachon","as":"user","type":"created","title":"A string literal column is named with its quotes","state":"Todo"}
+{"at":"2026-08-21T02:24:55Z","id":60,"by":"Christopher Vachon","as":"user","type":"created","title":"A rewritten statement names its columns after the rewrite","state":"Todo"}
+{"at":"2026-08-21T02:28:39Z","id":44,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}

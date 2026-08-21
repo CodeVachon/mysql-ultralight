@@ -150,6 +150,20 @@ const KNOWN: &[&str] = &[
 ];
 
 /// Dispatches a scalar function call.
+/// A value with no fractional part, as an integer where one will hold it.
+///
+/// Not a bare `as i64`: that cast saturates in Rust, so `FLOOR(1e30)` answered
+/// i64::MAX where MySQL answers 1e30. MySQL types these by their argument and
+/// calls an approximate one a DOUBLE for exactly this reason — the answer is
+/// whole, but it is not always an integer.
+fn whole(n: f64) -> Value {
+    if n >= i64::MIN as f64 && n < -(i64::MIN as f64) {
+        Value::Int(n as i64)
+    } else {
+        Value::Float(n)
+    }
+}
+
 pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Value> {
     let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
     let text = |i: usize| arg(i).as_text();
@@ -693,36 +707,28 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         }
 
         // -- numbers -------------------------------------------------------
+        // An integer keeps its exactness; everything else reads as the number
+        // MySQL takes out of it, so `ABS('abc')` is 0 rather than NULL.
         "abs" => match arg(0) {
             Value::Int(v) => Value::Int(v.abs()),
-            other => other
-                .as_float()
-                .map(|f| Value::Float(f.abs()))
-                .unwrap_or(Value::Null),
+            other => Value::Float(other.as_number().abs()),
         },
         "round" => {
             let places = args.get(1).and_then(Value::as_int).unwrap_or(0);
-            match arg(0).as_float() {
-                Some(f) => {
-                    let factor = 10f64.powi(places as i32);
-                    let rounded = (f * factor).round() / factor;
-                    if places <= 0 {
-                        Value::Int(rounded as i64)
-                    } else {
-                        Value::Float(rounded)
-                    }
-                }
-                None => Value::Null,
+            let factor = 10f64.powi(places as i32);
+            let rounded = (arg(0).as_number() * factor).round() / factor;
+            if places <= 0 {
+                whole(rounded)
+            } else {
+                Value::Float(rounded)
             }
         }
-        "floor" => arg(0)
-            .as_float()
-            .map(|f| Value::Int(f.floor() as i64))
-            .unwrap_or(Value::Null),
-        "ceil" | "ceiling" => arg(0)
-            .as_float()
-            .map(|f| Value::Int(f.ceil() as i64))
-            .unwrap_or(Value::Null),
+        // By the number MySQL reads out of the argument rather than a strict
+        // parse: `FLOOR('abc')` is 0 and `CEIL('3.2')` is 4, where answering
+        // NULL for anything unparseable made both of those NULL. A real NULL
+        // has already been answered above.
+        "floor" => whole(arg(0).as_number().floor()),
+        "ceil" | "ceiling" => whole(arg(0).as_number().ceil()),
         "mod" => match (arg(0).as_int(), arg(1).as_int()) {
             (Some(_), Some(0)) | (None, _) | (_, None) => Value::Null,
             (Some(a), Some(b)) => Value::Int(a % b),
