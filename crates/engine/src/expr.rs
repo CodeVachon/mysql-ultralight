@@ -956,6 +956,15 @@ pub(crate) fn reassociated(op: &BinaryOperator, left: &Expr, right: &Expr) -> Op
     if level == 0 {
         return None;
     }
+    // Nearly every node that gets here is already the shape MySQL means, and
+    // recognising that is a walk over the chain rather than the two steps
+    // below, which deep-clone both operands and rebuild the tree before they
+    // can conclude the same thing. This runs on every arithmetic node of every
+    // row, so `a + b` doing that work is the difference between a chain of
+    // twelve terms over twenty thousand rows costing 10 ms and 310 ms.
+    if grouped_node(level, left, right).is_some() {
+        return None;
+    }
     let node = Expr::BinaryOp {
         left: Box::new(left.clone()),
         op: op.clone(),
@@ -1006,6 +1015,86 @@ fn regrouped(e: &Expr) -> Expr {
     let mut operands = operands.into_iter();
     let mut ops = ops.into_iter().peekable();
     build(&mut operands, &mut ops, 0)
+}
+
+/// The loosest operator in `e`, when `e` is already grouped MySQL's way.
+///
+/// `None` when it is not, and also when it holds something this cannot answer
+/// for — the slow path decides those, so being unsure only costs the work that
+/// was being done unconditionally before.
+///
+/// The tree that precedence climbing builds for a chain is the only one where
+/// every node has its left operand no looser than itself and its right operand
+/// strictly tighter, so checking that at each node is checking the whole
+/// answer: the root of a correct chain is the *last* of its loosest operators,
+/// and those two conditions say exactly that. `build` is what has to agree
+/// with this, and it does by construction — it takes operators while their
+/// level is at or above the minimum and reads each right operand at one level
+/// above the operator, so what it returns satisfies both.
+fn grouped(e: &Expr) -> Option<u8> {
+    use Expr as E;
+    match e {
+        // Zero is not a level, and reporting it is what refuses an operator
+        // that has none: no link in a chain is that loose, so a caller asking
+        // for something no looser than itself on the left, or tighter on the
+        // right, is answered no either way. That is the refusal `doc->'$.b' =
+        // 6` needs — it arrives as `doc -> ('$.b' = 6)`, and the `=` is not a
+        // link in the chain but something the path extraction swallowed.
+        E::BinaryOp { left, op, right } => grouped_node(precedence(op), left, right),
+        // `~` reads its operand at the precedence of `+` where MySQL binds it
+        // to the operand next to it, so one holding an operator is holding
+        // part of the chain: `3 ^ ~1 % 5` hides the `%` inside it. Anything an
+        // expression can extend to its left is what `reassociated_unary` moves
+        // out, and asking it directly would clone the operand to answer — the
+        // clone this exists to avoid — so the same question is asked of the
+        // shape instead.
+        E::UnaryOp {
+            op: UnaryOperator::BitwiseNot,
+            expr,
+        } => (!matches!(**expr, E::BinaryOp { .. }) && grouped(expr).is_some()).then_some(u8::MAX),
+        // Constructs that extend an expression to their *left*, which is what
+        // `take_leftmost` walks: `7 DIV 2 IS NULL` arrives as
+        // `7 DIV (2 IS NULL)` and only that walk puts the `IS NULL` back
+        // outside. The list is that walk's, and has to stay it.
+        E::IsNull(_)
+        | E::IsNotNull(_)
+        | E::IsTrue(_)
+        | E::IsFalse(_)
+        | E::IsNotTrue(_)
+        | E::IsNotFalse(_)
+        | E::IsUnknown(_)
+        | E::IsNotUnknown(_)
+        | E::InList { .. }
+        | E::InSubquery { .. }
+        | E::InUnnest { .. }
+        | E::Between { .. }
+        | E::Like { .. }
+        | E::ILike { .. }
+        | E::SimilarTo { .. }
+        | E::RLike { .. }
+        | E::IsDistinctFrom(..)
+        | E::IsNotDistinctFrom(..) => None,
+        // Everything else is one operand and ends the chain: a literal, a
+        // column, a call, a parenthesised group, and every prefix but `~` —
+        // which is the same set `reassociated_unary` refuses to look at.
+        // Whatever is inside one is corrected when `eval` reaches it, which is
+        // why `7 DIV (2 + 1)` keeps its parentheses here as well as there.
+        _ => Some(u8::MAX),
+    }
+}
+
+/// `grouped` for one node, given the level of its operator.
+///
+/// Split out because `reassociated` has the operands in hand and not the node:
+/// building one to ask about would be the clone this exists to avoid.
+fn grouped_node(level: u8, left: &Expr, right: &Expr) -> Option<u8> {
+    let left_level = grouped(left)?;
+    let right_level = grouped(right)?;
+    // Left-associative, so an operator of equal precedence belongs on the left
+    // and not on the right: `1 - 2 - 3` is grouped `(1 - 2) - 3`, and
+    // `7 DIV 2 * 3` arriving as `7 DIV (2 * 3)` is the same levels the wrong
+    // way round and has to be rebuilt.
+    (left_level >= level && right_level > level).then_some(level)
 }
 
 /// The chain's operands and operators, in the order they were written.
@@ -1568,4 +1657,112 @@ fn read_interval(
     };
     let unit = Unit::parse(&field.to_string())?;
     Ok(amount(&interval.value)?.map(|a| (a, unit)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Counts allocations, because taking the fast path is not observable any
+    /// other way.
+    ///
+    /// `reassociated` answers `None` for a chain that is already grouped
+    /// MySQL's way whether or not `grouped_node` recognised it first — the
+    /// long way round arrives at the same answer, which is the whole reason
+    /// the waste was silent. What separates them is that the long way clones
+    /// both operands and rebuilds the tree, so a test that counts allocations
+    /// is a test that fails when the early exit stops firing.
+    ///
+    /// Per thread rather than per process: the test binary runs its tests in
+    /// parallel, and a shared counter would be measuring whatever else happens
+    /// to be running.
+    struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
+            // SAFETY: the layout is the caller's, passed through unchanged.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: as above, and the pointer came from `System.alloc`.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: Counting = Counting;
+
+    fn parse(sql: &str) -> Expr {
+        sqlparser::parser::Parser::new(&sqlparser::dialect::MySqlDialect {})
+            .try_with_sql(sql)
+            .and_then(|mut p| p.parse_expr())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+    }
+
+    /// The shapes an application writes, none of which needs a thing done to
+    /// it: sqlparser and MySQL group `+ - * / %` identically, and every row of
+    /// every query was rebuilding them anyway.
+    #[test]
+    fn a_chain_mysql_already_agrees_with_is_not_rebuilt() {
+        for sql in [
+            "a + b",
+            "a * b + c",
+            "a + b * c",
+            "a - b - c",
+            "price * quantity + shipping - discount",
+            "a + b * c - d / e % f",
+            "(a + b) * c",
+            "a * (b + c)",
+            "~a & 255",
+        ] {
+            let expr = parse(sql);
+            let Expr::BinaryOp { left, op, right } = &expr else {
+                panic!("{sql} did not parse to a binary operator");
+            };
+            let before = ALLOCATIONS.with(Cell::get);
+            let fixed = reassociated(op, left, right);
+            let allocated = ALLOCATIONS.with(Cell::get) - before;
+            assert!(fixed.is_none(), "`{sql}` was regrouped");
+            assert_eq!(allocated, 0, "`{sql}` allocated {allocated} times");
+        }
+    }
+
+    /// The other half of the same claim: a shape that *is* grouped wrongly
+    /// must not be recognised as already grouped, or the correction stops
+    /// happening. These are the answers `crate::exec`'s tests pin.
+    #[test]
+    fn a_chain_that_needs_correcting_is_not_taken_for_a_grouped_one() {
+        for sql in [
+            // `20 DIV (2 * 5)`: the same level to the right of DIV, which is
+            // left-associative and so belongs on its left.
+            "20 DIV 2 * 5",
+            // `(1 + 2) ^ 3`: a looser operator to the left of `^`, which
+            // sqlparser puts below `+` and MySQL puts above it.
+            "1 + 2 ^ 3",
+            // `7 DIV (2 IS NULL)`: not an operator at all, and only the walk
+            // in `take_leftmost` puts it back.
+            "7 DIV 2 IS NULL",
+            // `~((-6) * 2) ^ 3` and `3 ^ ~(1 % 5)`: a prefix holding part of
+            // the chain, on either side of the operator.
+            "~(-6) * 2 ^ 3",
+            "3 ^ ~1 % 5",
+        ] {
+            let expr = parse(sql);
+            let Expr::BinaryOp { left, op, right } = &expr else {
+                panic!("{sql} did not parse to a binary operator");
+            };
+            assert!(
+                grouped_node(precedence(op), left, right).is_none(),
+                "`{sql}` was taken for a chain that needs nothing"
+            );
+        }
+    }
 }

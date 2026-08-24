@@ -166,3 +166,4 @@
 {"at":"2026-08-24T18:02:26Z","id":81,"by":"Christopher Vachon","as":"user","type":"created","title":"differential.sh can compare against a stale engine and report green","state":"Todo"}
 {"at":"2026-08-24T18:02:26Z","id":82,"by":"Christopher Vachon","as":"user","type":"created","title":"information_schema nullability is conditioned on sql_mode in MySQL","state":"Todo"}
 {"at":"2026-08-24T18:02:26Z","id":83,"by":"Christopher Vachon","as":"user","type":"created","title":"A concatenation of two literals is typed nullable","state":"Todo"}
+{"at":"2026-08-24T18:45:15Z","id":81,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
