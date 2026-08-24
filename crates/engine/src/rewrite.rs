@@ -1181,12 +1181,16 @@ mod review_regressions {
         super::normalise(sql, mode).sql
     }
 
+    /// MySQL's `ANSI` as 8.3 expands it, so the name does not describe one
+    /// mode while the fields describe another. `normalise` reads only the two
+    /// text-rewriting flags, but a fixture that disagrees with `SqlMode::parse`
+    /// is a second answer to a question that has one.
     const ANSI: SqlMode = SqlMode {
         ansi_quotes: true,
         pipes_as_concat: true,
         ignore_space: true,
-        real_as_float: false,
-        strict: true,
+        real_as_float: true,
+        strict: false,
         only_full_group_by: true,
     };
 

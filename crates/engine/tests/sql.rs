@@ -1075,6 +1075,187 @@ fn ansi_quotes_changes_what_a_quoted_word_means() {
     );
 }
 
+/// Under REAL_AS_FLOAT a `REAL` column is four bytes rather than eight.
+///
+/// The mode the target deployment runs sets this flag, so `REAL` there is not
+/// the `REAL` of a default server. Every row below measured on MySQL 8.3 under
+/// both modes.
+#[test]
+fn real_as_float_narrows_what_real_declares() {
+    let (engine, mut session) = engine();
+
+    // Without the flag `REAL` is `DOUBLE`, which is MySQL's default.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Wide (r REAL, ru REAL UNSIGNED, dp DOUBLE PRECISION, \
+         dpu DOUBLE PRECISION UNSIGNED)",
+    );
+
+    session.config.sql_mode.push_str(",REAL_AS_FLOAT");
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Narrow (r REAL, ru REAL UNSIGNED, dp DOUBLE PRECISION, \
+         dpu DOUBLE PRECISION UNSIGNED)",
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, NUMERIC_PRECISION \
+             FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME IN ('Narrow', 'Wide') \
+             ORDER BY TABLE_NAME, ORDINAL_POSITION"
+        ),
+        vec![
+            vec!["Narrow", "r", "float", "float", "12"],
+            vec!["Narrow", "ru", "float", "float unsigned", "12"],
+            // `DOUBLE PRECISION` is not a synonym for `REAL`, and the flag
+            // leaves it and its unsigned form alone.
+            vec!["Narrow", "dp", "double", "double", "22"],
+            vec!["Narrow", "dpu", "double", "double unsigned", "22"],
+            vec!["Wide", "r", "double", "double", "22"],
+            vec!["Wide", "ru", "double", "double unsigned", "22"],
+            vec!["Wide", "dp", "double", "double", "22"],
+            vec!["Wide", "dpu", "double", "double unsigned", "22"],
+        ]
+    );
+
+    // The declared width is what the value is held in, so the narrow column
+    // loses the digits four bytes cannot carry — and the table created before
+    // the flag keeps every one of them, because the type was fixed by the DDL
+    // and not by the mode in force when it is read.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Narrow (r) VALUES (1.234567890123)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Wide (r) VALUES (1.234567890123)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT r FROM Narrow"),
+        vec![vec!["1.23457"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT r FROM Wide"),
+        vec![vec!["1.234567890123"]]
+    );
+
+    // And it says so on the wire: the binary protocol encodes by the type
+    // code, so a column announced `Double` is sent as eight bytes whatever it
+    // was declared.
+    let described = engine
+        .describe(&session, "SELECT Narrow.r, Wide.r FROM Narrow, Wide", 0)
+        .unwrap();
+    let codes: Vec<String> = described.iter().map(|c| format!("{:?}", c.ty)).collect();
+    assert_eq!(codes, vec!["Float", "Double"]);
+}
+
+/// `ANSI` is the compound spelling, and it has to mean all five flags.
+///
+/// The expansion was short by `REAL_AS_FLOAT` and `ONLY_FULL_GROUP_BY`, which
+/// nothing could see while the first was inert. Both halves measured on 8.3
+/// under `SET sql_mode = 'ANSI'`.
+#[test]
+fn the_compound_ansi_mode_narrows_a_real_and_polices_grouping() {
+    let (engine, mut session) = engine();
+    session.config.sql_mode = "ANSI".to_owned();
+
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE A (id INT NOT NULL, r REAL NULL, dp DOUBLE PRECISION NULL, \
+         PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO A VALUES (1, 1.234567890123, 1.234567890123)",
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, NUMERIC_PRECISION \
+             FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'A' ORDER BY ORDINAL_POSITION"
+        ),
+        vec![
+            vec!["id", "int", "int", "10"],
+            // The flag the compound spelling was missing.
+            vec!["r", "float", "float", "12"],
+            vec!["dp", "double", "double", "22"],
+        ]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT r, dp FROM A"),
+        vec![vec!["1.23457", "1.234567890123"]]
+    );
+
+    // And the other one it was missing. `v` is not functionally determined by
+    // `k` here, which is what separates this from the primary-key case MySQL
+    // allows even under the flag.
+    run(&engine, &mut session, "CREATE TABLE G2 (k INT, v INT)");
+    run(&engine, &mut session, "INSERT INTO G2 VALUES (1,10),(1,20)");
+    let refused = engine
+        .execute(&mut session, "SELECT k, v FROM G2 GROUP BY k", &[])
+        .expect_err("ANSI implies ONLY_FULL_GROUP_BY");
+    assert_eq!(refused.code, 1055);
+}
+
+/// A cast follows the same flag the declaration does.
+#[test]
+fn real_as_float_narrows_a_cast_to_real() {
+    let (engine, mut session) = engine();
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT CAST(1.234567890123 AS REAL)"),
+        vec![vec!["1.234567890123"]]
+    );
+
+    session.config.sql_mode.push_str(",REAL_AS_FLOAT");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT CAST(1.234567890123 AS REAL)"),
+        vec![vec!["1.23457"]],
+        "the value has to be the one the four bytes hold"
+    );
+
+    // The description has to move with the value: MySQL types this cast FLOAT
+    // under the flag and DOUBLE without it.
+    let described = engine
+        .describe(&session, "SELECT CAST(1.234567890123 AS REAL)", 0)
+        .unwrap();
+    assert_eq!(format!("{:?}", described[0].ty), "Float");
+
+    // What the narrowing refuses, which is the half the digits above cannot
+    // see: the projection rounds a value to the type it announced either way,
+    // so only an operand that four bytes cannot hold at all separates a cast
+    // that narrowed from one that was merely described as if it had. MySQL
+    // errors here under the flag and answers 1e300 without it, and it names
+    // the cast `as float` even where the statement wrote REAL.
+    let refused = engine
+        .execute(&mut session, "SELECT CAST(1e300 AS REAL)", &[])
+        .expect_err("four bytes cannot hold 1e300");
+    assert_eq!(refused.code, 1690);
+    assert_eq!(
+        refused.message,
+        "DOUBLE value is out of range in 'cast(1e300 as float)'"
+    );
+
+    session.config.sql_mode = ServerConfig::default().sql_mode;
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT CAST(1e300 AS REAL)"),
+        vec![vec!["1e300"]],
+        "without the flag the cast is to a double and holds it"
+    );
+}
+
 /// `LEFT (` is the LEFT() function under IGNORE_SPACE, not a join.
 #[test]
 fn ignore_space_allows_a_gap_before_a_call() {

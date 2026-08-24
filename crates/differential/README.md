@@ -52,7 +52,7 @@ Two things fail a run:
 
 So the file only ever shrinks, and it shrinks by fixing things.
 
-**It is empty.** All 302 statements answer exactly as MySQL 8.3 answers them,
+**It is empty.** All 312 statements answer exactly as MySQL 8.3 answers them,
 in both protocols — the rows, the column names, the type codes, and the
 nullability and signedness flags. It started at 108 divergences across 66
 statements.
@@ -83,6 +83,12 @@ Two rules the harness enforces rather than trusts:
 A setup statement that fails is a failed run, and refuses to be blessed: if
 setup fails on *both* servers every case in the group then fails identically,
 compares equal, and reports a group that tested nothing as a group that agreed.
+
+A group may change `sql_mode` in its setup and leave it changed for its cases —
+`REAL_AS_FLOAT` does. The two connections outlive every group, so the mode is
+restored to the server's default before each one rather than trusted to be it;
+add to the mode in force rather than replacing it, or the group silently runs
+without `STRICT_TRANS_TABLES` as well.
 
 ## The corpus
 

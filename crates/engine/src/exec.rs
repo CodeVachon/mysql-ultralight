@@ -6830,6 +6830,10 @@ struct Origin {
     /// and therefore what `DIV` beside it divides, which is not recoverable
     /// from the tree.
     pipes_as_concat: bool,
+    /// Whether `REAL` names four bytes rather than eight. The tree records
+    /// only that the word was written; which type it declares is the mode's
+    /// answer, not the parser's.
+    real_as_float: bool,
 }
 
 thread_local! {
@@ -6856,6 +6860,24 @@ pub(crate) fn pipes_as_concat() -> bool {
     })
 }
 
+/// Whether `REAL` means `FLOAT` in the statement being handled.
+///
+/// Read here rather than passed to `SqlType::from_ast` for the same reason as
+/// above: the type is built from a column definition and from a cast, both of
+/// them several calls below the only place that holds the session, and a
+/// `mode` argument would have to be added to signatures that do not otherwise
+/// care — column building, cast nullability, computed column types.
+///
+/// `false` without a statement in scope, which is MySQL's default: `REAL` is
+/// `DOUBLE` unless `REAL_AS_FLOAT` says otherwise.
+pub(crate) fn real_as_float() -> bool {
+    SOURCE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .is_some_and(|current| current.real_as_float)
+    })
+}
+
 /// Publishes the statement text for the duration of a scope.
 ///
 /// Restored through a guard rather than a trailing assignment: a stale text
@@ -6870,6 +6892,7 @@ impl Source {
             mod_operators: std::rc::Rc::from(normalised.mod_operators.as_slice()),
             names: std::cell::RefCell::new(std::collections::HashMap::new()),
             pipes_as_concat: mode.pipes_as_concat,
+            real_as_float: mode.real_as_float,
         };
         Self(SOURCE.with(|s| s.replace(Some(current))))
     }

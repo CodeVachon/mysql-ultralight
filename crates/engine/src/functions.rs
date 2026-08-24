@@ -997,11 +997,15 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
         // By the number MySQL reads out of the value: `CAST('abc' AS DOUBLE)`
         // is 0 there, not NULL. Answering NULL made the cast contradict the
         // NOT NULL a numeric target is described with.
-        D::Double(_) | D::DoublePrecision | D::Real => Value::Float(value.as_number()),
+        D::Double(_) | D::DoublePrecision => Value::Float(value.as_number()),
+        // `CAST(x AS REAL)` follows the same flag a `REAL` column does: MySQL
+        // describes it DOUBLE by default and FLOAT under REAL_AS_FLOAT, and
+        // the value has to match whichever it announced.
+        D::Real if !crate::exec::real_as_float() => Value::Float(value.as_number()),
         // A cast to FLOAT narrows, or the cast is only a relabelling: the
         // column is described FLOAT and a binary client decodes four bytes,
         // so the value has to be the one those four bytes hold.
-        D::Float(_) => {
+        D::Float(_) | D::Real => {
             let n = value.as_number();
             let narrowed = n as f32;
             // `as f32` saturates, so `CAST(1e300 AS FLOAT)` came back an

@@ -55,6 +55,10 @@ impl SqlType {
     }
 
     /// Maps a parsed type to the engine's representation.
+    ///
+    /// Not a pure function of the tree: `REAL` is `DOUBLE` or `FLOAT`
+    /// depending on `REAL_AS_FLOAT`, which is read from the statement scope
+    /// rather than passed in, by `real_name` below.
     pub fn from_ast(ty: &DataType) -> EngineResult<Self> {
         use DataType as D;
 
@@ -73,10 +77,17 @@ impl SqlType {
             D::BigInt(n) | D::Int8(n) => int_type("bigint", *n, false),
             D::BigIntUnsigned(n) | D::Int8Unsigned(n) => int_type("bigint", *n, true),
             // `REAL` is a synonym for DOUBLE in MySQL, not for FLOAT — only
-            // `FLOAT4` is the narrow one.
+            // `FLOAT4` is unconditionally the narrow one. Under REAL_AS_FLOAT
+            // the synonym moves: MySQL then stores `REAL` in four bytes and
+            // reports it as `float`, verified against 8.3 both ways.
             D::Float4 => Self::simple(TypeKind::Float, "float"),
-            D::Real => Self::simple(TypeKind::Float, "double"),
-            D::RealUnsigned | D::DoublePrecisionUnsigned => {
+            D::Real => Self::simple(TypeKind::Float, real_name()),
+            D::RealUnsigned => {
+                float_type(real_name(), &sqlparser::ast::ExactNumberInfo::None, true)
+            }
+            // `DOUBLE PRECISION` is not a synonym for `REAL` and the flag does
+            // not reach it: MySQL leaves it eight bytes under either mode.
+            D::DoublePrecisionUnsigned => {
                 float_type("double", &sqlparser::ast::ExactNumberInfo::None, true)
             }
             D::Float(info) => float_type("float", info, false),
@@ -556,6 +567,19 @@ fn decimal_type(info: &sqlparser::ast::ExactNumberInfo, unsigned: bool) -> SqlTy
         scale,
         unsigned,
         variants: Vec::new(),
+    }
+}
+
+/// What `REAL` declares, which `sql_mode` decides rather than the grammar.
+///
+/// MySQL's default is `DOUBLE`; `REAL_AS_FLOAT` makes it `FLOAT`, and the
+/// declared name is what everything downstream reads — the storage width, the
+/// wire type code, and what `information_schema` reports.
+fn real_name() -> &'static str {
+    if crate::exec::real_as_float() {
+        "float"
+    } else {
+        "double"
     }
 }
 

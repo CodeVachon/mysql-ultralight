@@ -28,6 +28,14 @@ use mysql::Conn;
 
 const DATABASE: &str = "differential";
 
+/// The mode both servers start every group in.
+///
+/// MySQL 8.3's own default, and the engine's; a group that changes it changes
+/// it only for itself, because the two connections outlive every group and a
+/// session setting left behind would silently reinterpret the next group's SQL.
+const DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,\
+                                NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
+
 struct Options {
     reference: String,
     engine: String,
@@ -260,6 +268,7 @@ fn check_identities(reference: &mut Conn, engine: &mut Conn) {
 
 fn reset(conn: &mut Conn, group: &str) {
     for statement in [
+        format!("SET SESSION sql_mode = '{DEFAULT_SQL_MODE}'"),
         format!("DROP DATABASE IF EXISTS `{DATABASE}`"),
         format!("CREATE DATABASE `{DATABASE}`"),
         format!("USE `{DATABASE}`"),

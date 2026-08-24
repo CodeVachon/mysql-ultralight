@@ -157,3 +157,8 @@
 {"at":"2026-08-24T14:20:53Z","id":76,"by":"Christopher Vachon","as":"user","type":"created","title":"Cut the v0.1.0 release: token, push, tag","state":"Todo"}
 {"at":"2026-08-24T14:21:51Z","id":76,"by":"Christopher Vachon","as":"user","type":"parent","from":8,"to":62}
 {"at":"2026-08-24T15:19:55Z","id":51,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-24T17:04:41Z","id":52,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-24T17:04:58Z","id":77,"by":"Christopher Vachon","as":"user","type":"created","title":"A bitwise value above i64::MAX is refused, not answered","state":"Todo"}
+{"at":"2026-08-24T17:36:11Z","id":78,"by":"Christopher Vachon","as":"user","type":"created","title":"Arithmetic re-associates on every node of every row","state":"Todo"}
+{"at":"2026-08-24T17:36:11Z","id":79,"by":"Christopher Vachon","as":"user","type":"created","title":"A bitwise operand reads a temporal or decimal by its leading digits","state":"Todo"}
+{"at":"2026-08-24T17:36:23Z","id":80,"by":"Christopher Vachon","as":"user","type":"created","title":"A view does not remember the sql_mode it was created under","state":"Todo"}

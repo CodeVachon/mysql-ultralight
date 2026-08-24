@@ -188,14 +188,15 @@ pub const GROUPS: &[Group] = &[
                  note TEXT NULL,
                  amt DECIMAL(10,2) NULL,
                  approx DOUBLE NULL,
+                 r REAL NULL,
                  at DATETIME(3) NULL,
                  d DATE NULL,
                  kind ENUM('x','y') NULL,
                  flag BOOLEAN NULL,
                  PRIMARY KEY (id))",
-            "INSERT INTO T (small, big, name, note, amt, approx, at, d, kind, flag) \
-             VALUES (5, 9000000000, 'n', 'note', '1.25', 2.5, '2026-01-02 03:04:05.678', \
-             '2026-01-02', 'x', 1)",
+            "INSERT INTO T (small, big, name, note, amt, approx, r, at, d, kind, flag) \
+             VALUES (5, 9000000000, 'n', 'note', '1.25', 2.5, 1.234567890123, \
+             '2026-01-02 03:04:05.678', '2026-01-02', 'x', 1)",
             "CREATE VIEW V AS SELECT id, small, name, amt, at, kind, flag FROM T",
         ],
         cases: &[
@@ -448,6 +449,67 @@ pub const GROUPS: &[Group] = &[
             same("SELECT ~neg, neg & 7, id & 1, id << 2, u & 15 FROM B ORDER BY id"),
             same("SELECT id FROM B WHERE id & 1 = 1 ORDER BY id"),
             same("SELECT (7 ^ 3) = 4, (7 & 3) > 1, 7 ^ 3 IS NULL, (NULL & 1) IS NULL"),
+        ],
+    },
+    Group {
+        // `sql_mode` is a session setting, and the harness restores it before
+        // every group, so this one can turn a flag on and leave it on for its
+        // cases. Written as an addition to the mode already in force rather
+        // than as a mode of its own: replacing it would quietly drop
+        // STRICT_TRANS_TABLES for this group and make its inserts mean
+        // something else.
+        name: "sql_mode: REAL_AS_FLOAT",
+        setup: &[
+            "SET SESSION sql_mode = CONCAT(@@sql_mode, ',REAL_AS_FLOAT')",
+            // The flag moves what `REAL` is a synonym for. `DOUBLE PRECISION`
+            // is not that synonym and does not move, which is the half a table
+            // of REAL columns alone could not tell apart from a mode that
+            // narrowed every float.
+            "CREATE TABLE R (id INT NOT NULL, r REAL NULL, ru REAL UNSIGNED NULL, \
+             dp DOUBLE PRECISION NULL, f FLOAT NULL, d DOUBLE NULL, PRIMARY KEY (id))",
+            "INSERT INTO R VALUES (1, 1.234567890123, 2.5, 1.234567890123, \
+             1.234567890123, 1.234567890123)",
+        ],
+        cases: &[
+            same("SELECT r, ru, dp, f, d FROM R"),
+            same(
+                "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE \
+                 FROM information_schema.columns \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'R' ORDER BY ORDINAL_POSITION",
+            ),
+            // A cast reads the flag too, and it is the only place the narrowing
+            // can be seen without a table to have declared it.
+            same("SELECT CAST(1.234567890123 AS REAL), CAST(1.234567890123 AS DOUBLE)"),
+            // Arithmetic widens a four-byte column back to a double, so the
+            // digits the column dropped stay dropped and the ones it kept are
+            // shown in full.
+            same("SELECT r + 0, r * 2, dp + 0 FROM R"),
+        ],
+    },
+    Group {
+        // The compound spelling, which is the one route to REAL_AS_FLOAT that
+        // does not name it. `ANSI` is set on its own rather than added to the
+        // mode in force, because that is what it means: MySQL replaces the
+        // whole mode with the five flags it expands to.
+        name: "sql_mode: ANSI",
+        setup: &[
+            "SET SESSION sql_mode = 'ANSI'",
+            "CREATE TABLE A (id INT NOT NULL, r REAL NULL, dp DOUBLE PRECISION NULL, \
+             PRIMARY KEY (id))",
+            "INSERT INTO A VALUES (1, 1.234567890123, 1.234567890123)",
+        ],
+        cases: &[
+            // The value and its type code together, which is the whole claim:
+            // `ANSI` reached `REAL_AS_FLOAT` without naming it.
+            //
+            // Deliberately no `information_schema` case here, and no
+            // `'a' || 'b'`. Both diverge, and neither divergence is about this
+            // mode: MySQL describes information_schema's own columns NOT NULL
+            // unless STRICT_TRANS_TABLES is set — which `ANSI` does not set —
+            // and it calls a concatenation of two literals NOT NULL where this
+            // engine calls it nullable. Adding either would put a second
+            // issue's gap in this group and cost the empty baseline.
+            same("SELECT r, dp FROM A"),
         ],
     },
 ];
