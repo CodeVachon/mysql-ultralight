@@ -156,3 +156,4 @@
 {"at":"2026-08-21T19:43:10Z","id":55,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-24T14:20:53Z","id":76,"by":"Christopher Vachon","as":"user","type":"created","title":"Cut the v0.1.0 release: token, push, tag","state":"Todo"}
 {"at":"2026-08-24T14:21:51Z","id":76,"by":"Christopher Vachon","as":"user","type":"parent","from":8,"to":62}
+{"at":"2026-08-24T15:19:55Z","id":51,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}

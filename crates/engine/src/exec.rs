@@ -5360,6 +5360,29 @@ fn unsigned_answer(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelCo
         }
         Expr::BinaryOp { left, op, right } => {
             use sqlparser::ast::BinaryOperator as B;
+            // The corrected shape, for the same reason `computed_column_type`
+            // uses it: `2 ^ 3 / 2` arrives with `^` at its root and is really
+            // a division, which MySQL reports signed. Reading the root as
+            // parsed would have flagged a decimal column UNSIGNED.
+            if let Some(fixed) = crate::expr::reassociated(op, left, right) {
+                return recur(&fixed);
+            }
+            // Every bitwise operator answers a BIGINT UNSIGNED whatever it was
+            // given, which is the one family here that does not have to argue
+            // about its operands: `-1 & 1` is 1 and `-1 >> 1` is
+            // 9223372036854775807. Safe for `never_negative` to read too,
+            // because an answer this engine cannot hold as a non-negative
+            // `i64` is refused rather than returned — see `expr::bit_pattern`.
+            if matches!(
+                op,
+                B::BitwiseAnd
+                    | B::BitwiseOr
+                    | B::BitwiseXor
+                    | B::PGBitwiseShiftLeft
+                    | B::PGBitwiseShiftRight
+            ) {
+                return true;
+            }
             // Only where the answer cannot come out negative. MySQL calls
             // `u - 1` unsigned and *refuses* `u - 100` with 1690 rather than
             // answering; this engine holds an i64 and answers -93, so a column
@@ -5376,6 +5399,13 @@ fn unsigned_answer(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelCo
                     .iter()
                     .all(|side| never_negative(side, refs, input))
         }
+        // `~x` is a BIGINT UNSIGNED like the binary bitwise operators. A sign
+        // is not — MySQL reports `-(7 ^ 3)` signed — which is what the
+        // fall-through leaves.
+        Expr::UnaryOp { op, expr } => match crate::expr::reassociated_unary(op, expr) {
+            Some(fixed) => recur(&fixed),
+            None => matches!(op, sqlparser::ast::UnaryOperator::BitwiseNot),
+        },
         // `CEIL` and `FLOOR` arrive as their own nodes rather than as calls.
         Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => recur(expr),
         // Every result has to be unsigned; a signed `ELSE` gives it away.
@@ -5505,10 +5535,13 @@ fn never_null(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]
         Expr::Cast {
             data_type, expr, ..
         } => numeric_cast(data_type) && recur(expr),
-        // `NOT` and a sign propagate.
+        // `NOT`, a sign and `~` propagate.
         Expr::UnaryOp { op, expr } => {
             use sqlparser::ast::UnaryOperator as U;
-            matches!(op, U::Minus | U::Plus | U::Not) && recur(expr)
+            if let Some(fixed) = crate::expr::reassociated_unary(op, expr) {
+                return recur(&fixed);
+            }
+            matches!(op, U::Minus | U::Plus | U::Not | U::BitwiseNot) && recur(expr)
         }
         // Asking whether something is NULL always has an answer, whatever the
         // something is.
@@ -5521,7 +5554,21 @@ fn never_null(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]
         | Expr::Exists { .. } => true,
         Expr::BinaryOp { left, op, right } => {
             use sqlparser::ast::BinaryOperator as B;
+            // The corrected shape, as in `unsigned_answer`: `2 ^ 3 / 2` has
+            // `^` at its root as parsed and is really a division, which is
+            // nullable because the divisor can be zero.
+            if let Some(fixed) = crate::expr::reassociated(op, left, right) {
+                return recur(&fixed);
+            }
             match op {
+                // A bitwise operator has no zero-divisor case to answer NULL
+                // for: every bit pattern is an answer, so it is NOT NULL
+                // whenever its operands are.
+                B::BitwiseAnd
+                | B::BitwiseOr
+                | B::BitwiseXor
+                | B::PGBitwiseShiftLeft
+                | B::PGBitwiseShiftRight => recur(left) && recur(right),
                 // Division and the remainder answer NULL for a zero divisor,
                 // so they are nullable however sound their operands are.
                 B::Plus
@@ -5956,6 +6003,14 @@ fn computed_column_type(
                     computed_column_type(left, refs, input),
                     computed_column_type(right, refs, input),
                 ),
+                // Every bitwise operator answers 64 unsigned bits whatever it
+                // was given: `1.5 ^ 1` is a LONGLONG in MySQL and so is
+                // `'3' & 1`. The UNSIGNED flag is `unsigned_answer`'s.
+                B::BitwiseAnd
+                | B::BitwiseOr
+                | B::BitwiseXor
+                | B::PGBitwiseShiftLeft
+                | B::PGBitwiseShiftRight => ColumnType::LongLong,
                 // `->` yields a document and `->>` the text inside one.
                 B::Arrow => ColumnType::Json,
                 B::LongArrow => ColumnType::LongBlob,
@@ -5964,8 +6019,13 @@ fn computed_column_type(
         }
         Expr::UnaryOp { op, expr } => {
             use sqlparser::ast::UnaryOperator as U;
+            // As with the binary operators above, the corrected shape decides:
+            // `~1 * 2` arrives as `~(1 * 2)` and is really a multiplication.
+            if let Some(fixed) = crate::expr::reassociated_unary(op, expr) {
+                return computed_column_type(&fixed, refs, input);
+            }
             match op {
-                U::Not => ColumnType::LongLong,
+                U::Not | U::BitwiseNot => ColumnType::LongLong,
                 U::Minus | U::Plus => match computed_column_type(expr, refs, input) {
                     t if is_integer(t) => ColumnType::LongLong,
                     // As with `ABS`: computing with a float widens it, and

@@ -208,6 +208,9 @@ const IMPURE: &[&str] = &[
 
 /// Evaluates an expression to a single value.
 pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
+    // Bound before the match, because two arms below shadow `expr` with the
+    // operand they destructure and still need the node itself.
+    let expr_node = expr;
     match expr {
         Expr::Identifier(ident) if ident.value.starts_with('@') => variable(&ident.value, ctx),
 
@@ -253,6 +256,14 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
         Expr::IsNotFalse(inner) => Ok(bool_value(eval(inner, ctx)?.truthy() != Some(false))),
 
         Expr::UnaryOp { op, expr } => {
+            // `~` reaches us having swallowed more than its operand, the same
+            // way `DIV` does, so the shape is corrected before it is read.
+            if let Some(fixed) = reassociated_unary(op, expr) {
+                return eval(&fixed, ctx);
+            }
+            if matches!(op, UnaryOperator::BitwiseNot) {
+                return bitwise_value(expr_node, ctx);
+            }
             let value = eval(expr, ctx)?;
             match op {
                 UnaryOperator::Not => Ok(match value.truthy() {
@@ -279,6 +290,11 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             // it is read rather than evaluated as parsed.
             if let Some(fixed) = reassociated(op, left, right) {
                 return eval(&fixed, ctx);
+            }
+            // A bitwise chain is evaluated as a chain rather than operand by
+            // operand, because its intermediate values are wider than `Value`.
+            if bitwise_op(op) {
+                return bitwise_value(expr_node, ctx);
             }
             binary(op, eval(left, ctx)?, eval(right, ctx)?, ctx)
         }
@@ -866,60 +882,211 @@ fn binary(
     })
 }
 
-/// How tightly an operator binds, for the ones sqlparser binds too loosely.
+/// How tightly an operator binds, in MySQL's order rather than sqlparser's.
 ///
-/// Zero means sqlparser already agrees with MySQL and nothing needs moving.
-/// The order among the rest is MySQL's: a path extraction is a primary, then
-/// `^`, then `||` where it concatenates, then `DIV`.
-fn tightness(op: &BinaryOperator) -> u8 {
+/// Higher binds tighter. Zero is not a level: it means the operator takes no
+/// part in any disagreement between the two, so nothing below moves it and
+/// nothing is moved past it.
+///
+/// Every order here was measured against MySQL 8.3, because sqlparser's
+/// numbers are wrong in both directions and the manual does not cover `||` at
+/// all. `2*3||4` is 68 rather than 64, so `||` where it concatenates binds
+/// tighter than `*`; `'x' || doc->'$.a'` is `x5`, so a path extraction binds
+/// tighter still; and `2^3||4` is 32, `2^3+1` is 2, `1+2<<3` is 24, `1<<2&3`
+/// is 0 and `1&2|3` is 3, which is the bitwise order `^`, then `* / DIV %`,
+/// then `+ -`, then `<< >>`, then `&`, then `|`.
+fn precedence(op: &BinaryOperator) -> u8 {
     use BinaryOperator as B;
     match op {
-        B::Arrow | B::LongArrow => 4,
-        B::BitwiseXor => 3,
+        B::Arrow | B::LongArrow => 9,
         // Two operators wearing one token: concatenating it binds tighter than
-        // `DIV`, and meaning OR it binds looser than everything here.
+        // everything but a path extraction, and meaning OR it binds looser
+        // than everything here.
         //
         // Read from the statement rather than from a session, which is where
         // `binary` reads it to decide what `||` *does*. Two readings of one
         // flag, so `eval` has to run inside a `crate::exec::Source` scope or
         // they can disagree and `7 DIV 2 || 3` would be shaped as OR and then
         // concatenated. Both entry points that parse set that scope.
-        B::StringConcat if crate::exec::pipes_as_concat() => 2,
-        B::MyIntegerDivide => 1,
+        B::StringConcat if crate::exec::pipes_as_concat() => 8,
+        B::BitwiseXor => 7,
+        B::Multiply | B::Divide | B::Modulo | B::MyIntegerDivide => 6,
+        B::Plus | B::Minus => 5,
+        B::PGBitwiseShiftLeft | B::PGBitwiseShiftRight => 4,
+        B::BitwiseAnd => 3,
+        B::BitwiseOr => 2,
         _ => 0,
     }
 }
 
-/// Re-associates an operator sqlparser binds more loosely than MySQL does.
+/// Tighter than any binary operator, which is where MySQL puts a prefix.
 ///
-/// Two of them are wrong in different ways. `DIV` is parsed by a dialect hook
-/// that reads its right operand with `parse_expr`, which takes everything to
-/// the end of the expression: `7 DIV 2 + 1` arrives as `7 DIV (2 + 1)` and
-/// answers 2 where MySQL answers 4. `->` and `->>` are given nearly the
-/// loosest precedence there is, where MySQL treats a path extraction as a
-/// primary: `doc->'$.b' = 6` arrives as `doc -> ('$.b' = 6)` and asks for the
-/// path `0`. Both are silent — a `WHERE` over either matches the wrong rows.
+/// `~1*2` is `(~1)*2` there — it overflows and is refused — where `~(1*2)` is
+/// 18446744073709551613 and is not.
+const PREFIX: u8 = 10;
+
+/// Re-associates a tree sqlparser grouped differently from MySQL.
+///
+/// Three separate disagreements, and they are wrong in different ways. `DIV`
+/// is parsed by a dialect hook that reads its right operand with `parse_expr`,
+/// which takes everything to the end of the expression: `7 DIV 2 + 1` arrives
+/// as `7 DIV (2 + 1)` and answers 2 where MySQL answers 4. `->` and `->>` are
+/// given nearly the loosest precedence there is, where MySQL treats a path
+/// extraction as a primary: `doc->'$.b' = 6` arrives as `doc -> ('$.b' = 6)`
+/// and asks for the path `0`. And sqlparser's bitwise order is Postgres's, not
+/// MySQL's — `^` is put *below* `+` and `&` *above* `<<`, so `2 ^ 3 + 1` is
+/// grouped `2 ^ (3 + 1)` and `1 & 2 << 3` is grouped `(1 & 2) << 3`. All of
+/// them are silent: a `WHERE` over any of them matches the wrong rows.
 ///
 /// A wrapper `Dialect` that fixed this at the source is not an option here —
 /// see `crate::dialect` for why — so the shape is corrected after parsing,
 /// wherever the tree is read.
 ///
-/// The operator keeps only the leftmost operand of whatever it swallowed and
-/// the rest stays outside it. Anything bound tighter is a unit it cannot reach
-/// into, so that unit is corrected first and then stepped through.
+/// Two steps, because the two problems are not the same problem. What `DIV`
+/// and `->` swallowed can be something that is not an operator at all — a
+/// postfix test, an `IN` list, a `BETWEEN` — and only a walk can put those
+/// back. What is left after that is a chain of operators, and a chain is
+/// regrouped wholesale rather than one pair at a time.
 ///
-/// `None` when nothing needs moving, which is also what stops the caller
-/// recursing forever.
+/// `None` when the tree already means what MySQL means, which is also what
+/// stops the caller recursing forever: the answer is compared against the node
+/// that came in.
 pub(crate) fn reassociated(op: &BinaryOperator, left: &Expr, right: &Expr) -> Option<Expr> {
-    let level = tightness(op);
+    let level = precedence(op);
     if level == 0 {
         return None;
     }
+    let node = Expr::BinaryOp {
+        left: Box::new(left.clone()),
+        op: op.clone(),
+        right: Box::new(right.clone()),
+    };
+
+    // Step one: give back what the right operand swallowed and is not part of
+    // any chain. `7 DIV 2 IS NULL` arrives as `7 DIV (2 IS NULL)`, and the
+    // `IS NULL` is a node the regrouping below cannot see into.
     let mut fixed = right.clone();
-    take_leftmost(&mut fixed, left, op, level).then_some(fixed)
+    let wrap = |operand: Expr| Expr::BinaryOp {
+        left: Box::new(left.clone()),
+        op: op.clone(),
+        right: Box::new(operand),
+    };
+    let walked = if take_leftmost(&mut fixed, &wrap, level) {
+        fixed
+    } else {
+        node.clone()
+    };
+
+    // Step two: regroup the operator chain by MySQL's precedence.
+    let grouped = regrouped(&walked);
+    (grouped != node).then_some(grouped)
 }
 
-/// Puts `left <op> …` around the operand `op` should have taken, in place.
+/// The chain rooted at `e`, grouped the way MySQL groups it.
+///
+/// Rotating one disagreement at a time cannot do this. A rotation has to know
+/// the *root* of the left operand to decide, and the left operand does not
+/// have its final root until it has been corrected itself: `2 ^ 3 + 2 ^ 3`
+/// arrives as `(2 ^ (3 + 2)) ^ 3`, whose left corrects to `(2 ^ 3) + 2` — but
+/// the decision was already made against the `^` that was there before, so the
+/// outer `^` swallowed the lot and answered 0 where MySQL answers 2. A fuzz of
+/// 6000 random three- to five-term expressions found roughly 150 such shapes.
+///
+/// So the chain is rebuilt instead. The tree sqlparser produced is a valid
+/// reading of the same tokens under *its* precedences, and an in-order walk
+/// hands those tokens back; parsing them again under MySQL's is one rule for
+/// every pair at once, with no order to get wrong.
+fn regrouped(e: &Expr) -> Expr {
+    let mut operands = Vec::new();
+    let mut ops = Vec::new();
+    flatten(e, &mut operands, &mut ops);
+    if ops.is_empty() {
+        return e.clone();
+    }
+    let mut operands = operands.into_iter();
+    let mut ops = ops.into_iter().peekable();
+    build(&mut operands, &mut ops, 0)
+}
+
+/// The chain's operands and operators, in the order they were written.
+///
+/// An operator this engine has no measured precedence for ends the chain, so a
+/// comparison or an `AND` bounds it and keeps the grouping sqlparser already
+/// gets right. A parenthesised group ends it too, which is why `7 DIV (2 + 1)`
+/// keeps its parentheses.
+///
+/// A prefix `~` is corrected on the way past. It reads its operand at the
+/// precedence of `+`, so `3 ^ ~1 % 5` hides the `%` inside it and the chain
+/// would otherwise be two terms where it is three.
+fn flatten(e: &Expr, operands: &mut Vec<Expr>, ops: &mut Vec<BinaryOperator>) {
+    let corrected;
+    let e = match e {
+        Expr::UnaryOp { op, expr } => match reassociated_unary(op, expr) {
+            Some(fixed) => {
+                corrected = fixed;
+                &corrected
+            }
+            None => e,
+        },
+        _ => e,
+    };
+    match e {
+        Expr::BinaryOp { left, op, right } if precedence(op) > 0 => {
+            flatten(left, operands, ops);
+            ops.push(op.clone());
+            flatten(right, operands, ops);
+        }
+        operand => operands.push(operand.clone()),
+    }
+}
+
+/// Precedence climbing over the flattened chain.
+fn build(
+    operands: &mut std::vec::IntoIter<Expr>,
+    ops: &mut std::iter::Peekable<std::vec::IntoIter<BinaryOperator>>,
+    min: u8,
+) -> Expr {
+    // `flatten` pushes an operand either side of every operator, so there is
+    // always one more of them than there are operators.
+    let mut left = operands.next().expect("an operand before every operator");
+    while let Some(next) = ops.peek() {
+        let level = precedence(next);
+        if level < min {
+            break;
+        }
+        let op = ops.next().expect("just peeked");
+        // `level + 1` rather than `level`: every operator here is
+        // left-associative, so one of equal precedence belongs to the operand
+        // on its left. Passing `level` would make `1 - 2 - 3` mean 2.
+        let right = build(operands, ops, level + 1);
+        left = Expr::BinaryOp {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        };
+    }
+    left
+}
+
+/// Re-associates the prefix `~`.
+///
+/// sqlparser reads its operand at the precedence of `+`, so it swallows
+/// everything binding tighter than that: `~1*2` arrives as `~(1*2)`. MySQL
+/// binds `~` to the operand next to it and to nothing else, which is the same
+/// walk as above with a different wrapper.
+pub(crate) fn reassociated_unary(op: &UnaryOperator, expr: &Expr) -> Option<Expr> {
+    if !matches!(op, UnaryOperator::BitwiseNot) {
+        return None;
+    }
+    let mut fixed = expr.clone();
+    let wrap = |operand: Expr| Expr::UnaryOp {
+        op: *op,
+        expr: Box::new(operand),
+    };
+    take_leftmost(&mut fixed, &wrap, PREFIX).then_some(fixed)
+}
+
+/// Puts the corrected operator around the operand it should have taken.
 ///
 /// Walks down the left spine of what was swallowed. Every construct here is
 /// one that extends an expression to its *left* — a binary operator, a postfix
@@ -927,9 +1094,20 @@ pub(crate) fn reassociated(op: &BinaryOperator, left: &Expr, right: &Expr) -> Op
 /// really adjacent. A prefix or a parenthesised group is not on that list and
 /// ends the walk, which is why `7 DIV (2 + 1)` keeps its parentheses.
 ///
+/// A prefix `~` on that spine is corrected before it is stepped over, because
+/// it reads its own operand at the precedence of `+` and so can be holding
+/// part of the chain: `~ ~ 1 * 7` arrives as `~(~(1 * 7))`, and only correcting
+/// the *outer* one first gets the `* 7` outside both of them.
+///
 /// `false` when the node *is* the operand, so nothing needs moving.
-fn take_leftmost(e: &mut Expr, left: &Expr, op: &BinaryOperator, level: u8) -> bool {
+fn take_leftmost(e: &mut Expr, wrap: &dyn Fn(Expr) -> Expr, level: u8) -> bool {
     use Expr as E;
+
+    if let E::UnaryOp { op, expr } = e {
+        if let Some(corrected) = reassociated_unary(op, expr) {
+            *e = corrected;
+        }
+    }
 
     // Something bound tighter than `op` is a unit, but it may have swallowed
     // too much of its own. Correcting it first leaves a looser operator at the
@@ -941,7 +1119,7 @@ fn take_leftmost(e: &mut Expr, left: &Expr, op: &BinaryOperator, level: u8) -> b
         right: inner_right,
     } = e
     {
-        if tightness(inner) > level {
+        if precedence(inner) > level {
             match reassociated(inner, inner_left, inner_right) {
                 Some(corrected) => *e = corrected,
                 None => return false,
@@ -968,13 +1146,8 @@ fn take_leftmost(e: &mut Expr, left: &Expr, op: &BinaryOperator, level: u8) -> b
         E::IsDistinctFrom(x, _) | E::IsNotDistinctFrom(x, _) => x,
         _ => return false,
     };
-    if !take_leftmost(child, left, op, level) {
-        let operand = child.clone();
-        *child = E::BinaryOp {
-            left: Box::new(left.clone()),
-            op: op.clone(),
-            right: Box::new(operand),
-        };
+    if !take_leftmost(child, wrap, level) {
+        *child = wrap(child.clone());
     }
     true
 }
@@ -1087,6 +1260,189 @@ pub(crate) fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> En
         }
         _ => unreachable!("caller restricts the operator set"),
     })
+}
+
+/// A bitwise chain's answer as a `Value`, or a refusal.
+///
+/// MySQL answers every bitwise operator as a `BIGINT UNSIGNED` and this engine
+/// holds an `i64`, so an answer above `i64::MAX` has no value to be. Keeping
+/// the bits and letting the column's UNSIGNED flag reinterpret them looks like
+/// it works — `SELECT ~0` prints 18446744073709551615 that way — but only for
+/// a value that leaves as a column of its own and is never read again. *Every*
+/// other reader sees the raw `i64`, and nothing on the value tells them not
+/// to: measured against 8.3, `~0 / 2` answered -0.5 for 9223372036854775807.5,
+/// `~0 MOD 10` answered 18446744073709551615 for 5, `CONCAT(~0)` answered -1,
+/// `~0 > 5` answered 0 for 1, and a `UNION` dropped the flag and printed -1.
+/// Those are wrong answers rather than gaps, which this engine does not trade
+/// for coverage.
+///
+/// So the answer is refused where it cannot be represented, and only there:
+/// the check is at the chain's boundary, so everything the chain can compute
+/// exactly it still computes. What refuses is a bitwise expression whose own
+/// value is above `i64::MAX` — `SELECT ~0` and `SELECT 1 << 63` — and nothing
+/// else. `SELECT ~0 & 255` is 255 and `SELECT 1 + 3 & ~5` is 0.
+///
+/// Representing the rest means giving `Value` an unsigned variant, which
+/// reaches the state image, every comparison, and every function's `match` —
+/// its own issue rather than a corner of this one.
+fn bit_pattern(bits: u64) -> EngineResult<Value> {
+    i64::try_from(bits).map(Value::Int).map_err(|_| {
+        unsupported(format!(
+            "the bitwise result {bits}, which is above the largest signed 64-bit integer"
+        ))
+    })
+}
+
+/// The bit pattern MySQL reads out of one operand.
+///
+/// Not `as_number`, because MySQL reads a string and a number differently and
+/// answering both the same way gets one of them wrong: a *string* converts by
+/// its leading integer, so `'3.7' | 0` is 3 and `'1e2' | 0` is 1, where a
+/// number is rounded to the nearest integer first, so `3.7 & 1` is 0 and
+/// `-2.5 & 3` is 1.
+///
+/// A binary string is refused rather than converted. MySQL gives these
+/// operators a second meaning over one — `_binary'ab' & _binary'cd'` is a
+/// bytewise AND of two strings, and operands of unequal length are refused
+/// with 3513 — and that meaning is not implemented. The engine cannot answer
+/// the *numeric* readings either, because `Value::Bytes` is what both a
+/// `VARBINARY` column and a hex literal come back as, and MySQL reads those
+/// two oppositely: `_binary'ab' & 1` is 0, reading the bytes as the characters
+/// `ab`, while `X'0F' & 255` is 15, reading them as a number. One `Value` and
+/// two answers, so neither is given.
+fn bit_operand(v: &Value) -> EngineResult<u64> {
+    Ok(match v {
+        Value::Int(n) => *n as u64,
+        Value::Text(s) | Value::Json(s) => integer_prefix(s),
+        Value::Bytes(_) => {
+            return Err(unsupported("a bitwise operator over a binary string"));
+        }
+        // Away from zero at a half, which is MySQL's rounding and Rust's:
+        // `2.5 & 3` is 3 and `-2.5 & 3` is 1. The cast saturates rather than
+        // wrapping, which is also MySQL's answer — `1e30 | 0` is
+        // 9223372036854775807 and not the unsigned maximum.
+        other => other.as_number().round() as i64 as u64,
+    })
+}
+
+/// The integer at the front of a string, as MySQL converts one.
+///
+/// Stops at the first character that is not a digit, so `'3.7'` is 3, `'1e2'`
+/// is 1 and `'x'` is 0 — the point and the exponent that `as_number` reads are
+/// not part of an integer. The two ends clamp differently, which is measured
+/// rather than reasoned: `'99999999999999999999' | 0` is the unsigned maximum
+/// and `'-99999999999999999999' | 0` is the *signed* minimum.
+fn integer_prefix(s: &str) -> u64 {
+    let text = s.trim_start();
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    let digits = &digits[..end];
+    if digits.is_empty() {
+        return 0;
+    }
+    if negative {
+        // Parsed without the sign and negated after, so the clamp lands on
+        // `i64::MIN` rather than on whatever `"-…"` failed to parse as.
+        digits.parse::<i64>().map_or(i64::MIN as u64, |n| -n as u64)
+    } else {
+        digits.parse::<u64>().unwrap_or(u64::MAX)
+    }
+}
+
+/// Whether an operator computes over bits rather than over numbers.
+fn bitwise_op(op: &BinaryOperator) -> bool {
+    use BinaryOperator as B;
+    matches!(
+        op,
+        B::BitwiseAnd
+            | B::BitwiseOr
+            | B::BitwiseXor
+            | B::PGBitwiseShiftLeft
+            | B::PGBitwiseShiftRight
+    )
+}
+
+/// The value a bitwise chain produces.
+///
+/// Range-checked exactly once, here, where the chain hands its answer to
+/// something that is not another bitwise operator. Checking every operator
+/// would refuse far more than it has to: `1 + 3 & ~5` is 0 in MySQL and
+/// reaches it through 18446744073709551610, a number this engine cannot hold
+/// but can carry the bits of.
+fn bitwise_value(e: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
+    match bitwise_bits(e, ctx)? {
+        Some(bits) => bit_pattern(bits),
+        None => Ok(Value::Null),
+    }
+}
+
+/// The 64 bits a bitwise chain computes, or `None` where it is NULL.
+///
+/// Recurses through the chain rather than going back out through `eval`, so
+/// that an intermediate wider than `i64` never has to become a `Value`. Every
+/// operator here is exact on the bits whatever their sign, which is why the
+/// chain composes and the boundary is the only place a range matters.
+fn bitwise_bits(e: &Expr, ctx: &Context<'_>) -> EngineResult<Option<u64>> {
+    use BinaryOperator as B;
+    match e {
+        // Transparent: parentheses group the chain, they do not end it.
+        // `(~0) & 255` is one chain and answers 255.
+        Expr::Nested(inner) => bitwise_bits(inner, ctx),
+        Expr::BinaryOp { left, op, right } => {
+            if let Some(fixed) = reassociated(op, left, right) {
+                return bitwise_bits(&fixed, ctx);
+            }
+            if !bitwise_op(op) {
+                return operand_bits(e, ctx);
+            }
+            let (Some(a), Some(b)) = (bitwise_bits(left, ctx)?, bitwise_bits(right, ctx)?) else {
+                return Ok(None);
+            };
+            Ok(Some(match op {
+                B::BitwiseAnd => a & b,
+                B::BitwiseOr => a | b,
+                B::BitwiseXor => a ^ b,
+                // The shift count is read unsigned and is not reduced modulo
+                // anything: `1 << 64` is 0 and so is `1 << -1`, where -1
+                // arrives as a count of 18446744073709551615.
+                B::PGBitwiseShiftLeft if b >= 64 => 0,
+                B::PGBitwiseShiftLeft => a << b,
+                B::PGBitwiseShiftRight if b >= 64 => 0,
+                // Logical, not arithmetic: the operand is unsigned, so
+                // `-1 >> 1` is 9223372036854775807 rather than -1.
+                B::PGBitwiseShiftRight => a >> b,
+                _ => unreachable!("guarded by `bitwise_op`"),
+            }))
+        }
+        Expr::UnaryOp { op, expr } => {
+            if let Some(fixed) = reassociated_unary(op, expr) {
+                return bitwise_bits(&fixed, ctx);
+            }
+            if !matches!(op, UnaryOperator::BitwiseNot) {
+                return operand_bits(e, ctx);
+            }
+            Ok(bitwise_bits(expr, ctx)?.map(|bits| !bits))
+        }
+        other => operand_bits(other, ctx),
+    }
+}
+
+/// One operand of a chain: everything the chain is not.
+///
+/// Evaluated as an ordinary expression and then read as bits, which is where
+/// an operand that cannot be read as bits at all — a binary string — is
+/// refused.
+fn operand_bits(e: &Expr, ctx: &Context<'_>) -> EngineResult<Option<u64>> {
+    let value = eval(e, ctx)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    bit_operand(&value).map(Some)
 }
 
 /// The date functions whose arguments are partly syntax.

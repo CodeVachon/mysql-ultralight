@@ -244,8 +244,15 @@ fn mod_operator_to_percent(sql: &str, sites: &mut Vec<(usize, String)>) -> Strin
     // the two is the grammar, so the parser is asked: a rewrite that will not
     // parse is not applied, and the statement keeps the meaning it had.
     //
-    // The trade is that a statement broken for some *other* reason reports the
-    // error its unrewritten text produces, which will point at the `MOD`.
+    // Two trades come with that. A statement broken for some *other* reason
+    // reports the error its unrewritten text produces, which will point at the
+    // `MOD`. And the parse here is a second one: the caller parses the same
+    // text again to execute or describe it, so a statement using infix `MOD`
+    // costs two full parses where every other statement costs one. That is a
+    // real cost for an engine whose reason to exist is start-up and query
+    // latency, and it is paid only by statements that reach here at all —
+    // `contains_the_word_mod` rejects the rest on a byte scan, and `sites`
+    // being empty means nothing was substituted to check.
     if !sites.is_empty() && Parser::parse_sql(&MySqlDialect {}, &out).is_err() {
         sites.clear();
         return sql.to_owned();

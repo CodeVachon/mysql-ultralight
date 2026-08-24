@@ -7161,6 +7161,255 @@ fn integer_division_binds_as_tightly_as_multiplication() {
 }
 
 #[test]
+fn the_bitwise_operators_answer_over_unsigned_bits() {
+    // MySQL evaluates every one of these over 64 *unsigned* bits and reports
+    // the answer BIGINT UNSIGNED, which is why they are their own piece of
+    // work rather than more arithmetic: `-1 & 1` is 1 and `-1 >> 1` is
+    // 9223372036854775807. Every answer here was read off MySQL 8.3.
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        ("SELECT 7 ^ 3", "4"),
+        ("SELECT 7 & 3", "3"),
+        ("SELECT 7 | 3", "7"),
+        ("SELECT 1 << 3", "8"),
+        ("SELECT 16 >> 2", "4"),
+        ("SELECT -1 & 1", "1"),
+        // Logical rather than arithmetic, because the operand is unsigned: a
+        // sign-extending shift would answer -1.
+        ("SELECT -1 >> 1", "9223372036854775807"),
+        // The count is unsigned and is not reduced modulo the width: 64 shifts
+        // everything out, and -1 arrives as a count of 18446744073709551615.
+        ("SELECT 1 << 64", "0"),
+        ("SELECT 1 << 100", "0"),
+        ("SELECT 1 << -1", "0"),
+        // A number is rounded to the nearest integer first, away from zero at
+        // a half — 3.7 becomes 4, and -2.5 becomes -3 and then its bits.
+        ("SELECT 3.7 & 1", "0"),
+        ("SELECT 3.4 & 1", "1"),
+        ("SELECT 2.5 & 3", "3"),
+        ("SELECT -2.5 & 3", "1"),
+        ("SELECT ~-3", "2"),
+        ("SELECT 1.5 << 1", "4"),
+        // A string is not rounded: it converts by its leading *integer*, so it
+        // stops at the point and at the exponent where the number reader that
+        // arithmetic uses reads on. Reading both the same way answers one of
+        // them wrongly whichever way it is read.
+        ("SELECT '3.7' | 0", "3"),
+        ("SELECT '1e2' | 0", "1"),
+        ("SELECT 'x' & 1", "0"),
+        ("SELECT ' 5 ' | 0", "5"),
+        ("SELECT '-3' & 255", "253"),
+        ("SELECT NULL & 1", "NULL"),
+        ("SELECT 1 << NULL", "NULL"),
+        ("SELECT ~NULL", "NULL"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // The column says how MySQL reads those bits: LONGLONG with the UNSIGNED
+    // flag, NOT NULL unless an operand can be NULL. A sign drops the flag,
+    // which is MySQL's answer for `-(7 ^ 3)` too.
+    let described = engine
+        .describe(&session, "SELECT ~-1, 7 ^ 3, NULL & 1, -(7 ^ 3)", 0)
+        .unwrap();
+    let shape: Vec<String> = described
+        .iter()
+        .map(|c| format!("{:?} {} {}", c.ty, c.unsigned, c.nullable))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            "LongLong true false",
+            "LongLong true false",
+            "LongLong true true",
+            "LongLong false false",
+        ]
+    );
+}
+
+#[test]
+fn a_bitwise_answer_too_wide_for_an_i64_is_refused() {
+    // MySQL answers a BIGINT UNSIGNED and the engine holds an i64, so an
+    // answer above `i64::MAX` has no value to be. Carrying the bits and
+    // letting the column's UNSIGNED flag reinterpret them prints the right
+    // digits for `SELECT ~0` and is wrong everywhere else — `~0 > 5` answered
+    // 0 for MySQL's 1, `CONCAT(~0)` answered -1, `~0 MOD 10` answered
+    // 18446744073709551615 for 5 — because nothing on the value tells the next
+    // reader it is unsigned. Wrong answers are not a trade this engine makes,
+    // so the shapes it cannot represent refuse.
+    let (engine, mut session) = engine();
+    for sql in [
+        "SELECT ~0",
+        "SELECT 1 << 63",
+        "SELECT -5 & -3",
+        "SELECT ~0 > 5",
+        "SELECT ~0 DIV 2",
+        "SELECT ~0 - 1",
+        "SELECT CONCAT(~0)",
+    ] {
+        let error = engine
+            .execute(&mut session, sql, &[])
+            .expect_err("an answer above i64::MAX is not representable");
+        assert_eq!(error.code, 1235, "{sql}");
+        assert!(
+            error
+                .message
+                .contains("above the largest signed 64-bit integer"),
+            "{sql} refused with {}",
+            error.message
+        );
+    }
+}
+
+#[test]
+fn a_bitwise_chain_composes_over_bits_it_cannot_hand_out() {
+    // The refusal is at the chain's boundary and not at every operator, which
+    // is the difference between a gap and a rout: `1 + 3 & ~5` is 0 in MySQL
+    // and reaches it through 18446744073709551610 — a number the engine cannot
+    // hold but can carry the bits of. Checking each operator refused 1354 of
+    // 6000 random expressions that it can answer exactly.
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        ("SELECT 1 + 3 & ~5", "0"),
+        ("SELECT ~0 & 255", "255"),
+        ("SELECT ~2 >> 4 - 2", "4611686018427387903"),
+        ("SELECT (1 << 63) >> 63", "1"),
+        ("SELECT ~-6 ^ ~-6", "0"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // Refused rather than answered numerically, and refused whichever side it
+    // is on. MySQL gives these operators a second, bytewise meaning over a
+    // *binary* string, and `Value::Bytes` is what both a `VARBINARY` column
+    // and a hex literal come back as — which MySQL reads oppositely, 0 for
+    // `_binary'ab' & 1` and 15 for `X'0F' & 255`. One value and two answers,
+    // so neither is given.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Bin (a VARBINARY(4), b VARBINARY(4))",
+    );
+    run(&engine, &mut session, "INSERT INTO Bin VALUES ('ab', 'cd')");
+    for sql in [
+        "SELECT a & b FROM Bin",
+        "SELECT a & 255 FROM Bin",
+        "SELECT X'0F' & 255",
+        "SELECT ~a FROM Bin",
+    ] {
+        let error = engine
+            .execute(&mut session, sql, &[])
+            .expect_err("a bitwise operator over a binary string is not implemented");
+        assert_eq!(error.code, 1235, "{sql}");
+    }
+}
+
+#[test]
+fn the_bitwise_operators_bind_the_way_mysql_binds_them() {
+    // sqlparser numbers these operators from Postgres: it puts `^` below both
+    // `+` and `*`, and `&` above `<<`. MySQL binds `^` tightest of the set,
+    // then `* / DIV %`, then `+ -`, then `<< >>`, then `&`, then `|` — read
+    // off 8.3 rather than off the manual, and checked against a reference
+    // evaluator over 14000 random expressions. The comment on each line is
+    // what sqlparser's grouping answers instead; a line without one is a case
+    // the two already agree on, kept so a fix that overshoots shows up.
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        ("SELECT 2 ^ 3 + 1", "2"),       // 2 ^ (3 + 1) = 6
+        ("SELECT 1 + 2 ^ 3", "2"),       // (1 + 2) ^ 3 = 0
+        ("SELECT 2 ^ 3 * 2", "2"),       // 2 ^ (3 * 2) = 4
+        ("SELECT 2 ^ 3 % 3", "1"),       // 2 ^ (3 % 3) = 2
+        ("SELECT 2 ^ 3 DIV 4", "0"),     // 2 ^ (3 DIV 4) = 2
+        ("SELECT 1 & 2 ^ 3", "1"),       // (1 & 2) ^ 3 = 3
+        ("SELECT 1 | 2 ^ 3", "1"),       // (1 | 2) ^ 3 = 0
+        ("SELECT 1 << 2 ^ 3", "2"),      // (1 << 2) ^ 3 = 7
+        ("SELECT 1 << 2 & 3", "0"),      // 1 << (2 & 3) = 4
+        ("SELECT 2 & 4 >> 1", "2"),      // (2 & 4) >> 1 = 0
+        ("SELECT 4 >> 1 & 2", "2"),      // 4 >> (1 & 2) = 4
+        ("SELECT 1 + 2 * 3 ^ 4", "15"),  // (1 + 2 * 3) ^ 4 = 3
+        ("SELECT 1 & 2 ^ 3 + 4", "1"),   // (1 & 2) ^ (3 + 4) = 7
+        ("SELECT 7 DIV 2 ^ 3 + 1", "8"), // 7 DIV (2 ^ (3 + 1)) = 1
+        // A tighter operator either side of a looser one. One rotation cannot
+        // reach these: the decision needs the left operand's *final* root, and
+        // `2 ^ 3 + 2` is what the left of this becomes only after it has been
+        // corrected itself. A fuzz of 6000 expressions found ~150 such shapes,
+        // all of them silently wrong.
+        ("SELECT 2 ^ 3 + 2 ^ 3", "2"),   // (2 ^ (3 + 2)) ^ 3 = 0
+        ("SELECT 7 ^ 1 + 6 ^ 7", "7"),   // (7 ^ (1 + 6)) ^ 7 = 11
+        ("SELECT 1 + 2 ^ 3 ^ 7", "7"),   // ((1 + 2) ^ 3) ^ 7 = 5
+        ("SELECT 1 << 3 & 7 << 3", "8"), // ((1 << 3) & 7) << 3 = 0
+        ("SELECT 3 ^ 3 & 4 ^ 2", "0"),   // ((3 ^ (3 & 4)) ^ 2) = 2
+        ("SELECT 6 & 5 >> 1 << 3", "0"), // ((6 & 5) >> 1) << 3 = 16
+        ("SELECT 1 ^ 2 & 3", "3"),
+        ("SELECT 1 ^ 2 | 3", "3"),
+        ("SELECT 1 & 2 << 3", "0"),
+        ("SELECT 1 + 2 << 3", "24"),
+        ("SELECT 1 << 2 + 3", "32"),
+        ("SELECT 1 * 2 << 3", "16"),
+        ("SELECT 1 << 2 * 3", "64"),
+        ("SELECT 1 & 2 | 3", "3"),
+        ("SELECT 1 | 2 & 3", "3"),
+        ("SELECT 1 >> 2 | 3", "3"),
+        // Left-associative, which the rebuild has to be told: every one of
+        // these means something else read right to left.
+        ("SELECT 2 >> 1 << 3", "8"), // 2 >> (1 << 3) = 0
+        ("SELECT 8 >> 1 >> 1", "2"), // 8 >> (1 >> 1) = 8
+        ("SELECT 1 - 2 - 3", "-4"),  // 1 - (2 - 3) = 2
+        // Parentheses are their own node, so nothing regroups through them.
+        ("SELECT (1 + 2) ^ 3", "0"),
+        ("SELECT 1 + (2 ^ 3)", "2"),
+        // `~` is a prefix and binds tighter than every operator, where
+        // sqlparser reads its operand at the precedence of `+` and so lets it
+        // swallow a `*`, a `DIV` or a `%`.
+        ("SELECT ~-3 * 2", "4"),        // ~((-3) * 2) = 5
+        ("SELECT ~-9 DIV 2", "4"),      // ~((-9) DIV 2) = 3
+        ("SELECT ~-9 % 3", "2"),        // ~((-9) % 3) = 18446744073709551615
+        ("SELECT 3 ^ ~(-6) * 2", "12"), // 3 ^ ~((-6) * 2) = 8
+        // Nested, which needs the *outer* one corrected before the inner one
+        // is: correcting the inner first hands `~1` to a multiplication, and
+        // `~1` is a value the engine refuses.
+        ("SELECT ~ ~ 1 * 7", "7"), // ~(~(1 * 7)) = 7, by a different route
+        ("SELECT ~ ~ 3 * 5 % 9", "6"),
+        // And on the *left* of a chain, where the walk never looks: the walk
+        // only ever reads the right operand, so the rebuild is the only thing
+        // that can see this `~` has the `* 2` inside it.
+        ("SELECT ~(-6) * 2 ^ 3", "5"),   // ~((-6) * 2) ^ 3 = 8
+        ("SELECT ~(-9) DIV 2 ^ 3", "8"), // ~((-9) DIV 2) ^ 3 = 11
+        ("SELECT 1 + ~(-6) * 2", "11"),
+        ("SELECT 8 - ~(-4) DIV 2", "7"),
+        ("SELECT ~-3 * 2 + 1", "5"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // The corrected shape is what the column is typed from, as it is for
+    // `DIV`: `2 ^ 3 / 2` reaches the engine with `^` at its root and is really
+    // a division, which MySQL reports as a nullable, signed decimal. Reading
+    // the root as parsed promised NOT NULL and UNSIGNED for a column holding
+    // 0.5.
+    let described = engine
+        .describe(&session, "SELECT 2 ^ 3 / 2, 2 ^ 3 + 1", 0)
+        .unwrap();
+    let shape: Vec<String> = described
+        .iter()
+        .map(|c| format!("{:?} {} {}", c.ty, c.unsigned, c.nullable))
+        .collect();
+    assert_eq!(shape, vec!["NewDecimal false true", "LongLong true false"]);
+}
+
+#[test]
 fn arithmetic_reads_a_number_out_of_anything_it_is_given() {
     // MySQL's arithmetic has no "not a number" case — it reads the leading
     // numeric part and calls the rest zero. Answering NULL instead made every

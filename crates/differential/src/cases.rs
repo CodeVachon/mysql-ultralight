@@ -388,4 +388,66 @@ pub const GROUPS: &[Group] = &[
             same("SELECT MD5('x'), LEFT(t, 2), RIGHT(t, 2) FROM S ORDER BY id"),
         ],
     },
+    Group {
+        name: "bitwise operators",
+        setup: &[
+            "CREATE TABLE B (id INT NOT NULL, n INT NULL, neg INT NULL, u BIGINT UNSIGNED NULL, \
+             PRIMARY KEY (id))",
+            "INSERT INTO B VALUES (1, 5, -1, 12), (2, NULL, NULL, NULL), (3, 12, -6, 255)",
+        ],
+        cases: &[
+            same("SELECT 7 ^ 3, 7 & 3, 7 | 3, 1 << 3, 16 >> 2, ~-1"),
+            // MySQL computes these over 64 *unsigned* bits, so a negative
+            // operand is its two's complement and a shift does not sign-extend.
+            // Only answers up to `i64::MAX` are here: the engine holds an i64
+            // and refuses what it cannot represent, which is its own gap and
+            // not something this file can ask about.
+            same("SELECT -1 & 1, -1 >> 1, ~-6, ~-1 & 255, 1 + 3 & ~-6"),
+            // A shift count is unsigned and is not reduced: 64 shifts
+            // everything out, and -1 arrives as a count of 2^64-1.
+            same("SELECT 1 << 64, 1 << 100, 1 << -1, (-1 >> 1) >> 62"),
+            // A number is rounded to the nearest integer, away from zero at a
+            // half — 3.7 becomes 4 and -2.5 becomes -3.
+            same("SELECT 3.7 & 1, 3.4 & 1, 2.5 & 3, -2.5 & 3, ~-2.5, 1.5 << 1"),
+            // A string is not: it converts by its leading *integer*, so it
+            // stops at the point and at the exponent where a number does not.
+            same("SELECT '3' & 1, 'x' & 1, '3.7' | 0, '1e2' | 0, '-3' & 255, ' 5 ' | 0"),
+            same("SELECT 5 & NULL, NULL << 1, 1 << NULL, ~NULL, NULL ^ 1"),
+            // sqlparser gives `^` Postgres's precedence, below `+` and `*`,
+            // where MySQL binds it tighter than either. Each of these is a
+            // different answer under the two readings.
+            same("SELECT 2 ^ 3 + 1, 1 + 2 ^ 3, 2 ^ 3 * 2, 2 ^ 3 % 3, 2 ^ 3 DIV 4"),
+            same("SELECT 1 & 2 ^ 3, 1 ^ 2 | 3, 1 | 2 ^ 3, 1 << 2 ^ 3, 1 ^ 2 << 3"),
+            // And it ties `<<` with `^` and puts `&` above both, where MySQL
+            // has `+ -`, then `<< >>`, then `&`, then `|`.
+            same("SELECT 1 << 2 & 3, 1 & 2 << 3, 4 >> 1 & 2, 2 & 4 >> 1, 1 >> 2 | 3"),
+            same("SELECT 1 + 2 << 3, 1 << 2 + 3, 1 * 2 << 3, 1 << 2 * 3, 1 & 2 | 3"),
+            // Left-associative, which a rebuild has to be told: each of these
+            // means something else read right to left.
+            same("SELECT 2 >> 1 << 3, 8 >> 1 >> 1, 1 - 2 - 3, 7 ^ 2 ^ 1"),
+            // A tighter operator on *both* sides of a looser one, which no
+            // single rotation reaches: deciding needs the left operand's final
+            // root, and it does not have one until it has been corrected too.
+            same("SELECT 2 ^ 3 + 2 ^ 3, 7 ^ 1 + 6 ^ 7, 1 + 2 ^ 3 ^ 7"),
+            same("SELECT 1 << 3 & 7 << 3, 3 ^ 3 & 4 ^ 2, 6 & 5 >> 1 << 3, 1 + 2 * 3 ^ 4"),
+            // Two corrections meeting: `DIV` swallows the rest of the
+            // expression and `^` has to be taken back out of what it swallowed.
+            same("SELECT 7 DIV 2 ^ 3 + 1, 1 & 2 ^ 3 + 4"),
+            // `~` is a prefix and binds tighter than any of them, where
+            // sqlparser reads its operand at the precedence of `+`.
+            same("SELECT ~-3 * 2, ~-9 DIV 2, ~-9 % 3, ~-3 * 2 + 1, 3 ^ ~(-6) * 2"),
+            // Nested, which needs the outer `~` corrected before the inner
+            // one; and a `~` the walk declines to move, whose correction still
+            // has to reach the rebuild. Written `~ ~` because sqlparser reads
+            // `~~` as one token and refuses it.
+            same("SELECT ~ ~ 1 * 7, ~ ~ 3 * 5 % 9, 1 + ~(-6) * 2"),
+            // A `~` on the *left* of a chain, which the walk never reads: only
+            // the rebuild can see the `* 2` is inside it.
+            same("SELECT ~(-6) * 2 ^ 3, ~(-9) DIV 2 ^ 3"),
+            same("SELECT n & 1, n | 8, n ^ 3, n << 1, n >> 1 FROM B ORDER BY id"),
+            same("SELECT ~neg, neg & 7, id & 1, id << 2, u & 15 FROM B ORDER BY id"),
+            same("SELECT id FROM B WHERE id & 1 = 1 ORDER BY id"),
+            same("SELECT (7 ^ 3) = 4, (7 & 3) > 1, 7 ^ 3 IS NULL, (NULL & 1) IS NULL"),
+        ],
+    },
 ];
