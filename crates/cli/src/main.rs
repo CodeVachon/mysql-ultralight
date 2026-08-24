@@ -55,8 +55,11 @@ OPTIONS:
     -h, --help           Print this message
 
 On startup the server prints one line to stdout:
-    ready port=<PORT> socket=<PATH|-> startup_ms=<MS>
-so a harness can parse the port and wait for readiness without polling.
+    ready port=<PORT> socket=<PATH|-> startup_ms=<MS> instance=<ID>
+so a harness can parse the port and wait for readiness without polling. The
+instance id is fresh per process and is also served as @@ultralight_instance,
+so a harness can check that the server it reached is the one it started rather
+than a leftover process holding the same port.
 
 STATE IMAGES
     Replaying a migration history costs seconds; loading its result costs
@@ -205,10 +208,14 @@ async fn main() -> std::io::Result<()> {
 
     let server = Arc::new(Server::new(config).with_trace(trace));
 
+    // The instance id goes out over the pipe to whoever started this process,
+    // which is what makes it proof: a leftover server on the same port never
+    // gets to say this, and `@@ultralight_instance` reads the same value back.
     println!(
-        "ready port={port} socket={} startup_ms={:.3}",
+        "ready port={port} socket={} startup_ms={:.3} instance={}",
         options.socket.as_deref().unwrap_or("-"),
-        started.elapsed().as_secs_f64() * 1000.0
+        started.elapsed().as_secs_f64() * 1000.0,
+        engine_config.instance
     );
     use std::io::Write;
     let _ = std::io::stdout().flush();

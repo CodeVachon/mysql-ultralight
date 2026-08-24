@@ -483,6 +483,28 @@ fn an_unknown_system_variable_errors_rather_than_returning_nothing() {
     assert_eq!(err.code, 1193);
 }
 
+/// The differential harness asks this exact statement to prove the server it
+/// reached is the one its caller started, and fails the run when the answer is
+/// not the id that server printed. Answering it from anywhere but the running
+/// server's own configuration would make that check pass against a leftover
+/// process, which is the false green the check exists to stop.
+#[test]
+fn the_instance_id_is_readable_over_sql() {
+    let config = ServerConfig {
+        instance: "0123456789abcdef".to_owned(),
+        ..Default::default()
+    };
+    let engine = Engine::new(config.clone());
+    engine.bootstrap_database("testdb").unwrap();
+    let mut session = Session::new(config, 1);
+    session.current_database = Some("testdb".to_owned());
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @@ultralight_instance"),
+        vec![vec!["0123456789abcdef".to_owned()]]
+    );
+}
+
 /// Unimplemented features must say so rather than return a plausible answer.
 #[test]
 fn unsupported_features_error_rather_than_guess() {

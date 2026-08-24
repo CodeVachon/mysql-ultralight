@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-08-24T17:36:23Z
-updated: 2026-08-24T17:36:23Z
+updated: 2026-08-24T18:44:02Z
 ---
 
 ## Description
@@ -22,3 +22,11 @@ ANSI_QUOTES and IGNORE_SPACE are unaffected: those reach the code by rewriting t
 Fixing it means storing the mode with the view and resolving the body under it. crates/engine/src/image.rs is append-only, so the field is a new FORMAT_VERSION, and every view execution path has to route the stored mode rather than the session's.
 
 Only visible when a session changes sql_mode mid-connection. Under a fixed server-wide mode, which is how this engine is used, nothing diverges.
+
+## Notes
+
+### 2026-08-24T18:44:02Z — Christopher Vachon (user)
+
+Confirmed again by review during #0081, and #0053 widened it: REAL inside a view body now resolves under the reading session's mode, so one view gives Float/1.23457 while REAL_AS_FLOAT is set and Double/1.234567890123 after it is cleared, where MySQL gives float both times. Before #0053 a REAL in a view was unconditionally double -- wrong against MySQL under the flag, but at least self-consistent between two reads.
+
+Narrow: only a REAL written inside a view body. A view over a REAL column is fine, because the column's type is baked at DDL time.

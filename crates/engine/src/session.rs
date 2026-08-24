@@ -15,6 +15,17 @@ pub struct ServerConfig {
     /// does not use MySQL's default, and two of its flags change what a query
     /// means rather than how it behaves.
     pub sql_mode: String,
+    /// Identifies this particular server process, reported as
+    /// `@@ultralight_instance`.
+    ///
+    /// A harness that starts a server and then connects to a port cannot
+    /// otherwise tell the process it started from a leftover one on the same
+    /// port: both accept a connection and both call themselves
+    /// mysql-ultralight. The differential harness compared MySQL against a
+    /// previous build for exactly that reason and reported no divergences, so
+    /// the answer to "are you the server I started" is a value only that
+    /// process knows.
+    pub instance: String,
 }
 
 impl Default for ServerConfig {
@@ -26,8 +37,30 @@ impl Default for ServerConfig {
             sql_mode: "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,\
                        ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
                 .to_owned(),
+            instance: new_instance_id(),
         }
     }
+}
+
+/// A value no other running server will report.
+///
+/// Mixed from three sources rather than one because each is defeatable alone:
+/// the clock repeats across a restart of a suspended machine, the pid is
+/// reused, and a fixed hash of the two is the same on every host. `RandomState`
+/// is seeded per process by the OS, which is the part that makes two servers
+/// started in the same millisecond differ.
+fn new_instance_id() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hash, Hasher};
+
+    let mut hasher = RandomState::new().build_hasher();
+    std::process::id().hash(&mut hasher);
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// State belonging to one connection.
@@ -158,6 +191,10 @@ impl Session {
         match name.as_str() {
             "version" => text(&self.config.version),
             "version_comment" => text("mysql-ultralight (test engine)"),
+            // Not a MySQL variable: a real server answers 1193, which is how a
+            // harness holding an instance id can tell it has reached the wrong
+            // kind of server as well as the wrong process.
+            "ultralight_instance" => text(&self.config.instance),
             "version_compile_os" => text(std::env::consts::OS),
             "version_compile_machine" => text(std::env::consts::ARCH),
             "socket" => text(self.config.socket.as_deref().unwrap_or("")),
@@ -247,6 +284,11 @@ impl Session {
             "wait_timeout",
         ];
 
+        // `ultralight_instance` is deliberately not in that list. SHOW
+        // VARIABLES is one of the outputs the differential harness compares
+        // against MySQL, and a name MySQL does not have would be a divergence
+        // introduced by the thing that exists to catch them. Reading it by
+        // name still works, which is all the check needs.
         let mut out: Vec<(String, String)> = NAMES
             .iter()
             .filter_map(|n| {
@@ -328,6 +370,29 @@ mod tests {
     fn an_unknown_system_variable_is_none_rather_than_a_guess() {
         let s = Session::new(ServerConfig::default(), 1);
         assert_eq!(s.system_variable("not_a_real_variable"), None);
+    }
+
+    /// The whole point of the value is that a second server does not have it,
+    /// so the two things worth asserting are that it is reported and that two
+    /// servers report different ones.
+    #[test]
+    fn each_server_reports_its_own_instance_id() {
+        let first = ServerConfig::default();
+        let second = ServerConfig::default();
+        assert_ne!(first.instance, second.instance);
+
+        let s = Session::new(first.clone(), 1);
+        assert_eq!(
+            s.system_variable("ultralight_instance"),
+            Some(Value::Text(first.instance.clone()))
+        );
+        // Every connection to one server must answer the same, or the harness
+        // would be checking the connection rather than the server.
+        let other_connection = Session::new(first.clone(), 2);
+        assert_eq!(
+            other_connection.system_variable("@@ultralight_instance"),
+            Some(Value::Text(first.instance))
+        );
     }
 
     #[test]

@@ -126,7 +126,7 @@ It prints one line when it is up, so a shell script can wait on it without
 polling:
 
 ```
-ready port=53412 socket=- startup_ms=0.932
+ready port=53412 socket=- startup_ms=0.932 instance=3f1c0a9b6d2e4517
 ```
 
 ## Platforms

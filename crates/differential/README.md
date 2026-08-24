@@ -6,7 +6,7 @@ statements are legal at all.
 
 ```sh
 ./scripts/differential.sh           # start mysql:8.3 in Docker, run, tear down
-./scripts/differential.sh --keep    # leave it running for the next run
+./scripts/differential.sh --keep    # leave MySQL running for the next run
 ./scripts/differential.sh --bless   # record the current divergences
 ```
 
@@ -20,6 +20,26 @@ of an argument that sounded right, and MySQL returns a string.
 
 The harness asks MySQL instead. Its first run found 108 divergences across 66
 statements, in eight classes, none of which anything else had noticed.
+
+## The engine it compares against
+
+A green run is a claim about the build in the working tree, so the harness
+refuses to make it about anything else. The engine prints a fresh instance id
+on its `ready` line and serves the same value back as `@@ultralight_instance`;
+`--engine-instance` is required, and a peer that reports a different id — or
+cannot report one at all — fails the run instead of being compared.
+
+That is not hypothetical. A run once reported zero divergences because a
+mysql-ultralight left over from an earlier debugging step still held port
+33307: the engine the script started could not bind, exited, and the readiness
+poll was answered by the stale one, so MySQL was compared against a previous
+build. It surfaced only because `scripts/mutate.sh` reported a test passing
+with the mutation in place — a false green in the one place the project uses to
+prove that a test bites.
+
+`--keep` reuses MySQL and nothing else. MySQL costs seconds to start, which is
+worth keeping; the engine costs milliseconds, so reusing one saves nothing and
+gives up the only thing the harness guarantees.
 
 ## Both protocols
 

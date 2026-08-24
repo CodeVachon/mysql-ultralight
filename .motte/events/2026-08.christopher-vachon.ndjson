@@ -162,3 +162,7 @@
 {"at":"2026-08-24T17:36:11Z","id":78,"by":"Christopher Vachon","as":"user","type":"created","title":"Arithmetic re-associates on every node of every row","state":"Todo"}
 {"at":"2026-08-24T17:36:11Z","id":79,"by":"Christopher Vachon","as":"user","type":"created","title":"A bitwise operand reads a temporal or decimal by its leading digits","state":"Todo"}
 {"at":"2026-08-24T17:36:23Z","id":80,"by":"Christopher Vachon","as":"user","type":"created","title":"A view does not remember the sql_mode it was created under","state":"Todo"}
+{"at":"2026-08-24T18:02:04Z","id":53,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-24T18:02:26Z","id":81,"by":"Christopher Vachon","as":"user","type":"created","title":"differential.sh can compare against a stale engine and report green","state":"Todo"}
+{"at":"2026-08-24T18:02:26Z","id":82,"by":"Christopher Vachon","as":"user","type":"created","title":"information_schema nullability is conditioned on sql_mode in MySQL","state":"Todo"}
+{"at":"2026-08-24T18:02:26Z","id":83,"by":"Christopher Vachon","as":"user","type":"created","title":"A concatenation of two literals is typed nullable","state":"Todo"}

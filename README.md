@@ -69,10 +69,12 @@ which is the fastest way to see what a client actually asks a MySQL server for.
 | `--trace` | Log all protocol activity to stderr |
 
 On startup the server prints one line to stdout so a harness can parse the port and know
-it is ready without polling:
+it is ready without polling. The instance id is fresh per process and is served back as
+`@@ultralight_instance`, so a harness can tell the server it started from a leftover one
+holding the same port:
 
 ```
-ready port=3307 socket=- startup_ms=1.312
+ready port=3307 socket=- startup_ms=1.312 instance=3f1c0a9b6d2e4517
 ```
 
 ## Layout

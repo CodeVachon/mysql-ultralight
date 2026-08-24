@@ -9,6 +9,12 @@
 #   ./scripts/differential.sh              # start MySQL, run, tear down
 #   ./scripts/differential.sh --keep       # leave MySQL running for the next run
 #
+# --keep applies to MySQL and to nothing else. MySQL takes seconds to come up,
+# which is worth reusing; the engine takes milliseconds, so reusing one would
+# save nothing and cost the only guarantee this harness makes -- a run that
+# reached a server left behind by an earlier one compares MySQL against a build
+# nobody is running and reports it as agreement.
+#
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -65,21 +71,51 @@ if ! docker exec "$CONTAINER" mysqladmin ping -h 127.0.0.1 --silent >/dev/null 2
 fi
 
 cargo build --release -q -p mysql-ultralight-cli
-# Kept rather than discarded: a port already in use makes the engine exit, and
-# without its output the harness only reports that it could not connect.
+# Kept rather than discarded: the ready line is read back out of it, and a port
+# already in use makes the engine exit before printing one -- without its output
+# that failure would be a timeout with no reason attached to it.
 engine_log=$(mktemp)
 ./target/release/mysql-ultralight --port "$ENGINE_PORT" --database differential >"$engine_log" 2>&1 &
 engine_pid=$!
 
-# The engine is ready as soon as it accepts a connection; it has no warm-up.
-ready=0
+# Waits for *this* process to say it is ready, rather than for something to
+# accept a connection on the port. Those are different questions, and asking
+# the second one is how a run once compared MySQL against an engine left over
+# from an earlier debugging session: the new engine failed to bind, exited, and
+# the stale one answered the poll. Reading the ready line instead means the
+# port cannot have been taken, since this process could not have bound it and
+# printed that line otherwise -- and the line carries the instance id, which is
+# how the harness proves the connection it makes lands here too.
+instance=
 for _ in $(seq 1 100); do
-    if (echo > "/dev/tcp/127.0.0.1/${ENGINE_PORT}") >/dev/null 2>&1; then ready=1; break; fi
+    line=$(grep -m1 '^ready ' "$engine_log" 2>/dev/null || true)
+    if [ -n "$line" ]; then
+        # Matched rather than stripped: `${line##*instance=}` on a line without
+        # the field hands back the whole line, and the harness would then be
+        # told the engine's id is the word "ready".
+        case "$line" in
+            *" instance="*)
+                instance=${line##* instance=}
+                instance=${instance%% *}
+                ;;
+            *)
+                echo "the engine's ready line carries no instance id: $line" >&2
+                exit 2
+                ;;
+        esac
+        break
+    fi
+    # Checked after the log, not before: a server that starts and reports in
+    # under one poll interval would otherwise be declared dead.
+    kill -0 "$engine_pid" 2>/dev/null || break
     sleep 0.1
 done
-if [ "$ready" = 0 ]; then
-    echo "the engine never accepted a connection on port ${ENGINE_PORT}:" >&2
+if [ -z "$instance" ]; then
+    echo "the engine did not come up on port ${ENGINE_PORT}; it said:" >&2
     cat "$engine_log" >&2
+    echo "" >&2
+    echo "if that is an address already in use, a mysql-ultralight from an earlier" >&2
+    echo "run still holds the port. Stop it rather than comparing against it." >&2
     exit 2
 fi
 
@@ -88,4 +124,5 @@ fi
 cargo run --release -q -p mysql-ultralight-differential -- \
     --reference "mysql://root@127.0.0.1:${REF_PORT}" \
     --engine "mysql://root@127.0.0.1:${ENGINE_PORT}" \
+    --engine-instance "$instance" \
     ${EXTRA[@]+"${EXTRA[@]}"}

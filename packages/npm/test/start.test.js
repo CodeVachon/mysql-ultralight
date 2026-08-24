@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
@@ -19,6 +20,42 @@ async function startTracked(options) {
     const server = await start(options);
     running.push(server);
     return server;
+}
+
+/**
+ * The raw ready line, read straight from a server spawned for the purpose.
+ *
+ * Not read through `start`, which parses the line and keeps only the fields it
+ * has a use for: a contract asserted through the parser cannot see a field
+ * that stopped being printed.
+ */
+function readyLine() {
+    return new Promise((resolve, reject) => {
+        const child = spawn(resolveBinary(), ['--port', '0'], {
+            stdio: ['ignore', 'pipe', 'pipe']
+        });
+        let stdout = '';
+        const timer = setTimeout(() => {
+            child.kill('SIGKILL');
+            reject(new Error(`no ready line within 10s; stdout was "${stdout}"`));
+        }, 10_000);
+        child.stdout.setEncoding('utf8');
+        child.stdout.on('data', (chunk) => {
+            stdout += chunk;
+            const line = stdout.split('\n').find((l) => l.startsWith('ready '));
+            if (!line) return;
+            clearTimeout(timer);
+            child.kill('SIGKILL');
+            resolve(line.trim());
+        });
+        // A spawn that fails rejects immediately, but the pending timer would keep
+        // the event loop alive for its full 10s and then SIGKILL a child that never
+        // started -- so `node --test` would stall long after the test had failed.
+        child.on('error', (err) => {
+            clearTimeout(timer);
+            reject(err);
+        });
+    });
 }
 
 /** Whether a TCP port accepts a connection, which is the only real readiness. */
@@ -83,6 +120,25 @@ describe('start', () => {
         // exits before it is ready. The reason has to reach the caller rather
         // than sit in a stream nobody reads.
         await assert.rejects(() => start({ port: 1, readyTimeoutMs: 5_000 }), /before it was ready/);
+    });
+});
+
+describe('the ready line', () => {
+    it('carries an instance id, and a different one per process', async () => {
+        // `scripts/differential.sh` reads this field and the harness refuses to
+        // compare against a server that will not report it back over SQL --
+        // which is what stops a run comparing MySQL against a mysql-ultralight
+        // left behind by an earlier one. Nothing else in `scripts/check.sh`
+        // spawns the binary and reads the line, so without this the field could
+        // be dropped by a refactor and pass the whole gate.
+        const [first, second] = await Promise.all([readyLine(), readyLine()]);
+
+        assert.match(
+            first,
+            /^ready port=\d+ socket=\S+ startup_ms=[\d.]+ instance=[0-9a-f]{16}$/
+        );
+        const id = (line) => /\binstance=(\S+)/.exec(line)[1];
+        assert.notEqual(id(first), id(second), 'two servers must not share an id');
     });
 });
 
