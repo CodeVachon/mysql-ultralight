@@ -5,7 +5,7 @@ state: Todo
 parent: 8
 labels: [phase-7]
 created: 2026-08-21T13:06:15Z
-updated: 2026-08-24T14:16:58Z
+updated: 2026-08-24T14:21:04Z
 ---
 
 ## Description
@@ -42,3 +42,7 @@ Not fixed, reported instead: the CLI has no --version flag at all (--version hit
 Also noted, out of scope: crates/conformance/src/main.rs has the identical --help-exits-2 shape. Nothing in CI or check.sh runs that binary, so it cannot break a build today.
 
 Still the maintainer's to do, and deliberately not done here: the NPM_TOKEN secret, and the tag. Nothing was published, tagged, or pushed.
+
+### 2026-08-24T14:21:04Z — Christopher Vachon (user)
+
+Pre-flight complete. The half of this that a checkout can do is done, and it turned up a bug that would have aborted the release: release.yml smoke-tests each built binary with --help, which exited 2, under bash -e with fail-fast: true. Fixed in 95541dd with a test that bites. Versions, target lists, runtime package names, a prepare-release.js dry run and a real pack-and-install all check out. The maintainer-only remainder — NPM_TOKEN, pushing the two local commits, an optional dry run, and the tag — is #0076, so it stays visible instead of living in a closed issue's description.
