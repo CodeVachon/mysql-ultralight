@@ -37,8 +37,8 @@ impl Default for Options {
     }
 }
 
-fn usage() -> ! {
-    eprintln!(
+fn usage_text() -> String {
+    format!(
         "mysql-ultralight — a fast-starting, MySQL 8 compatible engine for tests
 
 USAGE:
@@ -70,7 +70,24 @@ STATE IMAGES
 
     `SELECT ultralight_restore('schema.mus')` does the same to a running server,
     which resets it between test files without paying for a new process."
-    );
+    )
+}
+
+/// Help that was asked for: stdout, and a successful exit.
+///
+/// `--help` exiting non-zero aborts any caller running under `set -e`, which
+/// is every GitHub Actions `run:` step — the release workflow's smoke test is
+/// exactly `mysql-ultralight --help`, and it took the whole release down with
+/// it.
+fn help() -> ! {
+    println!("{}", usage_text());
+    std::process::exit(0);
+}
+
+/// The same text for a misuse: stderr, and a failing exit, so a script can
+/// tell "you typed it wrong" from "here is what you asked for".
+fn usage() -> ! {
+    eprintln!("{}", usage_text());
     std::process::exit(2);
 }
 
@@ -90,7 +107,7 @@ fn parse_args() -> Options {
             "--password" => options.password = Some(value()),
             "--server-version" => options.version = value(),
             "--trace" => options.trace = true,
-            "-h" | "--help" => usage(),
+            "-h" | "--help" => help(),
             _ => usage(),
         }
     }
