@@ -99,7 +99,7 @@ impl Engine {
         // Held for the whole call: a computed column is named after the text
         // it was written as, and that text is only available here.
         let _source = Source::set(&normalised, session.sql_mode());
-        let statements = Parser::parse_sql(&MySqlDialect {}, &normalised).ok()?;
+        let statements = Parser::parse_sql(&MySqlDialect {}, &normalised.sql).ok()?;
         let [Statement::Query(query)] = statements.as_slice() else {
             return None;
         };
@@ -427,7 +427,7 @@ impl Engine {
 
         let normalised = rewrite::normalise(&bound, mode);
         let _source = Source::set(&normalised, mode);
-        let statements = Parser::parse_sql(&MySqlDialect {}, &normalised)
+        let statements = Parser::parse_sql(&MySqlDialect {}, &normalised.sql)
             .map_err(|e| EngineError::parse(format!("{e}")))?;
 
         match statements.len() {
@@ -6572,10 +6572,14 @@ const SPAN_SLACK: usize = 64;
 /// `None` rather than a guess: the caller falls back to rendering the tree,
 /// which is wrong about spacing but never about *which* expression it names.
 fn source_text(e: &Expr) -> Option<String> {
-    let sql = SOURCE.with(|s| s.borrow().as_ref().map(|c| c.sql.clone()))?;
+    let (sql, mod_operators) = SOURCE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .map(|c| (c.sql.clone(), c.mod_operators.clone()))
+    })?;
     let span = e.span();
-    let reported = byte_offset(&sql, span.start)?;
-    let from = byte_offset(&sql, span.end)
+    let reported = rewrite::byte_offset(&sql, span.start)?;
+    let from = rewrite::byte_offset(&sql, span.end)
         .unwrap_or(reported)
         .max(reported);
     if let Some(known) = SOURCE.with(|s| {
@@ -6617,7 +6621,7 @@ fn source_text(e: &Expr) -> Option<String> {
             .map(|end| sql[start..end].trim_end())
             .find(|slice| !slice.is_empty() && parses_back_to(slice, &rendered));
         if let Some(slice) = found {
-            answer = Some(slice.to_owned());
+            answer = Some(respell_mod(slice, start, &mod_operators));
             break;
         }
     }
@@ -6632,6 +6636,36 @@ fn source_text(e: &Expr) -> Option<String> {
         }
     });
     answer
+}
+
+/// Puts `MOD` back into a name the rewriter spelled `%`.
+///
+/// The parser is handed `%` because sqlparser has no infix `MOD`, but MySQL
+/// names an unaliased column after the text the *client* wrote — so without
+/// this, `SELECT n MOD 3` comes back as a column called `n % 3` and a caller
+/// reading the row by the name it asked for finds nothing.
+///
+/// `sites` are offsets into the whole statement and ascending, which is the
+/// order `normalise` records them in, each with the word that stood there.
+fn respell_mod(slice: &str, start: usize, sites: &[(usize, String)]) -> String {
+    let mut out = String::with_capacity(slice.len());
+    let mut copied = 0usize;
+    for (at, spelling) in sites
+        .iter()
+        .filter_map(|(site, spelling)| Some((site.checked_sub(start)?, spelling)))
+    {
+        if at < copied || at >= slice.len() {
+            continue;
+        }
+        out.push_str(&slice[copied..at]);
+        // The spelling the client used, not a canonical one: MySQL names
+        // `SELECT 7 mod 3` after the lowercase it was given.
+        out.push_str(spelling);
+        // Past the single byte the `%` occupies, whatever it replaced.
+        copied = at + 1;
+    }
+    out.push_str(&slice[copied..]);
+    out
 }
 
 /// Where an expression's text could end, nearest first.
@@ -6718,29 +6752,14 @@ fn starts_a_token(sql: &str, at: usize) -> bool {
     }
 }
 
-/// A `Location` as an index into the statement it came from.
-fn byte_offset(sql: &str, at: sqlparser::tokenizer::Location) -> Option<usize> {
-    if at.line == 0 {
-        return None;
-    }
-    let mut offset = 0;
-    for line in sql.split_inclusive('\n').take((at.line - 1) as usize) {
-        offset += line.len();
-    }
-    let rest = sql.get(offset..)?;
-    let column = rest
-        .char_indices()
-        .nth((at.column - 1) as usize)
-        .map(|(i, _)| i)
-        .unwrap_or(rest.len());
-    Some(offset + column)
-}
-
 /// What the current parse tree came from, for the parts of it that the tree
 /// alone does not say.
 struct Origin {
     /// The text, so a computed column can be named after what was written.
     sql: std::rc::Rc<str>,
+    /// Where in `sql` an infix `MOD` was rewritten to `%`, and how it was
+    /// spelled before it was.
+    mod_operators: std::rc::Rc<[(usize, String)]>,
     /// What each span has already been found to be called.
     ///
     /// A name is asked for at least twice per column — once to plan the
@@ -6785,9 +6804,10 @@ pub(crate) fn pipes_as_concat() -> bool {
 struct Source(Option<Origin>);
 
 impl Source {
-    fn set(sql: &str, mode: crate::dialect::SqlMode) -> Self {
+    fn set(normalised: &rewrite::Normalised, mode: crate::dialect::SqlMode) -> Self {
         let current = Origin {
-            sql: std::rc::Rc::from(sql),
+            sql: std::rc::Rc::from(normalised.sql.as_str()),
+            mod_operators: std::rc::Rc::from(normalised.mod_operators.as_slice()),
             names: std::cell::RefCell::new(std::collections::HashMap::new()),
             pipes_as_concat: mode.pipes_as_concat,
         };

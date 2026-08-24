@@ -374,6 +374,13 @@ pub const GROUPS: &[Group] = &[
             same("SELECT SOUNDEX('Robert'), SOUNDEX('Bhbb'), SOUNDEX(''), SOUNDEX(123)"),
             same("SELECT COALESCE(t, 'none'), IFNULL(n, 0), NULLIF(n, 5) FROM S ORDER BY id"),
             same("SELECT ROUND(n / 3, 2), ABS(n), n DIV 2, n % 3 FROM S ORDER BY id"),
+            // `MOD` is `%` spelled as a keyword, and the parser is given the
+            // symbol instead. That is only sound if the two are one operator
+            // at one precedence, so the grouping is asked about here — and
+            // the lowercase spelling, because an unaliased column is named
+            // after the text the client wrote and not the text that parsed.
+            same("SELECT n MOD 3, MOD(n, 3), n mod 2 + 1 FROM S ORDER BY id"),
+            same("SELECT 1 + 8 MOD 3, 8 MOD 5 * 2, 17 MOD 7 MOD 2, 7.5 MOD 2, 7 MOD 0"),
             same("SELECT t LIKE 'H%', t REGEXP '^H', t IS NULL FROM S ORDER BY id"),
             same("SELECT CAST(n AS CHAR), CAST(t AS UNSIGNED) FROM S ORDER BY id"),
             same("SELECT id FROM S WHERE n > 0 ORDER BY id"),

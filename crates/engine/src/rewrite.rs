@@ -7,6 +7,10 @@
 //! small hand-written matchers rather than by forking the parser.
 
 use crate::dialect::SqlMode;
+use sqlparser::dialect::MySqlDialect;
+use sqlparser::keywords::Keyword;
+use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer};
 
 /// A statement handled outside the general parser.
 #[derive(Debug, Clone, PartialEq)]
@@ -92,8 +96,24 @@ pub fn intercept(sql: &str) -> Option<Intercepted> {
     }
 }
 
+/// A statement rewritten for the parser, and what the rewriting cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Normalised {
+    /// The text to parse.
+    pub sql: String,
+    /// Each `%` that was written as `MOD`: its byte offset in `sql`, and the
+    /// spelling it replaced.
+    ///
+    /// MySQL names an unaliased computed column after the text it was written
+    /// as, and the executor reads that name back out of `sql` — so these are
+    /// the places where `sql` no longer says what the client said. Carried
+    /// rather than recovered: a rewritten `%` cannot be told from one that was
+    /// typed, and `mod` is as valid a spelling as `MOD`.
+    pub mod_operators: Vec<(usize, String)>,
+}
+
 /// Rewrites text the parser would reject but that needs no special handling.
-pub fn normalise(sql: &str, mode: SqlMode) -> String {
+pub fn normalise(sql: &str, mode: SqlMode) -> Normalised {
     let mut out = sql.to_owned();
 
     // `SET @x := 1` is the same statement as `SET @x = 1`; only the spelling
@@ -130,7 +150,217 @@ pub fn normalise(sql: &str, mode: SqlMode) -> String {
         out = close_call_spaces(&out);
     }
 
+    // `n MOD 3` is the same operator as `n % 3`, and only the second spelling
+    // parses. Last of the passes, so the tokenizer is shown the text the
+    // parser will see and the offsets it reports are offsets into the answer.
+    let mut mod_operators = Vec::new();
+    out = mod_operator_to_percent(&out, &mut mod_operators);
+
+    Normalised {
+        sql: out,
+        mod_operators,
+    }
+}
+
+/// Rewrites the infix `MOD` operator to `%`.
+///
+/// MySQL defines the two as one operator with one precedence, the same as `*`
+/// and `DIV`, so swapping the spelling cannot regroup an expression the way
+/// #0042 found `DIV` being regrouped. sqlparser's MySQL dialect implements
+/// only `DIV` in its infix hook, which leaves `n MOD 3` a parse error while
+/// `n % 3` and `MOD(n, 3)` both work.
+///
+/// `MOD(7, 2)` is a call and `7 MOD (2)` is the operator, and nothing in the
+/// word itself separates them — only the tokens on either side do. Both sides
+/// are checked, because either alone is wrong: without a left operand
+/// `SELECT MOD(7, 2)` becomes `SELECT %(7, 2)`, and without a right one
+/// `SELECT a mod FROM t`, where `mod` is a column alias, becomes a syntax
+/// error. This is sqlparser's own tokenizer rather than a text search so that
+/// a `MOD` inside a string, a comment or a backquoted name is not a candidate
+/// at all.
+///
+/// Each substitution is recorded in `sites` with the word it replaced, because
+/// a column named after the text it was written as has to be able to say
+/// `MOD` — or `mod`, which MySQL names just as faithfully.
+fn mod_operator_to_percent(sql: &str, sites: &mut Vec<(usize, String)>) -> String {
+    // Nearly every statement is tokenized here for nothing, so the cheap test
+    // comes first. As a *word*: `model`, `mode` and `modified_at` are ordinary
+    // column names in the target schema, and a substring test would hand every
+    // statement mentioning one a tokenizer pass it can never use.
+    if !contains_the_word_mod(sql) {
+        return sql.to_owned();
+    }
+
+    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize_with_location() else {
+        // Text the tokenizer refuses is text the parser will refuse, with a
+        // better message than a half-applied rewrite could produce.
+        return sql.to_owned();
+    };
+
+    // Whitespace and comments are not operands, and MySQL allows any amount of
+    // either around an operator, so the neighbour tests read past them.
+    let code: Vec<&TokenWithSpan> = tokens
+        .iter()
+        .filter(|t| !matches!(t.token, Token::Whitespace(_)))
+        .collect();
+
+    let mut out = String::with_capacity(sql.len());
+    let mut copied = 0usize;
+
+    for (index, token) in code.iter().enumerate() {
+        // A backquoted `mod` is `Keyword::NoKeyword`, so a column of that name
+        // never reaches the neighbour tests.
+        if !matches!(&token.token, Token::Word(word) if word.keyword == Keyword::MOD) {
+            continue;
+        }
+        let has_operands = index
+            .checked_sub(1)
+            .is_some_and(|before| ends_an_operand(&code[before].token))
+            && code
+                .get(index + 1)
+                .is_some_and(|after| begins_an_operand(&after.token));
+        if !has_operands {
+            continue;
+        }
+        let (Some(start), Some(end)) = (
+            byte_offset(sql, token.span.start),
+            byte_offset(sql, token.span.end),
+        ) else {
+            continue;
+        };
+        out.push_str(&sql[copied..start]);
+        sites.push((out.len(), sql[start..end].to_owned()));
+        out.push('%');
+        copied = end;
+    }
+
+    out.push_str(&sql[copied..]);
+
+    // Last, because no rule on the tokens either side can finish the job.
+    // `ALTER TABLE t CHANGE colx mod GEOMETRY` renames a column to `mod` and
+    // has an operand on both sides of the word, exactly as `a MOD b` does —
+    // and `GEOMETRY`, `SERIAL`, `FIXED` and the spatial types are not even
+    // keywords sqlparser knows, so no list of them would hold. What separates
+    // the two is the grammar, so the parser is asked: a rewrite that will not
+    // parse is not applied, and the statement keeps the meaning it had.
+    //
+    // The trade is that a statement broken for some *other* reason reports the
+    // error its unrewritten text produces, which will point at the `MOD`.
+    if !sites.is_empty() && Parser::parse_sql(&MySqlDialect {}, &out).is_err() {
+        sites.clear();
+        return sql.to_owned();
+    }
+
     out
+}
+
+/// Whether `mod` appears as a whole word, ignoring case.
+fn contains_the_word_mod(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    bytes.windows(3).enumerate().any(|(at, window)| {
+        window.eq_ignore_ascii_case(b"mod")
+            && at
+                .checked_sub(1)
+                .is_none_or(|before| !is_ident_byte(bytes[before]))
+            && bytes.get(at + 3).is_none_or(|after| !is_ident_byte(*after))
+    })
+}
+
+/// Whether a token can end an operand, and so be the left side of an operator.
+///
+/// The list is short on purpose. A token not on it leaves the `MOD` alone,
+/// which is the parse error that already exists; being wrong the other way
+/// rewrites SQL that works today into SQL that does not. A keyword MySQL also
+/// accepts as a column name — `year`, `status`, and a hundred more sqlparser
+/// has a `Keyword` for — is on the losing side of that trade, so `year MOD 4`
+/// stays unsupported.
+fn ends_an_operand(token: &Token) -> bool {
+    match token {
+        Token::Word(word) => {
+            word.quote_style.is_some()
+                || matches!(
+                    word.keyword,
+                    Keyword::NoKeyword | Keyword::NULL | Keyword::TRUE | Keyword::FALSE
+                )
+        }
+        Token::RParen
+        | Token::Number(..)
+        | Token::Placeholder(_)
+        | Token::SingleQuotedString(_)
+        | Token::DoubleQuotedString(_)
+        | Token::NationalStringLiteral(_)
+        | Token::HexStringLiteral(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether a token can begin an operand, and so be the right side of one.
+///
+/// A bare keyword is not one, even when a `(` follows it. Reading that as a
+/// call — sqlparser has a `Keyword` for `ABS` and most of the rest of the
+/// function library — accepts the two shapes where the word after a `MOD` is
+/// a keyword introducing a parenthesised *something else*:
+/// `SELECT n mod FROM (SELECT 1 AS n) x`, where `mod` is a column alias, and
+/// `ALTER TABLE t CHANGE old mod VARCHAR(20)`, where it is a column being
+/// renamed. Both parse today and neither would afterwards. The cost is that
+/// `n MOD ABS(x)` keeps the parse error it already had; `n MOD CAST(...)` and
+/// the other keywords below are spelled out instead.
+///
+/// `BINARY` is deliberately not among them. It starts an operand — `MOD
+/// BINARY '2'` is a cast — and it is also a MySQL column type, so accepting it
+/// re-opens the `CHANGE colx mod BINARY(16)` hole this list exists to close.
+fn begins_an_operand(token: &Token) -> bool {
+    match token {
+        Token::Word(word) => {
+            word.quote_style.is_some()
+                || matches!(
+                    word.keyword,
+                    Keyword::NoKeyword
+                        | Keyword::NULL
+                        | Keyword::TRUE
+                        | Keyword::FALSE
+                        | Keyword::CASE
+                        | Keyword::CAST
+                        | Keyword::CONVERT
+                        | Keyword::INTERVAL
+                        | Keyword::EXISTS
+                )
+        }
+        // A sign or a bitwise NOT in front of the right operand.
+        Token::Minus | Token::Plus | Token::Tilde => true,
+        Token::LParen
+        | Token::Number(..)
+        | Token::Placeholder(_)
+        | Token::SingleQuotedString(_)
+        | Token::DoubleQuotedString(_)
+        | Token::NationalStringLiteral(_)
+        | Token::HexStringLiteral(_) => true,
+        _ => false,
+    }
+}
+
+/// The byte index a tokenizer `Location` refers to.
+///
+/// Locations count lines and *characters*; every offset that indexes a
+/// statement counts bytes, and any non-ASCII text ahead of the position makes
+/// the two differ — `SELECT 'café'` aborted the process when they were
+/// confused. There is one of these because there were two, agreeing on the
+/// arithmetic and not on the edges.
+///
+/// `None` for the zero line or column sqlparser uses to mean an empty span,
+/// rather than the subtraction underflow that panics far from its cause.
+pub(crate) fn byte_offset(sql: &str, at: Location) -> Option<usize> {
+    let line = usize::try_from(at.line).ok()?.checked_sub(1)?;
+    let column = usize::try_from(at.column).ok()?.checked_sub(1)?;
+    let start: usize = sql.split_inclusive('\n').take(line).map(str::len).sum();
+    let rest = sql.get(start..)?;
+    Some(
+        start
+            + rest
+                .char_indices()
+                .nth(column)
+                .map_or(rest.len(), |(at, _)| at),
+    )
 }
 
 /// True when the statement's first keyword matches, ignoring leading comments.
@@ -660,6 +890,11 @@ fn utf8_len(first: u8) -> usize {
 mod tests {
     use super::*;
 
+    /// The text `normalise` hands the parser, which is all these look at.
+    fn normalise(sql: &str, mode: SqlMode) -> String {
+        super::normalise(sql, mode).sql
+    }
+
     #[test]
     fn recognises_the_dynamic_sql_idiom() {
         assert_eq!(
@@ -767,6 +1002,134 @@ mod tests {
         );
     }
 
+    /// sqlparser only implements `DIV` infix, so `MOD` is rewritten to the `%`
+    /// spelling of the same operator — but only where it *is* the operator.
+    #[test]
+    fn infix_mod_becomes_percent() {
+        let mode = SqlMode::default();
+        assert_eq!(
+            normalise("SELECT n MOD 3 FROM t", mode),
+            "SELECT n % 3 FROM t"
+        );
+        // Case and layout are the parser's business, not the rewriter's.
+        assert_eq!(normalise("SELECT 8 mod 3", mode), "SELECT 8 % 3");
+        assert_eq!(
+            normalise("SELECT n\n  MOD 3\nFROM t", mode),
+            "SELECT n\n  % 3\nFROM t"
+        );
+        // The right operand may be parenthesised, signed, or one of the few
+        // keywords that begin a value rather than a clause.
+        assert_eq!(normalise("SELECT 7 MOD (2)", mode), "SELECT 7 % (2)");
+        assert_eq!(normalise("SELECT n MOD -3", mode), "SELECT n % -3");
+        assert_eq!(
+            normalise("SELECT 9 MOD CAST('4' AS SIGNED)", mode),
+            "SELECT 9 % CAST('4' AS SIGNED)"
+        );
+        // A left operand that is itself a MOD call, which is the one shape
+        // where both readings of the word appear in one statement.
+        assert_eq!(
+            normalise("SELECT MOD(7, 2) MOD 3", mode),
+            "SELECT MOD(7, 2) % 3"
+        );
+        // Both readings, unrelated. The parser is the backstop for a rewrite
+        // that will not parse, but it can only revert the *statement* — so
+        // rewriting the call here would cost the operator beside it too.
+        assert_eq!(
+            normalise("SELECT MOD(7, 2), n MOD 3 FROM t", mode),
+            "SELECT MOD(7, 2), n % 3 FROM t"
+        );
+    }
+
+    /// Every `MOD` that is not the operator, which is what makes this a token
+    /// pass rather than a text substitution.
+    #[test]
+    fn a_mod_that_is_not_the_operator_is_left_alone() {
+        let mode = SqlMode::default();
+        for sql in [
+            // A call: the word has no left operand.
+            "SELECT MOD(7, 2)",
+            "SELECT a, MOD(n, 3) FROM t WHERE MOD(n, 2) = 0",
+            // A column alias: the word has no right operand. A text
+            // substitution turns this into a syntax error.
+            "SELECT a mod FROM t",
+            "SELECT id AS mod, x FROM t",
+            // The same, where the clause after the alias opens with a `(`.
+            // Reading a keyword before a paren as a function call accepted
+            // both of these and broke them.
+            "SELECT n mod FROM (SELECT 1 AS n) x",
+            // A column, in a definition and in a reference.
+            "CREATE TABLE t (mod VARCHAR(20))",
+            "INSERT INTO t (mod) VALUES (1)",
+            "ALTER TABLE t ADD COLUMN mod VARCHAR(20)",
+            "SELECT `mod` FROM t",
+            // A call on the right whose name sqlparser holds a keyword for.
+            // Supporting it needs the lookahead that breaks the line above,
+            // so this keeps the parse error it already had.
+            "SELECT 8 MOD ABS(-3)",
+            // `BINARY` starts an operand here and is a column type in
+            // `CHANGE colx mod BINARY(16)`, so it is not on the list either.
+            "SELECT 8 MOD BINARY '2'",
+            // Data and commentary, not code.
+            "SELECT 'a MOD b'",
+            "-- n MOD 3\nSELECT 1",
+        ] {
+            assert_eq!(normalise(sql, mode), sql, "{sql} should be left alone");
+        }
+    }
+
+    /// A column *renamed* to `mod` has an operand on both sides of the word,
+    /// exactly as `a MOD b` does, so nothing local separates them. Half these
+    /// type names are not keywords sqlparser knows — `GEOMETRY` and `SERIAL`
+    /// tokenize as plain identifiers — which is why the guard is the parser
+    /// rather than a list.
+    #[test]
+    fn renaming_a_column_to_mod_is_not_an_operator() {
+        for kind in [
+            "INT",
+            "VARCHAR(20)",
+            "BINARY(16)",
+            "VARBINARY(16)",
+            "CHAR(4)",
+            "DECIMAL(5,2)",
+            "FIXED(4,1)",
+            "SERIAL",
+            "GEOMETRY",
+            "LINESTRING",
+            "GEOMETRYCOLLECTION",
+            "ENUM('a','b')",
+            "JSON",
+        ] {
+            let sql = format!("ALTER TABLE t CHANGE colx mod {kind}");
+            assert_eq!(normalise(&sql, SqlMode::default()), sql, "{sql}");
+        }
+    }
+
+    /// The tokenizer costs more than the rest of this module put together, and
+    /// the schema this engine exists for is full of `model` and `modified_at`.
+    #[test]
+    fn the_fast_path_matches_mod_only_as_a_word() {
+        for sql in [
+            "SELECT model, mode, modified_at, module FROM t",
+            "SELECT amod, x_mod, mod$ FROM t",
+        ] {
+            assert!(!contains_the_word_mod(sql), "{sql}");
+        }
+        for sql in ["SELECT n MOD 3", "SELECT mod FROM t", "mod", "SELECT a-mod"] {
+            assert!(contains_the_word_mod(sql), "{sql}");
+        }
+    }
+
+    /// Locations from the tokenizer count characters; the offsets this module
+    /// splices at count bytes, and a statement with non-ASCII text ahead of
+    /// the `MOD` is where the two part company.
+    #[test]
+    fn a_non_ascii_statement_splices_at_the_right_byte() {
+        assert_eq!(
+            normalise("SELECT 'é', 8 MOD 3", SqlMode::default()),
+            "SELECT 'é', 8 % 3"
+        );
+    }
+
     /// Under ANSI_QUOTES a double-quoted word is a column, not a string.
     #[test]
     fn ansi_quotes_become_identifier_quotes() {
@@ -805,6 +1168,11 @@ mod tests {
 #[cfg(test)]
 mod review_regressions {
     use super::*;
+
+    /// The text `normalise` hands the parser, which is all these look at.
+    fn normalise(sql: &str, mode: SqlMode) -> String {
+        super::normalise(sql, mode).sql
+    }
 
     const ANSI: SqlMode = SqlMode {
         ansi_quotes: true,
@@ -882,7 +1250,7 @@ mod in_list_expansion {
     use super::*;
 
     fn expand(sql: &str) -> String {
-        normalise(sql, SqlMode::default())
+        normalise(sql, SqlMode::default()).sql
     }
 
     /// MySQL accepts an IN list of scalar subqueries; the parser reads the
@@ -964,7 +1332,7 @@ mod in_list_review_regressions {
     use super::*;
 
     fn expand(sql: &str) -> String {
-        normalise(sql, SqlMode::default())
+        normalise(sql, SqlMode::default()).sql
     }
 
     /// Slicing to a fixed byte length panics when it lands mid-character, and

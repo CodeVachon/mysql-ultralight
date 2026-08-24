@@ -7021,6 +7021,70 @@ fn a_computed_column_is_named_after_the_text_it_was_written_as() {
     assert_eq!(names, vec!["total", "doc"]);
 }
 
+/// `MOD` is the keyword spelling of `%`, and sqlparser's MySQL dialect
+/// implements only `DIV` in its infix hook, so the rewrite hands the parser
+/// the symbol instead. That is only sound if the two really are one operator
+/// at one precedence, which is what the grouping cases here check. Every
+/// answer was read off MySQL 8.3.
+#[test]
+fn mod_spelled_as_a_keyword_is_the_percent_operator() {
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        ("SELECT 7 MOD 3", "1"),
+        ("SELECT 7 mod 3", "1"),
+        // As tight as `*`, so this is `1 + (8 MOD 3)`. Rewriting the spelling
+        // without that being true would give `(1 + 8) MOD 3`, which is 0.
+        ("SELECT 1 + 8 MOD 3", "3"),
+        ("SELECT 8 MOD 3 + 1", "3"),
+        // And left-associative among the operators it ties with.
+        ("SELECT 8 MOD 5 * 2", "6"),
+        ("SELECT 17 MOD 7 MOD 2", "1"),
+        // The call and the operator in one statement, which is the shape that
+        // makes this a token pass rather than a text substitution.
+        ("SELECT MOD(17, 7) MOD 2", "1"),
+        ("SELECT 7 MOD (2)", "1"),
+        // The remainder itself is the one `%` already computed: the sign
+        // follows the dividend and a zero divisor is NULL, not an error.
+        ("SELECT -7 MOD 3", "-1"),
+        ("SELECT 7 MOD 0", "NULL"),
+        ("SELECT NULL MOD 2", "NULL"),
+        ("SELECT 7.5 MOD 2", "1.5"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // A column named `mod` is still a column. The word is the operator only
+    // between two operands, so the quoted name reads as the left one here.
+    run(&engine, &mut session, "CREATE TABLE M (id INT, `mod` INT)");
+    run(&engine, &mut session, "INSERT INTO M VALUES (1, 9)");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT `mod` MOD 4 FROM M"),
+        vec![vec!["1"]]
+    );
+
+    // An unaliased column is named after the text the client wrote, and that
+    // text says `MOD` whatever the parser had to be handed to read it. A
+    // client keys the row by this name, so getting it wrong loses the column.
+    // Down to the case the client typed: MySQL names `SELECT 7 mod 3` after
+    // the lowercase it was given, and this engine keeps case everywhere else.
+    let described = engine
+        .describe(&session, "SELECT 7 MOD 3, 1 + 8 mod 3, 7 % 3", 0)
+        .unwrap();
+    let names: Vec<&str> = described.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["7 MOD 3", "1 + 8 mod 3", "7 % 3"]);
+
+    // An alias called `mod` in front of a derived table. Reading the keyword
+    // before the `(` as a function call rewrote this into a syntax error.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT n mod FROM (SELECT 1 AS n) x"),
+        vec![vec!["1"]]
+    );
+}
+
 #[test]
 fn integer_division_binds_as_tightly_as_multiplication() {
     // `DIV` reaches the engine mis-associated: sqlparser's dialect hook reads
