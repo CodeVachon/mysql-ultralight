@@ -6647,14 +6647,19 @@ fn a_computed_column_keeps_the_unsigned_flag() {
     // whether it parses as a float also takes `inf` and `1e3` and hands them
     // straight back under a NEWDECIMAL, which is not a decimal any client can
     // read; MySQL answers 0 and 1000.
+    //
+    // And a cast declares a scale even when it does not write one — a bare
+    // `DECIMAL` is `DECIMAL(10,0)` — so `-2.5` comes back rounded away from
+    // zero rather than as the text it was handed. Measured on 8.3.
     assert_eq!(
         rows(
             &engine,
             &mut session,
             "SELECT CAST('inf' AS DECIMAL), CAST('1e3' AS DECIMAL), \
-                    CAST('nan' AS DECIMAL), CAST('-2.5' AS DECIMAL)"
+                    CAST('nan' AS DECIMAL), CAST('-2.5' AS DECIMAL), \
+                    CAST('3.75' AS DECIMAL(10,1)), CAST(1 AS DECIMAL(8,2))"
         ),
-        vec![vec!["0", "1000", "0", "-2.5"]]
+        vec![vec!["0", "1000", "0", "-3", "3.8", "1.00"]]
     );
 
     // A union is unsigned only if both branches are, in either order — the
@@ -7512,6 +7517,239 @@ fn a_bitwise_chain_composes_over_bits_it_cannot_hand_out() {
             .execute(&mut session, sql, &[])
             .expect_err("a bitwise operator over a binary string is not implemented");
         assert_eq!(error.code, 1235, "{sql}");
+    }
+}
+
+#[test]
+fn a_bitwise_decimal_operand_is_read_exactly() {
+    // #0052 measured that a *number* operand rounds to an integer away from
+    // zero at a half. A decimal is one, and reaching that rule through an
+    // `f64` loses it: 4503599627370496.5 is the first tie a double cannot
+    // hold, and rounds to ...496 there where MySQL answers ...497. Counting
+    // the digits instead is exact for anything MySQL's own DECIMAL holds.
+    // Every answer here was read off MySQL 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE D (id INT NOT NULL, wide DECIMAL(20,1), one DECIMAL(10,1), \
+         two DECIMAL(10,2), huge DECIMAL(30,0), wide30 DECIMAL(40,30), \
+         carry DECIMAL(40,30))",
+    );
+    // Written as strings, because a decimal *literal* is an f64 to this engine
+    // on the way in as much as on the way out — see #0070 — and the column is
+    // what this test is about.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO D VALUES (1, '4503599627370496.5', '3.7', '2.55', \
+         '999999999999999999999999999999', '1234567890.5', \
+         '9.9999999999999999999999999999995')",
+    );
+    for (sql, expected) in [
+        // Ten integer digits at a scale of 30 is more than an `i128` counts,
+        // and MySQL holds it: the digits are rescaled on the characters
+        // rather than folded through an `f64`, which answered `i128::MAX`.
+        (
+            "SELECT wide30 FROM D",
+            "1234567890.500000000000000000000000000000",
+        ),
+        // Including the carry, which can run off the front of the number.
+        ("SELECT carry FROM D", "10.000000000000000000000000000000"),
+        ("SELECT wide | 0 FROM D", "4503599627370497"),
+        ("SELECT wide & 1 FROM D", "1"),
+        ("SELECT one | 0 FROM D", "4"),
+        ("SELECT two | 0 FROM D", "3"),
+        // A decimal past 64 bits saturates at the *signed* end, which is not
+        // where a string saturates: `'99999999999999999999' | 0` is the
+        // unsigned maximum and this is 9223372036854775807.
+        ("SELECT huge | 0 FROM D", "9223372036854775807"),
+        // The cast has to carry the type too, or the operand arrives as text
+        // and is read by its leading digits: this answered 3.
+        ("SELECT CAST('3.7' AS DECIMAL(10,1)) | 0", "4"),
+        ("SELECT CAST('2.5' AS DECIMAL(10,1)) | 0", "3"),
+        // And a decimal literal is read off the token for the same reason the
+        // column is read off its digits.
+        ("SELECT 4503599627370496.5 | 0", "4503599627370497"),
+        ("SELECT 4503599627370496.5 & 1", "1"),
+        // A sign is a unary operator to the parser and part of the number to
+        // MySQL, so the same digits have to read the same way with one: this
+        // answered 0 and 0 while the positive twin beside it answered
+        // correctly, which is the same number diverging by how it was written.
+        ("SELECT -4503599627370496.5 & 1", "1"),
+        ("SELECT -4503599627370496.5 & 3", "3"),
+        ("SELECT -3.7 & 255", "252"),
+        // A leading `+` is a unary operator too, and it has to be peeled for
+        // the same reason: with it left on, the tie goes back through the f64.
+        ("SELECT +4503599627370496.5 & 1", "1"),
+        ("SELECT +2.5 & 3", "3"),
+        // Signs are counted rather than concatenated. Spelling `- -2.5` as
+        // the text `"--2.5"` made it not a decimal at all, so it fell to the
+        // leading-number reader and answered 0 — a correct answer turned
+        // wrong by the fix beside it.
+        ("SELECT - -2.5 & 3", "3"),
+        ("SELECT - - -2.5 & 3", "1"),
+        ("SELECT -(-2.5) & 3", "3"),
+        // Parentheses group a number without retyping it, so the exact
+        // reading has to see through them.
+        ("SELECT -(4503599627370496.5) & 1", "1"),
+        // An exponent is a DOUBLE to MySQL rather than a decimal, so it keeps
+        // the reading it had.
+        ("SELECT 1e2 | 0", "100"),
+        // Past the 38 digits an `i128` counts the digits are kept rather than
+        // read through an `f64`, which answered `i128::MAX` — a number nothing
+        // asked for. MySQL's DECIMAL goes to 65, so these are values it holds
+        // and answers exactly.
+        (
+            "SELECT CAST('123456789012345678901234567890123456789012' AS DECIMAL(65,0))",
+            "123456789012345678901234567890123456789012",
+        ),
+        (
+            "SELECT CAST('12345678901234567890123456789012345678.12' AS DECIMAL(65,2))",
+            "12345678901234567890123456789012345678.12",
+        ),
+        // The scale is reached exactly even where counting it would overflow
+        // an `i128` — `DECIMAL(65,30)` spends the whole budget on the scale,
+        // so this padded to 30 places rather than handing back `1.5`.
+        (
+            "SELECT CAST('1.5' AS DECIMAL(65,30))",
+            "1.500000000000000000000000000000",
+        ),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn a_bitwise_temporal_operand_is_refused_rather_than_read_as_digits() {
+    // MySQL converts a temporal *type* to its packed digits here — a DATE of
+    // 2026-01-02 is 20260102, a DATETIME 20260102030405, a TIME of 06:07:08 is
+    // 60708 — and a *string* of the same characters by its leading integer,
+    // giving 2026, 2026 and 6. Both measured on 8.3. The engine stores a
+    // temporal as `Value::Text`, so the two are the same value by the time an
+    // operator sees them and only one of the two answers can be given.
+    //
+    // Which makes this a refusal rather than a fix: it waits on #0054 giving
+    // the operand its declared type. Answering the string reading was the
+    // regression #0079 records.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (id INT NOT NULL, d DATE, dt DATETIME, tm TIME, \
+         ts TIMESTAMP NULL, y YEAR, s VARCHAR(30), near VARCHAR(30), part VARCHAR(30), \
+         packed VARCHAR(30), noisy VARCHAR(30), clockish VARCHAR(30), \
+         dtm DATETIME)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO T VALUES (1, '2026-01-02', '2026-01-02 03:04:05', '06:07:08', \
+         '2026-01-02 03:04:05', 2026, '2026-01-02', '1-2', '2026-01', '20260102', '2026-01-02 x', '12:34', '2026-01-02 03:04')",
+    );
+    for sql in [
+        "SELECT d | 0 FROM T",
+        "SELECT dt | 0 FROM T",
+        "SELECT tm | 0 FROM T",
+        "SELECT ts | 0 FROM T",
+        "SELECT CAST('2026-01-02' AS DATE) | 0",
+        // `IF`, `GREATEST` and a `CASE` keep the temporal in MySQL — all
+        // three are 20260102 there — so they stay refused where the string
+        // functions below do not. Measured rather than reasoned from
+        // `COALESCE`, which does the opposite.
+        "SELECT IF(1, d, '0') | 0 FROM T",
+        "SELECT GREATEST(d, '0') | 0 FROM T",
+        "SELECT (CASE WHEN 1 THEN d ELSE '0' END) | 0 FROM T",
+        // And `COALESCE` only becomes a string when something in it is one:
+        // with no string argument it keeps the temporal, 20260102 in MySQL,
+        // so it refuses like the bare column does.
+        "SELECT COALESCE(d, d) | 0 FROM T",
+        "SELECT IFNULL(d, NULL) | 0 FROM T",
+        "SELECT CAST('06:07:08' AS TIME) | 0",
+        // A fractional part belongs to the clock and does not take the value
+        // out of the refusal: MySQL reads a TIME(2) of 06:07:08.25 as 60708,
+        // and its leading integer is 6.
+        "SELECT CAST('06:07:08.25' AS TIME) | 0",
+        "SELECT ~d FROM T",
+        // A VARCHAR holding those characters refuses too. That is the cost of
+        // the refusal and it is paid knowingly: nothing distinguishes this
+        // column's value from the DATE column's, which is the whole defect.
+        "SELECT s | 0 FROM T",
+        // Two groups *after a date* are still a temporal: the engine stores a
+        // DATETIME as the text it was written with rather than normalising
+        // it, so this column holds `2026-01-02 03:04` and MySQL reads the
+        // column it came from as 20260102030400.
+        "SELECT dtm | 0 FROM T",
+    ] {
+        let error = engine
+            .execute(&mut session, sql, &[])
+            .expect_err("a temporal operand has two readings and no type to pick between them");
+        assert_eq!(error.code, 1235, "{sql}");
+        assert!(
+            error.message.contains("reads one way as a DATE"),
+            "{sql} refused with {}",
+            error.message
+        );
+    }
+
+    // And the refusal is drawn no wider than that. A quoted string is a string
+    // however much it looks like a date — the statement says so — and MySQL
+    // answers 2026 for it, which is the answer this engine keeps. A YEAR is an
+    // integer and never had the problem.
+    for (sql, expected) in [
+        ("SELECT '2026-01-02' | 0", "2026"),
+        ("SELECT '2026-01-02 03:04:05' | 0", "2026"),
+        ("SELECT '06:07:08' | 0", "6"),
+        ("SELECT '2026' | 0", "2026"),
+        ("SELECT '20260102' | 0", "20260102"),
+        ("SELECT y | 0 FROM T", "2026"),
+        // Three groups of digits and no fewer, tested where a literal cannot
+        // decide it: these are columns, so only the shape rule stands between
+        // them and the refusal above. MySQL reads both as strings — 1 and
+        // 2026 — and so does this.
+        ("SELECT near | 0 FROM T", "1"),
+        ("SELECT part | 0 FROM T", "2026"),
+        // A run of digits is not a clock, which matters beyond the string:
+        // this engine stores a temporal as the text it was written with, so a
+        // DATE written `'20260102'` sits in its column exactly like this — and
+        // 20260102 is what MySQL reads out of that column too.
+        ("SELECT packed | 0 FROM T", "20260102"),
+        // A date followed by something that is not a clock is neither, so the
+        // date half alone does not decide it: MySQL answers 2026.
+        ("SELECT noisy | 0 FROM T", "2026"),
+        // And two groups *without* a date in front are not a clock, because
+        // nothing renders a temporal that way and refusing them would take
+        // ordinary text with it — MySQL reads this as 12.
+        ("SELECT clockish | 0 FROM T", "12"),
+        // An expression whose *result* type the statement declares is a
+        // string, whatever it was given: each of these is 2026 in MySQL over
+        // the DATE column, and refusing them took away answers the engine
+        // gives correctly. The VARCHAR column above stays refused because
+        // nothing in the statement says what it holds.
+        ("SELECT CAST(d AS CHAR) | 0 FROM T", "2026"),
+        ("SELECT CONCAT(d, '') | 0 FROM T", "2026"),
+        ("SELECT LEFT(d, 10) | 0 FROM T", "2026"),
+        ("SELECT SUBSTRING(d, 1, 10) | 0 FROM T", "2026"),
+        ("SELECT TRIM(d) | 0 FROM T", "2026"),
+        ("SELECT UPPER(d) | 0 FROM T", "2026"),
+        // MySQL aggregates a string with anything to a string, so these two
+        // become strings where `IF` and `GREATEST` above do not.
+        ("SELECT COALESCE(d, '0') | 0 FROM T", "2026"),
+        ("SELECT IFNULL(d, '0') | 0 FROM T", "2026"),
+        // And the same read off an expression with no column in it at all.
+        ("SELECT CAST('2026-01-02' AS CHAR) | 0", "2026"),
+        ("SELECT CONCAT('2026-', '01-02') | 0", "2026"),
+        ("SELECT LEFT('2026-01-02 03:04:05', 10) | 0", "2026"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
     }
 }
 

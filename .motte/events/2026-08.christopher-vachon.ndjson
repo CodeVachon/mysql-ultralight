@@ -167,3 +167,4 @@
 {"at":"2026-08-24T18:02:26Z","id":82,"by":"Christopher Vachon","as":"user","type":"created","title":"information_schema nullability is conditioned on sql_mode in MySQL","state":"Todo"}
 {"at":"2026-08-24T18:02:26Z","id":83,"by":"Christopher Vachon","as":"user","type":"created","title":"A concatenation of two literals is typed nullable","state":"Todo"}
 {"at":"2026-08-24T18:45:15Z","id":81,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-24T19:24:53Z","id":78,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}

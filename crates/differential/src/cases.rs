@@ -384,6 +384,18 @@ pub const GROUPS: &[Group] = &[
             same("SELECT 1 + 8 MOD 3, 8 MOD 5 * 2, 17 MOD 7 MOD 2, 7.5 MOD 2, 7 MOD 0"),
             same("SELECT t LIKE 'H%', t REGEXP '^H', t IS NULL FROM S ORDER BY id"),
             same("SELECT CAST(n AS CHAR), CAST(t AS UNSIGNED) FROM S ORDER BY id"),
+            // A cast to DECIMAL carries the scale it declares, filling in
+            // (10,0) where it writes none, and reads a number out of text that
+            // is not a decimal at all. The engine handed the text straight
+            // back: `CAST('-2.5' AS DECIMAL)` was -2.5 where MySQL says -3.
+            same("SELECT CAST('3.75' AS DECIMAL(10,1)), CAST('-2.5' AS DECIMAL), \
+                  CAST('abc' AS DECIMAL(10,2)), CAST('1e3' AS DECIMAL(6,2))"),
+            // MySQL's DECIMAL holds 65 digits and this engine counts 38, so
+            // past that the digits are kept rather than folded through an
+            // f64 — which answered `i128::MAX` for a number nothing asked for.
+            same("SELECT CAST('123456789012345678901234567890123456789012' AS DECIMAL(65,0)), \
+                  CAST('12345678901234567890123456789012345678.12' AS DECIMAL(65,2))"),
+            same("SELECT CAST(n AS DECIMAL(8,2)), CAST(t AS DECIMAL(6,1)) FROM S ORDER BY id"),
             same("SELECT id FROM S WHERE n > 0 ORDER BY id"),
             same("SELECT id FROM S WHERE t = 'hello' ORDER BY id"),
             same("SELECT MD5('x'), LEFT(t, 2), RIGHT(t, 2) FROM S ORDER BY id"),
@@ -395,6 +407,16 @@ pub const GROUPS: &[Group] = &[
             "CREATE TABLE B (id INT NOT NULL, n INT NULL, neg INT NULL, u BIGINT UNSIGNED NULL, \
              PRIMARY KEY (id))",
             "INSERT INTO B VALUES (1, 5, -1, 12), (2, NULL, NULL, NULL), (3, 12, -6, 255)",
+            // Written as strings, because a decimal literal reaches a column
+            // through an f64 here and the digits are the point of the table.
+            "CREATE TABLE Bd (id INT NOT NULL, wide DECIMAL(20,1), one DECIMAL(10,1), \
+             two DECIMAL(10,2), huge DECIMAL(30,0), near VARCHAR(30), part VARCHAR(30), \
+             packed VARCHAR(30), noisy VARCHAR(30), clockish VARCHAR(30), dt DATE, \
+             wide30 DECIMAL(40,30), carry DECIMAL(40,30), PRIMARY KEY (id))",
+            "INSERT INTO Bd VALUES (1, '4503599627370496.5', '3.7', '2.55', \
+             '999999999999999999999999999999', '1-2', '2026-01', '20260102', \
+             '2026-01-02 x', '12:34', '2026-01-02', '1234567890.5', \
+             '9.9999999999999999999999999999995')",
         ],
         cases: &[
             same("SELECT 7 ^ 3, 7 & 3, 7 | 3, 1 << 3, 16 >> 2, ~-1"),
@@ -449,6 +471,52 @@ pub const GROUPS: &[Group] = &[
             same("SELECT ~neg, neg & 7, id & 1, id << 2, u & 15 FROM B ORDER BY id"),
             same("SELECT id FROM B WHERE id & 1 = 1 ORDER BY id"),
             same("SELECT (7 ^ 3) = 4, (7 & 3) > 1, 7 ^ 3 IS NULL, (NULL & 1) IS NULL"),
+            // A decimal operand is rounded on its own digits rather than
+            // through a double: 4503599627370496.5 is the first tie a double
+            // cannot hold, and answering ...496 for MySQL's ...497 puts every
+            // bit below it on the wrong side. Past 64 bits it saturates at the
+            // *signed* end, which is not where a string saturates.
+            same("SELECT wide | 0, wide & 1, one | 0, two | 0, huge | 0 FROM Bd ORDER BY id"),
+            same("SELECT CAST('3.7' AS DECIMAL(10,1)) | 0, CAST('2.5' AS DECIMAL(10,1)) | 0, \
+                  CAST('-0.4' AS DECIMAL(10,1)) | 0"),
+            // A literal with a point is a DECIMAL to MySQL and an f64 here, so
+            // it is read off the token for the same reason. An exponent is a
+            // DOUBLE to MySQL too and keeps the reading it had.
+            same("SELECT 4503599627370496.5 | 0, 4503599627370496.5 & 1, 1e2 | 0, 2.675 | 0"),
+            // A sign is a unary operator to the parser and part of the number
+            // to MySQL, so the same digits have to read the same way with one.
+            same("SELECT -4503599627370496.5 & 1, -4503599627370496.5 & 3, -3.7 & 255, \
+                  +4503599627370496.5 & 1, +2.5 & 3"),
+            // Signs are counted, not concatenated, and parentheses group a
+            // number without retyping it.
+            same("SELECT - -2.5 & 3, - - -2.5 & 3, -(-2.5) & 3, \
+                  -(4503599627370496.5) & 1"),
+            // A quoted string is a string however much it looks like a date,
+            // and these are the answers the engine keeps while the *typed*
+            // temporal beside them is refused — see #0054 and #0079.
+            same("SELECT '2026-01-02' | 0, '2026-01-02 03:04:05' | 0, '06:07:08' | 0, \
+                  '2026' | 0, '20260102' | 0"),
+            // And the line the refusal is drawn on, asked where no literal can
+            // decide it: two groups of digits are not a date, a run of them is
+            // not a clock, and a date followed by something else is neither.
+            same("SELECT near | 0, part | 0, packed | 0, noisy | 0, clockish | 0 \
+                  FROM Bd ORDER BY id"),
+            // An expression whose *result* type the statement declares is a
+            // string, and MySQL reads it as one however its argument was
+            // typed. Refusing these took away answers the engine gives
+            // correctly; the plain column they are built from stays refused
+            // because nothing says what it holds.
+            same("SELECT CAST(dt AS CHAR) | 0, CONCAT(dt, '') | 0, LEFT(dt, 10) | 0, \
+                  SUBSTRING(dt, 1, 10) | 0 FROM Bd ORDER BY id"),
+            same("SELECT TRIM(dt) | 0, UPPER(dt) | 0, COALESCE(dt, '0') | 0, \
+                  IFNULL(dt, '0') | 0 FROM Bd ORDER BY id"),
+            same("SELECT CAST('2026-01-02' AS CHAR) | 0, CONCAT('2026-', '01-02') | 0, \
+                  LEFT('2026-01-02 03:04:05', 10) | 0"),
+            // The scale is reached exactly however many digits stand in front
+            // of it: `DECIMAL(40,30)` overflows the counted rescaler at ten,
+            // and the carry can run off the front of the number.
+            same("SELECT wide30, carry FROM Bd ORDER BY id"),
+            same("SELECT CAST('1.5' AS DECIMAL(65,30))"),
         ],
     },
     Group {

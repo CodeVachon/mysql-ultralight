@@ -55,6 +55,80 @@ pub fn units(text: &str, scale: usize) -> Option<i128> {
     Some(if negative { -value } else { value })
 }
 
+/// `text` at exactly `scale` digits, worked on the characters.
+///
+/// [`rescale`] counts in an `i128` and runs out at 38 digits — and spends the
+/// budget on the scale before the whole part is reached at all, so a
+/// `DECIMAL(40,30)` overflows at ten integer digits. MySQL's DECIMAL is 65
+/// digits and 30 places, so those are values it holds and answers exactly,
+/// and folding them through an `f64` answered `i128::MAX`'s digits instead —
+/// a number nothing asked for.
+///
+/// Rounds half away from zero on the first digit dropped, which is the rule
+/// [`units`] applies rather than "round what is left over": 1.0049 at two
+/// places is 1.00 both there and here.
+///
+/// `None` for text that is not a decimal at all. That case has a correct
+/// answer of its own — the number MySQL reads out of it — and is not this
+/// function's to give.
+pub fn rescale_wide(text: &str, scale: usize) -> Option<String> {
+    let trimmed = text.trim();
+    let (negative, rest) = match trimmed.strip_prefix(['-', '+']) {
+        Some(rest) => (trimmed.starts_with('-'), rest),
+        None => (false, trimmed),
+    };
+    let (whole, fraction) = rest.split_once('.').unwrap_or((rest, ""));
+    let plain = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if !plain(whole) || !plain(fraction) || (whole.is_empty() && fraction.is_empty()) {
+        return None;
+    }
+
+    // Whole part then the fraction padded out to the scale, as one run of
+    // digits with the point's position implied by `scale`.
+    let mut digits: Vec<u8> = whole.bytes().collect();
+    for i in 0..scale {
+        digits.push(*fraction.as_bytes().get(i).unwrap_or(&b'0'));
+    }
+    if fraction.as_bytes().get(scale).is_some_and(|d| *d >= b'5') {
+        // Carried through the string rather than added, because 9.99 at one
+        // place is 10.0 and the carry can run off the front into a new digit.
+        let mut at = digits.len();
+        loop {
+            if at == 0 {
+                digits.insert(0, b'1');
+                break;
+            }
+            at -= 1;
+            if digits[at] == b'9' {
+                digits[at] = b'0';
+            } else {
+                digits[at] += 1;
+                break;
+            }
+        }
+    }
+
+    let (whole, fraction) = digits.split_at(digits.len() - scale);
+    let whole = std::str::from_utf8(whole).ok()?.trim_start_matches('0');
+    let fraction = std::str::from_utf8(fraction).ok()?;
+    // Never empty before the point: `render` left-pads for the same reason,
+    // because five units at scale two is `0.05` and not `.05`.
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let written = if scale == 0 {
+        whole.to_owned()
+    } else {
+        format!("{whole}.{fraction}")
+    };
+    // A value that rounded to zero has no sign, which is `render`'s answer
+    // too: -0.4 at scale zero is `0` and not `-0`.
+    let zero = whole == "0" && fraction.bytes().all(|b| b == b'0');
+    Some(if negative && !zero {
+        format!("-{written}")
+    } else {
+        written
+    })
+}
+
 /// A count of units at `scale`, written out.
 pub fn render(units: i128, scale: usize) -> String {
     let negative = units < 0;
@@ -165,4 +239,78 @@ pub fn shortest(mut units: i128, mut scale: usize) -> (i128, usize) {
         scale -= 1;
     }
     (units, scale)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two rescalers have to be one answer, because `decimal_digits` picks
+    /// between them by whether an `i128` happened to overflow — a boundary no
+    /// caller can see and none should be able to feel.
+    #[test]
+    fn the_wide_rescaler_agrees_with_the_counted_one() {
+        let values = [
+            "0",
+            "1",
+            "1.5",
+            "2.5",
+            "-2.5",
+            "1.005",
+            "-1.005",
+            "0.4",
+            "-0.4",
+            "9.99",
+            "-9.99",
+            "0.05",
+            "-0.05",
+            "12345.6789",
+            "-12345.6789",
+            "1.0049",
+            "999.995",
+            "-999.995",
+            "+7.5",
+            "  7.5  ",
+            ".5",
+            "-.5",
+            "100",
+            "0.000",
+        ];
+        for text in values {
+            for scale in 0..=6 {
+                assert_eq!(
+                    rescale(text, scale),
+                    rescale_wide(text, scale),
+                    "{text} at scale {scale}"
+                );
+            }
+        }
+    }
+
+    /// And it answers where the counted one cannot, which is the whole reason
+    /// it exists: a `DECIMAL(40,30)` overflows an `i128` at ten integer digits
+    /// and MySQL holds it, so the fallback is reached by ordinary values.
+    #[test]
+    fn the_wide_rescaler_reaches_past_an_i128() {
+        assert_eq!(rescale("1234567890.5", 30), None);
+        assert_eq!(
+            rescale_wide("1234567890.5", 30).as_deref(),
+            Some("1234567890.500000000000000000000000000000")
+        );
+        // The carry runs off the front of the number, which is why it is
+        // propagated through the digits rather than added to them.
+        assert_eq!(
+            rescale_wide("9.9999999999999999999999999999995", 30).as_deref(),
+            Some("10.000000000000000000000000000000")
+        );
+        // 42 digits, which MySQL's 65 hold and an `i128`'s 38 do not.
+        let long = "123456789012345678901234567890123456789012";
+        assert_eq!(rescale(long, 0), None);
+        assert_eq!(rescale_wide(long, 0).as_deref(), Some(long));
+        // Text that is not a decimal is not this function's to answer.
+        assert_eq!(rescale_wide("abc", 2), None);
+        assert_eq!(rescale_wide("1e3", 2), None);
+        assert_eq!(rescale_wide("-", 2), None);
+        assert_eq!(rescale_wide(".", 2), None);
+    }
 }

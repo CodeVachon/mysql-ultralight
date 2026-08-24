@@ -1021,28 +1021,23 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
             }
             Value::Float32(narrowed)
         }
-        // Kept as text where it really is a number, because that is how a
-        // decimal holds digits an f64 would lose. Where it is not, the number
-        // MySQL reads out of it: `CAST('abc' AS DECIMAL)` is 0 there, and
-        // handing back `abc` contradicted the NOT NULL this is described with.
+        // Tagged and rescaled, exactly as a DECIMAL column's value is. The tag
+        // is what carries the type past the cast: without it the result is an
+        // ordinary string, and every later reader has to guess — a bitwise
+        // operand read `CAST('3.7' AS DECIMAL(10,1))` by its leading digits
+        // and answered 3 where MySQL rounds the decimal and answers 4.
+        //
+        // The scale comes with it, because the cast declares one and MySQL
+        // applies it: `CAST('3.75' AS DECIMAL(10,1))` is 3.8 and a bare
+        // `DECIMAL` is `DECIMAL(10,0)`, so `CAST('-2.5' AS DECIMAL)` is -3.
+        // Handing the text back unrounded contradicted the NEWDECIMAL the
+        // column is described as, at the scale it was described with.
         D::Decimal(_) | D::Numeric(_) | D::Dec(_) => {
-            let text = value.as_text();
-            // Digits and an optional point, which is what a decimal is. A
-            // parse as a float would also take `inf` and `1e3` and hand them
-            // back untouched under a NEWDECIMAL, where MySQL answers 0 and
-            // 1000 — neither of them something a client can read as a decimal.
-            let plain = {
-                let digits = text.trim().strip_prefix(['-', '+']).unwrap_or(text.trim());
-                !digits.is_empty()
-                    && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
-                    && digits.chars().filter(|c| *c == '.').count() <= 1
-                    && digits.chars().any(|c| c.is_ascii_digit())
-            };
-            if plain {
-                Value::Text(text)
-            } else {
-                Value::Text(Value::Float(value.as_number()).as_text())
-            }
+            // Through `SqlType`, so the cast and a column declared the same
+            // way fill an omitted scale in one place: a bare `DECIMAL` is
+            // `DECIMAL(10,0)` to both.
+            let scale = crate::types::SqlType::from_ast(ty)?.scale.unwrap_or(0) as usize;
+            Value::Decimal(crate::types::decimal_digits(&value.as_text(), scale))
         }
         D::Char(_) | D::Varchar(_) | D::Text | D::CharacterVarying(_) | D::Character(_) => {
             Value::Text(value.as_text())

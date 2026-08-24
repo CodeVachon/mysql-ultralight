@@ -312,7 +312,7 @@ fn format_float(v: f64) -> String {
 /// Not a parse of the whole thing: MySQL takes the leading numeric part and
 /// ignores the rest, so `'12abc'` is 12 and `'abc'` is 0. Used wherever a
 /// string has to answer a numeric question, which includes being true or false.
-fn numeric_prefix(text: &str) -> f64 {
+pub(crate) fn numeric_prefix(text: &str) -> f64 {
     let trimmed = text.trim_start();
     let bytes = trimmed.as_bytes();
     let digit = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_digit);

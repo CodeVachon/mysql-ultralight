@@ -448,13 +448,7 @@ impl SqlType {
                 // 1.5 in a `DECIMAL(6,2)` is `1.50` and 1.005 is `1.01`.
                 // Keeping whatever the caller wrote made the scale a property
                 // of the statement rather than of the column.
-                let scale = self.scale.unwrap_or(0) as usize;
-                let digits = crate::decimal::rescale(&stored, scale).unwrap_or_else(|| {
-                    // Not a decimal at all, so the number MySQL reads out of
-                    // it — which is 0 for a name and clamped for an overflow.
-                    crate::decimal::from_f64(Value::text(&stored).as_number(), scale)
-                });
-                Value::Decimal(digits)
+                Value::Decimal(decimal_digits(&stored, self.scale.unwrap_or(0) as usize))
             }
             TypeKind::Blob => match value {
                 Value::Bytes(b) => Value::Bytes(b),
@@ -497,6 +491,24 @@ impl SqlType {
             _ => Value::Text(value.as_text()),
         })
     }
+}
+
+/// `text` as a DECIMAL of `scale` digits after the point.
+///
+/// The same conversion on the way into a column and at a `CAST`, because MySQL
+/// applies the same one: `CAST('3.75' AS DECIMAL(10,1))` is 3.8 there exactly
+/// as a `DECIMAL(10,1)` column stores 3.75 as 3.8.
+///
+/// A decimal is rescaled exactly however many digits it has: the counted path
+/// first, and the one that works on the characters where an `i128` runs out —
+/// which a `DECIMAL(40,30)` reaches at ten integer digits, well inside what
+/// MySQL holds. Only text that is not a decimal at all becomes the number
+/// MySQL reads out of it, which is 0 for a name and 1000 for `'1e3'` — neither
+/// of them text a client could read back under a NEWDECIMAL.
+pub(crate) fn decimal_digits(text: &str, scale: usize) -> String {
+    crate::decimal::rescale(text, scale)
+        .or_else(|| crate::decimal::rescale_wide(text, scale))
+        .unwrap_or_else(|| crate::decimal::from_f64(crate::value::numeric_prefix(text), scale))
 }
 
 fn int_type(name: &str, display: Option<u64>, unsigned: bool) -> SqlType {

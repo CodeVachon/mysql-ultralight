@@ -1399,9 +1399,37 @@ fn bit_pattern(bits: u64) -> EngineResult<Value> {
 /// two oppositely: `_binary'ab' & 1` is 0, reading the bytes as the characters
 /// `ab`, while `X'0F' & 255` is 15, reading them as a number. One `Value` and
 /// two answers, so neither is given.
+///
+/// A string spelled like a date or a time is refused for the same reason, and
+/// it is the one the caller's literal check exists for. Measured on 8.3, a
+/// temporal *type* converts to its packed digits — a DATE of 2026-01-02 is
+/// 20260102, a DATETIME 20260102030405, a TIME of 06:07:08 is 60708 — where a
+/// *string* of those characters converts by its leading integer and gives 2026
+/// and 6. The engine stores a temporal as `Value::Text`, so the two arrive
+/// here identical and neither answer can be given. See #0054: until the
+/// operand carries its declared type, this is a refusal rather than a fix.
 fn bit_operand(v: &Value) -> EngineResult<u64> {
     Ok(match v {
         Value::Int(n) => *n as u64,
+        // Exact rather than through an `f64`, because the rounding is a tie
+        // rule and a double loses ties past the fifteenth digit:
+        // `DECIMAL(20,1)` holding 4503599627370496.5 is 4503599627370497 in
+        // MySQL and 4503599627370496 through a double, which lands on the
+        // wrong side of every bit it is then masked with.
+        Value::Decimal(text) => decimal_bits(text),
+        // `Value::Json` as well as `Value::Text`, so two byte-identical values
+        // cannot answer differently by which tag they carry. No test bites
+        // this arm and none can: a serialised document never spells a bare
+        // temporal, because a JSON string scalar keeps its quotes and
+        // `"2026-01-02"` is not date-shaped. It is here because a rule with an
+        // unexplained exception in it is a rule nobody can apply, not because
+        // it is reachable.
+        Value::Text(s) | Value::Json(s) if temporal_shaped(s) => {
+            return Err(unsupported(format!(
+                "a bitwise operator over `{s}`, which reads one way as a DATE, \
+                 DATETIME or TIME and another as a string"
+            )));
+        }
         Value::Text(s) | Value::Json(s) => integer_prefix(s),
         Value::Bytes(_) => {
             return Err(unsupported("a bitwise operator over a binary string"));
@@ -1441,6 +1469,98 @@ fn integer_prefix(s: &str) -> u64 {
     } else {
         digits.parse::<u64>().unwrap_or(u64::MAX)
     }
+}
+
+/// The integer MySQL reads out of an exact decimal.
+///
+/// Rounded to an integer away from zero at a half, which is the rule #0052
+/// measured for a *number* operand — `2.5 | 0` is 3 and `-2.5 | 0` is -3 — but
+/// applied to the digits rather than to a double, so a decimal wider than an
+/// `f64`'s fifteen significant digits keeps its tie.
+///
+/// Saturating at the *signed* range, which is measured and is not what a
+/// string does: a `DECIMAL(30,0)` of thirty digits reads 9223372036854775807
+/// and its negative reads back the bits of `i64::MIN`, where
+/// `'99999999999999999999' | 0` is the unsigned maximum.
+///
+/// That saturation is MySQL's for a *signed* decimal only. An UNSIGNED one is
+/// read through MySQL's unsigned path and keeps its value —
+/// `DECIMAL(30,0) UNSIGNED` holding 12345678901234567890 answers that number,
+/// and `& 255` answers 210 where this answers 255. `Value::Decimal` carries
+/// the digits and not the column's sign, so the two are the same value here:
+/// the same defect as #0054 and #0068, in the one flag rather than the type.
+fn decimal_bits(text: &str) -> u64 {
+    // `units` at scale zero *is* the rounding: it carries the first dropped
+    // digit into the count, away from zero, which is MySQL's rule for both.
+    let Some(units) = crate::decimal::units(text, 0) else {
+        // Not a plain decimal — more digits than an `i128` counts, or an
+        // exponent. The float reading saturates to the same two ends.
+        return crate::value::numeric_prefix(text).round() as i64 as u64;
+    };
+    let clamped = if units < 0 { i64::MIN } else { i64::MAX };
+    i64::try_from(units).unwrap_or(clamped) as u64
+}
+
+/// Whether a string is spelled the way a temporal value is.
+///
+/// What [`bit_operand`] refuses on, so it is drawn at the shapes a DATE,
+/// DATETIME, TIMESTAMP or TIME reads back as and no wider: `YYYY-MM-DD`, a
+/// date and a clock with a space or a `T` between them, and a clock on its
+/// own, each group being digits rather than a fixed width. A plain integer is
+/// not one of them, which is what keeps `'2026' | 0` and `'20260102' | 0`
+/// answering — and 20260102 is what a DATE written that way is stored as, so
+/// those two agree anyway.
+fn temporal_shaped(text: &str) -> bool {
+    let trimmed = text.trim();
+    match trimmed.split_once([' ', 'T']) {
+        // The date anchors this, so the clock after it may be the two-group
+        // `03:04` that MySQL accepts on the way in and this engine stores
+        // without normalising — `'2026-01-02 03:04'` in a DATETIME column,
+        // which MySQL reads as 20260102030400.
+        Some((date, clock)) => date_shaped(date) && clock_shaped(clock.trim_start(), 2),
+        // On its own it has to be the three groups a TIME reads *back* as.
+        // Taking two would take `'12:34'` with it, and that is ordinary text
+        // MySQL reads as 12 — a refusal has to cost less than the answers it
+        // takes away, and no temporal renders with two.
+        None => date_shaped(trimmed) || clock_shaped(trimmed, 3),
+    }
+}
+
+/// Three groups of digits separated by `-`, which is every DATE's own text.
+fn date_shaped(text: &str) -> bool {
+    let mut parts = text.split('-');
+    let mut group = || parts.next().is_some_and(digits);
+    group() && group() && group() && parts.next().is_none()
+}
+
+/// `least` to three groups of digits separated by `:`, with an optional
+/// fraction.
+///
+/// The caller sets `least`, because how few groups can still be a clock
+/// depends on what stands beside it. A leading `-` is allowed because a TIME
+/// may be negative.
+fn clock_shaped(text: &str, least: usize) -> bool {
+    let text = text.strip_prefix('-').unwrap_or(text);
+    let (clock, fraction) = match text.split_once('.') {
+        Some((clock, fraction)) => (clock, Some(fraction)),
+        None => (text, None),
+    };
+    if fraction.is_some_and(|f| !digits(f)) {
+        return false;
+    }
+    let mut groups = 0;
+    for group in clock.split(':') {
+        if !digits(group) {
+            return false;
+        }
+        groups += 1;
+    }
+    (least..=3).contains(&groups)
+}
+
+/// A non-empty run of ASCII digits and nothing else.
+fn digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Whether an operator computes over bits rather than over numbers.
@@ -1524,14 +1644,146 @@ fn bitwise_bits(e: &Expr, ctx: &Context<'_>) -> EngineResult<Option<u64>> {
 /// One operand of a chain: everything the chain is not.
 ///
 /// Evaluated as an ordinary expression and then read as bits, which is where
-/// an operand that cannot be read as bits at all — a binary string — is
-/// refused.
+/// an operand that cannot be read as bits at all — a binary string, or a
+/// temporal the engine cannot tell from a string — is refused.
 fn operand_bits(e: &Expr, ctx: &Context<'_>) -> EngineResult<Option<u64>> {
+    // The token before the value, because the token carries a type the value
+    // does not. A literal is never NULL, so this runs ahead of the NULL check
+    // rather than after it.
+    if let Some(bits) = literal_bits(e) {
+        return Ok(Some(bits));
+    }
     let value = eval(e, ctx)?;
     if value.is_null() {
         return Ok(None);
     }
+    // Only where the two readings differ, which is the only place the answer
+    // turns on the operand's type — and it keeps `string_typed`, which walks
+    // the expression, off every other row.
+    if let Value::Text(text) = &value {
+        if temporal_shaped(text) && string_typed(e) {
+            return Ok(Some(integer_prefix(text)));
+        }
+    }
     bit_operand(&value).map(Some)
+}
+
+/// The bits an operand written as a literal contributes.
+///
+/// A literal is the one operand whose type is in the statement rather than on
+/// the value, and reading it off the token is what keeps the refusal in
+/// [`bit_operand`] narrow: a quoted string *is* a string however much its
+/// characters look like a date, so `'2026-01-02' | 0` still answers 2026 —
+/// MySQL's answer, and the one the DATE column beside it does not share.
+///
+/// A number with a point is the same argument the other way. MySQL types it
+/// DECIMAL and evaluates it exactly where the engine evaluates it to an `f64`,
+/// which loses the tie at the seventeenth digit: `4503599627370496.5 | 0` is
+/// 4503599627370497 there and 4503599627370496 through a double. An exponent
+/// is a DOUBLE to MySQL too, so `1e2 | 0` is left to the value.
+fn literal_bits(e: &Expr) -> Option<u64> {
+    let (negative, number) = number_token(e)?;
+    // A point and no exponent is what MySQL types DECIMAL; `1e2` is a DOUBLE
+    // there as much as here, so it keeps the reading it had. Tested on the
+    // borrowed token, so an operand that is not one of these — every column
+    // reference, every row of `WHERE id & 1` — costs no allocation at all.
+    if !number.contains('.') || number.contains(['e', 'E']) {
+        return None;
+    }
+    Some(if negative {
+        decimal_bits(&format!("-{number}"))
+    } else {
+        decimal_bits(number)
+    })
+}
+
+/// The numeric token a literal operand spells, and whether it is negated.
+///
+/// A sign is a unary operator to the parser and part of the number to MySQL,
+/// so the signs are folded here. Counted rather than concatenated: building
+/// `"-{token}"` at each step spelled `- -2.5` as `"--2.5"`, which is not a
+/// decimal, so it fell to the leading-number reader and answered 0 where MySQL
+/// and this engine's own `- -2.5` both answer 3.
+///
+/// Parentheses are transparent, because they group a number without retyping
+/// it: `-(4503599627370496.5)` is the same DECIMAL as its unparenthesised
+/// twin and has to read the same way.
+fn number_token(e: &Expr) -> Option<(bool, &str)> {
+    match e {
+        Expr::Nested(inner) => number_token(inner),
+        Expr::Value(v) => match &v.value {
+            AstValue::Number(n, _) => Some((false, n)),
+            _ => None,
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => number_token(expr),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => {
+            let (negative, number) = number_token(expr)?;
+            Some((!negative, number))
+        }
+        _ => None,
+    }
+}
+
+/// Whether the statement itself declares this operand a string.
+///
+/// The counterweight to [`bit_operand`]'s refusal, which exists because the
+/// engine cannot tell a temporal from a string. Where it *can* — where the
+/// operand's type is written in the statement rather than carried on the
+/// value — there is nothing to refuse: `CAST(d AS CHAR) | 0`, `CONCAT(d, '')`
+/// and `LEFT(d, 10)` are all 2026 in MySQL however the argument was typed,
+/// because the result of each is a string. Refusing those took away answers
+/// this engine gives correctly.
+///
+/// Conservative on purpose: saying "string" wrongly is a wrong answer, and
+/// saying nothing is only a refusal. So it names what was measured on 8.3 and
+/// nothing by analogy — `IF(1, d, '0')`, `GREATEST(d, '0')` and
+/// `CASE WHEN 1 THEN d ELSE '0' END` are all 20260102 there, keeping the
+/// temporal, where `COALESCE` and `IFNULL` become strings.
+fn string_typed(e: &Expr) -> bool {
+    use sqlparser::ast::DataType as D;
+    match e {
+        Expr::Nested(inner) => string_typed(inner),
+        // A quoted literal is a string however much it looks like a date.
+        // Asked of `literal` rather than by listing the six spellings again,
+        // because a copy of that list is a list that drifts.
+        Expr::Value(v) => matches!(literal(&v.value), Ok(Value::Text(_))),
+        // The same targets the cast itself answers `Value::Text` for.
+        Expr::Cast { data_type, .. } => matches!(
+            data_type,
+            D::Char(_)
+                | D::Varchar(_)
+                | D::Text
+                | D::TinyText
+                | D::MediumText
+                | D::LongText
+                | D::CharacterVarying(_)
+                | D::Character(_)
+        ),
+        // Spelled as syntax rather than as calls, and typed VARCHAR by the
+        // executor for the same reason they are strings here.
+        Expr::Substring { .. } | Expr::Trim { .. } | Expr::Overlay { .. } => true,
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_ascii_lowercase();
+            // The one place the executor already records which functions hand
+            // back a string, so the two cannot disagree about `CONCAT`.
+            if crate::exec::returns_string(&name) {
+                return true;
+            }
+            // These hand back an argument, and MySQL aggregates a string with
+            // anything to a string: `COALESCE(d, '0') | 0` is 2026 where the
+            // bare `d` is 20260102. Only these two spellings — `IF` and
+            // `GREATEST` were measured and do *not* aggregate that way.
+            matches!(name.as_str(), "coalesce" | "ifnull" | "nvl")
+                && argument_exprs(f).iter().any(string_typed)
+        }
+        _ => false,
+    }
 }
 
 /// The date functions whose arguments are partly syntax.

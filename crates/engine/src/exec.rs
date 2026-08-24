@@ -5649,6 +5649,19 @@ fn never_null(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]
 /// as `Expr::Floor` and friends and never as a call — listing them here would
 /// make the table look like it covers cases it does not. Their near-synonyms
 /// `CEILING`, `MID` and `LTRIM` do parse as calls and so are here.
+/// Whether a function hands back a string whatever it was given.
+///
+/// Read off [`function_result_type`] rather than listed again, so the
+/// evaluator and the metadata cannot disagree about `CONCAT`. The evaluator
+/// needs it because a bitwise operand's answer turns on whether the statement
+/// declared it a string — see `expr::string_typed`.
+pub(crate) fn returns_string(name: &str) -> bool {
+    matches!(
+        function_result_type(name),
+        Some(ColumnType::VarString | ColumnType::String | ColumnType::LongBlob)
+    )
+}
+
 fn function_result_type(name: &str) -> Option<ColumnType> {
     Some(match name {
         // Counting and measuring, which are always integers.
