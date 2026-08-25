@@ -269,6 +269,48 @@ fn a_float_survives_exactly() {
 }
 
 #[test]
+fn a_temporal_survives_as_a_temporal() {
+    // The tag has to be in the image, not only in the row that was inserted.
+    // Reloaded as text a DATE reads 2024 in arithmetic where MySQL says
+    // 20240105 — the whole of #0054, reintroduced by a restart.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (id INTEGER NOT NULL, d DATE NOT NULL, dt DATETIME(3) NOT NULL, \
+         tm TIME NOT NULL, s VARCHAR(30) NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO T VALUES (1, '2024-01-05', '2024-01-05 06:07:08.500', '06:07:08', \
+         '2024-01-05')",
+    );
+
+    let sql = "SELECT d + 0, dt + 0, tm + 0, s + 0, d FROM T ORDER BY id";
+    let before = rows(&engine, &mut session, sql);
+    // Stated rather than only compared, so a reload that lost the tag on both
+    // sides could not pass by agreeing with itself.
+    assert_eq!(
+        before,
+        vec![vec![
+            "20240105",
+            "20240105060708.500",
+            "60708",
+            "2024",
+            "2024-01-05"
+        ]]
+    );
+
+    let encoded = image::encode(&engine.catalog_snapshot().unwrap());
+    let decoded = image::decode(&encoded).unwrap();
+    let restored = Engine::from_catalog(decoded, ServerConfig::default()).unwrap();
+    let mut session = Session::new(ServerConfig::default(), 1);
+    session.current_database = Some("testdb".to_owned());
+    assert_eq!(rows(&restored, &mut session, sql), before);
+}
+
+#[test]
 fn a_truncated_image_is_refused() {
     let (engine, mut session) = engine();
     populate(&engine, &mut session);

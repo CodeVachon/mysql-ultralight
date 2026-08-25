@@ -7625,17 +7625,562 @@ fn a_bitwise_decimal_operand_is_read_exactly() {
 }
 
 #[test]
-fn a_bitwise_temporal_operand_is_refused_rather_than_read_as_digits() {
+fn a_temporal_in_arithmetic_is_its_packed_number() {
+    // MySQL converts a temporal to its packed `YYYYMMDD[HHMMSS]` integer in an
+    // arithmetic context, and the answer turns on the operand's *type*: the
+    // DATE column and the VARCHAR beside it hold the same characters and
+    // convert to 20240105 and 2024. Measured on 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (id INT NOT NULL, d DATE, dt DATETIME, dt3 DATETIME(3), \
+         tm TIME, tm3 TIME(3), ts TIMESTAMP NULL, y YEAR, s VARCHAR(30), \
+         short DATETIME, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO T VALUES (1, '2024-01-05', '2024-01-05 06:07:08', \
+         '2024-01-05 06:07:08.500', '06:07:08', '06:07:08.500', \
+         '2024-01-05 06:07:08', 2024, '2024-01-05', '2024-01-05 06:07')",
+    );
+    for (sql, expected) in [
+        ("SELECT d + 0 FROM T", "20240105"),
+        ("SELECT dt + 0 FROM T", "20240105060708"),
+        ("SELECT tm + 0 FROM T", "60708"),
+        ("SELECT ts + 0 FROM T", "20240105060708"),
+        // A YEAR is already a number and MySQL computes in it directly.
+        ("SELECT y + 0 FROM T", "2024"),
+        // Fractional seconds pack after the point and keep every digit the
+        // column was declared with — 20240105060708.5 is not the same answer.
+        ("SELECT dt3 + 0 FROM T", "20240105060708.500"),
+        ("SELECT tm3 + 0 FROM T", "60708.500"),
+        // Missing groups pack as zero rather than shortening the number. The
+        // engine stores a DATETIME as it was written, so this column really
+        // does hold `2024-01-05 06:07`.
+        ("SELECT short + 0 FROM T", "20240105060700"),
+        ("SELECT d - 0 FROM T", "20240105"),
+        ("SELECT d * 1 FROM T", "20240105"),
+        ("SELECT d MOD 7 FROM T", "4"),
+        ("SELECT d DIV 1 FROM T", "20240105"),
+        ("SELECT -d FROM T", "-20240105"),
+        // Unary plus is the identity and does not convert at all.
+        ("SELECT +d FROM T", "2024-01-05"),
+        // The counterweight: the same characters in a VARCHAR, and the same
+        // characters written as a literal, are strings and read 2024.
+        ("SELECT s + 0 FROM T", "2024"),
+        ("SELECT '2024-01-05' + 0", "2024"),
+        ("SELECT '06:07:08' + 0", "6"),
+        // Beside a string the temporal still converts; the string does not.
+        ("SELECT d + '1' FROM T", "20240106"),
+        ("SELECT d + s FROM T", "20242129"),
+        // A comparison against a number is numeric, over the packed value.
+        ("SELECT d = 20240105 FROM T", "1"),
+        ("SELECT dt = 20240105060708 FROM T", "1"),
+        ("SELECT tm = 60708 FROM T", "1"),
+        ("SELECT d > 2024 FROM T", "1"),
+        // And against a string it is not, so a DATE still equals its own text.
+        ("SELECT d = '2024-01-05' FROM T", "1"),
+        // A cast reads the packed number and rounds it away from zero.
+        ("SELECT CAST(d AS SIGNED) FROM T", "20240105"),
+        ("SELECT CAST(dt3 AS SIGNED) FROM T", "20240105060709"),
+        ("SELECT CAST(tm3 AS SIGNED) FROM T", "60709"),
+        ("SELECT CAST(d AS DECIMAL(20,2)) FROM T", "20240105.00"),
+        // A cast to CHAR is the text, which is the distinction itself.
+        ("SELECT CAST(d AS CHAR) FROM T", "2024-01-05"),
+        ("SELECT CONCAT(d, '') FROM T", "2024-01-05"),
+        // An aggregate folds the packed numbers, and MIN and MAX keep the
+        // value they folded.
+        ("SELECT SUM(d) FROM T", "20240105"),
+        ("SELECT AVG(d) FROM T", "20240105.0000"),
+        ("SELECT SUM(dt3) FROM T", "20240105060708.500"),
+        ("SELECT MAX(d) FROM T", "2024-01-05"),
+        ("SELECT MIN(tm) FROM T", "06:07:08"),
+        // A TIME keeps its sign and runs past 99 hours.
+        ("SELECT CAST('-06:07:08' AS TIME) + 0", "-60708"),
+        ("SELECT CAST('838:59:59' AS TIME) + 0", "8385959"),
+        // Truthiness asks the same number, which is only visible where the
+        // two readings disagree about zero: `00:07:08` is 708 packed and 0 by
+        // its leading digits, and MySQL calls it true.
+        ("SELECT IF(CAST('00:07:08' AS TIME), 'y', 'n')", "y"),
+        ("SELECT IF(CAST('00:00:00' AS TIME), 'y', 'n')", "n"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // Written in a shape the column does not use. MySQL stores a temporal by
+    // its type, so both of these are canonical by the time they are read back
+    // — and the packed number follows from the column rather than from how the
+    // statement happened to spell it.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO T (id, d, short) VALUES (2, '2024-1-5', '2024-01-05 6:7')",
+    );
+    for (sql, expected) in [
+        ("SELECT d + 0 FROM T WHERE id = 2", "20240105"),
+        ("SELECT short + 0 FROM T WHERE id = 2", "20240105060700"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn arithmetic_over_a_temporal_is_typed_by_its_packed_number() {
+    // The value and the type are decided in different code for the same
+    // expression, and the binary protocol encodes by the *type* — so a column
+    // holding 20240105 and described DOUBLE reaches a client as a float. Every
+    // code here measured on 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE E (d DATE, dt DATETIME, dt3 DATETIME(3), tm TIME, tm3 TIME(3), \
+         y YEAR, s VARCHAR(20))",
+    );
+    let codes = |engine: &Engine, session: &Session, sql: &str| -> Vec<String> {
+        engine
+            .describe(session, sql, 0)
+            .unwrap()
+            .iter()
+            .map(|c| format!("{:?}", c.ty))
+            .collect()
+    };
+    for (sql, expected) in [
+        // A temporal converts to an integer before the operator sees it, so
+        // the arithmetic over it is integer arithmetic.
+        (
+            "SELECT d + 0, dt - 0, tm * 1, d MOD 7, d DIV 1 FROM E",
+            vec!["LongLong"; 5],
+        ),
+        // Fractional seconds pack after the point, which makes the operand a
+        // decimal and the answer one.
+        (
+            "SELECT dt3 + 0, tm3 - 0, dt3 * 1 FROM E",
+            vec!["NewDecimal"; 3],
+        ),
+        // Unary minus is a DOUBLE where `d + 0` is a LONGLONG, and unary plus
+        // does not convert at all. Measured, not derived.
+        (
+            "SELECT -d, +d, -dt3 FROM E",
+            vec!["Double", "Date", "Double"],
+        ),
+        // A string operand makes it a double, as it does for any other value
+        // with no numeric type of its own.
+        ("SELECT d + s, d + '1' FROM E", vec!["Double"; 2]),
+        // A YEAR is already a number, so it is a LONGLONG and not a decimal.
+        ("SELECT y + 0, y * 1 FROM E", vec!["LongLong"; 2]),
+        // The aggregates, the casts and the bitwise operators.
+        (
+            "SELECT SUM(d), AVG(d), MAX(d), MIN(tm) FROM E",
+            vec!["NewDecimal", "NewDecimal", "Date", "Time"],
+        ),
+        (
+            "SELECT CAST(d AS SIGNED), CAST(d AS DECIMAL(20,2)), CAST(d AS CHAR), d | 0 FROM E",
+            vec!["LongLong", "NewDecimal", "VarString", "LongLong"],
+        ),
+        // A precision written into the statement counts as much as one on a
+        // column: `NOW(3)` and a cast both make the operand a decimal.
+        (
+            "SELECT NOW(3) + 0, NOW() + 0, CAST('2024-01-05 06:07:08.5' AS DATETIME(1)) + 0",
+            vec!["NewDecimal", "LongLong", "NewDecimal"],
+        ),
+    ] {
+        assert_eq!(codes(&engine, &session, sql), expected, "{sql}");
+    }
+
+    // A YEAR is UNSIGNED on the wire, which `information_schema` does not say
+    // — it reports plain `year` — and which the arithmetic over one keeps.
+    let unsigned = |sql: &str| -> Vec<bool> {
+        engine
+            .describe(&session, sql, 0)
+            .unwrap()
+            .iter()
+            .map(|c| c.to_wire().flags & mysql_ultralight_protocol::column::flags::UNSIGNED != 0)
+            .collect()
+    };
+    assert_eq!(
+        unsigned("SELECT y, y + 0, y * 1, -y, d FROM E"),
+        vec![true, true, true, false, false]
+    );
+}
+
+#[test]
+fn a_column_filled_from_its_implicit_default_holds_a_temporal() {
+    // The value an `INSERT IGNORE` writes into a NOT NULL column it was not
+    // given. It goes into the row without passing `coerce`, so it has to carry
+    // the tag on its own — otherwise it is the one DATE in the column that
+    // reads 1970 in arithmetic while every other row reads 19700101.
+    //
+    // The value itself is the epoch rather than MySQL's `0000-00-00`, because
+    // the mode this engine targets sets NO_ZERO_DATE and would reject that —
+    // which is why this is asserted here and not asked of the differential.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE D (id INT NOT NULL, d DATE NOT NULL, dt DATETIME NOT NULL, \
+         tm TIME NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT IGNORE INTO D (id) VALUES (1)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT d + 0, dt + 0, tm + 0 FROM D"),
+        vec![vec!["19700101", "19700101000000", "0"]]
+    );
+}
+
+#[test]
+fn a_temporal_is_stored_in_the_shape_its_type_declares() {
+    // MySQL stores a temporal by its *type*, not by how it was written, and
+    // this engine kept the characters: a DATETIME given a bare date holds
+    // midnight, a DATE given a datetime keeps only the date, and a fraction is
+    // rounded to the declared precision. Keeping the text made the packed
+    // number a property of the statement rather than of the column.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE S (id INT NOT NULL, dt DATETIME, d DATE, tm TIME, tm1 TIME(1), \
+         dt6 DATETIME(6), roll TIME, edge DATETIME, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO S VALUES (1, '2024-01-05', '2024-01-05 06:07:08', '06:07:08.567', \
+         '06:07:08.567', '2024-01-05 06:07:08.567', '23:59:59.567', \
+         '2024-01-05 23:59:59.567')",
+    );
+    for (sql, expected) in [
+        ("SELECT dt FROM S", "2024-01-05 00:00:00"),
+        ("SELECT dt + 0 FROM S", "20240105000000"),
+        ("SELECT d FROM S", "2024-01-05"),
+        ("SELECT d + 0 FROM S", "20240105"),
+        // A DATE written with a clock on it still equals its own date, which
+        // it did not while the clock was kept.
+        ("SELECT d = '2024-01-05' FROM S", "1"),
+        // A TIME with no declared precision rounds the fraction away.
+        ("SELECT tm FROM S", "06:07:09"),
+        ("SELECT tm + 0 FROM S", "60709"),
+        ("SELECT tm1 FROM S", "06:07:08.6"),
+        ("SELECT tm1 + 0 FROM S", "60708.6"),
+        ("SELECT dt6 FROM S", "2024-01-05 06:07:08.567000"),
+        // The rounding carries, and a TIME has no day to carry into where a
+        // DATETIME does.
+        ("SELECT roll FROM S", "24:00:00"),
+        ("SELECT edge FROM S", "2024-01-06 00:00:00"),
+        // A cast declares a shape and a precision exactly as a column does.
+        ("SELECT CAST('06:07:08.567' AS TIME)", "06:07:09"),
+        ("SELECT CAST('06:07:08.567' AS TIME(1))", "06:07:08.6"),
+        ("SELECT CAST('06:07:08.567' AS TIME(1)) + 0", "60708.6"),
+        ("SELECT CAST(dt6 AS DATETIME) FROM S", "2024-01-05 06:07:09"),
+        ("SELECT CAST(dt6 AS DATETIME) + 0 FROM S", "20240105060709"),
+        (
+            "SELECT CAST('2024-01-05' AS DATETIME)",
+            "2024-01-05 00:00:00",
+        ),
+        ("SELECT CAST('2024-01-05 06:07:08' AS DATE)", "2024-01-05"),
+        // A shift keeps the precision of its argument's declared type, which a
+        // string literal does not have — so a fraction written into one is
+        // padded to the full six digits where a DATETIME(6) column is not.
+        (
+            "SELECT DATE_ADD(dt6, INTERVAL 1 DAY) FROM S",
+            "2024-01-06 06:07:08.567000",
+        ),
+        ("SELECT DATE_ADD(tm1, INTERVAL 1 SECOND) FROM S", "NULL"),
+        (
+            "SELECT DATE_ADD('2026-01-01 00:00:00.1', INTERVAL 1 SECOND)",
+            "2026-01-01 00:00:01.100000",
+        ),
+        (
+            "SELECT DATE_ADD('2026-01-01', INTERVAL 1 SECOND)",
+            "2026-01-01 00:00:01",
+        ),
+        (
+            "SELECT DATE_ADD(dt, INTERVAL 1 SECOND) FROM S",
+            "2024-01-05 00:00:01",
+        ),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn a_fraction_never_lands_under_an_integer_column() {
+    // The worst shape this engine has: the two protocols disagreeing. A value
+    // carrying a fraction under a column described LONGLONG is sent as its
+    // digits by the text protocol and as *zero* by the binary one, because
+    // `encode_binary` parses it as an `i64` and the parse fails. Same row, two
+    // connections, two answers, and nothing in a test that reads the text
+    // would ever see it.
+    //
+    // So the invariant is asserted directly rather than through a rendering:
+    // under an integer code the value has to be an integer.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE F (id INT NOT NULL, tm TIME, dt DATETIME, dt3 DATETIME(3), \
+         PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO F VALUES (1, '06:07:08.567', '2024-01-05 06:07:08.567', \
+         '2024-01-05 06:07:08.567')",
+    );
+    for sql in [
+        "SELECT tm + 0 FROM F",
+        "SELECT dt + 0 FROM F",
+        "SELECT CAST('06:07:08.567' AS TIME) + 0",
+        "SELECT CAST(dt3 AS DATETIME) + 0 FROM F",
+        "SELECT DATE_ADD(dt3, INTERVAL 1 DAY) + 0 FROM F",
+        "SELECT COALESCE(dt3, dt3) + 0 FROM F",
+        "SELECT MAX(dt3) + 0 FROM F",
+        "SELECT tm * 1, dt - 0, tm MOD 100 FROM F",
+    ] {
+        let Outcome::Rows(result) = run(&engine, &mut session, sql) else {
+            panic!("expected rows from: {sql}");
+        };
+        for (index, column) in result.columns.iter().enumerate() {
+            let integral = matches!(
+                column.ty,
+                mysql_ultralight_protocol::column::ColumnType::Tiny
+                    | mysql_ultralight_protocol::column::ColumnType::Short
+                    | mysql_ultralight_protocol::column::ColumnType::Int24
+                    | mysql_ultralight_protocol::column::ColumnType::Long
+                    | mysql_ultralight_protocol::column::ColumnType::LongLong
+                    | mysql_ultralight_protocol::column::ColumnType::Year
+            );
+            for row in &result.rows {
+                let value = &row[index];
+                assert!(
+                    !integral || value.is_null() || matches!(value, Value::Int(_)),
+                    "{sql} column {index} is {:?} under {:?}",
+                    value,
+                    column.ty
+                );
+            }
+        }
+    }
+
+    // And the values themselves, so the invariant cannot be met by answering
+    // the wrong integer.
+    for (sql, expected) in [
+        ("SELECT tm + 0 FROM F", "60709"),
+        ("SELECT dt + 0 FROM F", "20240105060709"),
+        ("SELECT CAST('06:07:08.567' AS TIME) + 0", "60709"),
+        (
+            "SELECT DATE_ADD(dt3, INTERVAL 1 DAY) + 0 FROM F",
+            "20240106060708.567",
+        ),
+        ("SELECT MAX(dt3) + 0 FROM F", "20240105060708.567"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn an_exponent_reaches_a_decimal_as_digits_and_not_through_a_float() {
+    // A `DECIMAL(65,30)` asks for thirty places and an `f64` holds about
+    // fifteen digits in total, so folding the value through one wrote noise
+    // into every place past the fifteenth: `1e3` came back
+    // 1000.000000000000089690419062898688 where MySQL answers thirty zeros.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE X (id INT NOT NULL, wide DECIMAL(65,30), two DECIMAL(20,2), \
+         PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO X VALUES (1, '1e3', '1e3')",
+    );
+    for (sql, expected) in [
+        ("SELECT wide FROM X", "1000.000000000000000000000000000000"),
+        ("SELECT two FROM X", "1000.00"),
+        (
+            "SELECT CAST('1e3' AS DECIMAL(65,30))",
+            "1000.000000000000000000000000000000",
+        ),
+        ("SELECT CAST('1e3' AS DECIMAL(20,2))", "1000.00"),
+        ("SELECT CAST('1.5e2' AS DECIMAL(10,3))", "150.000"),
+        ("SELECT CAST('-2.5e-1' AS DECIMAL(10,4))", "-0.2500"),
+        // Text that is not a number at all still reads as the number MySQL
+        // reads out of it, which is the fallback this shares.
+        ("SELECT CAST('abc' AS DECIMAL(20,2))", "0.00"),
+        ("SELECT CAST('12abc' AS DECIMAL(20,2))", "12.00"),
+        ("SELECT CAST('1e' AS DECIMAL(20,2))", "1.00"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn the_clock_functions_read_their_precision_argument() {
+    // The argument of `CURTIME(3)` is a fractional-second precision, and
+    // ignoring it is not cosmetic: the metadata reads the same token to type
+    // the column, so the column was described a decimal and answered an
+    // integer. `NOW(3)` already read it; `CURTIME` did not.
+    //
+    // The value moves, so its width is what is asserted.
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT LENGTH(CURTIME(3)), LENGTH(CURTIME()), LENGTH(NOW(3)), LENGTH(NOW())"
+        ),
+        vec![vec!["12", "8", "23", "19"]]
+    );
+    // And they are NOT NULL whatever precision they were asked for: `NOW(NULL)`
+    // is a syntax error in MySQL, so there is no value to pass in that could
+    // make one. The argument-count rule beside this was measured against
+    // `UNIX_TIMESTAMP`, where it does hold.
+    let nullable = |sql: &str| -> Vec<bool> {
+        engine
+            .describe(&session, sql, 0)
+            .unwrap()
+            .iter()
+            .map(|c| c.to_wire().flags & mysql_ultralight_protocol::column::flags::NOT_NULL == 0)
+            .collect()
+    };
+    assert_eq!(
+        nullable("SELECT NOW(3), CURTIME(3), NOW(), UNIX_TIMESTAMP(), UNIX_TIMESTAMP(NULL)"),
+        vec![false, false, false, false, true]
+    );
+}
+
+#[test]
+fn a_temporal_expression_converts_like_a_temporal_column() {
+    // The tag rides on the value rather than being read off the statement,
+    // which is measured and not obvious: MySQL types
+    // `DATE_ADD('2024-01-05', INTERVAL 1 DAY)` a *string* — `STRING`, not
+    // `DATE` — and still reads it 20240106, where the bare literal beside it
+    // reads 2024. A conversion driven by the declared type would say 2024.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (d DATE, dt DATETIME)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO T VALUES ('2024-01-05', '2024-01-05 06:07:08')",
+    );
+    for (sql, expected) in [
+        (
+            "SELECT DATE_ADD('2024-01-05', INTERVAL 1 DAY) + 0",
+            "20240106",
+        ),
+        ("SELECT DATE_ADD(d, INTERVAL 1 DAY) + 0 FROM T", "20240106"),
+        ("SELECT ADDDATE(d, 1) + 0 FROM T", "20240106"),
+        ("SELECT DATE_SUB(d, INTERVAL 1 DAY) + 0 FROM T", "20240104"),
+        ("SELECT TIMESTAMPADD(DAY, 1, d) + 0 FROM T", "20240106"),
+        ("SELECT DATE('2024-01-05 06:07:08') + 0", "20240105"),
+        ("SELECT DATE(dt) + 0 FROM T", "20240105"),
+        ("SELECT LAST_DAY('2024-01-05') + 0", "20240131"),
+        ("SELECT CAST('2024-01-05' AS DATE) + 0", "20240105"),
+        ("SELECT CAST('06:07:08' AS TIME) + 0", "60708"),
+        // The same expressions unconverted, so a test that lost the tag on
+        // both sides could not pass by agreeing with itself.
+        ("SELECT '2024-01-05' + 0", "2024"),
+        ("SELECT CURDATE() + 0 > 20200101", "1"),
+        ("SELECT NOW() + 0 > 20200101000000", "1"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn coalesce_makes_a_temporal_a_string_where_if_and_greatest_do_not() {
+    // Two families that look alike and are not, measured rather than reasoned
+    // from each other: `COALESCE` and `IFNULL` aggregate their arguments'
+    // types, so anything non-temporal in them makes the answer a string and it
+    // reads 2024. `IF`, `GREATEST` and `CASE` hand back the argument itself
+    // and keep the temporal, which reads 20240105.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (d DATE, dt DATETIME)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO T VALUES ('2024-01-05', '2024-01-05 06:07:08')",
+    );
+    for (sql, expected) in [
+        ("SELECT COALESCE(d, '0') + 0 FROM T", "2024"),
+        ("SELECT IFNULL(d, '0') + 0 FROM T", "2024"),
+        // A number beside it does the same thing: MySQL types the whole call
+        // VAR_STRING, not a number.
+        ("SELECT COALESCE(d, 0) + 0 FROM T", "2024"),
+        ("SELECT COALESCE(d, 1.5) + 0 FROM T", "2024"),
+        // With nothing but temporals in it the tag stays, and a NULL argument
+        // does not count as something beside it.
+        ("SELECT COALESCE(d, d) + 0 FROM T", "20240105"),
+        ("SELECT COALESCE(d, dt) + 0 FROM T", "20240105"),
+        ("SELECT COALESCE(NULL, d) + 0 FROM T", "20240105"),
+        ("SELECT IFNULL(d, NULL) + 0 FROM T", "20240105"),
+        ("SELECT IFNULL(NULL, d) + 0 FROM T", "20240105"),
+        ("SELECT IF(1, d, '0') + 0 FROM T", "20240105"),
+        ("SELECT GREATEST(d, '0') + 0 FROM T", "20240105"),
+        (
+            "SELECT (CASE WHEN 1 THEN d ELSE '0' END) + 0 FROM T",
+            "20240105",
+        ),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn a_bitwise_temporal_operand_is_its_packed_digits() {
     // MySQL converts a temporal *type* to its packed digits here — a DATE of
     // 2026-01-02 is 20260102, a DATETIME 20260102030405, a TIME of 06:07:08 is
     // 60708 — and a *string* of the same characters by its leading integer,
-    // giving 2026, 2026 and 6. Both measured on 8.3. The engine stores a
-    // temporal as `Value::Text`, so the two are the same value by the time an
-    // operator sees them and only one of the two answers can be given.
+    // giving 2026 and 6. Both measured on 8.3.
     //
-    // Which makes this a refusal rather than a fix: it waits on #0054 giving
-    // the operand its declared type. Answering the string reading was the
-    // regression #0079 records.
+    // Until #0054 the engine stored a temporal as `Value::Text`, so the two
+    // were one value by the time an operator saw them and this refused rather
+    // than picking. `Value::Temporal` is what tells them apart, and every
+    // shape below that used to refuse now answers.
     let (engine, mut session) = engine();
     run(
         &engine,
@@ -7651,96 +8196,64 @@ fn a_bitwise_temporal_operand_is_refused_rather_than_read_as_digits() {
         "INSERT INTO T VALUES (1, '2026-01-02', '2026-01-02 03:04:05', '06:07:08', \
          '2026-01-02 03:04:05', 2026, '2026-01-02', '1-2', '2026-01', '20260102', '2026-01-02 x', '12:34', '2026-01-02 03:04')",
     );
-    for sql in [
-        "SELECT d | 0 FROM T",
-        "SELECT dt | 0 FROM T",
-        "SELECT tm | 0 FROM T",
-        "SELECT ts | 0 FROM T",
-        "SELECT CAST('2026-01-02' AS DATE) | 0",
-        // `IF`, `GREATEST` and a `CASE` keep the temporal in MySQL — all
-        // three are 20260102 there — so they stay refused where the string
-        // functions below do not. Measured rather than reasoned from
-        // `COALESCE`, which does the opposite.
-        "SELECT IF(1, d, '0') | 0 FROM T",
-        "SELECT GREATEST(d, '0') | 0 FROM T",
-        "SELECT (CASE WHEN 1 THEN d ELSE '0' END) | 0 FROM T",
-        // And `COALESCE` only becomes a string when something in it is one:
-        // with no string argument it keeps the temporal, 20260102 in MySQL,
-        // so it refuses like the bare column does.
-        "SELECT COALESCE(d, d) | 0 FROM T",
-        "SELECT IFNULL(d, NULL) | 0 FROM T",
-        "SELECT CAST('06:07:08' AS TIME) | 0",
-        // A fractional part belongs to the clock and does not take the value
-        // out of the refusal: MySQL reads a TIME(2) of 06:07:08.25 as 60708,
-        // and its leading integer is 6.
-        "SELECT CAST('06:07:08.25' AS TIME) | 0",
-        "SELECT ~d FROM T",
-        // A VARCHAR holding those characters refuses too. That is the cost of
-        // the refusal and it is paid knowingly: nothing distinguishes this
-        // column's value from the DATE column's, which is the whole defect.
-        "SELECT s | 0 FROM T",
-        // Two groups *after a date* are still a temporal: the engine stores a
-        // DATETIME as the text it was written with rather than normalising
-        // it, so this column holds `2026-01-02 03:04` and MySQL reads the
-        // column it came from as 20260102030400.
-        "SELECT dtm | 0 FROM T",
-    ] {
-        let error = engine
-            .execute(&mut session, sql, &[])
-            .expect_err("a temporal operand has two readings and no type to pick between them");
-        assert_eq!(error.code, 1235, "{sql}");
-        assert!(
-            error.message.contains("reads one way as a DATE"),
-            "{sql} refused with {}",
-            error.message
-        );
-    }
-
-    // And the refusal is drawn no wider than that. A quoted string is a string
-    // however much it looks like a date — the statement says so — and MySQL
-    // answers 2026 for it, which is the answer this engine keeps. A YEAR is an
-    // integer and never had the problem.
     for (sql, expected) in [
+        ("SELECT d | 0 FROM T", "20260102"),
+        ("SELECT dt | 0 FROM T", "20260102030405"),
+        ("SELECT tm | 0 FROM T", "60708"),
+        ("SELECT ts | 0 FROM T", "20260102030405"),
+        ("SELECT CAST('2026-01-02' AS DATE) | 0", "20260102"),
+        // `IF`, `GREATEST` and a `CASE` keep the temporal in MySQL — all
+        // three are 20260102 there — where `COALESCE` and `IFNULL` turn it
+        // into a string as soon as anything beside it is one. Measured, not
+        // reasoned from each other: the two families disagree.
+        ("SELECT IF(1, d, '0') | 0 FROM T", "20260102"),
+        ("SELECT GREATEST(d, '0') | 0 FROM T", "20260102"),
+        (
+            "SELECT (CASE WHEN 1 THEN d ELSE '0' END) | 0 FROM T",
+            "20260102",
+        ),
+        ("SELECT COALESCE(d, d) | 0 FROM T", "20260102"),
+        ("SELECT IFNULL(d, NULL) | 0 FROM T", "20260102"),
+        ("SELECT COALESCE(d, '0') | 0 FROM T", "2026"),
+        ("SELECT IFNULL(d, '0') | 0 FROM T", "2026"),
+        ("SELECT CAST('06:07:08' AS TIME) | 0", "60708"),
+        // The fraction packs after the point and is then rounded like any
+        // other decimal operand, which is MySQL's answer for both of these:
+        // 06:07:08.25 rounds down to 60708 and 03:04:05.5 up to ...406.
+        ("SELECT CAST('06:07:08.25' AS TIME) | 0", "60708"),
+        (
+            "SELECT CAST('2026-01-02 03:04:05.5' AS DATETIME(1)) | 0",
+            "20260102030406",
+        ),
+        // A DATETIME stored with its seconds left off. The engine keeps the
+        // text it was written with rather than normalising it, and the packing
+        // widens the missing group — which is what MySQL reads that column as.
+        ("SELECT dtm | 0 FROM T", "20260102030400"),
+        // The counterweight, and the reason the tag had to exist: a VARCHAR
+        // holding the same characters is a string, and MySQL reads it 2026.
+        // This is the case a shape rule over the text could never get right,
+        // because there is nothing in `'2026-01-02'` to tell the two apart.
+        ("SELECT s | 0 FROM T", "2026"),
         ("SELECT '2026-01-02' | 0", "2026"),
         ("SELECT '2026-01-02 03:04:05' | 0", "2026"),
         ("SELECT '06:07:08' | 0", "6"),
         ("SELECT '2026' | 0", "2026"),
         ("SELECT '20260102' | 0", "20260102"),
+        // A YEAR is an integer and never had the problem.
         ("SELECT y | 0 FROM T", "2026"),
-        // Three groups of digits and no fewer, tested where a literal cannot
-        // decide it: these are columns, so only the shape rule stands between
-        // them and the refusal above. MySQL reads both as strings — 1 and
-        // 2026 — and so does this.
         ("SELECT near | 0 FROM T", "1"),
         ("SELECT part | 0 FROM T", "2026"),
-        // A run of digits is not a clock, which matters beyond the string:
-        // this engine stores a temporal as the text it was written with, so a
-        // DATE written `'20260102'` sits in its column exactly like this — and
-        // 20260102 is what MySQL reads out of that column too.
         ("SELECT packed | 0 FROM T", "20260102"),
-        // A date followed by something that is not a clock is neither, so the
-        // date half alone does not decide it: MySQL answers 2026.
         ("SELECT noisy | 0 FROM T", "2026"),
-        // And two groups *without* a date in front are not a clock, because
-        // nothing renders a temporal that way and refusing them would take
-        // ordinary text with it — MySQL reads this as 12.
         ("SELECT clockish | 0 FROM T", "12"),
-        // An expression whose *result* type the statement declares is a
-        // string, whatever it was given: each of these is 2026 in MySQL over
-        // the DATE column, and refusing them took away answers the engine
-        // gives correctly. The VARCHAR column above stays refused because
-        // nothing in the statement says what it holds.
+        // An expression the statement declares a string reads as one, which
+        // it always did — these are 2026 in MySQL over the DATE column.
         ("SELECT CAST(d AS CHAR) | 0 FROM T", "2026"),
         ("SELECT CONCAT(d, '') | 0 FROM T", "2026"),
         ("SELECT LEFT(d, 10) | 0 FROM T", "2026"),
         ("SELECT SUBSTRING(d, 1, 10) | 0 FROM T", "2026"),
         ("SELECT TRIM(d) | 0 FROM T", "2026"),
         ("SELECT UPPER(d) | 0 FROM T", "2026"),
-        // MySQL aggregates a string with anything to a string, so these two
-        // become strings where `IF` and `GREATEST` above do not.
-        ("SELECT COALESCE(d, '0') | 0 FROM T", "2026"),
-        ("SELECT IFNULL(d, '0') | 0 FROM T", "2026"),
-        // And the same read off an expression with no column in it at all.
         ("SELECT CAST('2026-01-02' AS CHAR) | 0", "2026"),
         ("SELECT CONCAT('2026-', '01-02') | 0", "2026"),
         ("SELECT LEFT('2026-01-02 03:04:05', 10) | 0", "2026"),
@@ -7751,6 +8264,19 @@ fn a_bitwise_temporal_operand_is_refused_rather_than_read_as_digits() {
             "{sql}"
         );
     }
+
+    // `~d` still refuses, and now for the only reason left: MySQL answers
+    // 18446744073689291513, which is above `i64::MAX` and has no `Value` to
+    // be. That is #0077 and not this — the operand converted fine.
+    let error = engine
+        .execute(&mut session, "SELECT ~d FROM T", &[])
+        .expect_err("the complement of a date is above the signed range");
+    assert_eq!(error.code, 1235);
+    assert!(
+        error.message.contains("18446744073689291513"),
+        "refused with {}",
+        error.message
+    );
 }
 
 #[test]

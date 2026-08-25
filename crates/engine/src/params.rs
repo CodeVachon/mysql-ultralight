@@ -91,6 +91,10 @@ pub fn literal(value: &Value) -> String {
         // Unquoted, so it re-parses as the number it is rather than as the
         // characters that spell it.
         Value::Decimal(v) => v.clone(),
+        // Quoted, because SQL has no temporal literal without a keyword in
+        // front of it — so this round trip loses the tag, exactly as the JSON
+        // one below does. A bound parameter has no declared type to lose.
+        Value::Temporal(v) => literal(&Value::Text(v.clone())),
         Value::Float(v) => {
             // A bare `inf` or `nan` would not re-parse.
             if v.is_finite() {

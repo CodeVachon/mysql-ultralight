@@ -492,20 +492,18 @@ pub const GROUPS: &[Group] = &[
             same("SELECT - -2.5 & 3, - - -2.5 & 3, -(-2.5) & 3, \
                   -(4503599627370496.5) & 1"),
             // A quoted string is a string however much it looks like a date,
-            // and these are the answers the engine keeps while the *typed*
-            // temporal beside them is refused — see #0054 and #0079.
+            // and reads by its leading integer where the *typed* temporal
+            // beside it reads its packed digits — see the temporal group below.
             same("SELECT '2026-01-02' | 0, '2026-01-02 03:04:05' | 0, '06:07:08' | 0, \
                   '2026' | 0, '20260102' | 0"),
-            // And the line the refusal is drawn on, asked where no literal can
-            // decide it: two groups of digits are not a date, a run of them is
-            // not a clock, and a date followed by something else is neither.
+            // And the same asked of columns, where no literal can decide it:
+            // every one of these is a VARCHAR, so every one reads as a string
+            // however much its characters look like a date or a clock.
             same("SELECT near | 0, part | 0, packed | 0, noisy | 0, clockish | 0 \
                   FROM Bd ORDER BY id"),
             // An expression whose *result* type the statement declares is a
             // string, and MySQL reads it as one however its argument was
-            // typed. Refusing these took away answers the engine gives
-            // correctly; the plain column they are built from stays refused
-            // because nothing says what it holds.
+            // typed — 2026 where the bare DATE column beside it is 20260102.
             same("SELECT CAST(dt AS CHAR) | 0, CONCAT(dt, '') | 0, LEFT(dt, 10) | 0, \
                   SUBSTRING(dt, 1, 10) | 0 FROM Bd ORDER BY id"),
             same("SELECT TRIM(dt) | 0, UPPER(dt) | 0, COALESCE(dt, '0') | 0, \
@@ -517,6 +515,180 @@ pub const GROUPS: &[Group] = &[
             // and the carry can run off the front of the number.
             same("SELECT wide30, carry FROM Bd ORDER BY id"),
             same("SELECT CAST('1.5' AS DECIMAL(65,30))"),
+        ],
+    },
+    Group {
+        // MySQL reads a temporal in a numeric context as its packed
+        // `YYYYMMDD[HHMMSS]` integer, and the answer turns on the operand's
+        // *type* rather than its characters: the DATE column and the VARCHAR
+        // beside it hold the same text and convert to 20240105 and 2024.
+        // Nothing about the text can decide that, which is why the engine
+        // tags the value.
+        name: "a temporal in a numeric context",
+        setup: &[
+            "CREATE TABLE Tm (id INT NOT NULL, d DATE NULL, dt DATETIME NULL, \
+             dt3 DATETIME(3) NULL, tm TIME NULL, tm3 TIME(3) NULL, ts TIMESTAMP NULL, \
+             y YEAR NULL, s VARCHAR(30) NULL, short DATETIME NULL, PRIMARY KEY (id))",
+            // The second row is all NULL, so every case below also says what
+            // the conversion does with one.
+            "INSERT INTO Tm VALUES (1, '2024-01-05', '2024-01-05 06:07:08', \
+             '2024-01-05 06:07:08.500', '06:07:08', '06:07:08.500', \
+             '2024-01-05 06:07:08', 2024, '2024-01-05', '2024-01-05 06:07')",
+            "INSERT INTO Tm (id) VALUES (2)",
+            // A temporal is stored by its *type*, not by how it was written,
+            // and every column here is given something the wrong shape for it:
+            // a bare date into a DATETIME, a datetime into a DATE, and a
+            // fraction into columns declared without one. The last is the
+            // pairing that splits the two protocols, because it packs to a
+            // decimal under a column described LONGLONG.
+            "CREATE TABLE Shape (id INT NOT NULL, dt DATETIME NULL, d DATE NULL, \
+             tm TIME NULL, tm1 TIME(1) NULL, dt0 DATETIME NULL, dt6 DATETIME(6) NULL, \
+             roll TIME NULL, PRIMARY KEY (id))",
+            "INSERT INTO Shape VALUES (1, '2024-01-05', '2024-01-05 06:07:08', \
+             '06:07:08.567', '06:07:08.567', '2024-01-05 06:07:08.567', \
+             '2024-01-05 06:07:08.567', '23:59:59.567')",
+            "INSERT INTO Shape (id) VALUES (2)",
+            // Written as strings, because a literal with an exponent reaches a
+            // column through an f64 and the digits are the point of the table.
+            "CREATE TABLE Exp (id INT NOT NULL, wide DECIMAL(65,30) NULL, \
+             two DECIMAL(20,2) NULL, PRIMARY KEY (id))",
+            "INSERT INTO Exp VALUES (1, '1e3', '1e3'), (2, '1.5e2', '-2.5e-1')",
+        ],
+        cases: &[
+            // The table itself: a DATE is eight digits, a DATETIME fourteen, a
+            // TIME six with its leading zero gone, and a YEAR the number it
+            // already was.
+            same("SELECT d + 0, dt + 0, tm + 0, ts + 0, y + 0 FROM Tm ORDER BY id"),
+            // Fractional seconds pack after the point, so these are decimals
+            // and keep every digit the column was declared with.
+            same("SELECT dt3 + 0, tm3 + 0 FROM Tm ORDER BY id"),
+            // A YEAR is the exception: MySQL computes in it directly, because
+            // it already is a number. It is UNSIGNED there, which the others
+            // are not.
+            // `y - 1` is left out: MySQL reports it UNSIGNED and this engine
+            // keeps subtraction off the unsigned list on purpose, because it
+            // answers -1 where MySQL raises 1690. That is #0069, not this.
+            same("SELECT y, y + 0, y * 1, -y FROM Tm ORDER BY id"),
+            // The same number under every arithmetic operator. Unary minus is
+            // a DOUBLE in MySQL where `d + 0` is a LONGLONG, and unary plus
+            // is the identity and stays a DATE.
+            // `+d` is aliased because MySQL names that column `d` and this
+            // engine names it `+d`, which is a naming gap and not this one.
+            same("SELECT d - 0, d * 1, d MOD 7, d DIV 1, -d, +d AS plus_d FROM Tm ORDER BY id"),
+            same("SELECT -dt, -tm, dt * 1, tm * 1, ts - 0 FROM Tm ORDER BY id"),
+            // A comparison against a number is numeric — the packed value —
+            // and against a string is not.
+            same("SELECT d = 20240105, d = '2024-01-05', dt = 20240105060708, \
+                  tm = 60708, d > 2024 FROM Tm ORDER BY id"),
+            same("SELECT id FROM Tm WHERE d > 20240101 ORDER BY id"),
+            same("SELECT d BETWEEN 20240100 AND 20240110, d IN (20240105), \
+                  d IN ('2024-01-05') FROM Tm ORDER BY id"),
+            // A cast reads the packed number too, and rounds it: a DATETIME(3)
+            // at .500 is ...709 AS SIGNED.
+            same("SELECT CAST(d AS SIGNED), CAST(dt AS SIGNED), CAST(dt3 AS SIGNED), \
+                  CAST(tm3 AS SIGNED) FROM Tm ORDER BY id"),
+            same("SELECT CAST(d AS DECIMAL(20,2)), CAST(dt3 AS DECIMAL(30,6)), \
+                  CAST(tm AS DECIMAL(20,0)) FROM Tm ORDER BY id"),
+            // A cast to CHAR is the text, not the number, which is the whole
+            // distinction the tag draws.
+            same("SELECT CAST(d AS CHAR), CAST(dt AS CHAR), CONCAT(d, ''), \
+                  CONCAT(dt3, '') FROM Tm ORDER BY id"),
+            // An aggregate folds the packed numbers and answers a decimal.
+            same("SELECT SUM(d), AVG(d), MAX(d), MIN(tm) FROM Tm"),
+            same("SELECT SUM(dt), SUM(tm), SUM(dt3), SUM(y), MAX(y) FROM Tm"),
+            same("SELECT d, COUNT(*) FROM Tm GROUP BY d ORDER BY d"),
+            // Beside a string the answer is a double, and the string still
+            // reads by its leading number.
+            same("SELECT d + '1', d + s, s + 0, d + 'x' FROM Tm ORDER BY id"),
+            // `COALESCE` and `IFNULL` aggregate their arguments' types, so a
+            // string anywhere in them makes the temporal a string — 2024.
+            // `IF`, `GREATEST` and `CASE` were measured and do not.
+            same("SELECT COALESCE(d, '0') + 0, IFNULL(d, '0') + 0, COALESCE(d, 0) + 0, \
+                  COALESCE(d, d) + 0 FROM Tm ORDER BY id"),
+            same("SELECT IF(1, d, '0') + 0, GREATEST(d, '0') + 0, \
+                  (CASE WHEN 1 THEN d ELSE '0' END) + 0 FROM Tm ORDER BY id"),
+            // A temporal *expression* converts like a temporal column, which
+            // is measured and not obvious: MySQL types
+            // `DATE_ADD('2024-01-05', INTERVAL 1 DAY)` a string and still
+            // reads it 20240106, where the bare literal reads 2024.
+            same("SELECT DATE_ADD('2024-01-05', INTERVAL 1 DAY) + 0, \
+                  DATE('2024-01-05 06:07:08') + 0, LAST_DAY('2024-01-05') + 0, \
+                  '2024-01-05' + 0"),
+            same("SELECT DATE_ADD(d, INTERVAL 1 DAY) + 0, ADDDATE(d, 1) + 0, \
+                  DATE(dt) + 0 FROM Tm ORDER BY id"),
+            same("SELECT CAST('2024-01-05' AS DATE) + 0, \
+                  CAST('2024-01-05 06:07:08' AS DATETIME) + 0, \
+                  CAST('06:07:08' AS TIME) + 0"),
+            // A TIME keeps its sign and runs past 99 hours, so the packing
+            // widens groups without truncating them.
+            same("SELECT CAST('-06:07:08' AS TIME) + 0, CAST('838:59:59' AS TIME) + 0, \
+                  CAST('-06:07:08' AS TIME) < 0"),
+            // A DATETIME written without its seconds. MySQL reads the column
+            // as 20240105060700, so the missing group packs as zero rather
+            // than shortening the number.
+            same("SELECT short + 0 FROM Tm ORDER BY id"),
+            // The bitwise operators read the same packed number, rounded the
+            // way any other decimal operand is.
+            same("SELECT d | 0, dt | 0, tm | 0, dt3 | 0, tm3 | 0 FROM Tm ORDER BY id"),
+            // And the numeric functions, which widen to a double.
+            same("SELECT ABS(d), FLOOR(d), CEILING(d), TRUNCATE(d, 0) FROM Tm ORDER BY id"),
+
+            // -- stored by the type, not by how it was written --------------
+            //
+            // A DATETIME given a bare date holds midnight, a DATE given a
+            // datetime keeps only the date, and a fraction is rounded to the
+            // column's declared precision — so `06:07:08.567` in a TIME is
+            // `06:07:09`. Keeping the characters made the packed number a
+            // property of the statement, and `d = '2024-01-05'` false for a
+            // DATE the statement had written with a clock on it.
+            same("SELECT dt, d, tm, tm1, dt0, dt6 FROM Shape ORDER BY id"),
+            same("SELECT dt + 0, d + 0, tm + 0, tm1 + 0, dt0 + 0, dt6 + 0 \
+                  FROM Shape ORDER BY id"),
+            same("SELECT d = '2024-01-05', dt = '2024-01-05 00:00:00', tm = '06:07:09' \
+                  FROM Shape ORDER BY id"),
+            // The rounding carries, and a TIME has no day to spill into.
+            same("SELECT roll, roll + 0 FROM Shape ORDER BY id"),
+            // The cast declares a shape and a precision exactly as a column
+            // does, and both are applied.
+            same("SELECT CAST('06:07:08.567' AS TIME), CAST('06:07:08.567' AS TIME) + 0, \
+                  CAST('06:07:08.567' AS TIME(1)), CAST('06:07:08.567' AS TIME(1)) + 0"),
+            same("SELECT CAST(dt6 AS DATETIME), CAST(dt6 AS DATETIME) + 0, \
+                  CAST(dt6 AS DATETIME(1)) + 0, CAST(dt AS DATE), \
+                  CAST('2024-01-05' AS DATETIME) FROM Shape ORDER BY id"),
+            // A shift keeps the precision of the argument's declared type,
+            // which a string does not have: a DATETIME(3) column keeps three
+            // digits and a string literal with a fraction is padded to six.
+            same("SELECT DATE_ADD(dt3, INTERVAL 1 DAY), DATE_ADD(dt3, INTERVAL 1 DAY) + 0, \
+                  DATE_ADD(dt, INTERVAL 1 SECOND) + 0 FROM Tm ORDER BY id"),
+            same("SELECT DATE_ADD('2026-01-01 00:00:00.1', INTERVAL 1 SECOND) , \
+                  DATE_ADD('2026-01-01', INTERVAL 1 SECOND), \
+                  TIMESTAMPADD(SECOND, 1, dt3) FROM Tm ORDER BY id"),
+            // Where the precision is carried through an expression rather than
+            // read off a column: MySQL keeps it and so must the metadata, or
+            // the value is a decimal under a column described LONGLONG.
+            same("SELECT COALESCE(dt3, dt3) + 0, IFNULL(dt3, dt3) + 0, \
+                  GREATEST(dt3, dt3) + 0, IF(1, dt3, dt3) + 0, \
+                  (CASE WHEN 1 THEN dt3 ELSE dt3 END) + 0 FROM Tm ORDER BY id"),
+            same("SELECT MAX(dt3) + 0, MIN(tm3) + 0 FROM Tm"),
+            // `CURTIME(n)` takes a precision like `NOW(n)` does, and ignoring
+            // it described the column a decimal and answered an integer. The
+            // value moves, so its width is what is compared: twelve characters
+            // with three digits of fraction and eight without.
+            same("SELECT LENGTH(CURTIME(3)), LENGTH(CURTIME()), LENGTH(NOW(3)), LENGTH(NOW())"),
+
+            // -- an exponent is spelled out, not folded through a float ------
+            //
+            // `1e3` at thirty places is a thousand and thirty zeros. Through
+            // an `f64` it was 1000.000000000000089690419062898688, because a
+            // double holds about fifteen of those digits and the scale asks
+            // for twice that.
+            same("SELECT wide, two FROM Exp ORDER BY id"),
+            same("SELECT CAST('1e3' AS DECIMAL(65,30)), CAST('1e3' AS DECIMAL(20,2)), \
+                  CAST('1.5e2' AS DECIMAL(10,3)), CAST('-2.5e-1' AS DECIMAL(10,4))"),
+            // And text that is not a number at all still reads as the number
+            // MySQL reads out of it, which is the path this shares.
+            same("SELECT CAST('abc' AS DECIMAL(20,2)), CAST('12abc' AS DECIMAL(20,2)), \
+                  CAST('1e' AS DECIMAL(20,2))"),
         ],
     },
     Group {

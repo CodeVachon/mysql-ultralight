@@ -27,6 +27,9 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// not fail cleanly, it would silently produce a catalog with the wrong shape,
 /// and every test running against it would be wrong in a way nothing reports.
 ///
+/// v6 adds another: a temporal, which a v5 image would reload as text — and a
+/// DATE read as text is 2024 in arithmetic where MySQL says 20240105.
+///
 /// v5 adds another: a four-byte float, which a v4 image would reload as a
 /// double and print to seventeen digits where MySQL shows six.
 ///
@@ -42,7 +45,7 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// answering it, which is the wrong answer the version check exists to
 /// prevent. An image is a file a user keeps and boots from with `--state`, so
 /// the stale one has to fail rather than mislead.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 
 /// Writes the whole catalog.
 pub fn encode(catalog: &Catalog) -> Vec<u8> {
@@ -472,6 +475,13 @@ fn write_value(w: &mut Writer, value: &Value) {
             w.u8(7);
             w.u32(f.to_bits());
         }
+        // Tag 8, appended like every tag before it. A temporal reloaded as a
+        // string would read 2024 where the column reads 20240105, which is the
+        // whole defect the tag closes.
+        Value::Temporal(s) => {
+            w.u8(8);
+            w.str(s);
+        }
     }
 }
 
@@ -506,6 +516,7 @@ fn read_value(r: &mut Reader<'_>) -> EngineResult<Value> {
         }
         6 => Value::Decimal(r.str()?),
         7 => Value::Float32(f32::from_bits(r.u32()?)),
+        8 => Value::Temporal(r.str()?),
         other => return Err(malformed(format!("unknown value tag {other}"))),
     })
 }

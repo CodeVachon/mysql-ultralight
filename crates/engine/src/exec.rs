@@ -5134,7 +5134,7 @@ fn apply_distinct(
 fn exact_total(values: &[&Value]) -> Option<(i128, usize)> {
     let scale = values
         .iter()
-        .map(|v| match v {
+        .map(|v| match exact_operand(v)?.as_ref() {
             Value::Int(_) => Some(0),
             Value::Decimal(text) => Some(crate::decimal::scale_of(text)),
             _ => None,
@@ -5143,7 +5143,7 @@ fn exact_total(values: &[&Value]) -> Option<(i128, usize)> {
 
     let mut total: i128 = 0;
     for value in values {
-        let units = match value {
+        let units = match exact_operand(value)?.as_ref() {
             // Checked, because `scale` comes from a value's own text and
             // nothing bounds how many digits that has.
             Value::Int(n) => i128::from(*n).checked_mul(10i128.checked_pow(scale as u32)?)?,
@@ -5153,6 +5153,26 @@ fn exact_total(values: &[&Value]) -> Option<(i128, usize)> {
         total = total.checked_add(units)?;
     }
     Some((total, scale))
+}
+
+/// One aggregated value as the exact number it counts as, borrowed where it
+/// already is one.
+///
+/// A temporal is exact too, at its packed number: MySQL answers `SUM(d)`
+/// 20240105 and `AVG(d)` 20240105.0000 for a DATE of 2024-01-05, both
+/// NEWDECIMAL.
+///
+/// Borrowed rather than promoted into a vector, because this runs per row and
+/// per group: building one cost an allocation and a `String` clone for every
+/// value in every `SUM` and `AVG`, to carry a case most columns do not have.
+/// The same function of the same text in both passes, so the scale and the
+/// units still cannot read one value two ways.
+fn exact_operand(value: &Value) -> Option<std::borrow::Cow<'_, Value>> {
+    match value {
+        Value::Int(_) | Value::Decimal(_) => Some(std::borrow::Cow::Borrowed(value)),
+        Value::Temporal(_) => value.temporal_number().map(std::borrow::Cow::Owned),
+        _ => None,
+    }
 }
 
 /// The name of the hidden column a folded aggregate is bound to.
@@ -5261,6 +5281,12 @@ fn literal_expr(value: &Value) -> Expr {
         Value::Float32(_) => wrap(AstValue::Null),
         Value::Float(_) => wrap(AstValue::Null),
         Value::Text(v) => wrap(AstValue::SingleQuotedString(v.clone())),
+        // As a quoted string, because the AST has no temporal literal without
+        // a keyword in front of it — so this round trip loses the tag, and an
+        // alias substituted into HAVING is compared as the string it renders
+        // as. That is what it was before the tag existed, so nothing regressed
+        // here; it is a gap rather than a change.
+        Value::Temporal(v) => wrap(AstValue::SingleQuotedString(v.clone())),
         // As a number, not a quoted string: a decimal that went back through
         // here as text would be compared by its characters, which is the whole
         // thing the tag exists to prevent.
@@ -5493,21 +5519,30 @@ const ALWAYS_NOT_NULL: &[&str] = &["count", "dense_rank", "isnull", "rank", "row
 /// `UUID()` are measured nullable and are deliberately not here.
 const NULLARY_NOT_NULL: &[&str] = &[
     "connection_id",
+    "last_insert_id",
+    "pi",
+    "rand",
+    "row_count",
+    "unix_timestamp",
+    "version",
+];
+
+/// The clock functions, whose one argument is a *precision* and not a value.
+///
+/// Split out of [`NULLARY_NOT_NULL`] because the argument-count rule was
+/// measured against `UNIX_TIMESTAMP` and does not hold here: `NOW(3)` and
+/// `CURTIME(3)` are NOT NULL on 8.3, and `NOW(NULL)` is a syntax error rather
+/// than a NULL — there is no value to pass in that could make one.
+const CLOCK_NOT_NULL: &[&str] = &[
     "curdate",
     "current_date",
     "current_time",
     "current_timestamp",
     "curtime",
-    "last_insert_id",
     "localtime",
     "localtimestamp",
     "now",
-    "pi",
-    "rand",
-    "row_count",
     "sysdate",
-    "unix_timestamp",
-    "version",
 ];
 
 /// Whether an expression can be said to be NOT NULL on the wire.
@@ -5606,7 +5641,7 @@ fn never_null(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]
         Expr::Function(f) => {
             let name = f.name.to_string().to_ascii_lowercase();
             let args = function_arguments(f);
-            if ALWAYS_NOT_NULL.contains(&name.as_str()) {
+            if ALWAYS_NOT_NULL.contains(&name.as_str()) || CLOCK_NOT_NULL.contains(&name.as_str()) {
                 return true;
             }
             if args.is_empty() {
@@ -5649,19 +5684,6 @@ fn never_null(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]
 /// as `Expr::Floor` and friends and never as a call — listing them here would
 /// make the table look like it covers cases it does not. Their near-synonyms
 /// `CEILING`, `MID` and `LTRIM` do parse as calls and so are here.
-/// Whether a function hands back a string whatever it was given.
-///
-/// Read off [`function_result_type`] rather than listed again, so the
-/// evaluator and the metadata cannot disagree about `CONCAT`. The evaluator
-/// needs it because a bitwise operand's answer turns on whether the statement
-/// declared it a string — see `expr::string_typed`.
-pub(crate) fn returns_string(name: &str) -> bool {
-    matches!(
-        function_result_type(name),
-        Some(ColumnType::VarString | ColumnType::String | ColumnType::LongBlob)
-    )
-}
-
 fn function_result_type(name: &str) -> Option<ColumnType> {
     Some(match name {
         // Counting and measuring, which are always integers.
@@ -5713,6 +5735,120 @@ fn numeric_answer(argument: ColumnType, whole: bool) -> ColumnType {
         ColumnType::Float => ColumnType::Double,
         t @ (ColumnType::Decimal | ColumnType::NewDecimal | ColumnType::Double) => t,
         _ => ColumnType::Double,
+    }
+}
+
+/// Whether a code is one of the temporal types.
+fn is_temporal(t: ColumnType) -> bool {
+    matches!(
+        t,
+        ColumnType::Date | ColumnType::Time | ColumnType::DateTime | ColumnType::Timestamp
+    )
+}
+
+/// The type an operand contributes to arithmetic over it.
+///
+/// A temporal is not a type MySQL computes *in*: it converts to its packed
+/// number and the arithmetic happens over that, so the operand behaves as an
+/// integer — or as a decimal when it carries fractional seconds, which pack
+/// into the digits after the point. Measured on 8.3: `d + 0` is a LONGLONG
+/// and `dt3 + 0` a NEWDECIMAL.
+fn arithmetic_operand_type(
+    e: &Expr,
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+) -> ColumnType {
+    let ty = computed_column_type(e, refs, input);
+    if !is_temporal(ty) {
+        return ty;
+    }
+    if temporal_precision(e, refs, input) > 0 {
+        ColumnType::NewDecimal
+    } else {
+        ColumnType::LongLong
+    }
+}
+
+/// The fractional-second precision a temporal expression carries.
+///
+/// Only where it is written down — a column's declaration, a cast's target,
+/// and the argument `NOW(3)` takes. Everything else answers zero, which is
+/// what a temporal with no declared precision has; guessing higher would type
+/// `CURDATE() + 0` a decimal where MySQL says LONGLONG.
+fn temporal_precision(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]) -> u64 {
+    use sqlparser::ast::DataType as D;
+    match e {
+        Expr::Nested(inner) => temporal_precision(inner, refs, input),
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => direct_column(e, refs, input)
+            .and_then(|column| column.ty.length)
+            .unwrap_or(0),
+        Expr::Cast { data_type, .. } => match data_type {
+            D::Datetime(precision) | D::Time(precision, _) => precision.unwrap_or(0),
+            D::Timestamp(precision, _) => precision.unwrap_or(0),
+            _ => 0,
+        },
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_ascii_lowercase();
+            let args = function_arguments(f);
+            let widest = |candidates: &[Expr]| {
+                candidates
+                    .iter()
+                    .map(|a| temporal_precision(a, refs, input))
+                    .max()
+                    .unwrap_or(0)
+            };
+            let first = |n: usize| widest(args.get(..n).unwrap_or(&args));
+            match name.as_str() {
+                // The clock functions carry their precision as an argument.
+                // The literal digit count, read off the token: the value is
+                // evaluated elsewhere and this runs before any row exists.
+                "now" | "current_timestamp" | "localtime" | "localtimestamp" | "sysdate"
+                | "curtime" | "current_time" => match args.first() {
+                    Some(Expr::Value(v)) => match &v.value {
+                        sqlparser::ast::Value::Number(text, _) => text.parse().unwrap_or(0),
+                        _ => 0,
+                    },
+                    _ => 0,
+                },
+                // Everything below hands back one of its arguments, so the
+                // precision comes from the same argument its *type* does —
+                // taken from `computed_column_type`'s own families rather than
+                // a second list, because two lists drift. MySQL keeps it:
+                // `DATE_ADD(dt3, INTERVAL 1 DAY) + 0` and `MAX(dt3) + 0` are
+                // both NEWDECIMAL there and both keep all three digits.
+                "date_add" | "date_sub" | "adddate" | "subdate" | "nullif" => first(1),
+                // `TIMESTAMPADD(HOUR, 1, dt)` puts the unit first, so the
+                // value it shifts is the third argument.
+                "timestampadd" => args
+                    .get(2)
+                    .map_or(0, |a| temporal_precision(a, refs, input)),
+                "min" | "max" => {
+                    aggregate_argument(f).map_or(0, |a| temporal_precision(&a, refs, input))
+                }
+                "coalesce" | "ifnull" | "nvl" | "greatest" | "least" => widest(&args),
+                // `IF` chooses between its second and third; the condition
+                // says nothing about the result.
+                "if" => widest(args.get(1..).unwrap_or(&[])),
+                _ => 0,
+            }
+        }
+        // A `CASE` hands back one of its results, and any of them can be the
+        // one that runs.
+        Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => conditions
+            .iter()
+            .map(|w| temporal_precision(&w.result, refs, input))
+            .chain(
+                else_result
+                    .iter()
+                    .map(|e| temporal_precision(e, refs, input)),
+            )
+            .max()
+            .unwrap_or(0),
+        _ => 0,
     }
 }
 
@@ -5914,7 +6050,7 @@ fn computed_column_type(
                     let args = function_arguments(f);
                     let side = |i: usize| {
                         args.get(i)
-                            .map(|a| computed_column_type(a, refs, input))
+                            .map(|a| arithmetic_operand_type(a, refs, input))
                             .unwrap_or(ColumnType::Null)
                     };
                     arithmetic_type(side(0), side(1))
@@ -6013,8 +6149,8 @@ fn computed_column_type(
                 B::Divide => ColumnType::NewDecimal,
                 B::MyIntegerDivide => ColumnType::LongLong,
                 B::Plus | B::Minus | B::Multiply | B::Modulo => arithmetic_type(
-                    computed_column_type(left, refs, input),
-                    computed_column_type(right, refs, input),
+                    arithmetic_operand_type(left, refs, input),
+                    arithmetic_operand_type(right, refs, input),
                 ),
                 // Every bitwise operator answers 64 unsigned bits whatever it
                 // was given: `1.5 ^ 1` is a LONGLONG in MySQL and so is
@@ -6039,6 +6175,13 @@ fn computed_column_type(
             }
             match op {
                 U::Not | U::BitwiseNot => ColumnType::LongLong,
+                // Unary plus is the identity — `+d` is still a DATE — where
+                // unary minus computes, and MySQL answers a DOUBLE for the
+                // negation of a temporal even though `d + 0` is a LONGLONG.
+                // Measured, not derived: `-d` is DOUBLE -20240105 on 8.3.
+                U::Minus if is_temporal(computed_column_type(expr, refs, input)) => {
+                    ColumnType::Double
+                }
                 U::Minus | U::Plus => match computed_column_type(expr, refs, input) {
                     t if is_integer(t) => ColumnType::LongLong,
                     // As with `ABS`: computing with a float widens it, and
@@ -6095,6 +6238,11 @@ fn is_integer(t: ColumnType) -> bool {
             | ColumnType::Short
             | ColumnType::Int24
             | ColumnType::Long
+            // A YEAR is the one temporal type MySQL computes in directly
+            // rather than packing first, because it already is a number:
+            // `y + 0` is a LONGLONG UNSIGNED there and `y` itself the
+            // number the column holds.
+            | ColumnType::Year
             | ColumnType::LongLong
     )
 }

@@ -503,6 +503,11 @@ pub fn from_value(value: &Value) -> Json {
             serde_json::Number::from_f64(f64::from(*f)).map_or(Json::Null, Json::Number)
         }
         Value::Text(s) => Json::String(s.clone()),
+        // A string, like the text it renders as: MySQL gives
+        // `JSON_OBJECT('a', d)` the value `"2024-01-05"` and not the packed
+        // number it would read in arithmetic. The tag changes the *numeric*
+        // reading of a temporal and nothing else.
+        Value::Temporal(s) => Json::String(s.clone()),
         Value::Bytes(b) => Json::String(String::from_utf8_lossy(b).into_owned()),
         // A number rather than a string: `JSON_OBJECT('a', decimal_column)`
         // gives `{"a": 2.5}` and not `{"a": "2.50"}`. The scale is lost on the

@@ -140,9 +140,11 @@ impl ResultSet {
     /// rather than a list of functions to remember, so it is closed here
     /// instead — every result passes through this on its way out.
     ///
-    /// Only the approximate types, because they are the ones where the same
-    /// number has two spellings. Nothing else is touched: a wrongly *tagged*
-    /// value is a bug to find, not one to paper over.
+    /// The approximate types, because they are the ones where the same number
+    /// has two spellings — and one exact pairing, a fraction under an integer
+    /// code, which is the one combination the two protocols cannot both send
+    /// at all. Nothing else is touched: a wrongly *tagged* value is a bug to
+    /// find, not one to paper over.
     pub fn reconcile(&mut self) {
         for (index, column) in self.columns.iter().enumerate() {
             for row in &mut self.rows {
@@ -156,6 +158,31 @@ impl ResultSet {
                     // float behind it renders as. See `decimal::plain`.
                     (ColumnType::NewDecimal | ColumnType::Decimal, Value::Float(v)) => {
                         *value = Value::Decimal(crate::decimal::plain(*v));
+                    }
+                    // A fraction under an integer code. The text protocol
+                    // writes the digits and the binary one parses them as an
+                    // `i64`, fails, and writes zero — so the same row reads
+                    // 60708.567 through one connection and 0 through the
+                    // other. Reachable wherever an operand's declared
+                    // precision is out of the metadata's reach, and this is
+                    // the last place the value and the code are both in hand.
+                    //
+                    // Rounded rather than truncated, which is what MySQL
+                    // renders an exact value as under a LONGLONG.
+                    (
+                        ColumnType::Tiny
+                        | ColumnType::Short
+                        | ColumnType::Int24
+                        | ColumnType::Long
+                        | ColumnType::LongLong
+                        | ColumnType::Year,
+                        Value::Decimal(text),
+                    ) => {
+                        if let Some(n) =
+                            crate::decimal::units(text, 0).and_then(|u| i64::try_from(u).ok())
+                        {
+                            *value = Value::Int(n);
+                        }
                     }
                     _ => {}
                 }
@@ -236,6 +263,35 @@ mod tests {
         assert_eq!(
             mismatched(ColumnType::NewDecimal, Value::Float(4e16)).as_text(),
             "40000000000000000"
+        );
+
+        // A fraction under an integer code, which is the one pairing the two
+        // protocols cannot both send: the text one writes `60708.567` and the
+        // binary one parses it as an `i64`, fails, and writes 0.
+        //
+        // No *statement* reaches this today — a temporal is written into its
+        // column's declared precision, and the metadata reads that same
+        // precision, so the two agree by construction all the way through a
+        // derived table, a union and a view. It is asserted here, at its own
+        // level, rather than through SQL that would have to be contrived: the
+        // guard exists because this failure is invisible to any test that
+        // reads the text, not because a known query produces it.
+        assert_eq!(
+            mismatched(ColumnType::LongLong, Value::Decimal("60708.567".to_owned())),
+            Value::Int(60709)
+        );
+        assert_eq!(
+            mismatched(ColumnType::Long, Value::Decimal("-2.5".to_owned())),
+            Value::Int(-3)
+        );
+        // A decimal under a *decimal* code is left alone, which is the whole
+        // point of the tag.
+        assert_eq!(
+            mismatched(
+                ColumnType::NewDecimal,
+                Value::Decimal("60708.567".to_owned())
+            ),
+            Value::Decimal("60708.567".to_owned())
         );
 
         // Nothing else is touched: a wrongly tagged value elsewhere is a bug

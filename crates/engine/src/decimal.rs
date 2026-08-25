@@ -129,6 +129,66 @@ pub fn rescale_wide(text: &str, scale: usize) -> Option<String> {
     })
 }
 
+/// A number written with an exponent, spelled out in plain digits.
+///
+/// `'1e3'` is 1000 and `'1.5e-2'` is 0.015, exactly — the point is moved
+/// through the digit string rather than through an `f64`, which is not exact
+/// past about fifteen of them: `CAST('1e3' AS DECIMAL(65,30))` came back
+/// 1000.000000000000089690419062898688 where MySQL answers thirty zeros.
+///
+/// `None` for anything that is not a number with an exponent, including a
+/// plain decimal — those have their own path and do not need this one.
+pub fn expanded(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let (mantissa, exponent) = trimmed.split_once(['e', 'E'])?;
+    let exponent: i64 = exponent.parse().ok()?;
+    let (negative, rest) = match mantissa.strip_prefix(['-', '+']) {
+        Some(rest) => (mantissa.starts_with('-'), rest),
+        None => (false, mantissa),
+    };
+    let (whole, fraction) = rest.split_once('.').unwrap_or((rest, ""));
+    let plain = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if !plain(whole) || !plain(fraction) || (whole.is_empty() && fraction.is_empty()) {
+        return None;
+    }
+    // Refused rather than expanded: an exponent of 10^18 asks for a string
+    // nothing can hold, and the caller's own fallback answers that case the
+    // way MySQL does.
+    let digits = whole.len() + fraction.len();
+    if exponent.unsigned_abs() > 1000 || digits > 1000 {
+        return None;
+    }
+
+    // The point's position counted from the front of the digits, which is
+    // where the exponent moves it.
+    let mut all: Vec<u8> = whole.bytes().chain(fraction.bytes()).collect();
+    let mut point = whole.len() as i64 + exponent;
+    // Padded on whichever side the point ran off, so the digits and the point
+    // stay in the same string.
+    while point > all.len() as i64 {
+        all.push(b'0');
+    }
+    while point < 0 {
+        all.insert(0, b'0');
+        point += 1;
+    }
+    let at = point as usize;
+    let text = std::str::from_utf8(&all).ok()?;
+    let (whole, fraction) = text.split_at(at);
+    let whole = whole.trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let written = if fraction.is_empty() {
+        whole.to_owned()
+    } else {
+        format!("{whole}.{fraction}")
+    };
+    Some(if negative {
+        format!("-{written}")
+    } else {
+        written
+    })
+}
+
 /// A count of units at `scale`, written out.
 pub fn render(units: i128, scale: usize) -> String {
     let negative = units < 0;

@@ -299,7 +299,7 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
                         })
                         .and_then(|first_of_next| first_of_next.add(temporal::Unit::Day, -1));
                     match last_day {
-                        Some(day) => Value::text(day.render()),
+                        Some(day) => Value::Temporal(day.render()),
                         None => Value::Null,
                     }
                 }
@@ -662,16 +662,19 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         }
 
         // -- null handling ------------------------------------------------
-        "coalesce" => args
-            .into_iter()
-            .find(|v| !v.is_null())
+        //
+        // These aggregate the *types* of their arguments, so a temporal beside
+        // anything else stops being one: measured on 8.3, `COALESCE(d, '0')`,
+        // `COALESCE(d, 0)` and `COALESCE(d, 1.5)` are all VAR_STRING and all
+        // read 2024 in arithmetic, where the bare `d` reads 20240105. `IF`,
+        // `GREATEST`, `LEAST` and `CASE` were measured too and do *not*
+        // aggregate that way — they keep the temporal — which is why the rule
+        // is written here and not shared with them.
+        "coalesce" => untag_mixed_temporal(&args, args.iter().find(|v| !v.is_null()).cloned())
             .unwrap_or(Value::Null),
         "ifnull" | "nvl" => {
-            if arg(0).is_null() {
-                arg(1)
-            } else {
-                arg(0)
-            }
+            let chosen = if arg(0).is_null() { arg(1) } else { arg(0) };
+            untag_mixed_temporal(&args, Some(chosen)).unwrap_or(Value::Null)
         }
         "nullif" => {
             if arg(0).compare(&arg(1)) == Some(std::cmp::Ordering::Equal) {
@@ -863,14 +866,25 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
                 .and_then(|v| v.as_int())
                 .unwrap_or(0)
                 .clamp(0, 6);
-            Value::Text(now_datetime_with(digits as usize))
+            Value::Temporal(now_datetime_with(digits as usize))
         }
-        "curdate" | "current_date" => Value::Text(now_datetime()[..10].to_owned()),
-        "curtime" | "current_time" => Value::Text(now_datetime()[11..].to_owned()),
+        "curdate" | "current_date" => Value::Temporal(now_datetime()[..10].to_owned()),
+        // The argument is the fractional-second precision here too, and it is
+        // read for the same reason `NOW(3)`'s is: the metadata reads it off the
+        // token to type the column, so ignoring it described `CURTIME(3) + 0`
+        // as a decimal and answered an integer.
+        "curtime" | "current_time" => {
+            let digits = args
+                .first()
+                .and_then(|v| v.as_int())
+                .unwrap_or(0)
+                .clamp(0, 6);
+            Value::Temporal(now_datetime_with(digits as usize)[11..].to_owned())
+        }
         "unix_timestamp" => Value::Int(unix_seconds() as i64),
         "date" => {
             let s = text(0);
-            Value::Text(s.chars().take(10).collect())
+            Value::Temporal(s.chars().take(10).collect())
         }
         // Through the same parser as the rest, so one bad value behaves one
         // way: splitting on '-' used to read '2026-13-45' as the year 2026
@@ -880,6 +894,29 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         "day" | "dayofmonth" => date_part(&arg(0), |s| i64::from(s.day)),
 
         other => return Err(unsupported(format!("function `{other}()`"))),
+    })
+}
+
+/// Drops the temporal tag where the arguments beside it were not temporals.
+///
+/// The aggregation is done over the argument *values*, because that is all
+/// this function has. One case is out of reach that way: an argument that is
+/// NULL carries no tag, so `COALESCE(d, s)` over a VARCHAR holding NULL keeps
+/// the temporal where MySQL — which aggregates declared types, NULL or not —
+/// makes it a string. Visible only in a further numeric context, and the same
+/// limit `Value::Decimal` already has.
+fn untag_mixed_temporal(args: &[Value], chosen: Option<Value>) -> Option<Value> {
+    let chosen = chosen?;
+    if !matches!(chosen, Value::Temporal(_)) {
+        return Some(chosen);
+    }
+    let mixed = args
+        .iter()
+        .any(|v| !v.is_null() && !matches!(v, Value::Temporal(_)));
+    Some(if mixed {
+        Value::Text(chosen.as_text())
+    } else {
+        chosen
     })
 }
 
@@ -1037,13 +1074,41 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
             // way fill an omitted scale in one place: a bare `DECIMAL` is
             // `DECIMAL(10,0)` to both.
             let scale = crate::types::SqlType::from_ast(ty)?.scale.unwrap_or(0) as usize;
-            Value::Decimal(crate::types::decimal_digits(&value.as_text(), scale))
+            // A temporal converts through its packed number, not its text:
+            // `CAST(d AS DECIMAL(20,2))` is 20240105.00 in MySQL where reading
+            // `2024-01-05` as a number gives 2024.00.
+            let source = value
+                .temporal_number()
+                .map_or_else(|| value.as_text(), |number| number.as_text());
+            Value::Decimal(crate::types::decimal_digits(&source, scale))
         }
         D::Char(_) | D::Varchar(_) | D::Text | D::CharacterVarying(_) | D::Character(_) => {
             Value::Text(value.as_text())
         }
-        D::Date => Value::Text(value.as_text().chars().take(10).collect()),
-        D::Datetime(_) | D::Timestamp(_, _) | D::Time(_, _) => Value::Text(value.as_text()),
+        // Tagged, exactly as the DECIMAL cast above is and for the same
+        // reason: the cast declares the type, and without the tag the result
+        // is an ordinary string that every later reader has to guess at —
+        // `CAST('2024-01-05' AS DATE) + 0` read 2024 where MySQL says
+        // 20240105, while the bare literal beside it really is 2024.
+        //
+        // Written into the target's shape and to the precision the cast
+        // declares: `CAST('06:07:08.567' AS TIME)` is 06:07:09 in MySQL and
+        // `AS TIME(1)` is 06:07:08.6. Taking the first ten characters made
+        // `AS DATE` a substring rather than a conversion, and keeping the text
+        // verbatim made the declared precision a claim the value did not meet
+        // — which is what the column is then described by.
+        D::Date | D::Datetime(_) | D::Timestamp(_, _) | D::Time(_, _) => {
+            let (shape, precision) = match ty {
+                D::Date => (temporal::Shape::Date, 0),
+                D::Time(precision, _) => (temporal::Shape::Time, precision.unwrap_or(0)),
+                D::Datetime(precision) | D::Timestamp(precision, _) => {
+                    (temporal::Shape::DateTime, precision.unwrap_or(0))
+                }
+                _ => unreachable!("guarded by this arm's own pattern"),
+            };
+            let text = value.as_text();
+            Value::Temporal(temporal::normalise(&text, shape, precision as u32).unwrap_or(text))
+        }
         // The cast is how a string becomes a document, so it parses rather
         // than relabelling: `JSON_OBJECT('c', CAST('[1,2]' AS JSON))` has to
         // give `{"c": [1, 2]}`, and text that is not JSON is an error here

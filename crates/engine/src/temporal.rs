@@ -505,3 +505,192 @@ pub fn format(stamp: &Stamp, spec: &str) -> EngineResult<String> {
     }
     Ok(out)
 }
+
+// ------------------------------------------------------------- normalising
+
+/// The shape a temporal column or cast target declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    Date,
+    /// DATETIME and TIMESTAMP, which differ in range and not in shape.
+    DateTime,
+    Time,
+}
+
+/// A temporal written into the shape its type declares.
+///
+/// MySQL stores a temporal by its *type* and not by how it was written, which
+/// this engine did not: it kept the characters. Measured on 8.3 — a DATETIME
+/// given `'2024-01-05'` holds `2024-01-05 00:00:00`, a DATE given a datetime
+/// keeps only the date, and a fraction is rounded to the declared precision,
+/// so a TIME given `'06:07:08.567'` holds `06:07:09`.
+///
+/// Keeping the text made the packed number a property of the statement rather
+/// than of the column — `dt + 0` answered 20240105 where MySQL says
+/// 20240105000000 — and left a TIME(0) carrying a fraction, which packs to a
+/// decimal under a column described LONGLONG. That is the one combination the
+/// two protocols cannot both send: the text one writes the digits and the
+/// binary one parses them as an `i64`, fails, and writes zero.
+///
+/// `None` where the text is not a temporal at all. A column can still be given
+/// one, because nothing validates on the way in, and the caller keeps what it
+/// had rather than inventing a value.
+pub fn normalise(text: &str, shape: Shape, precision: u32) -> Option<String> {
+    let precision = precision.min(6);
+    if shape == Shape::Time {
+        return normalise_time(text, precision);
+    }
+    let stamp = parse(text)?;
+    if shape == Shape::Date {
+        return Some(format!(
+            "{:04}-{:02}-{:02}",
+            stamp.year, stamp.month, stamp.day
+        ));
+    }
+    // Rounded rather than truncated, and carried: `2024-01-05 23:59:59.567`
+    // at precision zero is the sixth of January, not the fifth.
+    let (micros, carry) = round_micros(stamp.micros, precision);
+    let stamp = if carry {
+        let mut carried = stamp.add(Unit::Second, 1)?;
+        carried.micros = 0;
+        carried
+    } else {
+        Stamp { micros, ..stamp }
+    };
+    Some(format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}{}",
+        stamp.year,
+        stamp.month,
+        stamp.day,
+        stamp.hour,
+        stamp.minute,
+        stamp.second,
+        fraction(stamp.micros, precision)
+    ))
+}
+
+/// A TIME, which needs its own path: it runs to 838 hours, it may be negative,
+/// and a datetime given to one keeps only the clock.
+fn normalise_time(text: &str, precision: u32) -> Option<String> {
+    let trimmed = text.trim();
+    // A full datetime first, so `'2024-01-05 06:07:08'` in a TIME column is
+    // `06:07:08` and not a failed parse left as written.
+    let (negative, hour, minute, second, micros) = match parse(trimmed) {
+        Some(stamp) => (
+            false,
+            stamp.hour as i64,
+            stamp.minute,
+            stamp.second,
+            stamp.micros,
+        ),
+        None => {
+            let (negative, rest) = match trimmed.strip_prefix('-') {
+                Some(rest) => (true, rest),
+                None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+            };
+            let (clock, fraction) = rest.split_once('.').unwrap_or((rest, ""));
+            // A colon, or `'2026'` would read as 2026 o'clock — the same rule
+            // `parse_clock` draws, and for the same reason.
+            if !clock.contains(':') {
+                return None;
+            }
+            let mut units = clock.split(':');
+            let mut piece = |max: u32| -> Option<u32> {
+                let value: u32 = units.next().unwrap_or("0").parse().ok()?;
+                (value <= max).then_some(value)
+            };
+            // 838 is the range MySQL gives the type; the value is not clamped
+            // to it here, because nothing else on this path validates either.
+            let hour = piece(838)?;
+            let minute = piece(59)?;
+            let second = piece(59)?;
+            if units.next().is_some() {
+                return None;
+            }
+            if !fraction.is_empty() && !fraction.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let digits: String = fraction.chars().take(6).collect();
+            let micros = if digits.is_empty() {
+                0
+            } else {
+                digits.parse::<u32>().ok()? * 10u32.pow(6 - digits.len() as u32)
+            };
+            (negative, i64::from(hour), minute, second, micros)
+        }
+    };
+
+    let (micros, carry) = round_micros(micros, precision);
+    // Recomposed through a second count, because the carry runs through the
+    // minutes and the hours and a TIME has no day to spill into.
+    let mut seconds = hour * 3600 + i64::from(minute) * 60 + i64::from(second);
+    if carry {
+        seconds += 1;
+    }
+    let micros = if carry { 0 } else { micros };
+    Some(format!(
+        "{}{:02}:{:02}:{:02}{}",
+        // Away from zero, so `-06:07:08.567` at precision zero is -06:07:09.
+        // A value that rounds to nothing keeps no sign, as a decimal does not.
+        if negative && (seconds != 0 || micros != 0) {
+            "-"
+        } else {
+            ""
+        },
+        seconds / 3600,
+        seconds % 3600 / 60,
+        seconds % 60,
+        fraction(micros, precision)
+    ))
+}
+
+/// The number of fractional-second digits a temporal's text carries.
+///
+/// What a value shifted by an interval has to come back with: MySQL keeps the
+/// argument's precision, so `DATE_ADD(dt3, INTERVAL 1 DAY)` has three digits
+/// and not the six `Stamp::render` pads to. Read off the text because that is
+/// where the declared precisionlands — a normalised column holds exactly as
+/// many digits as it was declared with.
+pub fn fraction_digits(text: &str) -> u32 {
+    let trimmed = text.trim();
+    let Some((_, fraction)) = trimmed.split_once('.') else {
+        return 0;
+    };
+    let digits = fraction
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count()
+        .min(6);
+    if digits == fraction.len() {
+        digits as u32
+    } else {
+        0
+    }
+}
+
+/// Microseconds rounded to `precision` places, and whether the rounding
+/// carried into the next second.
+fn round_micros(micros: u32, precision: u32) -> (u32, bool) {
+    let step = 10u32.pow(6 - precision);
+    // Half up on the first digit dropped, which is what MySQL does to a
+    // temporal: `06:07:08.5` in a TIME is `06:07:09`.
+    //
+    // `div_ceil` rather than `step / 2`, because at full precision the step is
+    // one and `0 >= 0` rounded every value up by a microsecond — a DATETIME(6)
+    // of `.100000` came back `.100001`.
+    let rounded = (micros / step + u32::from(micros % step >= step.div_ceil(2))) * step;
+    if rounded >= 1_000_000 {
+        (0, true)
+    } else {
+        (rounded, false)
+    }
+}
+
+/// The fractional part a declared precision asks for, or nothing at zero.
+fn fraction(micros: u32, precision: u32) -> String {
+    if precision == 0 {
+        return String::new();
+    }
+    let digits = format!("{micros:06}");
+    format!(".{}", &digits[..precision as usize])
+}

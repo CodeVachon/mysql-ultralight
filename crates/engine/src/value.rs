@@ -47,6 +47,25 @@ pub enum Value {
     /// It does not survive arithmetic, which is right: `f + 0` in MySQL is a
     /// double and shows every digit of the widened value.
     Float32(f32),
+    /// A DATE, DATETIME, TIMESTAMP or TIME, held as its text.
+    ///
+    /// The sharpest case of the same argument `Json` and `Decimal` above make.
+    /// MySQL reads a temporal in a numeric context as its packed digits — a
+    /// DATE of 2024-01-05 is 20240105, a DATETIME 20240105060708, a TIME of
+    /// 06:07:08 is 60708 — where a *string* of those same characters is read
+    /// by its leading number and gives 2024 and 6. Both measured on 8.3.
+    /// Nothing about `"2024-01-05"` says which was meant, so the tag is the
+    /// only thing that can tell them apart.
+    ///
+    /// The tag rides on the value rather than being read off the expression
+    /// because MySQL's own answer does: `DATE_ADD('2024-01-05', INTERVAL 1
+    /// DAY)` is typed a *string* there — `STRING`, not `DATE` — and still
+    /// reads 20240106 in arithmetic. A type taken from the statement would
+    /// have said 2024.
+    ///
+    /// A YEAR is not one of these. MySQL reads it as the plain number it
+    /// already is, and this engine stores it as `Int`.
+    Temporal(String),
 }
 
 impl Value {
@@ -66,6 +85,14 @@ impl Value {
     pub fn as_int(&self) -> Option<i64> {
         match self {
             Value::Int(v) => Some(*v),
+            // Rounded rather than truncated, which is measured: MySQL answers
+            // `CAST(dt3 AS SIGNED)` 20240105060709 for a DATETIME(3) holding
+            // 06:07:08.500, and 60709 for the TIME(3) beside it.
+            Value::Temporal(_) => match self.temporal_number()? {
+                Value::Int(n) => Some(n),
+                Value::Decimal(text) => i64::try_from(crate::decimal::units(&text, 0)?).ok(),
+                _ => None,
+            },
             Value::Float(v) => Some(*v as i64),
             Value::Float32(v) => Some(*v as i64),
             Value::Text(v) | Value::Json(v) | Value::Decimal(v) => {
@@ -84,6 +111,10 @@ impl Value {
             Value::Float(v) => Some(*v),
             Value::Float32(v) => Some(*v as f64),
             Value::Text(v) | Value::Json(v) | Value::Decimal(v) => v.trim().parse().ok(),
+            // Its packed number, which is what makes `d = 20240105` true: a
+            // comparison against a number is numeric, and reading the text
+            // gave `None` here and sent the pair to the collation instead.
+            Value::Temporal(_) => Some(self.as_number()),
             _ => None,
         }
     }
@@ -102,6 +133,14 @@ impl Value {
             Value::Float32(v) => *v as f64,
             Value::Text(v) | Value::Json(v) | Value::Decimal(v) => numeric_prefix(v),
             Value::Bytes(v) => numeric_prefix(&String::from_utf8_lossy(v)),
+            // Its packed digits, and its leading number only where the text is
+            // not a temporal at all — a DATE column can hold text this engine
+            // never validated, and that is no reason to answer differently
+            // from the untagged value it used to be.
+            Value::Temporal(v) => match self.temporal_number() {
+                Some(number) => number.as_number(),
+                None => numeric_prefix(v),
+            },
         }
     }
 
@@ -118,6 +157,9 @@ impl Value {
             ),
             Value::Text(v) => v.clone(),
             Value::Bytes(v) => String::from_utf8_lossy(v).into_owned(),
+            // The text it was stored as: only the *numeric* reading of a
+            // temporal is packed, and `SELECT d` still shows `2024-01-05`.
+            Value::Temporal(v) => v.clone(),
             // The document as it was serialised, which is what MySQL sends and
             // what a client reads back.
             Value::Json(v) | Value::Decimal(v) => v.clone(),
@@ -141,6 +183,9 @@ impl Value {
             // Read like the text it used to be, so tagging a value changed
             // nothing about how a WHERE clause treats it.
             Value::Json(v) | Value::Decimal(v) => Some(numeric_prefix(v) != 0.0),
+            // By the packed number, for the same reason arithmetic is: MySQL
+            // asks a temporal the numeric question the way it converts one.
+            Value::Temporal(_) => Some(self.as_number() != 0.0),
         }
     }
 
@@ -187,6 +232,32 @@ impl Value {
             (Value::Bytes(a), Value::Bytes(b)) => Some(a.cmp(b)),
             _ => Some(collate(&self.as_text(), &other.as_text())),
         }
+    }
+
+    /// The exact number MySQL reads this temporal as, or `None` for anything
+    /// that is not one.
+    ///
+    /// An integer where the value has no fractional seconds and a decimal
+    /// where it has, because that is what MySQL types the arithmetic over one:
+    /// `d + 0` is a LONGLONG and `dt3 + 0` a NEWDECIMAL that keeps all three
+    /// digits — 20240105060708.500, not 20240105060708.5.
+    ///
+    /// `None` for a temporal whose text is not one, which a DATE column can
+    /// hold because nothing validates on the way in. The callers fall back to
+    /// the leading-number reading, which is what the untagged value gave.
+    pub fn temporal_number(&self) -> Option<Value> {
+        let Value::Temporal(text) = self else {
+            return None;
+        };
+        let (negative, packed, fraction) = packed_temporal(text)?;
+        let integer = packed.trim_start_matches('0');
+        let integer = if integer.is_empty() { "0" } else { integer };
+        let sign = if negative { "-" } else { "" };
+        Some(if fraction.is_empty() {
+            Value::Int(format!("{sign}{integer}").parse().ok()?)
+        } else {
+            Value::Decimal(format!("{sign}{integer}.{fraction}"))
+        })
     }
 
     /// This value as the JSON operand MySQL would compare it as.
@@ -256,7 +327,9 @@ impl Value {
             Value::Bytes(v) => WireValue::Bytes(v.clone()),
             // JSON crosses the wire as text, which is how MySQL transmits it.
             // A decimal travels as its text, which is how MySQL sends one.
-            Value::Json(v) | Value::Decimal(v) => WireValue::Str(v.clone()),
+            // A temporal does too — the packed number is a reading, not a
+            // representation, and a client asking for a DATE gets its text.
+            Value::Json(v) | Value::Decimal(v) | Value::Temporal(v) => WireValue::Str(v.clone()),
         }
     }
 
@@ -356,6 +429,77 @@ pub(crate) fn numeric_prefix(text: &str) -> f64 {
     }
 }
 
+/// The digits MySQL packs a temporal into, as a sign, an integer part and a
+/// fraction.
+///
+/// Positional rather than a parse: each group is widened to the place it
+/// occupies, so `2024-1-5` and `2024-01-05` are one date and both pack as
+/// 20240105. `None` where any group is not digits, which is the caller's
+/// signal that the text is not a temporal at all.
+fn packed_temporal(text: &str) -> Option<(bool, String, String)> {
+    let trimmed = text.trim();
+    let (body, fraction) = match trimmed.split_once('.') {
+        Some((body, fraction)) if !fraction.is_empty() && all_digits(fraction) => (body, fraction),
+        Some(_) => return None,
+        None => (trimmed, ""),
+    };
+    // Only a TIME is ever negative, and MySQL keeps the sign on the packed
+    // number: a TIME of -06:07:08 is -60708 rather than 60708.
+    let negative = body.starts_with('-');
+    let body = body.strip_prefix('-').unwrap_or(body);
+
+    // A space or a `T` separates the calendar from the clock. Without one, a
+    // colon anywhere says the whole value is a clock — that is the only thing
+    // telling a bare TIME from a bare DATE.
+    let (date, clock) = match body.split_once([' ', 'T']) {
+        Some((date, clock)) => (Some(date), Some(clock.trim_start())),
+        None if body.contains(':') => (None, Some(body)),
+        None => (Some(body), None),
+    };
+
+    let mut packed = String::new();
+    if let Some(date) = date {
+        let mut groups = date.split('-');
+        widen(groups.next()?, 4, &mut packed)?;
+        for group in groups {
+            widen(group, 2, &mut packed)?;
+        }
+    }
+    if let Some(clock) = clock {
+        let mut groups = 0;
+        for group in clock.split(':') {
+            // Widened, never truncated: a TIME runs to 838 hours, and
+            // `838:59:59` packs as 8385959 rather than losing a digit.
+            widen(group, 2, &mut packed)?;
+            groups += 1;
+        }
+        // MySQL takes `2024-01-05 06:07` on the way in, and this engine stores
+        // what was written. The missing groups pack as zero, which is what
+        // MySQL reads that value as: 20240105060700.
+        for _ in groups..3 {
+            packed.push_str("00");
+        }
+    }
+    Some((negative, packed, fraction.to_owned()))
+}
+
+/// Appends one group of a temporal, zero-padded to the width of its place.
+fn widen(group: &str, width: usize, out: &mut String) -> Option<()> {
+    if !all_digits(group) {
+        return None;
+    }
+    for _ in group.len()..width {
+        out.push('0');
+    }
+    out.push_str(group);
+    Some(())
+}
+
+/// A non-empty run of ASCII digits and nothing else.
+fn all_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +563,61 @@ mod tests {
         assert_eq!(Value::Null.truthy(), None);
         assert_eq!(Value::text("abc").truthy(), Some(false));
         assert_eq!(Value::text("1").truthy(), Some(true));
+    }
+
+    /// The packer at its own level.
+    ///
+    /// Every temporal a *statement* can produce is normalised first — into its
+    /// column's or its cast's declared shape — so the widening below is not
+    /// reachable through SQL any more. It is still reachable through text
+    /// nothing validated: `temporal::normalise` declines a date MySQL would
+    /// have rejected on the way in, and this engine keeps such text rather
+    /// than refusing the insert. So the rule is asserted here rather than
+    /// through a query that would have to be contrived to reach it.
+    #[test]
+    fn a_temporal_packs_each_group_into_the_place_it_occupies() {
+        let packed = |text: &str| Value::Temporal(text.to_owned()).temporal_number();
+
+        assert_eq!(packed("2024-01-05"), Some(Value::Int(20_240_105)));
+        assert_eq!(
+            packed("2024-01-05 06:07:08"),
+            Some(Value::Int(20_240_105_060_708))
+        );
+        assert_eq!(packed("06:07:08"), Some(Value::Int(60_708)));
+        // Groups narrower than their place are widened, not concatenated:
+        // `2024-1-5` is the fifth of January and not 2024105.
+        assert_eq!(packed("2024-1-5"), Some(Value::Int(20_240_105)));
+        assert_eq!(
+            packed("2024-1-5 6:7:8"),
+            Some(Value::Int(20_240_105_060_708))
+        );
+        // A clock with groups missing packs the rest as zero rather than
+        // shortening the number.
+        assert_eq!(
+            packed("2024-01-05 06:07"),
+            Some(Value::Int(20_240_105_060_700))
+        );
+        assert_eq!(
+            packed("2024-01-05 06"),
+            Some(Value::Int(20_240_105_060_000))
+        );
+        // A TIME keeps its sign and runs past two digits of hours.
+        assert_eq!(packed("-06:07:08"), Some(Value::Int(-60_708)));
+        assert_eq!(packed("838:59:59"), Some(Value::Int(8_385_959)));
+        // A fraction packs after the point, keeping exactly the digits given.
+        assert_eq!(
+            packed("2024-01-05 06:07:08.500"),
+            Some(Value::Decimal("20240105060708.500".to_owned()))
+        );
+        assert_eq!(
+            packed("06:07:08.5"),
+            Some(Value::Decimal("60708.5".to_owned()))
+        );
+        // And text that is not a temporal at all has no packed number, which
+        // is how the callers know to read it as a string instead.
+        assert_eq!(packed("hello"), None);
+        assert_eq!(packed("2024-01-05 x"), None);
+        assert_eq!(packed("06:07:08.5x"), None);
     }
 
     #[test]

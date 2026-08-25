@@ -161,7 +161,15 @@ impl SqlType {
             D::Custom(name, _) => {
                 // YEAR reaches us as a custom type rather than a known one.
                 if name.to_string().eq_ignore_ascii_case("year") {
-                    Self::simple(TypeKind::Year, "year")
+                    // Unsigned, which MySQL reports on the wire and not in
+                    // `COLUMN_TYPE`: a YEAR column is described `UNSIGNED
+                    // ZEROFILL` there while `information_schema` says plain
+                    // `year`. `simple` leaves `declared` alone, so setting the
+                    // flag here changes the one without touching the other.
+                    Self {
+                        unsigned: true,
+                        ..Self::simple(TypeKind::Year, "year")
+                    }
                 } else {
                     return Err(unsupported(format!("column type `{name}`")));
                 }
@@ -200,7 +208,10 @@ impl SqlType {
             ColumnType::Date => simple(TypeKind::Date, "date"),
             ColumnType::DateTime | ColumnType::Timestamp => simple(TypeKind::DateTime, "datetime"),
             ColumnType::Time => simple(TypeKind::Time, "time"),
-            ColumnType::Year => simple(TypeKind::Year, "year"),
+            ColumnType::Year => SqlType {
+                unsigned: true,
+                ..simple(TypeKind::Year, "year")
+            },
             ColumnType::Json => simple(TypeKind::Json, "json"),
             ColumnType::Blob
             | ColumnType::LongBlob
@@ -320,9 +331,14 @@ impl SqlType {
             }
             // The epoch rather than MySQL's `0000-00-00`, because the mode this
             // engine targets sets NO_ZERO_DATE and would reject that value.
-            TypeKind::Date => Value::text("1970-01-01"),
-            TypeKind::DateTime => Value::text("1970-01-01 00:00:00"),
-            TypeKind::Time => Value::text("00:00:00"),
+            //
+            // Tagged, like the decimal above and for the same reason: a row
+            // filled from its default holds a temporal like every other row,
+            // and left as text it would be the one DATE in the column that
+            // reads 1970 in arithmetic instead of 19700101.
+            TypeKind::Date => Value::Temporal("1970-01-01".to_owned()),
+            TypeKind::DateTime => Value::Temporal("1970-01-01 00:00:00".to_owned()),
+            TypeKind::Time => Value::Temporal("00:00:00".to_owned()),
             // Tagged, so a column filled from its default holds a document
             // like every other row does.
             TypeKind::Json => Value::Json("null".to_owned()),
@@ -488,6 +504,31 @@ impl SqlType {
                 // record of how it happened to be typed.
                 Value::Json(crate::json::render_text(&parsed))
             }
+            // Tagged, so the column's declared type reaches the evaluator on
+            // the value. Text is all the engine stores either way — MySQL
+            // transmits a temporal as text and so does this — but a DATE and a
+            // VARCHAR holding the same characters answer differently in every
+            // numeric context, and the tag is the only thing that says which
+            // is which. TIMESTAMP is a `DateTime` here, so it is covered too.
+            //
+            // Written into the column's own shape rather than kept as typed,
+            // because MySQL stores a temporal by its type: a DATETIME given
+            // `'2024-01-05'` holds `2024-01-05 00:00:00` and a TIME(0) given
+            // `'06:07:08.567'` holds `06:07:09`. Keeping the characters made
+            // the packed number a property of the statement — and left a
+            // fraction under a column typed LONGLONG, which the two protocols
+            // cannot both send. Text that is not a temporal at all is kept as
+            // written, which is what this column has always done with it.
+            TypeKind::Date | TypeKind::DateTime | TypeKind::Time => {
+                let text = value.as_text();
+                let shape = match self.kind {
+                    TypeKind::Date => crate::temporal::Shape::Date,
+                    TypeKind::Time => crate::temporal::Shape::Time,
+                    _ => crate::temporal::Shape::DateTime,
+                };
+                let precision = self.length.unwrap_or(0) as u32;
+                Value::Temporal(crate::temporal::normalise(&text, shape, precision).unwrap_or(text))
+            }
             _ => Value::Text(value.as_text()),
         })
     }
@@ -506,8 +547,16 @@ impl SqlType {
 /// MySQL reads out of it, which is 0 for a name and 1000 for `'1e3'` — neither
 /// of them text a client could read back under a NEWDECIMAL.
 pub(crate) fn decimal_digits(text: &str, scale: usize) -> String {
-    crate::decimal::rescale(text, scale)
-        .or_else(|| crate::decimal::rescale_wide(text, scale))
+    let rescaled = |text: &str| {
+        crate::decimal::rescale(text, scale).or_else(|| crate::decimal::rescale_wide(text, scale))
+    };
+    rescaled(text)
+        // An exponent is spelled out first rather than folded through an
+        // `f64`: `CAST('1e3' AS DECIMAL(65,30))` came back
+        // 1000.000000000000089690419062898688 that way, where MySQL answers
+        // thirty zeros, and a `DECIMAL(65,30)` column storing `'1e3'` did the
+        // same. The float only ever held about fifteen of those digits.
+        .or_else(|| crate::decimal::expanded(text).as_deref().and_then(rescaled))
         .unwrap_or_else(|| crate::decimal::from_f64(crate::value::numeric_prefix(text), scale))
 }
 
