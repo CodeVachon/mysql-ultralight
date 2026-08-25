@@ -1468,4 +1468,202 @@ pub const GROUPS: &[Group] = &[
             same("SELECT r, dp FROM A"),
         ],
     },
+    Group {
+        name: "extract",
+        setup: &[
+            "CREATE TABLE Ex (id INT NOT NULL, d DATE NULL, dt DATETIME NULL, \
+             dt6 DATETIME(6) NULL, tm TIME NULL, tmneg TIME NULL, tm6 TIME(6) NULL, \
+             ts TIMESTAMP NULL, s VARCHAR(40) NULL, fixed DATE NOT NULL, \
+             PRIMARY KEY (id))",
+            "INSERT INTO Ex VALUES (1, '2024-01-05', '2024-01-05 06:07:08', \
+             '2024-01-05 06:07:08.123456', '06:07:08', '-06:07:08', '-06:07:08.123456', \
+             '2024-01-05 06:07:08', '2024-01-05 06:07:08', '2024-01-05')",
+            // The second row is all NULL bar the two columns that cannot be,
+            // so every case below also says what each unit does with one.
+            "INSERT INTO Ex (id, fixed) VALUES (2, '2024-01-05')",
+        ],
+        cases: &[
+            // The five units MySQL reads by converting the argument to a
+            // DATETIME, and the four it reads by converting it to a TIME. The
+            // split shows in the second line: a DATE has no clock, so every
+            // clock unit over one is 0.
+            same("SELECT EXTRACT(YEAR FROM d), EXTRACT(QUARTER FROM d), \
+                  EXTRACT(MONTH FROM d), EXTRACT(WEEK FROM d), EXTRACT(DAY FROM d) \
+                  FROM Ex ORDER BY id"),
+            same("SELECT EXTRACT(HOUR FROM d), EXTRACT(MINUTE FROM d), \
+                  EXTRACT(SECOND FROM d), EXTRACT(MICROSECOND FROM d) \
+                  FROM Ex ORDER BY id"),
+            same("SELECT EXTRACT(HOUR FROM dt), EXTRACT(MINUTE FROM dt), \
+                  EXTRACT(SECOND FROM dt), EXTRACT(MICROSECOND FROM dt) \
+                  FROM Ex ORDER BY id"),
+            // The fraction, which only a column declared with one carries.
+            same("SELECT EXTRACT(MICROSECOND FROM dt6), EXTRACT(SECOND FROM dt6), \
+                  EXTRACT(DAY FROM dt6) FROM Ex ORDER BY id"),
+            same("SELECT EXTRACT(YEAR FROM ts), EXTRACT(DAY FROM ts), \
+                  EXTRACT(SECOND FROM ts) FROM Ex ORDER BY id"),
+            // A TIME is signed, and `EXTRACT` carries the sign where the
+            // function spelling of the same field does not: `HOUR(tmneg)` is
+            // 6 beside an `EXTRACT` of -6.
+            same("SELECT EXTRACT(HOUR FROM tmneg), EXTRACT(MINUTE FROM tmneg), \
+                  EXTRACT(SECOND FROM tmneg), HOUR(tmneg) FROM Ex ORDER BY id"),
+            same("SELECT EXTRACT(MICROSECOND FROM tm6), EXTRACT(SECOND FROM tm6) \
+                  FROM Ex ORDER BY id"),
+            // A TIME has no calendar, so a calendar unit puts it on today's
+            // date. Compared against each server's own `CURDATE` rather than
+            // against a literal: the two run in different zones, and the
+            // question here is whether the conversion happens at all.
+            same("SELECT EXTRACT(YEAR FROM tm) = YEAR(CURDATE()), \
+                  EXTRACT(MONTH FROM tm) = MONTH(CURDATE()), \
+                  EXTRACT(DAY FROM tm) = DAY(CURDATE()), \
+                  EXTRACT(WEEK FROM tm) = EXTRACT(WEEK FROM CURDATE()) \
+                  FROM Ex ORDER BY id"),
+            // And a negative TIME runs backwards from midnight, so it lands on
+            // yesterday. Against midnight shifted by the same 6h07m08s —
+            // 22028 seconds — which makes it a claim about the sign rather
+            // than about the hour the run happens at.
+            same("SELECT EXTRACT(DAY FROM tmneg) = \
+                  DAY(DATE_SUB(CURDATE(), INTERVAL 22028 SECOND)), \
+                  EXTRACT(MONTH FROM tmneg) = \
+                  MONTH(DATE_SUB(CURDATE(), INTERVAL 22028 SECOND)) \
+                  FROM Ex ORDER BY id"),
+            // Text spelling a datetime, which is read by the same rules once
+            // it parses as one — and a VARCHAR column holding the same.
+            same("SELECT EXTRACT(YEAR FROM '2024-01-05 06:07:08.123456'), \
+                  EXTRACT(HOUR FROM '2024-01-05 06:07:08.123456'), \
+                  EXTRACT(MICROSECOND FROM '2024-01-05 06:07:08.123456')"),
+            same("SELECT EXTRACT(YEAR FROM s), EXTRACT(SECOND FROM s) FROM Ex ORDER BY id"),
+            // Text spelling a bare TIME, which only the clock units read.
+            same("SELECT EXTRACT(HOUR FROM '06:07:08'), EXTRACT(MINUTE FROM '-06:07:08'), \
+                  EXTRACT(SECOND FROM '-06:07:08')"),
+            // Whitespace at either end changes nothing about which reader
+            // MySQL picks. Measured, and the reason the length and the
+            // separator have to be looked for in the same trimmed text: read
+            // one before trimming and one after, and the padding satisfies the
+            // separator test on its own.
+            same("SELECT EXTRACT(SECOND FROM ' 2024-01-05 06:07:08'), \
+                  EXTRACT(SECOND FROM '2024-01-05 06:07:08 '), \
+                  EXTRACT(SECOND FROM '  06:07:08  '), \
+                  EXTRACT(YEAR FROM ' 2024-01-05 ')"),
+            same("SELECT EXTRACT(YEAR FROM NULL), EXTRACT(SECOND FROM NULL), \
+                  EXTRACT(WEEK FROM NULL)"),
+            // A temporal *expression* rather than a column: MySQL types
+            // `DATE_ADD` a string and still reads it as a date, so its clock
+            // fields are 0 rather than the 20 minutes past that the leading
+            // `2024` of the same characters would spell.
+            same("SELECT EXTRACT(DAY FROM DATE_ADD('2024-01-05', INTERVAL 1 DAY)), \
+                  EXTRACT(SECOND FROM DATE_ADD('2024-01-05', INTERVAL 1 DAY)), \
+                  EXTRACT(HOUR FROM CAST('2024-01-05 06:07:08' AS DATETIME))"),
+            // The dates that separate MySQL's week numbering from a naive one:
+            // the first days of January belong to the year before, and the
+            // last of December can belong to the year after.
+            same("SELECT EXTRACT(WEEK FROM '2024-01-01'), EXTRACT(WEEK FROM '2023-01-01'), \
+                  EXTRACT(WEEK FROM '2026-12-31'), EXTRACT(WEEK FROM '2020-12-31'), \
+                  EXTRACT(WEEK FROM '2015-01-01'), EXTRACT(WEEK FROM '2000-02-29'), \
+                  EXTRACT(WEEK FROM '1901-01-01'), EXTRACT(WEEK FROM '2101-01-01')"),
+            // The column metadata: LONGLONG, signed, and nullable even over a
+            // NOT NULL column — and named after the text it was written as,
+            // odd spacing included.
+            same("SELECT EXTRACT(YEAR FROM fixed), EXTRACT( WEEK  FROM fixed) \
+                  FROM Ex ORDER BY id"),
+            // Where a query actually puts one. The aggregate cases are not
+            // decoration: an aggregate inside a node sqlparser gives its own
+            // grammar has to be folded out before the expression is evaluated,
+            // and until `EXTRACT` was added to that walk
+            // `EXTRACT(YEAR FROM MAX(d))` reported `max()` as unsupported
+            // where `YEAR(MAX(d))` beside it answered.
+            same("SELECT id FROM Ex WHERE EXTRACT(YEAR FROM d) = 2024 ORDER BY id"),
+            same("SELECT EXTRACT(YEAR FROM MAX(d)), EXTRACT(MONTH FROM MIN(d)) FROM Ex"),
+            same("SELECT SUM(EXTRACT(MONTH FROM d)), COUNT(EXTRACT(YEAR FROM d)) FROM Ex"),
+            same("SELECT COUNT(*) FROM Ex HAVING EXTRACT(YEAR FROM MAX(d)) = 2024"),
+            same("SELECT id FROM Ex ORDER BY EXTRACT(MONTH FROM d) DESC, id"),
+            // And ONLY_FULL_GROUP_BY has to see the column *through* it: this
+            // is 1055 on both, and was answered with an arbitrary row here
+            // until the same walk learned the variant.
+            same("SELECT EXTRACT(YEAR FROM d) FROM Ex GROUP BY s"),
+            // Grouped by one. Deliberately not *selecting* the group key:
+            // MySQL describes a selected grouped expression by the temporary
+            // table it materialises into, and that is narrower than the same
+            // expression on its own — MYSQL_TYPE_LONG for a two-digit month
+            // where every case above agrees on LONGLONG. Measured, and a gap
+            // about grouping rather than about EXTRACT, so asking it here
+            // would cost the empty baseline for somebody else's issue.
+            same("SELECT COUNT(*) FROM Ex GROUP BY EXTRACT(MONTH FROM d) ORDER BY 1"),
+            same("SELECT EXTRACT(YEAR FROM NOW()) > 2000, \
+                  EXTRACT(MONTH FROM CURDATE()) BETWEEN 1 AND 12, \
+                  EXTRACT(HOUR FROM CURTIME()) BETWEEN 0 AND 23"),
+        ],
+    },
+    Group {
+        // `EXTRACT(WEEK ...)` takes no mode argument and reads
+        // `default_week_format` instead, so the variable is the only way to
+        // ask the other seven questions. 1 is the one an application sets:
+        // weeks start on Monday and the partial first week is week 1 rather
+        // than week 0, which moves every date below.
+        name: "default_week_format: 1",
+        setup: &["SET SESSION default_week_format = 1"],
+        // No `SELECT @@default_week_format` case: an *overridden* system
+        // variable comes back from this engine as a string where MySQL sends
+        // an UNSIGNED LONGLONG, which is true of every variable a session sets
+        // and is a gap about `SET`, not about the week.
+        cases: &[
+            same("SELECT EXTRACT(WEEK FROM '2024-01-05'), EXTRACT(WEEK FROM '2023-01-01'), \
+                  EXTRACT(WEEK FROM '2026-12-31'), EXTRACT(WEEK FROM '2020-12-31'), \
+                  EXTRACT(WEEK FROM '2015-01-01'), EXTRACT(WEEK FROM '2000-02-29'), \
+                  EXTRACT(WEEK FROM '1901-01-01'), EXTRACT(WEEK FROM '2101-01-01')"),
+        ],
+    },
+    Group {
+        // Out of range, which MySQL clamps at `SET` time rather than refusing:
+        // 9 is stored as 7, so this group asks the same question as format 7
+        // and the way to get it wrong is to mask the value to three bits
+        // instead, which turns 9 into 1 and answers a different week.
+        name: "default_week_format: out of range",
+        setup: &["SET SESSION default_week_format = 9"],
+        cases: &[
+            same("SELECT EXTRACT(WEEK FROM '2023-01-01'), EXTRACT(WEEK FROM '2024-01-05'), \
+                  EXTRACT(WEEK FROM '2020-12-31'), EXTRACT(WEEK FROM '2015-01-01')"),
+            // Below the range clamps the other way, to 0 — and the `SET` is a
+            // case rather than setup so the group's own mode survives it.
+            same("SET SESSION default_week_format = -1"),
+            same(
+                "SELECT EXTRACT(WEEK FROM '2023-01-01') AS below, \
+                 EXTRACT(WEEK FROM '2024-01-05')",
+            ),
+            // A value that is not an integer is 1232 on both, a string
+            // spelling one included.
+            same("SET SESSION default_week_format = 'abc'"),
+            same("SET SESSION default_week_format = '3'"),
+            same("SET SESSION default_week_format = 3.7"),
+            same("SET SESSION default_week_format = NULL"),
+            // Above `i64::MAX`, which is a literal anyone can write and which
+            // arrives as an unsigned value. Read through a signed `i64` it
+            // wraps to -1 and clamps to 0, which is the far end of the range
+            // from the 7 MySQL stores.
+            same("SET SESSION default_week_format = 18446744073709551615"),
+            same(
+                "SELECT EXTRACT(WEEK FROM '2023-01-01') AS huge, \
+                 EXTRACT(WEEK FROM '2024-01-05')",
+            ),
+            // And an integer-valued expression is taken as the number it is.
+            same("SET SESSION default_week_format = 1 + 1"),
+            same(
+                "SELECT EXTRACT(WEEK FROM '2023-01-01') AS computed, \
+                 EXTRACT(WEEK FROM '2024-01-05')",
+            ),
+        ],
+    },
+    Group {
+        // Bit 1 is the one that makes the count run 1..53 with no week 0, by
+        // letting a January date belong to the previous year's last week and a
+        // December date to the next year's first. It is the branch of
+        // `calc_week` neither of the two formats above reaches.
+        name: "default_week_format: 3",
+        setup: &["SET SESSION default_week_format = 3"],
+        cases: &[
+            same("SELECT EXTRACT(WEEK FROM '2024-01-05'), EXTRACT(WEEK FROM '2023-01-01'), \
+                  EXTRACT(WEEK FROM '2026-12-31'), EXTRACT(WEEK FROM '2020-12-31'), \
+                  EXTRACT(WEEK FROM '2015-01-01'), EXTRACT(WEEK FROM '2000-02-29'), \
+                  EXTRACT(WEEK FROM '1901-01-01'), EXTRACT(WEEK FROM '2101-01-01')"),
+        ],
+    },
 ];

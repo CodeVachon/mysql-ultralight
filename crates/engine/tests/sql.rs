@@ -12982,3 +12982,458 @@ fn a_column_never_holds_a_boolean() {
         vec![vec!["2"], vec!["1"]]
     );
 }
+
+/// A table holding one row of every temporal shape `EXTRACT` reads.
+fn extractable(engine: &Engine, session: &mut Session) {
+    run(
+        engine,
+        session,
+        "CREATE TABLE X (d DATE NULL, dt DATETIME NULL, dt6 DATETIME(6) NULL, \
+         tm TIME NULL, tmneg TIME NULL, tm6 TIME(6) NULL, ts TIMESTAMP NULL, \
+         y YEAR NULL, s VARCHAR(40) NULL)",
+    );
+    run(
+        engine,
+        session,
+        "INSERT INTO X VALUES ('2024-01-05', '2024-01-05 06:07:08', \
+         '2024-01-05 06:07:08.123456', '06:07:08', '-06:07:08', '-06:07:08.123456', \
+         '2024-01-05 06:07:08', 2024, '2024-01-05 06:07:08')",
+    );
+}
+
+#[test]
+fn extract_answers_every_unit_mysql_takes_from_it() {
+    // Every number here was read off MySQL 8.3 rather than worked out. The
+    // column list is the point: the same unit answers differently for a DATE,
+    // a DATETIME, a TIME and a TIMESTAMP, and a clock unit over a DATE is 0
+    // where a calendar unit over a TIME is a day of *this* month.
+    let (engine, mut session) = engine();
+    extractable(&engine, &mut session);
+    for (sql, expected) in [
+        (
+            "SELECT EXTRACT(YEAR FROM d), EXTRACT(QUARTER FROM d), EXTRACT(MONTH FROM d), \
+             EXTRACT(WEEK FROM d), EXTRACT(DAY FROM d) FROM X",
+            vec!["2024", "1", "1", "0", "5"],
+        ),
+        (
+            "SELECT EXTRACT(HOUR FROM d), EXTRACT(MINUTE FROM d), EXTRACT(SECOND FROM d), \
+             EXTRACT(MICROSECOND FROM d) FROM X",
+            vec!["0", "0", "0", "0"],
+        ),
+        (
+            "SELECT EXTRACT(HOUR FROM dt), EXTRACT(MINUTE FROM dt), EXTRACT(SECOND FROM dt), \
+             EXTRACT(MICROSECOND FROM dt) FROM X",
+            vec!["6", "7", "8", "0"],
+        ),
+        (
+            "SELECT EXTRACT(SECOND FROM dt6), EXTRACT(MICROSECOND FROM dt6), \
+             EXTRACT(DAY FROM dt6) FROM X",
+            vec!["8", "123456", "5"],
+        ),
+        (
+            "SELECT EXTRACT(HOUR FROM ts), EXTRACT(DAY FROM ts), EXTRACT(YEAR FROM ts) FROM X",
+            vec!["6", "5", "2024"],
+        ),
+        (
+            "SELECT EXTRACT(HOUR FROM tm), EXTRACT(MINUTE FROM tm), EXTRACT(SECOND FROM tm) \
+             FROM X",
+            vec!["6", "7", "8"],
+        ),
+        (
+            "SELECT EXTRACT(MICROSECOND FROM tm6), EXTRACT(SECOND FROM tm6) FROM X",
+            vec!["-123456", "-8"],
+        ),
+        // A string spelling the same instant, which is read by the same rules
+        // once it parses as a datetime.
+        (
+            "SELECT EXTRACT(YEAR FROM '2024-01-05 06:07:08.123456'), \
+             EXTRACT(HOUR FROM '2024-01-05 06:07:08.123456'), \
+             EXTRACT(MICROSECOND FROM '2024-01-05 06:07:08.123456')",
+            vec!["2024", "6", "123456"],
+        ),
+        // A bare TIME string, which only the clock units read.
+        (
+            "SELECT EXTRACT(HOUR FROM '06:07:08'), EXTRACT(MINUTE FROM '06:07:08'), \
+             EXTRACT(SECOND FROM '06:07:08')",
+            vec!["6", "7", "8"],
+        ),
+        // NULL in, NULL out, for a calendar unit and a clock one alike.
+        (
+            "SELECT EXTRACT(YEAR FROM NULL), EXTRACT(SECOND FROM NULL), \
+             EXTRACT(WEEK FROM NULL)",
+            vec!["NULL", "NULL", "NULL"],
+        ),
+        // A temporal *expression* rather than a column, which is the case the
+        // value's tag exists for: MySQL types DATE_ADD a string and still
+        // reads it as a date, so the clock fields are 0 and not 20 minutes
+        // past the hour the leading `2024` would spell.
+        (
+            "SELECT EXTRACT(DAY FROM DATE_ADD('2024-01-05', INTERVAL 1 DAY)), \
+             EXTRACT(SECOND FROM DATE_ADD('2024-01-05', INTERVAL 1 DAY)), \
+             EXTRACT(HOUR FROM CAST('2024-01-05 06:07:08' AS DATETIME))",
+            vec!["6", "0", "6"],
+        ),
+    ] {
+        assert_eq!(rows(&engine, &mut session, sql), vec![expected], "{sql}");
+    }
+}
+
+#[test]
+fn extract_carries_a_negative_time_s_sign_into_every_clock_field() {
+    // The sharpest measured disagreement in the whole construct: over a TIME
+    // of `-06:07:08`, `EXTRACT(HOUR FROM t)` is -6 on 8.3 where `HOUR(t)` over
+    // the same value is 6. So the sign cannot live in the shared stamp, and
+    // the two spellings of "the hour" really do answer differently.
+    let (engine, mut session) = engine();
+    extractable(&engine, &mut session);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT EXTRACT(HOUR FROM tmneg), EXTRACT(MINUTE FROM tmneg), \
+             EXTRACT(SECOND FROM tmneg), EXTRACT(MICROSECOND FROM tm6), \
+             HOUR(tmneg), MINUTE(tmneg) FROM X"
+        ),
+        vec![vec!["-6", "-7", "-8", "-123456", "6", "7"]]
+    );
+    // And the calendar fields never take it: the same value's year is this
+    // year, not minus it.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT EXTRACT(YEAR FROM tmneg) > 0, EXTRACT(MONTH FROM tmneg) > 0 FROM X"
+        ),
+        vec![vec!["1", "1"]]
+    );
+    // A string TIME carries it too, which is the path a column does not take.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT EXTRACT(HOUR FROM '-06:07:08'), EXTRACT(SECOND FROM '-06:07:08')"
+        ),
+        vec![vec!["-6", "-8"]]
+    );
+}
+
+#[test]
+fn a_time_has_no_calendar_so_extract_puts_it_on_the_current_date() {
+    // A calendar unit converts the argument to a DATETIME, and a TIME has no
+    // date of its own, so MySQL adds it to the current date: over a TIME of
+    // `-06:07:08` the day is *yesterday* until the clock passes six in the
+    // morning. Asserted against the engine's own CURDATE rather than a fixed
+    // day, since a literal would fail once and then pass for a year.
+    let (engine, mut session) = engine();
+    extractable(&engine, &mut session);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT EXTRACT(YEAR FROM tm) = YEAR(CURDATE()), \
+             EXTRACT(MONTH FROM tm) = MONTH(CURDATE()), \
+             EXTRACT(DAY FROM tm) = DAY(CURDATE()), \
+             EXTRACT(WEEK FROM tm) = EXTRACT(WEEK FROM CURDATE()) FROM X"
+        ),
+        vec![vec!["1", "1", "1", "1"]]
+    );
+    // The negative one runs *backwards* from midnight, so it lands on
+    // yesterday. Asserted against midnight shifted by the same 6h07m08s —
+    // 22028 seconds — rather than against a day, which makes it a claim about
+    // the sign rather than about when the test happens to run.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT EXTRACT(DAY FROM tmneg) = DAY(DATE_SUB(CURDATE(), INTERVAL 22028 SECOND)), \
+             EXTRACT(MONTH FROM tmneg) = MONTH(DATE_SUB(CURDATE(), INTERVAL 22028 SECOND)), \
+             EXTRACT(DAY FROM tm) = DAY(DATE_ADD(CURDATE(), INTERVAL 22028 SECOND)) FROM X"
+        ),
+        vec![vec!["1", "1", "1"]]
+    );
+}
+
+#[test]
+fn extract_week_follows_default_week_format() {
+    // MySQL's WEEK has eight modes and EXTRACT takes no argument for one, so
+    // it reads `default_week_format`. Every row here was read off 8.3 under
+    // that variable set to each value in turn; the dates are the ones that
+    // separate the modes, where a January day belongs to the year before or a
+    // December day to the year after.
+    let (engine, mut session) = engine();
+    // The last two are centuries: 1900 was not a leap year and 2000 was, and
+    // the modes that let January belong to the year before count back over
+    // exactly that many days.
+    let week = "SELECT EXTRACT(WEEK FROM '2024-01-05'), EXTRACT(WEEK FROM '2023-01-01'), \
+                EXTRACT(WEEK FROM '2026-12-31'), EXTRACT(WEEK FROM '2020-12-31'), \
+                EXTRACT(WEEK FROM '2015-01-01'), EXTRACT(WEEK FROM '2000-02-29'), \
+                EXTRACT(WEEK FROM '1901-01-01'), EXTRACT(WEEK FROM '2101-01-01')";
+    // 0 is the default a stock server reports, so the first line also says
+    // what an untouched session answers.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @@default_week_format"),
+        vec![vec!["0"]]
+    );
+    for (format, expected) in [
+        (0, vec!["0", "1", "52", "52", "0", "9", "0", "0"]),
+        (1, vec!["1", "0", "53", "53", "1", "9", "1", "0"]),
+        (2, vec!["53", "1", "52", "52", "52", "9", "52", "52"]),
+        (3, vec!["1", "52", "53", "53", "1", "9", "1", "52"]),
+        (4, vec!["1", "1", "52", "53", "0", "9", "1", "0"]),
+        (5, vec!["1", "0", "52", "52", "0", "9", "0", "0"]),
+        (6, vec!["1", "1", "52", "53", "53", "9", "1", "52"]),
+        (7, vec!["1", "52", "52", "52", "52", "9", "53", "52"]),
+    ] {
+        run(
+            &engine,
+            &mut session,
+            &format!("SET @@default_week_format = {format}"),
+        );
+        assert_eq!(
+            rows(&engine, &mut session, week),
+            vec![expected],
+            "{format}"
+        );
+    }
+}
+
+#[test]
+fn extract_refuses_the_readings_it_cannot_make_exactly() {
+    // MySQL reads several shapes this engine's parser does not, and reads them
+    // as something other than nothing: `'06:07:08'` is the *date* 2006-07-08
+    // to a calendar unit, `'2024-01-05'` is the *time* 00:20:24 to a clock
+    // one, `'2024-01-05T06:07:08'` is 00:20:24 as well because its TIME reader
+    // does not take the `T`, and a YEAR of 2024 is 00:20:24 too. Answering
+    // NULL for any of them would be a wrong answer rather than a gap, so they
+    // are refused — and every one of them is a shape a *typed* temporal
+    // beside it answers exactly.
+    let (engine, mut session) = engine();
+    extractable(&engine, &mut session);
+    for sql in [
+        "SELECT EXTRACT(YEAR FROM '06:07:08')",
+        "SELECT EXTRACT(WEEK FROM '06:07:08')",
+        "SELECT EXTRACT(SECOND FROM '2024-01-05')",
+        "SELECT EXTRACT(SECOND FROM '2024-01-05T06:07:08')",
+        // The same shape with whitespace at either end, which MySQL still
+        // answers 24 for. Both halves of the guard have to read the same,
+        // trimmed text: measuring the length after trimming while looking for
+        // the space before it let the padding answer the space test on its
+        // own, and `temporal::parse` then took the `T` and answered 8.
+        "SELECT EXTRACT(SECOND FROM '2024-01-05T06:07:08 ')",
+        "SELECT EXTRACT(SECOND FROM ' 2024-01-05T06:07:08')",
+        // Eleven characters, so MySQL reads it as a TIME and answers a
+        // SECOND of 4 where the twelve-character spelling of the same shape
+        // answers 8. The length really is the switch, and it is measured.
+        "SELECT EXTRACT(SECOND FROM '4-1-5 6:7:8')",
+        "SELECT EXTRACT(HOUR FROM '4-1-5 6:7:8')",
+        // The same eleven characters behind a space. MySQL still answers 4, so
+        // it does not count leading whitespace toward the twelve — measuring
+        // the length before trimming would push this over the line and answer
+        // 8. (A *trailing* space does count there: `'4-1-5 6:7:8 '` is 8. This
+        // engine refuses that one, which is a refusal rather than a wrong
+        // answer, and it is why the length is read after trimming.)
+        "SELECT EXTRACT(SECOND FROM ' 4-1-5 6:7:8')",
+        "SELECT EXTRACT(SECOND FROM '  4-1-5 6:7:8')",
+        "SELECT EXTRACT(YEAR FROM 'hello')",
+        "SELECT EXTRACT(YEAR FROM 20240105)",
+        "SELECT EXTRACT(SECOND FROM 20240105060708)",
+        "SELECT EXTRACT(YEAR FROM y) FROM X",
+        "SELECT EXTRACT(SECOND FROM y) FROM X",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1235, "expected a refusal for: {sql}");
+    }
+    // The same readings the tag makes exact, so the refusals above are about
+    // what cannot be read and not about the units.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT EXTRACT(SECOND FROM d), EXTRACT(YEAR FROM tm) > 0, \
+             EXTRACT(SECOND FROM s), EXTRACT(SECOND FROM '24-1-5 6:7:8') FROM X"
+        ),
+        vec![vec!["0", "1", "8", "8"]]
+    );
+    // Whitespace at either end changes nothing about which reader MySQL uses,
+    // so the space-separated datetime and the bare TIME both still answer 8.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT EXTRACT(SECOND FROM ' 2024-01-05 06:07:08'), \
+             EXTRACT(SECOND FROM '2024-01-05 06:07:08 '), \
+             EXTRACT(SECOND FROM '  06:07:08  '), \
+             EXTRACT(YEAR FROM ' 2024-01-05 ')"
+        ),
+        vec![vec!["8", "8", "8", "2024"]]
+    );
+    // A typed temporal holding something that is not one, which MySQL has no
+    // way to reach — it refuses the write — and this engine does, because
+    // nothing validates on the way in. NULL rather than a refusal, which is
+    // what every neighbouring reader of the same column already answers.
+    run(&engine, &mut session, "CREATE TABLE J (d DATE NULL)");
+    run(&engine, &mut session, "INSERT INTO J VALUES ('hello')");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT EXTRACT(SECOND FROM d), EXTRACT(YEAR FROM d) FROM J"
+        ),
+        vec![vec!["NULL", "NULL"]]
+    );
+}
+
+#[test]
+fn extract_refuses_a_unit_mysql_does_not_take() {
+    // sqlparser recognises a pile of units from other dialects. MySQL calls
+    // each of them a syntax error, so answering one would invent a feature the
+    // engine exists to be compatible with the absence of.
+    let (engine, mut session) = engine();
+    for sql in [
+        "SELECT EXTRACT(DOW FROM NOW())",
+        "SELECT EXTRACT(EPOCH FROM NOW())",
+        "SELECT EXTRACT(ISOYEAR FROM NOW())",
+        "SELECT EXTRACT(YEARS FROM NOW())",
+        "SELECT EXTRACT(DAYOFWEEK FROM NOW())",
+        "SELECT EXTRACT(MILLISECOND FROM NOW())",
+        "SELECT EXTRACT(TIMEZONE_HOUR FROM NOW())",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1235, "expected a refusal for: {sql}");
+    }
+}
+
+#[test]
+fn an_aggregate_and_a_grouped_column_are_seen_through_extract() {
+    // `EXTRACT` is a node of its own rather than a call, so the two walks that
+    // have to look inside an expression did not: an aggregate under one was
+    // never folded out and reached the function table as unsupported, and a
+    // column under one was invisible to ONLY_FULL_GROUP_BY, which then
+    // answered with an arbitrary row. Both are the failure the `CEIL(SUM(x))`
+    // comment beside those walks already describes, one variant later.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE A (id INT NOT NULL, d DATE NULL, s VARCHAR(8) NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO A VALUES (1, '2024-01-05', 'x'), (2, '2025-06-30', 'x')",
+    );
+    for (sql, expected) in [
+        ("SELECT EXTRACT(YEAR FROM MAX(d)) FROM A", "2025"),
+        ("SELECT EXTRACT(MONTH FROM MIN(d)) FROM A", "1"),
+        ("SELECT SUM(EXTRACT(MONTH FROM d)) FROM A", "7"),
+        (
+            "SELECT COUNT(*) FROM A HAVING EXTRACT(YEAR FROM MAX(d)) = 2025",
+            "2",
+        ),
+        // The same aggregate spelled as a call, which already worked and is
+        // here so the pair says the two spellings now agree.
+        ("SELECT YEAR(MAX(d)) FROM A", "2025"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM A ORDER BY EXTRACT(MONTH FROM d) DESC, id"
+        ),
+        vec![vec!["2"], vec!["1"]]
+    );
+    // A column reachable only through an `EXTRACT` is still a nonaggregated
+    // column, and grouping by something it does not depend on is 1055 — which
+    // this engine answered as a row until the walk saw inside.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT EXTRACT(YEAR FROM d) FROM A GROUP BY s",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1055);
+}
+
+#[test]
+fn default_week_format_is_bounded_the_way_mysql_bounds_it() {
+    // The one system variable this engine reads back into an answer, so the
+    // value it stores has to be the value MySQL would store. Measured on 8.3:
+    // out of range is *clamped* with warning 1292 rather than refused, so 9 is
+    // 7 and -1 is 0 — where masking it to three bits, which is what
+    // `week_mode` does to the value once stored, would make 9 mean 1 and
+    // answer week 1 for a date MySQL puts in week 52.
+    let (engine, mut session) = engine();
+    for (set, stored, week) in [
+        ("9", "7", "52"),
+        // Above `i64::MAX`, which arrives as a `Value::Unsigned`. Read through
+        // `as_int` it wraps to -1 and clamps *down* to 0, answering week 1 for
+        // a date MySQL puts in week 52.
+        ("18446744073709551615", "7", "52"),
+        ("8", "7", "52"),
+        ("7", "7", "52"),
+        ("-1", "0", "1"),
+        ("0", "0", "1"),
+        ("1", "1", "0"),
+        // An expression and a keyword, both of which MySQL reads as the
+        // numbers they are.
+        ("1 + 1", "2", "1"),
+        ("TRUE", "1", "0"),
+    ] {
+        run(
+            &engine,
+            &mut session,
+            &format!("SET SESSION default_week_format = {set}"),
+        );
+        assert_eq!(
+            rows(
+                &engine,
+                &mut session,
+                "SELECT @@default_week_format, EXTRACT(WEEK FROM '2023-01-01')"
+            ),
+            vec![vec![stored, week]],
+            "{set}"
+        );
+    }
+    // And a value that is not an integer is refused rather than taken, which
+    // includes a string spelling one: `SET default_week_format = '3'` is 1232
+    // on 8.3, not three.
+    // `b'11'` is deliberately absent: MySQL refuses it with 1232 too, but this
+    // engine has no bit literal at all and answers 1235 for the literal rather
+    // than for the variable — a different gap wearing the same shape.
+    for set in ["'abc'", "'3'", "3.7", "NULL"] {
+        let err = engine
+            .execute(
+                &mut session,
+                &format!("SET SESSION default_week_format = {set}"),
+                &[],
+            )
+            .unwrap_err();
+        assert_eq!(err.code, 1232, "expected 1232 for: {set}");
+    }
+    // A variable the engine answers is a variable SHOW VARIABLES lists, and it
+    // has to be there on a session that has never set one: listed only after a
+    // write is worse than absent, because the list would then describe two
+    // different servers either side of a `SET` nothing else can see.
+    //
+    // Asserted by looking for the row rather than by filtering, because this
+    // engine's `SHOW VARIABLES` ignores its `LIKE` and hands back the whole
+    // list — a gap of its own, and not one this claim depends on.
+    let (fresh, mut clean) = fresh_engine();
+    let listed = |engine: &Engine, session: &mut Session| -> Vec<String> {
+        rows(engine, session, "SHOW VARIABLES")
+            .into_iter()
+            .filter(|row| row[0] == "default_week_format")
+            .map(|row| row[1].clone())
+            .collect()
+    };
+    assert_eq!(listed(&fresh, &mut clean), vec!["0".to_owned()]);
+    // And it follows the session's own value once one is set.
+    assert_eq!(listed(&engine, &mut session), vec!["1".to_owned()]);
+}

@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::error::{EngineError, EngineResult};
 use crate::value::Value;
 
 /// Server configuration a session reports and can override.
@@ -172,13 +173,73 @@ impl Session {
             .unwrap_or(Value::Null)
     }
 
-    pub fn set_system_variable(&mut self, name: &str, value: String) {
+    /// Applies a `SET` of a system variable.
+    ///
+    /// Nearly all of these are stored and handed straight back, so the value's
+    /// text is kept as written and nothing checks it. `default_week_format` is
+    /// the exception, because it is the one variable the engine *reads*:
+    /// `EXTRACT(WEEK FROM x)` answers a different question under each of its
+    /// eight values, so a value taken unchecked is a wrong answer rather than
+    /// an unread string.
+    ///
+    /// Measured on 8.3. Out of range is clamped rather than refused — 9 becomes
+    /// 7 and -1 becomes 0, each with warning 1292 — and masking to three bits
+    /// instead answers week 1 where MySQL answers week 52. A value that is not
+    /// an integer is refused with 1232, a *string* included: `'3'`, `3.7`,
+    /// `b'11'` and NULL are all errors there, while `TRUE` and `1 + 1` are
+    /// taken as the numbers they are.
+    ///
+    /// Every other variable is still stored unvalidated, which MySQL would
+    /// refuse for most of them. That gap is about `SET` rather than about the
+    /// week, and nothing here reads those values back into an answer.
+    pub fn set_system_variable(&mut self, name: &str, value: &Value) -> EngineResult<()> {
         let name = normalize_scope(name);
+        let text = match name.as_str() {
+            "default_week_format" => match value {
+                Value::Int(_) | Value::Unsigned(_) | Value::Bool(_) => {
+                    // `as_exact_int`, not `as_int`: the latter wraps a `u64`
+                    // above `i64::MAX` to a negative on purpose, so
+                    // `SET default_week_format = 18446744073709551615` clamped
+                    // *down* to 0 and answered week 1 for a date MySQL puts in
+                    // week 52. A literal that large really does arrive here as
+                    // `Value::Unsigned`. `i128` holds both ranges exactly.
+                    value.as_exact_int().unwrap_or(0).clamp(0, 7).to_string()
+                }
+                _ => {
+                    return Err(EngineError::new(
+                        1232,
+                        "42000",
+                        format!("Incorrect argument type to variable '{name}'"),
+                    ))
+                }
+            },
+            _ => value.as_text(),
+        };
         if name == "sql_mode" {
-            self.config.sql_mode = value.clone();
+            self.config.sql_mode = text.clone();
             self.refresh_mode();
         }
-        self.overrides.insert(name, value);
+        self.overrides.insert(name, text);
+        Ok(())
+    }
+
+    /// The week numbering `EXTRACT(WEEK FROM x)` counts under.
+    ///
+    /// Read straight off the override rather than through `system_variable`,
+    /// which allocates a normalised name and clones the value it finds. This
+    /// is the one system variable the engine reads *per row*, and both
+    /// allocations would be paid for something that cannot change while the
+    /// statement runs.
+    ///
+    /// The parse cannot fail for anything this engine stored:
+    /// `set_system_variable` above refuses a non-integer and clamps the rest
+    /// into 0..=7 before it gets here. 0 for an absent override is the stock
+    /// 8.3 default.
+    pub fn default_week_format(&self) -> u32 {
+        self.overrides
+            .get("default_week_format")
+            .and_then(|stored| stored.parse().ok())
+            .unwrap_or(0)
     }
 
     /// Resolves a system variable.
@@ -238,6 +299,10 @@ impl Session {
             "protocol_version" => int(10),
             "auto_increment_increment" | "auto_increment_offset" => int(1),
             "group_concat_max_len" => int(1024),
+            // `EXTRACT(WEEK FROM x)` reads this rather than taking a mode
+            // argument, so the session has to be able to answer it and to
+            // carry a `SET` of it. 0 is the stock 8.3 default, measured.
+            "default_week_format" => int(0),
             "max_execution_time" => int(0),
             "default_storage_engine" => text("InnoDB"),
             "init_connect" => text(""),
@@ -261,6 +326,7 @@ impl Session {
             "collation_database",
             "collation_server",
             "default_storage_engine",
+            "default_week_format",
             "foreign_key_checks",
             "group_concat_max_len",
             "have_ssl",
@@ -413,7 +479,8 @@ mod tests {
     #[test]
     fn setting_sql_mode_updates_what_the_parser_will_see() {
         let mut s = Session::new(ServerConfig::default(), 1);
-        s.set_system_variable("sql_mode", "ANSI_QUOTES".to_owned());
+        s.set_system_variable("sql_mode", &Value::text("ANSI_QUOTES"))
+            .unwrap();
         assert_eq!(s.config.sql_mode, "ANSI_QUOTES");
         assert_eq!(
             s.system_variable("sql_mode"),

@@ -1,8 +1,8 @@
 //! Expression evaluation.
 
 use sqlparser::ast::{
-    BinaryOperator, CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query,
-    UnaryOperator, Value as AstValue,
+    BinaryOperator, CaseWhen, DateTimeField, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
+    Query, UnaryOperator, Value as AstValue,
 };
 
 use crate::error::{unsupported, EngineError, EngineResult};
@@ -571,6 +571,8 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             let args = vec![eval(expr, ctx)?, eval(r#in, ctx)?];
             functions::call("position", args, ctx.session)
         }
+
+        Expr::Extract { field, expr, .. } => extract(field, expr, ctx),
 
         // `x REGEXP y` and `x RLIKE y`, which are the same operator.
         Expr::RLike {
@@ -2292,6 +2294,199 @@ fn number_token(e: &Expr) -> Option<(bool, &str)> {
         }
         _ => None,
     }
+}
+
+/// The field `EXTRACT(<field> FROM x)` names.
+///
+/// Two families, and the split is not cosmetic: MySQL converts the argument to
+/// a DATETIME for the calendar fields and to a TIME for the clock ones, and
+/// the two read the same value differently. Over a TIME column
+/// `EXTRACT(DAY FROM t)` is a day of *today's* month, while
+/// `EXTRACT(HOUR FROM t)` is the hours the TIME holds, sign and all.
+#[derive(Clone, Copy)]
+enum ExtractField {
+    Year,
+    Quarter,
+    Month,
+    Week,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    Microsecond,
+}
+
+impl ExtractField {
+    /// Whether MySQL reads the argument as a DATETIME rather than as a TIME.
+    fn calendar(self) -> bool {
+        matches!(
+            self,
+            ExtractField::Year
+                | ExtractField::Quarter
+                | ExtractField::Month
+                | ExtractField::Week
+                | ExtractField::Day
+        )
+    }
+}
+
+/// `EXTRACT(YEAR FROM x)`, which sqlparser gives its own node rather than
+/// routing through `Expr::Function` — which is why it reached the evaluator's
+/// catch-all and answered 1235 for every unit.
+///
+/// MySQL takes twenty units here, measured against 8.3 by asking it each in
+/// turn: the nine below and eleven compounds — `YEAR_MONTH`, `DAY_HOUR`,
+/// `DAY_MINUTE`, `DAY_SECOND`, `DAY_MICROSECOND`, `HOUR_MINUTE`,
+/// `HOUR_SECOND`, `HOUR_MICROSECOND`, `MINUTE_SECOND`, `MINUTE_MICROSECOND`
+/// and `SECOND_MICROSECOND` — which pack the fields they name into one number
+/// at two digits each and six for the microseconds, so `DAY_SECOND` over
+/// `2024-01-05 06:07:08` is 5060708. Those eleven do not arrive here at all:
+/// sqlparser has no keyword for them and its MySQL dialect refuses the
+/// `Custom` spelling, so the statement fails to parse. It is exactly the same
+/// set MySQL accepts after `INTERVAL`, which was measured rather than assumed
+/// — neither side takes a unit the other refuses.
+///
+/// Every unit sqlparser *does* recognise but MySQL does not — `DOW`, `EPOCH`,
+/// `ISOYEAR`, the plural forms — is refused here rather than answered, since
+/// MySQL calls each of them a syntax error.
+fn extract(field: &DateTimeField, arg: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
+    use crate::temporal;
+
+    let unit = match field {
+        DateTimeField::Year => ExtractField::Year,
+        DateTimeField::Quarter => ExtractField::Quarter,
+        DateTimeField::Month => ExtractField::Month,
+        DateTimeField::Week(None) => ExtractField::Week,
+        DateTimeField::Day => ExtractField::Day,
+        DateTimeField::Hour => ExtractField::Hour,
+        DateTimeField::Minute => ExtractField::Minute,
+        DateTimeField::Second => ExtractField::Second,
+        DateTimeField::Microsecond => ExtractField::Microsecond,
+        other => return Err(unsupported(format!("the `{other}` unit in EXTRACT()"))),
+    };
+
+    let value = eval(arg, ctx)?;
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    let text = value.as_text();
+    // Whether the value carries a temporal *type* or is text that merely looks
+    // like one. They are read by different rules and give different answers,
+    // which is the distinction `Value::Temporal` exists to make: MySQL reads
+    // `EXTRACT(SECOND FROM d)` over a DATE column as 0 and
+    // `EXTRACT(SECOND FROM '2024-01-05')` as 24, because the string is read as
+    // the *time* 00:20:24.
+    let typed = matches!(value, Value::Temporal(_));
+
+    let (negative, stamp) = if unit.calendar() {
+        match temporal::parse(&text) {
+            Some(stamp) => (false, stamp),
+            // A TIME has no calendar of its own, so MySQL puts it on today's:
+            // `EXTRACT(DAY FROM t)` over a TIME column holding `-06:07:08` is
+            // yesterday until the clock passes six in the morning. Only for a
+            // typed temporal — the same characters as a *string* are read as a
+            // date there, `'06:07:08'` giving 2006-07-08, and this engine's
+            // parser does not read that shape.
+            None if typed => {
+                let Some((negative, clock)) = temporal::parse_signed_clock(&text) else {
+                    return Ok(Value::Null);
+                };
+                let Some(today) = temporal::parse(&functions::now_datetime()[..10]) else {
+                    return Ok(Value::Null);
+                };
+                // Through microseconds rather than seconds, because a negative
+                // TIME of `-00:00:00.5` crosses midnight on the fraction alone
+                // and a second-wide step would leave it on today.
+                let micros = i64::from(clock.hour) * 3_600_000_000
+                    + i64::from(clock.minute) * 60_000_000
+                    + i64::from(clock.second) * 1_000_000
+                    + i64::from(clock.micros);
+                match today.add(
+                    temporal::Unit::Microsecond,
+                    if negative { -micros } else { micros },
+                ) {
+                    Some(stamp) => (false, stamp),
+                    None => return Ok(Value::Null),
+                }
+            }
+            None => return Err(unreadable(&text)),
+        }
+    } else {
+        // MySQL reads a string as a TIME first and only tries a datetime when
+        // it is at least twelve characters long — and its datetime reader does
+        // not take the `T` separator on this path, which the engine's does.
+        // Both measured: `EXTRACT(SECOND FROM '2024-01-05')` is 24 and
+        // `EXTRACT(SECOND FROM '2024-01-05T06:07:08')` is 24 as well, where
+        // the space-separated spelling of the same instant is 8.
+        //
+        // Both halves read the *trimmed* text, and that is the whole guard:
+        // measuring the length after trimming while looking for the space
+        // before it let surrounding whitespace answer the space test on its
+        // own, so `'2024-01-05T06:07:08 '` passed a guard written to stop
+        // `'2024-01-05T06:07:08'` — and `temporal::parse` trims and takes the
+        // `T`, so it answered 8 where MySQL answers 24.
+        //
+        // Trimming is the right reading for the length too, though not
+        // exactly: measured on 8.3, leading whitespace does *not* count toward
+        // the twelve — `' 4-1-5 6:7:8'` is 4, the TIME reading, at a raw
+        // length of 12 — while a trailing space does, so `'4-1-5 6:7:8 '` is
+        // 8. Trimming agrees with MySQL on the first and refuses the second
+        // rather than answering it, which is the safe direction.
+        let trimmed = text.trim();
+        let looks_like_a_datetime = typed || (trimmed.len() >= 12 && trimmed.contains(' '));
+        match looks_like_a_datetime
+            .then(|| temporal::parse(trimmed))
+            .flatten()
+        {
+            Some(stamp) => (false, stamp),
+            None => match temporal::parse_signed_clock(&text) {
+                Some(read) => read,
+                // A typed temporal that is neither is a column holding text
+                // nothing validated on the way in; MySQL has no such state and
+                // NULL is what the engine answers for it elsewhere.
+                None if typed => return Ok(Value::Null),
+                None => return Err(unreadable(&text)),
+            },
+        }
+    };
+
+    let read = match unit {
+        ExtractField::Year => stamp.year,
+        ExtractField::Quarter => i64::from((stamp.month - 1) / 3 + 1),
+        ExtractField::Month => i64::from(stamp.month),
+        // The one field with a mode. `EXTRACT` takes no argument for it and
+        // reads `default_week_format` instead, which is 0 on a stock 8.3 and
+        // moves 2024-01-05 from week 0 to week 1 when set to 1.
+        //
+        // Through the session's own accessor rather than `system_variable`,
+        // which normalises the name into a fresh `String` and clones the value
+        // it finds: this runs once per row, and #0078 is about exactly that
+        // cost paid per row for something that cannot change mid-statement.
+        ExtractField::Week => i64::from(stamp.week(ctx.session.default_week_format())),
+        ExtractField::Day => i64::from(stamp.day),
+        ExtractField::Hour => i64::from(stamp.hour),
+        ExtractField::Minute => i64::from(stamp.minute),
+        ExtractField::Second => i64::from(stamp.second),
+        ExtractField::Microsecond => i64::from(stamp.micros),
+    };
+    // The sign rides on every clock field and on none of the calendar ones,
+    // which is measured: over a TIME of `-06:07:08`, `EXTRACT(HOUR ...)` is -6
+    // where `HOUR()` over the same value is 6, and `EXTRACT(YEAR ...)` is this
+    // year rather than minus it.
+    Ok(Value::Int(if negative { -read } else { read }))
+}
+
+/// Text `EXTRACT` will not guess at.
+///
+/// MySQL answers NULL for text it cannot read as a temporal at all, and a
+/// number for several shapes this engine's parser does not take — `'06:07:08'`
+/// is the date 2006-07-08 to a calendar field, and a bare `20240105` is one
+/// too. Answering NULL for those would be a wrong answer wearing MySQL's
+/// clothes, so the ones that cannot be told apart are refused together.
+fn unreadable(text: &str) -> EngineError {
+    unsupported(format!(
+        "EXTRACT() over `{text}`, which is not a date or time this engine reads"
+    ))
 }
 
 /// The date functions whose arguments are partly syntax.

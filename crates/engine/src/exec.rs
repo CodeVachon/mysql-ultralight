@@ -2607,6 +2607,15 @@ impl Engine {
                 expr: Box::new(recur(expr, folded)?),
                 r#in: Box::new(recur(r#in, folded)?),
             },
+            Expr::Extract {
+                field,
+                syntax,
+                expr,
+            } => Expr::Extract {
+                field: field.clone(),
+                syntax: syntax.clone(),
+                expr: Box::new(recur(expr, folded)?),
+            },
             Expr::IsNull(inner) => Expr::IsNull(Box::new(recur(inner, folded)?)),
             Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(recur(inner, folded)?)),
             Expr::Between {
@@ -3905,7 +3914,7 @@ impl Engine {
                     Some(e) => expr::eval(e, &ctx)?,
                     None => Value::Null,
                 };
-                self.assign(session, &name, value);
+                self.assign(session, &name, value)?;
                 Ok(Outcome::ok())
             }
             S::MultipleAssignments { assignments } => {
@@ -3913,7 +3922,7 @@ impl Engine {
                     let name = object_name(&assignment.name);
                     let ctx = Context::rowless(session).with_executor(self);
                     let value = expr::eval(&assignment.value, &ctx)?;
-                    self.assign(session, &name, value);
+                    self.assign(session, &name, value)?;
                 }
                 Ok(Outcome::ok())
             }
@@ -3922,15 +3931,21 @@ impl Engine {
         }
     }
 
-    fn assign(&self, session: &mut Session, name: &str, value: Value) {
+    /// A `SET` of one variable.
+    ///
+    /// Fallible because a system variable can refuse its value: MySQL answers
+    /// 1232 for a `default_week_format` that is not an integer, and this
+    /// engine took it silently until the week had somewhere to be wrong.
+    fn assign(&self, session: &mut Session, name: &str, value: Value) -> EngineResult<()> {
         match name.strip_prefix("@@") {
-            Some(rest) => session.set_system_variable(rest, value.as_text()),
+            Some(rest) => session.set_system_variable(rest, &value)?,
             None => match name.strip_prefix('@') {
                 Some(rest) => session.set_user_variable(rest, value),
                 // A bare name in SET is a system variable.
-                None => session.set_system_variable(name, value.as_text()),
+                None => session.set_system_variable(name, &value)?,
             },
         }
+        Ok(())
     }
 
     // ----------------------------------------------------------------- SHOW
@@ -6946,6 +6961,7 @@ fn subexpressions(e: &Expr) -> Vec<&Expr> {
         | Expr::SimilarTo { expr, pattern, .. }
         | Expr::RLike { expr, pattern, .. } => vec![expr, pattern],
         Expr::Position { expr, r#in } => vec![expr, r#in],
+        Expr::Extract { expr, .. } => vec![expr],
         Expr::Substring {
             expr,
             substring_from,

@@ -183,3 +183,8 @@
 {"at":"2026-08-25T08:17:18Z","id":77,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-25T10:59:33Z","id":91,"by":"Christopher Vachon","as":"user","type":"created","title":"BETWEEN's high operand does not take a predicate","state":"Todo"}
 {"at":"2026-08-25T10:59:33Z","id":92,"by":"Christopher Vachon","as":"user","type":"created","title":"BETWEEN is not three-valued","state":"Todo"}
+{"at":"2026-08-25T11:26:06Z","id":56,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-25T12:57:57Z","id":93,"by":"Christopher Vachon","as":"user","type":"created","title":"LIKE takes its escape character from the opening quote","state":"Todo"}
+{"at":"2026-08-25T13:13:52Z","id":94,"by":"Christopher Vachon","as":"user","type":"created","title":"EXTRACT's compound units do not parse","state":"Todo"}
+{"at":"2026-08-25T13:13:52Z","id":95,"by":"Christopher Vachon","as":"user","type":"created","title":"SET accepts values MySQL refuses or clamps","state":"Todo"}
+{"at":"2026-08-25T13:13:52Z","id":96,"by":"Christopher Vachon","as":"user","type":"created","title":"SHOW VARIABLES ignores its LIKE pattern","state":"Todo"}

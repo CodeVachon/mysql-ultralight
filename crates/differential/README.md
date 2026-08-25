@@ -72,7 +72,7 @@ Two things fail a run:
 
 So the file only ever shrinks, and it shrinks by fixing things.
 
-**It is empty.** All 968 statements answer exactly as MySQL 8.3 answers them,
+**It is empty.** All 1044 statements answer exactly as MySQL 8.3 answers them,
 in both protocols — the rows, the column names, the type codes, and the
 nullability and signedness flags. It started at 108 divergences across 66
 statements.
@@ -109,6 +109,13 @@ A group may change `sql_mode` in its setup and leave it changed for its cases �
 restored to the server's default before each one rather than trusted to be it;
 add to the mode in force rather than replacing it, or the group silently runs
 without `STRICT_TRANS_TABLES` as well.
+
+`default_week_format` is the other variable a group may leave changed, and is
+restored the same way. `EXTRACT(WEEK FROM x)` takes no mode argument and reads
+that variable instead, so the only way to ask MySQL the other seven week
+questions is to set it — and a group that ran after one which did would
+otherwise be counting weeks under somebody else's mode. Any further variable a
+group sets needs the same line in `reset`, for the same reason.
 
 ## The corpus
 

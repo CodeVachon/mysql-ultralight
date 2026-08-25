@@ -341,6 +341,12 @@ fn wrong_instance(expected: &str, reported: Result<Option<String>, String>) -> O
 fn reset(conn: &mut Conn, group: &str) {
     for statement in [
         format!("SET SESSION sql_mode = '{DEFAULT_SQL_MODE}'"),
+        // The second variable a group is allowed to leave changed, for the
+        // same reason as the mode above: `EXTRACT(WEEK ...)` reads it and
+        // takes no argument, so asking the other seven questions means
+        // setting it — and a group after one that did would otherwise be
+        // counting weeks under somebody else's mode.
+        "SET SESSION default_week_format = 0".to_owned(),
         format!("DROP DATABASE IF EXISTS `{DATABASE}`"),
         format!("CREATE DATABASE `{DATABASE}`"),
         format!("USE `{DATABASE}`"),

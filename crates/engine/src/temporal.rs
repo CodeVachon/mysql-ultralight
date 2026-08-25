@@ -98,12 +98,19 @@ pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
 }
 
+/// Whether a year has a 29 February. The month lengths and the week rollover
+/// both turn on it, and a second spelling of the rule is a second place for it
+/// to be wrong.
+fn is_leap(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
 /// Days in a month, so calendar arithmetic can clamp rather than overflow.
 fn days_in_month(year: i64, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+        2 if is_leap(year) => 29,
         2 => 28,
         _ => 0,
     }
@@ -236,6 +243,17 @@ pub fn parse_clock(text: &str) -> Option<Stamp> {
         micros,
         has_time: true,
     })
+}
+
+/// The same clock, with the sign `parse_clock` drops.
+///
+/// A TIME runs both ways and `EXTRACT` carries the sign into every clock
+/// field: `EXTRACT(HOUR FROM '-06:07:08')` is -6 on 8.3, where `HOUR()` over
+/// the same value is 6. The two really do disagree, so the sign cannot live
+/// inside the stamp that both of them read.
+pub fn parse_signed_clock(text: &str) -> Option<(bool, Stamp)> {
+    let trimmed = text.trim();
+    Some((trimmed.starts_with('-'), parse_clock(trimmed)?))
 }
 
 impl Stamp {
@@ -418,6 +436,83 @@ impl Stamp {
     pub fn day_of_year(&self) -> u32 {
         (days_from_civil(self.year, self.month, self.day) - days_from_civil(self.year, 1, 1) + 1)
             as u32
+    }
+
+    /// The week of the year, under one of MySQL's eight week formats.
+    ///
+    /// `format` is `default_week_format` as written, not the behaviour bits:
+    /// MySQL's `week_mode` flips the "first weekday" bit for every format that
+    /// does not ask for Monday, so format 0 counts Sunday-started weeks and
+    /// numbers a partial first week 0 while format 1 counts Monday-started
+    /// ones and numbers it 1. Reading the bits directly would answer the other
+    /// mode's question for four of the eight.
+    ///
+    /// A transcription of MySQL's `calc_week` rather than a rederivation, down
+    /// to the year rollover: a date in the first days of January can belong to
+    /// week 52 or 53 of the year before, and under a `WEEK_YEAR` format the
+    /// last days of December can belong to week 1 of the year after. Measured
+    /// on 8.3 — 2024-01-05 is week 0 and 2023-01-01 is week 1, which are the
+    /// two branches.
+    pub fn week(&self, format: u32) -> u32 {
+        // `week_mode`: bit 2 is inverted unless bit 0 asked for Monday.
+        let behaviour = if format & 1 == 0 {
+            (format & 7) ^ 4
+        } else {
+            format & 7
+        };
+        let monday_first = behaviour & 1 != 0;
+        let mut week_year = behaviour & 2 != 0;
+        let first_weekday = behaviour & 4 != 0;
+        // 0 is the first day of the week, whichever day that is. MySQL's
+        // `calc_weekday` writes the same thing as `(daynr + 5 + sunday) % 7`
+        // over days counted from year zero; 3 is that 5 carried across to days
+        // counted from 1970-01-01, which was a Thursday.
+        let index = |days: i64| (days + 3 + i64::from(!monday_first)).rem_euclid(7);
+
+        let daynr = days_from_civil(self.year, self.month, self.day);
+        let mut first_daynr = days_from_civil(self.year, 1, 1);
+        let mut weekday = index(first_daynr);
+        let mut year = self.year;
+
+        // Inside the days January owes to the year before.
+        if self.month == 1 && i64::from(self.day) <= 7 - weekday {
+            if !week_year && ((first_weekday && weekday != 0) || (!first_weekday && weekday >= 4)) {
+                return 0;
+            }
+            week_year = true;
+            year -= 1;
+            let days = days_in_year(year);
+            first_daynr -= days;
+            // MySQL adds 53 weeks before this subtraction, because C's `%`
+            // keeps the sign of a negative left operand and would answer a
+            // weekday below zero. `rem_euclid` does not, so the padding would
+            // be dead arithmetic here.
+            weekday = (weekday - days).rem_euclid(7);
+        }
+
+        let days = if (first_weekday && weekday != 0) || (!first_weekday && weekday >= 4) {
+            daynr - (first_daynr + (7 - weekday))
+        } else {
+            daynr - (first_daynr - weekday)
+        };
+
+        // Past 52 whole weeks the date can belong to week 1 of the next year.
+        if week_year && days >= 52 * 7 {
+            weekday = (weekday + days_in_year(year)).rem_euclid(7);
+            if (!first_weekday && weekday < 4) || (first_weekday && weekday == 0) {
+                return 1;
+            }
+        }
+        (days / 7 + 1) as u32
+    }
+}
+
+/// Days in a year, which the week rollover counts back over.
+fn days_in_year(year: i64) -> i64 {
+    if is_leap(year) {
+        366
+    } else {
+        365
     }
 }
 
