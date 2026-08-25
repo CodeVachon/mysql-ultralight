@@ -179,3 +179,7 @@
 {"at":"2026-08-25T03:02:14Z","id":89,"by":"Christopher Vachon","as":"user","type":"created","title":"UPDATE reports rows matched where MySQL reports rows changed","state":"Todo"}
 {"at":"2026-08-25T05:12:33Z","id":61,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-25T05:12:45Z","id":90,"by":"Christopher Vachon","as":"user","type":"created","title":"ORDER BY a position sorts by the input column, not the projection","state":"Todo"}
+{"at":"2026-08-25T08:17:18Z","id":69,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-25T08:17:18Z","id":77,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-25T10:59:33Z","id":91,"by":"Christopher Vachon","as":"user","type":"created","title":"BETWEEN's high operand does not take a predicate","state":"Todo"}
+{"at":"2026-08-25T10:59:33Z","id":92,"by":"Christopher Vachon","as":"user","type":"created","title":"BETWEEN is not three-valued","state":"Todo"}

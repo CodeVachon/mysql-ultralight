@@ -208,6 +208,14 @@ const IMPURE: &[&str] = &[
 
 /// Evaluates an expression to a single value.
 pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
+    // A construct that extends an expression to its left can have been handed
+    // more than it should hold, the same way `~` and `DIV` are, so the shape
+    // is corrected before it is read. Ahead of the match rather than in each
+    // of the arms, because there are eighteen of them and one left out is a
+    // wrong answer with nothing to show for it.
+    if let Some(fixed) = reassociated_postfix(expr) {
+        return eval(&fixed, ctx);
+    }
     // Bound before the match, because two arms below shadow `expr` with the
     // operand they destructure and still need the node itself.
     let expr_node = expr;
@@ -895,6 +903,19 @@ fn binary(
             (Some(false), Some(false)) => bool_value(false),
             _ => Value::Null,
         },
+        // XOR is the connective neither side can settle on its own: flipping
+        // an unknown operand flips the answer, so one NULL is enough to make
+        // the whole thing NULL where `1 OR NULL` is 1 and `0 AND NULL` is 0.
+        //
+        // Its operands are truth values and not bits — measured on 8.3,
+        // `2 XOR 0` is 1 and `2.5 XOR 0` is 1 and `'abc' XOR 1` is 1, none of
+        // which is what the bitwise `^` would say. `bool_value` for the same
+        // reason every other connective uses it: `JSON_ARRAY(1 XOR 0)` is
+        // `[true]` there, not `[1]`.
+        B::Xor => match (left.truthy(), right.truthy()) {
+            (Some(a), Some(b)) => bool_value(a != b),
+            _ => Value::Null,
+        },
 
         B::Plus | B::Minus | B::Multiply | B::Divide | B::Modulo | B::MyIntegerDivide => {
             arithmetic(op, &left, &right)?
@@ -948,35 +969,84 @@ fn binary(
 /// tighter still; and `2^3||4` is 32, `2^3+1` is 2, `1+2<<3` is 24, `1<<2&3`
 /// is 0 and `1&2|3` is 3, which is the bitwise order `^`, then `* / DIV %`,
 /// then `+ -`, then `<< >>`, then `&`, then `|`.
+///
+/// The four loosest were added for #0056 and are measured the same way.
+/// `1 = 2 XOR 3` is 1, so a comparison binds tighter than `XOR`;
+/// `2 XOR 3 AND 0` is 1, so `AND` binds tighter still; and `1 OR 1 XOR 1` is
+/// 1, so `OR` is looser. `XOR` had to reach the table at all because
+/// sqlparser puts it between `+` and `&`, which is on the wrong side of every
+/// comparison, every bitwise operator and `AND` alike. `AND`, `OR` and the
+/// comparisons come with it rather than on their own account: a chain stops
+/// at an operator with no level, so `XOR` cannot be moved past what is not in
+/// it.
 fn precedence(op: &BinaryOperator) -> u8 {
     use BinaryOperator as B;
     match op {
-        B::Arrow | B::LongArrow => 9,
-        // Two operators wearing one token: concatenating it binds tighter than
-        // everything but a path extraction, and meaning OR it binds looser
-        // than everything here.
+        B::Arrow | B::LongArrow => 14,
+        // Two operators wearing one token, and sqlparser reads the token at
+        // one precedence — the one it gives `*`. Concatenating, that is nearly
+        // right and this row moves it above `*`; meaning OR, it is as wrong as
+        // a precedence can be, and `1 || 1 AND 0` is 1 in MySQL where the
+        // parsed shape `(1 || 1) AND 0` is 0.
         //
         // Read from the statement rather than from a session, which is where
         // `binary` reads it to decide what `||` *does*. Two readings of one
         // flag, so `eval` has to run inside a `crate::exec::Source` scope or
         // they can disagree and `7 DIV 2 || 3` would be shaped as OR and then
         // concatenated. Both entry points that parse set that scope.
-        B::StringConcat if crate::exec::pipes_as_concat() => 8,
-        B::BitwiseXor => 7,
-        B::Multiply | B::Divide | B::Modulo | B::MyIntegerDivide => 6,
-        B::Plus | B::Minus => 5,
-        B::PGBitwiseShiftLeft | B::PGBitwiseShiftRight => 4,
-        B::BitwiseAnd => 3,
-        B::BitwiseOr => 2,
+        B::StringConcat if crate::exec::pipes_as_concat() => 13,
+        B::BitwiseXor => 12,
+        B::Multiply | B::Divide | B::Modulo | B::MyIntegerDivide => 11,
+        B::Plus | B::Minus => 10,
+        B::PGBitwiseShiftLeft | B::PGBitwiseShiftRight => 9,
+        B::BitwiseAnd => 8,
+        B::BitwiseOr => 7,
+        B::Eq | B::NotEq | B::Lt | B::LtEq | B::Gt | B::GtEq | B::Spaceship => COMPARISON,
+        B::And => 3,
+        B::Xor => 2,
+        // `OR`, and `||` wherever it means OR. MySQL has one level looser
+        // still — `:=` — which this engine does not answer, so this is the
+        // bottom of the chain rather than a level with something below it.
+        B::Or | B::StringConcat => 1,
         _ => 0,
     }
 }
+
+/// Where MySQL puts the prefix `NOT`: looser than a comparison and tighter
+/// than `AND`. Not a `BinaryOp`, and not `PREFIX` either — `~` binds to the
+/// operand beside it and `NOT` binds to a whole comparison.
+///
+/// sqlparser reads its operand at a precedence that stops at `AND` and `OR`
+/// and swallows everything else, so the one thing it lets in that MySQL keeps
+/// out is `XOR`. Measured on 8.3: `NOT 0 XOR 1 AND 0` is 1, which is
+/// `(NOT 0) XOR (1 AND 0)`; the parsed `NOT (0 XOR 1) AND 0` is 0. So is
+/// `NOT 0 XOR 0 AND 0`, and `NOT NULL XOR 1 AND 0` is NULL where the parsed
+/// shape says 0. Everything tighter stays inside it: `NOT 0 = 0` is 0,
+/// `NOT 1 + 2` is 0, `NOT 0 | 1` is 0 and `NOT 2 IS NULL` is 1.
+const NOT: u8 = 4;
+
+/// Where MySQL puts every comparison, and the `IS` tests along with them.
+///
+/// `IS NULL` and its family are not `BinaryOp` nodes but they bind here, and
+/// left-associatively: `0 = 0 IS NULL` is 0 on 8.3, which is `(0 = 0) IS NULL`
+/// and not `0 = (0 IS NULL)`.
+const COMPARISON: u8 = 5;
+
+/// One level tighter, where MySQL's grammar puts `IN`, `BETWEEN`, `LIKE` and
+/// `REGEXP` — a `predicate`, which a `bool_pri` compares *to*.
+///
+/// A level of its own because the difference is visible: `2 = 2 IN (1)` is 0
+/// on 8.3, which is `2 = (2 IN (1))`. Reading them at `COMPARISON` and letting
+/// left-associativity decide would give `(2 = 2) IN (1)`, which is 1.
+/// Measured the same way for each: `2 = 2 LIKE 1`, `2 = 2 REGEXP '1'` and
+/// `3 = 3 BETWEEN 0 AND 1` are all 0.
+const PREDICATE: u8 = 6;
 
 /// Tighter than any binary operator, which is where MySQL puts a prefix.
 ///
 /// `~1*2` is `(~1)*2` there — it overflows and is refused — where `~(1*2)` is
 /// 18446744073709551613 and is not.
-const PREFIX: u8 = 10;
+const PREFIX: u8 = 15;
 
 /// Re-associates a tree sqlparser grouped differently from MySQL.
 ///
@@ -1086,6 +1156,23 @@ fn regrouped(e: &Expr) -> Expr {
 /// above the operator, so what it returns satisfies both.
 fn grouped(e: &Expr) -> Option<u8> {
     use Expr as E;
+    // A construct that extends an expression to its left binds at `COMPARISON`
+    // or at `PREDICATE`, and is grouped when both its operands are and neither
+    // holds anything looser. Left-associative like every operator here, so the
+    // operand on the left may tie with it and the one after the keyword may
+    // not.
+    //
+    // Reporting a level rather than refusing outright — which this whole list
+    // used to do — is what keeps `a IS NULL AND b = 1` on the fast path now
+    // that `AND` has a level of its own. The refusal is still there wherever
+    // it was doing work: `7 DIV (2 IS NULL)` is an operand at `COMPARISON`
+    // under an operator far tighter, which `grouped_node` turns down on the
+    // level alone, and only `take_leftmost` puts the `IS NULL` back outside.
+    if let Some((level, leading, trailing)) = postfix_operands(e) {
+        return (grouped(leading)? >= level
+            && trailing.is_none_or(|t| grouped(t).is_some_and(|l| l > level)))
+        .then_some(level);
+    }
     match e {
         // Zero is not a level, and reporting it is what refuses an operator
         // that has none: no link in a chain is that loose, so a caller asking
@@ -1105,28 +1192,16 @@ fn grouped(e: &Expr) -> Option<u8> {
             op: UnaryOperator::BitwiseNot,
             expr,
         } => (!matches!(**expr, E::BinaryOp { .. }) && grouped(expr).is_some()).then_some(u8::MAX),
-        // Constructs that extend an expression to their *left*, which is what
-        // `take_leftmost` walks: `7 DIV 2 IS NULL` arrives as
-        // `7 DIV (2 IS NULL)` and only that walk puts the `IS NULL` back
-        // outside. The list is that walk's, and has to stay it.
-        E::IsNull(_)
-        | E::IsNotNull(_)
-        | E::IsTrue(_)
-        | E::IsFalse(_)
-        | E::IsNotTrue(_)
-        | E::IsNotFalse(_)
-        | E::IsUnknown(_)
-        | E::IsNotUnknown(_)
-        | E::InList { .. }
-        | E::InSubquery { .. }
-        | E::InUnnest { .. }
-        | E::Between { .. }
-        | E::Like { .. }
-        | E::ILike { .. }
-        | E::SimilarTo { .. }
-        | E::RLike { .. }
-        | E::IsDistinctFrom(..)
-        | E::IsNotDistinctFrom(..) => None,
+        // `NOT` is a level of its own, so a node holding something looser than
+        // it is holding part of the chain: `NOT 0 XOR 1 AND 0` arrives as
+        // `NOT (0 XOR 1) AND 0` and the `XOR` belongs outside the `NOT`.
+        // Unlike `~`, an operand that *is* an operator is the normal case —
+        // `NOT 0 = 0` is `NOT (0 = 0)` in both readings — so what is asked is
+        // whether that operator binds tighter, not whether there is one.
+        E::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => (grouped(expr)? > NOT).then_some(NOT),
         // Everything else is one operand and ends the chain: a literal, a
         // column, a call, a parenthesised group, and every prefix but `~` —
         // which is the same set `reassociated_unary` refuses to look at.
@@ -1170,7 +1245,17 @@ fn flatten(e: &Expr, operands: &mut Vec<Expr>, ops: &mut Vec<BinaryOperator>) {
             }
             None => e,
         },
-        _ => e,
+        // A construct that extends an expression to its left is corrected on
+        // the way past for the same reason: `1 XOR 2 IS NULL AND 3` hides the
+        // `XOR` inside the `IS NULL`, and the chain would otherwise be two
+        // terms where it is three.
+        _ => match reassociated_postfix(e) {
+            Some(fixed) => {
+                corrected = fixed;
+                &corrected
+            }
+            None => e,
+        },
     };
     match e {
         Expr::BinaryOp { left, op, right } if precedence(op) > 0 => {
@@ -1217,15 +1302,288 @@ fn build(
 /// binds `~` to the operand next to it and to nothing else, which is the same
 /// walk as above with a different wrapper.
 pub(crate) fn reassociated_unary(op: &UnaryOperator, expr: &Expr) -> Option<Expr> {
-    if !matches!(op, UnaryOperator::BitwiseNot) {
+    match op {
+        UnaryOperator::BitwiseNot => {
+            // Nothing to pull out of an operand that already binds tighter
+            // than the prefix does, and answering that without cloning is
+            // what keeps `~a & 255` off the slow path for every row.
+            if grouped(expr).is_some_and(|level| level > PREFIX) {
+                return None;
+            }
+            let mut fixed = expr.clone();
+            let wrap = |operand: Expr| Expr::UnaryOp {
+                op: *op,
+                expr: Box::new(operand),
+            };
+            take_leftmost(&mut fixed, &wrap, PREFIX).then_some(fixed)
+        }
+        UnaryOperator::Not => reassociated_not(expr),
+        _ => None,
+    }
+}
+
+/// Re-associates the prefix `NOT`, which is not the same walk as `~`.
+///
+/// `~` binds to the operand next to it, so everything its parse swallowed has
+/// to come back out and `take_leftmost` walks it all the way. `NOT` binds to a
+/// whole comparison, so nearly everything sqlparser puts inside it belongs
+/// there — `NOT 1 + 2` is `NOT (1 + 2)` in MySQL too. The one exception is
+/// `XOR`, which is looser than `NOT` there and tighter than it in sqlparser:
+/// `NOT 0 XOR 1` arrives as `NOT (0 XOR 1)` and means `(NOT 0) XOR 1`.
+///
+/// So this sinks rather than walks, which is `reassociated_postfix`'s step two
+/// pointing the other way — into the *left* of the chain, because a prefix is
+/// what the leftmost operand is missing.
+fn reassociated_not(expr: &Expr) -> Option<Expr> {
+    // Corrected first, because the chain it is holding need not be at the root
+    // of what it holds: `NOT 2 || NULL IN (1)` arrives as
+    // `NOT ((2 || NULL) IN (1))`, and only once that is
+    // `NOT (2 || (NULL IN (1)))` is the `||` the operator to sink past. MySQL
+    // says NULL there and the parsed shape says 0.
+    let corrected;
+    let operand = match corrected_shape(expr) {
+        Some(fixed) => {
+            corrected = fixed;
+            &corrected
+        }
+        None => expr,
+    };
+    let Expr::BinaryOp { left, op, right } = operand else {
+        return None;
+    };
+    // Zero is not a level, so an operator with none is left where it is; one
+    // at `NOT`'s level or above binds at least as tightly and belongs inside.
+    let held = precedence(op);
+    if held == 0 || held >= NOT {
         return None;
     }
-    let mut fixed = expr.clone();
-    let wrap = |operand: Expr| Expr::UnaryOp {
-        op: *op,
-        expr: Box::new(operand),
+    // Left-associative, so `NOT a XOR b XOR c` is `((NOT a) XOR b) XOR c` and
+    // the prefix keeps going left until it reaches the operand.
+    Some(Expr::BinaryOp {
+        left: Box::new(negated(left)),
+        op: op.clone(),
+        right: right.clone(),
+    })
+}
+
+/// Whatever correction applies to a node, whichever kind of node it is.
+///
+/// The three correctors take different arguments because each is also called
+/// from the arm that destructured its node, and a caller that has only the
+/// node — which is every caller correcting somebody else's operand — wants
+/// exactly this.
+fn corrected_shape(e: &Expr) -> Option<Expr> {
+    match e {
+        Expr::BinaryOp { left, op, right } => reassociated(op, left, right),
+        Expr::UnaryOp { op, expr } => reassociated_unary(op, expr),
+        other => reassociated_postfix(other),
+    }
+}
+
+/// `NOT` over an operand, sunk further first where the operand is itself a
+/// chain looser than `NOT`.
+fn negated(e: &Expr) -> Expr {
+    reassociated_not(e).unwrap_or_else(|| Expr::UnaryOp {
+        op: UnaryOperator::Not,
+        expr: Box::new(e.clone()),
+    })
+}
+
+/// How tightly a construct that extends an expression to its left binds, and
+/// the operands it binds: the one it extends over, and the one after the
+/// keyword where there is one.
+///
+/// `None` for anything else, which is what says "this is not one of them".
+/// `grouped`, `take_leftmost` and `reassociated_postfix` all read the list
+/// from here rather than keeping one each, because they have to agree about it
+/// or a shape is refused in one place and walked in another.
+///
+/// `BETWEEN`'s `low` is deliberately not a trailing operand. sqlparser reads
+/// it at the precedence of `BETWEEN` and so lets `XOR` into it, but MySQL will
+/// not parse `1 BETWEEN 0 XOR 1 AND 2` at all — measured, it is a 1064 — so
+/// there is no grouping to agree with.
+///
+/// `BETWEEN`'s `high` is one, and is the one place this list does not reach
+/// far enough. MySQL's `high` is a `predicate`, so `1 BETWEEN 0 AND 2 IN (2)`
+/// is `1 BETWEEN 0 AND (2 IN (2))` and answers 1 on 8.3; sqlparser stops the
+/// `high` at `2` and makes the `IN` the parent, and this engine answers 0.
+/// Correcting it would mean pushing an operator *into* a trailing operand,
+/// which is the opposite of every walk here and has no other caller — so it
+/// is #0091 rather than something done here, and this note is where the
+/// measurement lives. Pre-existing: both constructs were refused
+/// outright before #0056 and the tree was left the same way.
+fn postfix_operands(e: &Expr) -> Option<(u8, &Expr, Option<&Expr>)> {
+    use Expr as E;
+    Some(match e {
+        E::IsNull(x)
+        | E::IsNotNull(x)
+        | E::IsTrue(x)
+        | E::IsFalse(x)
+        | E::IsNotTrue(x)
+        | E::IsNotFalse(x)
+        | E::IsUnknown(x)
+        | E::IsNotUnknown(x) => (COMPARISON, &**x, None),
+        E::InList { expr, .. } | E::InSubquery { expr, .. } | E::InUnnest { expr, .. } => {
+            (PREDICATE, &**expr, None)
+        }
+        E::Between { expr, high, .. } => (PREDICATE, &**expr, Some(&**high)),
+        E::Like { expr, pattern, .. }
+        | E::ILike { expr, pattern, .. }
+        | E::SimilarTo { expr, pattern, .. }
+        | E::RLike { expr, pattern, .. } => (PREDICATE, &**expr, Some(&**pattern)),
+        // Not MySQL's spelling of anything, so there is nothing measured to
+        // put it at; `COMPARISON` is where the `IS` it is written with binds.
+        E::IsDistinctFrom(x, y) | E::IsNotDistinctFrom(x, y) => (COMPARISON, &**x, Some(&**y)),
+        _ => return None,
+    })
+}
+
+/// The same two operands, to write through.
+///
+/// A second copy of the list rather than one function over both: Rust has no
+/// way to be generic over `&` and `&mut` here, and the alternative — cloning
+/// the node to ask an immutable one — is the allocation the fast path in
+/// `reassociated` exists to avoid. Anything added to one belongs in the other.
+fn postfix_operands_mut(e: &mut Expr) -> Option<(u8, &mut Expr, Option<&mut Expr>)> {
+    use Expr as E;
+    Some(match e {
+        E::IsNull(x)
+        | E::IsNotNull(x)
+        | E::IsTrue(x)
+        | E::IsFalse(x)
+        | E::IsNotTrue(x)
+        | E::IsNotFalse(x)
+        | E::IsUnknown(x)
+        | E::IsNotUnknown(x) => (COMPARISON, &mut **x, None),
+        E::InList { expr, .. } | E::InSubquery { expr, .. } | E::InUnnest { expr, .. } => {
+            (PREDICATE, &mut **expr, None)
+        }
+        E::Between { expr, high, .. } => (PREDICATE, &mut **expr, Some(&mut **high)),
+        E::Like { expr, pattern, .. }
+        | E::ILike { expr, pattern, .. }
+        | E::SimilarTo { expr, pattern, .. }
+        | E::RLike { expr, pattern, .. } => (PREDICATE, &mut **expr, Some(&mut **pattern)),
+        E::IsDistinctFrom(x, y) | E::IsNotDistinctFrom(x, y) => {
+            (COMPARISON, &mut **x, Some(&mut **y))
+        }
+        _ => return None,
+    })
+}
+
+/// The same construct over a different operand on its left.
+fn with_leading(e: &Expr, operand: Expr) -> Expr {
+    let mut node = e.clone();
+    let (_, leading, _) =
+        postfix_operands_mut(&mut node).expect("only called for one of these constructs");
+    *leading = operand;
+    node
+}
+
+/// The same construct with a different operand after its keyword.
+fn with_trailing(e: &Expr, operand: Expr) -> Expr {
+    let mut node = e.clone();
+    let (_, _, trailing) =
+        postfix_operands_mut(&mut node).expect("only called for one of these constructs");
+    *trailing.expect("only called for one that has an operand after its keyword") = operand;
+    node
+}
+
+/// Re-associates a construct that extends an expression to its left.
+///
+/// MySQL binds `IS NULL` where it binds a comparison, `IN`, `BETWEEN`, `LIKE`
+/// and `REGEXP` one level tighter, and `XOR` far looser than any of them.
+/// sqlparser puts the whole family between the comparisons and `XOR`, so each
+/// is on the wrong side of one of its neighbours — and the two mistakes point
+/// in opposite directions, which is why there are two corrections here.
+/// Neither can be `reassociated`'s: none of these is a `BinaryOp`, so nothing
+/// calls it for one.
+///
+/// Always answers a `BinaryOp` when it answers at all — both corrections lift
+/// an operator to the root — which is what lets a caller correcting a leading
+/// operand treat anything else as nothing to do.
+///
+/// `None` when the tree already means what MySQL means, which is what stops
+/// the caller recursing forever.
+pub(crate) fn reassociated_postfix(e: &Expr) -> Option<Expr> {
+    let (level, leading, trailing) = postfix_operands(e)?;
+
+    // Step one: what the operand *after* the keyword swallowed, which is the
+    // same problem `DIV` has and takes the same walk. `'a' LIKE 'a' XOR 0`
+    // arrives as `'a' LIKE ('a' XOR 0)` and answers 0 where MySQL says 1; so
+    // does `'a' LIKE 'a' = 1`, which needs no `XOR` to go wrong and was
+    // already wrong before this.
+    if let Some(trailing) = trailing {
+        if grouped(trailing).is_none_or(|held| held <= level) {
+            let mut fixed = trailing.clone();
+            let wrap = |operand: Expr| with_trailing(e, operand);
+            if take_leftmost(&mut fixed, &wrap, level) {
+                // Regrouped afterwards, the way `reassociated` regroups what
+                // its own walk gives back. The walk only puts the construct
+                // to the left of what swallowed it, and what it lands beside
+                // is still grouped sqlparser's way:
+                // `3 LIKE '3' <> 3 XOR NULL IS NOT NULL` comes out of the walk
+                // as `(3 LIKE '3') <> (3 XOR NULL)`, where MySQL means
+                // `((3 LIKE '3') <> 3) XOR ...` and answers 1 rather than 0.
+                return Some(regrouped(&fixed));
+            }
+        }
+    }
+
+    // Step two: what the construct itself was put inside. `1 XOR 2 IS NULL`
+    // arrives as `(1 XOR 2) IS NULL` and answers 0 where MySQL says 1, which
+    // means `1 XOR (2 IS NULL)`.
+    //
+    // The leading operand is corrected first, because its root is not final
+    // until it is: `1 XOR 2 | 3 IS NULL` arrives with `|` at the root of it,
+    // and only once that is `1 XOR (2 | 3)` is the `XOR` the operator to sink
+    // past.
+    // Whichever kind of node the leading operand is, because it can be any of
+    // them and each hides a chain its own way. One of these can hold another:
+    // `1 XOR 2 IS NULL IS NULL` arrives as `((1 XOR 2) IS NULL) IS NULL`, and
+    // the inner one has to give its `XOR` up before the outer one has a chain
+    // to sink past — MySQL says 1 and reading the pair as parsed says 0. A
+    // `NOT` holds one the same way: `NOT 0 XOR 1 IS NULL` arrives as
+    // `NOT (0 XOR 1) IS NULL`.
+    let corrected;
+    let leading = match corrected_shape(leading) {
+        Some(fixed) => {
+            corrected = fixed;
+            &corrected
+        }
+        None => leading,
     };
-    take_leftmost(&mut fixed, &wrap, PREFIX).then_some(fixed)
+    // A leading operand that was corrected and has nothing to sink past is
+    // handed back uncorrected, the way `reassociated` hands back the operands
+    // it corrected and then found nothing to regroup: the caller reaches the
+    // operand on its own way down and corrects it there. Both `eval` and
+    // `never_null` do, and the construct itself answers the same over either
+    // shape — `X IS NULL` is a LONGLONG and NOT NULL whatever `X` is grouped
+    // like.
+    let Expr::BinaryOp { left, op, right } = leading else {
+        return None;
+    };
+    // Zero is not a level, so an operator with none is left where it is; one
+    // at this construct's level or above binds at least as tightly as it and
+    // is already inside it, which is where it belongs.
+    let held = precedence(op);
+    if held == 0 || held >= level {
+        return None;
+    }
+    // And again on what it lands on, because one sink is not always enough:
+    // there are four levels below a `PREDICATE`, so a corrected chain rooted
+    // at `||` can still carry a `XOR` on its right. `0 || 1 XOR 2 IS NULL`
+    // sinks once to `0 || ((1 XOR 2) IS NULL)`, which is still not
+    // `0 || (1 XOR (2 IS NULL))`. `eval` re-enters and `flatten` finishes the
+    // job either way, so this costs no answer today — but a correction that
+    // is only right after being called twice is one the next caller gets
+    // wrong.
+    let inner = with_leading(e, (**right).clone());
+    let inner = reassociated_postfix(&inner).unwrap_or(inner);
+    Some(Expr::BinaryOp {
+        left: left.clone(),
+        op: op.clone(),
+        right: Box::new(inner),
+    })
 }
 
 /// Puts the corrected operator around the operand it should have taken.
@@ -1271,22 +1629,23 @@ fn take_leftmost(e: &mut Expr, wrap: &dyn Fn(Expr) -> Expr, level: u8) -> bool {
 
     let child: &mut Expr = match e {
         E::BinaryOp { left, .. } => left,
-        E::IsNull(x)
-        | E::IsNotNull(x)
-        | E::IsTrue(x)
-        | E::IsFalse(x)
-        | E::IsNotTrue(x)
-        | E::IsNotFalse(x)
-        | E::IsUnknown(x)
-        | E::IsNotUnknown(x) => x,
-        E::InList { expr, .. } | E::InSubquery { expr, .. } | E::InUnnest { expr, .. } => expr,
-        E::Between { expr, .. } => expr,
-        E::Like { expr, .. }
-        | E::ILike { expr, .. }
-        | E::SimilarTo { expr, .. }
-        | E::RLike { expr, .. } => expr,
-        E::IsDistinctFrom(x, _) | E::IsNotDistinctFrom(x, _) => x,
-        _ => return false,
+        _ => match postfix_operands_mut(e) {
+            // Stepped into only by something that binds at least as tightly as
+            // the construct does, because that is the only way one of these
+            // can have been swallowed. The same test the `BinaryOp` branch
+            // above makes, and a tie counts for the same reason: everything
+            // here is left-associative, so a construct of equal precedence
+            // belongs *outside* the one that gave up its operand.
+            // `3 LIKE '2' = 3 IN (1, 1)` arrives with the `IN` inside the
+            // pattern and is `(3 LIKE '2') = (3 IN (1, 1))` on 8.3.
+            //
+            // `AND`, `XOR` and `OR` bind looser and hold the construct as an
+            // operand already, and stepping in would pull them inside it:
+            // `1 AND 'a' LIKE 'a'` would become `(1 AND 'a') LIKE 'a'`, which
+            // is a different question with a different answer.
+            Some((held, leading, _)) if held <= level => leading,
+            _ => return false,
+        },
     };
     if !take_leftmost(child, wrap, level) {
         *child = wrap(child.clone());
@@ -2157,6 +2516,25 @@ mod tests {
             "(a + b) * c",
             "a * (b + c)",
             "~a & 255",
+            // The shapes a `WHERE` is made of. #0056 gave every comparison,
+            // `AND` and `OR` a level, which put them into the chain for the
+            // first time; without the fast path recognising them, every row of
+            // every filtered query would clone and rebuild its predicate.
+            "a = 1",
+            "a = 1 AND b = 2",
+            "a = 1 AND b = 2 AND c = 3",
+            "a = 1 OR b = 2",
+            "a = 1 AND b > 2 OR c <= 3 AND d <> 4",
+            "a IS NULL AND b = 2",
+            "a IN (1, 2) AND b IS NOT NULL",
+            "a LIKE 'x%' AND b BETWEEN 1 AND 2",
+            "a + 1 = b * 2",
+            "a XOR b",
+            // A `NOT` whose operand binds tighter than it does, which is
+            // every `NOT` an application writes.
+            "NOT a AND NOT b",
+            "NOT a = 1 AND b",
+            "NOT a IS NULL OR b",
         ] {
             let expr = parse(sql);
             let Expr::BinaryOp { left, op, right } = &expr else {
@@ -2189,6 +2567,25 @@ mod tests {
             // the chain, on either side of the operator.
             "~(-6) * 2 ^ 3",
             "3 ^ ~1 % 5",
+            // `(2 XOR 3) AND 0`: sqlparser puts XOR eight levels above where
+            // MySQL puts it, so everything between the two arrives inside it.
+            "2 XOR 3 AND 0",
+            "1 XOR 2 | 0",
+            "1 XOR 2 = 2",
+            // And the same disagreement read from the other side, where the
+            // XOR is what got swallowed: `1 = (2 XOR 3)`.
+            "1 = 2 XOR 3",
+            // `(1 || 1) AND 0`: sqlparser reads `||` at the precedence of `*`
+            // whichever of the two operators it means, and meaning OR it is
+            // the loosest thing in the statement.
+            "1 || 1 AND 0",
+            // `(a AND (b XOR c)) OR d`: three of the four new levels in one
+            // chain, and the only reading of it sqlparser gets right is which
+            // of them is loosest.
+            "a AND b XOR c OR d",
+            // `NOT (0 XOR 1) AND 0`: sqlparser lets the whole XOR chain into
+            // the `NOT`, where MySQL binds it to the operand beside it.
+            "NOT 0 XOR 1 AND 0",
         ] {
             let expr = parse(sql);
             let Expr::BinaryOp { left, op, right } = &expr else {
@@ -2197,6 +2594,196 @@ mod tests {
             assert!(
                 grouped_node(precedence(op), left, right).is_none(),
                 "`{sql}` was taken for a chain that needs nothing"
+            );
+        }
+    }
+
+    /// `take_leftmost` steps into a construct like `LIKE` only on behalf of an
+    /// operator that binds tighter than a comparison, because that is the only
+    /// way one can have been swallowed.
+    ///
+    /// Asserted here rather than through a query, and deliberately: the guard
+    /// is inert as the rest of the file stands, because a looser operator
+    /// walked wrongly *into* the construct is sunk straight back out of it by
+    /// `reassociated_postfix`, so no answer changes and no mutation of it
+    /// fails a test. What the guard buys is that `take_leftmost` is right on
+    /// its own terms rather than by something downstream repairing it — the
+    /// two exist to correct opposite mistakes, and a pass that makes one to
+    /// have the other undone is a pass nobody can reason about.
+    #[test]
+    fn a_postfix_construct_is_walked_into_only_from_something_tighter() {
+        let like = parse("'a' LIKE 'b'");
+        let wrap = |operand: Expr| Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: Box::new(operand),
+        };
+
+        // `DIV` binds tighter than a comparison, so it swallowed the whole
+        // construct and the walk is what puts it back outside.
+        let mut swallowed = like.clone();
+        assert!(take_leftmost(
+            &mut swallowed,
+            &wrap,
+            precedence(&BinaryOperator::MyIntegerDivide)
+        ));
+        assert_ne!(swallowed, like);
+
+        // `AND` binds looser and holds the construct as an operand already.
+        for op in [BinaryOperator::And, BinaryOperator::Xor, BinaryOperator::Or] {
+            let mut operand = like.clone();
+            assert!(
+                !take_leftmost(&mut operand, &wrap, precedence(&op)),
+                "{op} walked into a construct that binds tighter than it"
+            );
+            assert_eq!(operand, like);
+        }
+
+        // A comparison binds looser than a `PREDICATE` and holds one the same
+        // way.
+        let mut operand = like.clone();
+        assert!(!take_leftmost(&mut operand, &wrap, COMPARISON));
+        assert_eq!(operand, like);
+
+        // A tie *is* walked into, because everything here is left-associative
+        // and so one of equal precedence belongs outside the construct that
+        // gave up its operand — the same rule the `BinaryOp` branch follows.
+        // This is the level `reassociated_postfix` walks a trailing operand
+        // at, and `3 LIKE '2' = 3 IN (1, 1)` is where two `PREDICATE`s meet:
+        // the `IN` arrives inside the `LIKE` pattern and belongs around it.
+        for (level, node) in [
+            (PREDICATE, parse("a IN (1)")),
+            (COMPARISON, parse("a IS NULL")),
+        ] {
+            let mut operand = node.clone();
+            assert!(
+                take_leftmost(&mut operand, &wrap, level),
+                "a construct at level {level} was not walked into from its own level"
+            );
+            assert_ne!(operand, node);
+        }
+    }
+
+    /// A prefix is corrected only when it swallowed something that binds
+    /// looser than it does — for `NOT` that is `XOR` and nothing else, and for
+    /// `~` it is everything, because `~` binds to the operand beside it.
+    ///
+    /// The allocation count is the point of the first list: both of these run
+    /// on every such node of every row, and cloning the operand to find out
+    /// there was nothing to do is the waste `grouped` is asked about first.
+    #[test]
+    fn a_prefix_is_corrected_only_when_it_swallowed_a_looser_chain() {
+        for sql in [
+            "NOT a",
+            "NOT a = 1",
+            "NOT 1 + 2",
+            "NOT 0 | 1",
+            "NOT a IS NULL",
+            "NOT a IN (1, 2)",
+            "NOT (0 XOR 1)",
+            // `~` binds to its operand and nothing else, so one already
+            // holding just that has nothing to give back.
+            "~a",
+            "~1",
+            "~(1 * 2)",
+        ] {
+            let expr = parse(sql);
+            let Expr::UnaryOp { op, expr } = &expr else {
+                panic!("{sql} did not parse to a prefix");
+            };
+            let before = ALLOCATIONS.with(Cell::get);
+            let fixed = reassociated_unary(op, expr);
+            let allocated = ALLOCATIONS.with(Cell::get) - before;
+            assert!(fixed.is_none(), "`{sql}` was rebuilt");
+            assert_eq!(allocated, 0, "`{sql}` allocated {allocated} times");
+        }
+
+        for sql in [
+            "NOT 0 XOR 1",
+            "NOT 0 XOR 1 XOR 1",
+            "NOT 2 || NULL IN (1)",
+            "~1 * 2",
+        ] {
+            let expr = parse(sql);
+            let Expr::UnaryOp { op, expr } = &expr else {
+                panic!("{sql} did not parse to a prefix");
+            };
+            assert!(
+                reassociated_unary(op, expr).is_some(),
+                "`{sql}` was left as it arrived"
+            );
+        }
+    }
+
+    /// The corrected tree with its grouping written down. `Display` drops the
+    /// parentheses, which is the whole of what is asserted below.
+    fn shape(e: &Expr) -> String {
+        match e {
+            Expr::BinaryOp { left, op, right } => {
+                format!("({} {op} {})", shape(left), shape(right))
+            }
+            Expr::IsNull(inner) => format!("({} IS NULL)", shape(inner)),
+            other => other.to_string(),
+        }
+    }
+
+    /// One pass is the whole correction.
+    ///
+    /// There are four levels below a `PREDICATE`, so sinking a construct past
+    /// the root of its operand can land it on an operator that is looser than
+    /// it still: `0 || 1 XOR 2 IS NULL` sinks past the `||` onto the `XOR`.
+    /// Not visible in an answer — `eval` re-enters and `flatten` finishes the
+    /// job — so it is asserted on the tree, which is where the claim is.
+    #[test]
+    fn a_postfix_construct_sinks_all_the_way_in_one_pass() {
+        let expr = parse("0 || 1 XOR 2 IS NULL");
+        assert_eq!(
+            reassociated_postfix(&expr).as_ref().map(shape),
+            Some("(0 || (1 XOR (2 IS NULL)))".to_owned())
+        );
+    }
+
+    /// Both halves of the same claim for the constructs that are not
+    /// operators, which `reassociated` is never called for.
+    ///
+    /// `a IS NULL` is the shape a soft-deleted row is found by, so the fast
+    /// path matters here for the same reason it does above; and
+    /// `1 XOR 2 IS NULL` is the shape that makes the correction necessary at
+    /// all.
+    #[test]
+    fn a_postfix_test_is_corrected_only_when_it_swallowed_something() {
+        for sql in [
+            "a IS NULL",
+            "a IS NOT NULL",
+            "a + 1 IS NULL",
+            "a IN (1, 2)",
+            "a BETWEEN 1 AND 2",
+            "a LIKE 'x%'",
+            "a REGEXP 'x'",
+            "(1 XOR 2) IS NULL",
+        ] {
+            let expr = parse(sql);
+            let before = ALLOCATIONS.with(Cell::get);
+            let fixed = reassociated_postfix(&expr);
+            let allocated = ALLOCATIONS.with(Cell::get) - before;
+            assert!(fixed.is_none(), "`{sql}` was rebuilt");
+            assert_eq!(allocated, 0, "`{sql}` allocated {allocated} times");
+        }
+
+        for sql in [
+            // The construct swallowed the chain: MySQL means
+            // `1 XOR (2 IS NULL)`.
+            "1 XOR 2 IS NULL",
+            "1 XOR 2 IN (2)",
+            "1 XOR 2 BETWEEN 1 AND 3",
+            "1 XOR 'a' LIKE 'a'",
+            // The operand after the keyword swallowed it instead.
+            "'a' LIKE 'a' XOR 0",
+            "'a' LIKE 'a' = 1",
+            "1 BETWEEN 0 AND 2 XOR 1",
+        ] {
+            assert!(
+                reassociated_postfix(&parse(sql)).is_some(),
+                "`{sql}` was left as it arrived"
             );
         }
     }

@@ -1331,6 +1331,118 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // #0056. The operator is four lines of three-valued logic; where it
+        // binds is the rest of it. MySQL puts `XOR` between `OR` and `AND`
+        // and sqlparser puts it between `+` and `&`, so nearly everything it
+        // can be written beside groups the wrong way round. `AND`, `OR` and
+        // the comparisons are in here too because a chain stops at an
+        // operator with no measured level, so `XOR` cannot be moved past what
+        // is not in it — and `||` meaning OR was already being read at the
+        // precedence of `*`.
+        name: "xor and the loosest precedences",
+        setup: &[
+            "CREATE TABLE XO (id INT NOT NULL, a INT NOT NULL, b INT NULL, \
+             u INT UNSIGNED NOT NULL, s VARCHAR(10) NULL, PRIMARY KEY (id))",
+            "INSERT INTO XO VALUES (1, 1, NULL, 3, 'a'), (2, 0, 1, 0, 'b')",
+        ],
+        cases: &[
+            // The truth table, and the three-valued half of it: one unknown
+            // operand is enough, where `0 AND NULL` and `1 OR NULL` are not.
+            same("SELECT 1 XOR 0, 0 XOR 1, 0 XOR 0, 1 XOR 1"),
+            same("SELECT NULL XOR 1, 1 XOR NULL, NULL XOR 0, 0 XOR NULL, NULL XOR NULL"),
+            // Truth values and not bits: `5 XOR 3` is 0 where `5 ^ 3` is 6.
+            same("SELECT 2 XOR 0, 0 XOR 2, 5 XOR 3, 2.5 XOR 0, 0.0 XOR 1"),
+            same("SELECT 'abc' XOR 1, 'abc' XOR 0, '1x' XOR 0"),
+            same("SELECT 1 XOR 0 XOR 1, 1 XOR 1 XOR 1, 1 XOR 0 XOR 0 XOR 0"),
+            // A SQL boolean where a document can tell one from the number 1.
+            same("SELECT JSON_ARRAY(1 XOR 0), JSON_ARRAY(0 XOR 0), JSON_ARRAY(NULL XOR 1)"),
+            same("SELECT CAST('true' AS JSON) = (1 XOR 0)"),
+            // And an integer everywhere else, which is where a boolean tag
+            // has fallen out into a float under a LONGLONG code before.
+            same("SELECT -(1 XOR 0), (1 XOR 0) + 1, ABS(1 XOR 0), CONCAT(1 XOR 0)"),
+            same("SELECT SUM(1 XOR 0), MAX(1 XOR 0)"),
+            // The column metadata: a LONGLONG, NOT NULL only when neither
+            // operand can be, never UNSIGNED however unsigned an operand is,
+            // and named after the text it was written as.
+            same("SELECT id, a XOR a, a XOR b, u XOR a FROM XO ORDER BY id"),
+            same("SELECT 1 XOR 0, NULL XOR 1"),
+            same("SELECT id, b XOR 1 IS NULL, a XOR 1 IS NULL FROM XO ORDER BY id"),
+            same("SELECT id FROM XO WHERE a XOR b IS NULL ORDER BY id"),
+            same("SELECT id FROM XO WHERE s = 'a' XOR a = 0 ORDER BY id"),
+            // AND binds tighter and OR looser. The parsed shape reads
+            // `(2 XOR 3) AND 0`, which is 0.
+            same("SELECT 2 XOR 3 AND 0, 0 XOR 1 AND 0, 1 AND 1 XOR 1, 0 AND 1 XOR 1"),
+            same("SELECT 1 OR 1 XOR 1, 1 XOR 1 OR 1, 0 AND 1 XOR 1 OR 0"),
+            same("SELECT 1 XOR (1 OR 0), (1 XOR 1) OR 1"),
+            // Every comparison binds tighter, on either side of the operator.
+            same("SELECT 0 XOR 2 = 2, 0 XOR 2 > 1, 1 XOR 2 = 2, 1 = 2 XOR 3"),
+            same("SELECT 1 XOR 2 <=> 2, 0 XOR 2 <> 2"),
+            // So does every bitwise operator, and so does arithmetic — which
+            // is the half sqlparser already had right.
+            same("SELECT 1 XOR 2 | 0, 1 XOR 2 & 3, 1 XOR 3 ^ 3, 0 XOR 1 << 1"),
+            same("SELECT 1 XOR 2 - 2, 1 XOR 2 * 0, 1 XOR 7 DIV 2, 7 DIV 2 XOR 0"),
+            // `NOT` binds tighter than XOR in MySQL and looser in sqlparser,
+            // so the whole XOR chain arrives inside it. On two terms that is
+            // invisible — `NOT a XOR b` and `NOT (a XOR b)` are the same
+            // function — so these two are the control.
+            same("SELECT NOT 0 XOR 0, 1 XOR NOT 0"),
+            // And these are the claim: the equivalence stops as soon as
+            // anything is left outside the NOT.
+            same("SELECT NOT 0 XOR 1 AND 0, NOT 0 XOR 0 AND 0, NOT 1 XOR 1 AND 1"),
+            same("SELECT NOT NULL XOR 1 AND 0, NOT 0 XOR 1 XOR 1, NOT 1 XOR 0 XOR 1"),
+            same("SELECT NOT 0 XOR 1 OR 0, NOT 1 AND 0 XOR 1, NOT NOT 0 XOR 1 AND 0"),
+            same("SELECT NOT 0 XOR 2 IN (2), NOT 3 XOR 1 LIKE '1', NOT 0 XOR 1 | 0"),
+            // Everything tighter than NOT stays inside it, which is why this
+            // is a sink and not the walk `~` takes.
+            same("SELECT NOT 0 = 0, NOT 1 + 2, NOT 0 | 1, NOT 3 & 1, NOT 2 IS NULL"),
+            same("SELECT NOT (0 XOR 1) AND 0"),
+            // The chain the NOT holds need not be at the root of what it
+            // holds: `NOT ((2 || NULL) IN (1))` is what arrives.
+            same("SELECT NOT 2 || NULL IN (1), NOT NOT 1 IS NULL || NULL"),
+            same("SELECT JSON_ARRAY(NOT 0 XOR 1 AND 0)"),
+            // `||` means OR under the default mode, and the token is read at
+            // the precedence of `*` whichever it means.
+            same("SELECT 1 || 1 AND 0, 1 OR 1 AND 0"),
+            same("SELECT 1 || 0 XOR 1, 1 XOR 1 || 1, 1 || 1 XOR 1"),
+            // The constructs that are not operators but bind where a
+            // comparison binds. The parsed shape has each of them at the root
+            // with the XOR inside it, which is the wrong way round.
+            same("SELECT 1 XOR 2 IS NULL, 1 XOR 0 IS NULL, 1 XOR 2 IS NOT NULL"),
+            same("SELECT 1 XOR 2 IS TRUE, 0 XOR 2 IN (2), 1 XOR 2 NOT IN (2)"),
+            same("SELECT 0 XOR 2 BETWEEN 1 AND 3, 0 XOR 'a' LIKE 'a', 0 XOR 'a' REGEXP 'a'"),
+            // And the operand after the keyword swallowing one instead, which
+            // is the same problem `DIV` has. `'a' LIKE 'a' = 1` needs no XOR
+            // to go wrong and was wrong before this.
+            same("SELECT 'a' LIKE 'a' XOR 0, 'a' REGEXP 'a' XOR 0, 1 BETWEEN 0 AND 2 XOR 1"),
+            same("SELECT 2 BETWEEN 0 AND 3 XOR 0, 2 BETWEEN 0 AND 3 XOR 1"),
+            same("SELECT 'a' LIKE 'a' = 1"),
+            // The construct has to rejoin the chain rather than only come out
+            // of it: the AND belongs outside the LIKE and inside the XOR.
+            same("SELECT 1 AND 'a' LIKE 'a' XOR 0, 1 XOR 2 IS NULL AND 3"),
+            same("SELECT 0 AND 'a' LIKE 'a' XOR 1, 1 XOR 2 IS NULL AND 0"),
+            same("SELECT 1 XOR 2 | 3 IS NULL"),
+            // The other side of the same level: a comparison ties with the
+            // construct and stays outside it.
+            same("SELECT 0 = 0 IS NULL, 0 = 0 IS TRUE, 1 | 0 IS NULL"),
+            // And `IN`, `BETWEEN`, `LIKE` and `REGEXP` a level tighter than
+            // that, which is a `predicate` in MySQL's grammar: this is
+            // `2 = (2 IN (1))` and not `(2 = 2) IN (1)`.
+            same("SELECT 2 = 2 IN (1), 2 = 2 LIKE 1, 2 = 2 REGEXP '1', 3 = 3 BETWEEN 0 AND 1"),
+            // One of these holding another.
+            same("SELECT 1 XOR 2 IS NULL IS NULL, 1 XOR 2 IS NULL IS NOT NULL"),
+            same("SELECT 0 XOR 2 IS NULL IS NULL, 1 XOR 2 IN (2) IS NULL, 1 XOR 2 IS NULL = 1"),
+            // A `LIKE` pattern is the one trailing operand that can swallow
+            // another construct — MySQL reads it as a `simple_expr`, where
+            // sqlparser reads it below `=`, `IN` and `BETWEEN`.
+            same("SELECT 3 LIKE '2' = 3 IN (1, 1), 0 LIKE '2' <> 2 IN (2, 1), 2 LIKE 1 = 1"),
+            // And what the walk out of it gives back has to be regrouped: it
+            // lifts the leftmost operator and MySQL groups by the loosest.
+            same("SELECT 1 LIKE '2' = 0 XOR 1 IS NULL, 3 LIKE '3' <> 3 XOR NULL IS NOT NULL"),
+            same("SELECT 0 + NULL LIKE '2' = 1 XOR 3 IS NULL"),
+            same("SELECT 1 LIKE '3' XOR 0 + 3 IN (3, 2), 2 | 0 LIKE 'NULL' XOR 3 IN (3, 3)"),
+        ],
+    },
+    Group {
         // The compound spelling, which is the one route to REAL_AS_FLOAT that
         // does not name it. `ANSI` is set on its own rather than added to the
         // mode in force, because that is what it means: MySQL replaces the

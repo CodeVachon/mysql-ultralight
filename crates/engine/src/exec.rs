@@ -5514,6 +5514,23 @@ fn is_null_literal(e: &Expr) -> bool {
 fn unsigned_answer(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]) -> bool {
     let recur = |inner: &Expr| unsigned_answer(inner, refs, input);
     let integral = |e: &Expr| is_integer(computed_column_type(e, refs, input));
+    // The corrected shape, as in the arms below that ask `reassociated` for
+    // it. `a XOR b IS NULL` arrives with the `IS NULL` at its root and means
+    // `a XOR (b IS NULL)`, which is a different expression to read the sign
+    // of.
+    //
+    // It changes no answer today and cannot be made to: the only operators
+    // these corrections lift to the root are the connectives and the
+    // comparisons, and none of those is UNSIGNED. MySQL's grammar is what
+    // keeps a bitwise operator — the one family that *is* UNSIGNED — out of
+    // the position: a `bit_expr` cannot hold a `predicate`, so
+    // `SELECT 2 IN (2) | 4` and `SELECT 'a' LIKE 'a' + 1` are both 1064 on
+    // 8.3. That is a fact about MySQL's grammar and this engine's level
+    // table, not something this function states, and the three walkers over
+    // these trees have to read the same shape as `eval` does.
+    if let Some(fixed) = crate::expr::reassociated_postfix(e) {
+        return recur(&fixed);
+    }
     match e {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
             direct_column(e, refs, input).is_some_and(|column| column.ty.unsigned)
@@ -5757,6 +5774,14 @@ const CLOCK_NOT_NULL: &[&str] = &[
 /// nullable rather than being reasoned about.
 fn never_null(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]) -> bool {
     let recur = |inner: &Expr| never_null(inner, refs, input);
+    // The corrected shape, as in the `BinaryOp` arm below: `a XOR b IS NULL`
+    // arrives with the `IS NULL` at its root, where MySQL means
+    // `a XOR (b IS NULL)` — nullable whenever `a` is, and the arm below that
+    // answers NOT NULL for anything ending in `IS NULL` would have promised a
+    // client a column that can hold NULL cannot.
+    if let Some(fixed) = crate::expr::reassociated_postfix(e) {
+        return recur(&fixed);
+    }
     match e {
         Expr::Value(v) => !matches!(v.value, sqlparser::ast::Value::Null),
         // A column carries its own answer, which is the whole reason this
@@ -5821,6 +5846,12 @@ fn never_null(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]
                 | B::And
                 | B::Or
                 | B::Xor => recur(left) && recur(right),
+                // `||` meaning OR, which is what it means unless
+                // PIPES_AS_CONCAT says otherwise. Only that half: MySQL calls
+                // a concatenation of two literals NOT NULL where this engine
+                // calls it nullable, which is a gap of its own and not this
+                // one.
+                B::StringConcat if !pipes_as_concat() => recur(left) && recur(right),
                 // `<=>` is the one comparison that answers whatever it is
                 // given, NULL included, so it is NOT NULL however nullable its
                 // operands are — which is why it is here and not in the list
@@ -6201,6 +6232,16 @@ fn computed_column_type(
     refs: &[ColumnRef],
     input: &[crate::relation::RelColumn],
 ) -> ColumnType {
+    // The corrected shape, for the reason the `BinaryOp` arm below asks for
+    // it: the root as parsed is often not the operator that decides. Every
+    // construct here and every operator that can be sunk past one is a
+    // LONGLONG, so this changes no answer today — and MySQL's grammar is what
+    // holds that, not luck: see the note in `unsigned_answer`. The walkers
+    // over these trees have to agree with the shape `eval` reads, and
+    // `never_null` already does.
+    if let Some(fixed) = crate::expr::reassociated_postfix(e) {
+        return computed_column_type(&fixed, refs, input);
+    }
     match e {
         Expr::Function(f) => {
             let name = f.name.to_string().to_ascii_lowercase();
@@ -6427,6 +6468,12 @@ fn computed_column_type(
                 | B::And
                 | B::Or
                 | B::Xor => ColumnType::LongLong,
+                // `||` is two operators wearing one token, and only one of
+                // them concatenates. Under the default mode it is OR and
+                // MySQL describes it as it describes every other connective;
+                // reading the token as a concatenation whatever the mode said
+                // announced `1 || 1` VAR_STRING while answering 1.
+                B::StringConcat if !pipes_as_concat() => ColumnType::LongLong,
                 // Division is exact in MySQL, so it answers a decimal even
                 // over two integers — where `DIV` is integer division and is a
                 // LONGLONG whatever it divided, including two decimals.

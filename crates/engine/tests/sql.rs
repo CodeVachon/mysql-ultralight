@@ -1049,11 +1049,26 @@ fn pipes_follow_sql_mode() {
     let as_or = rows(&engine, &mut session, "SELECT 1 || 0");
     assert_eq!(as_or, vec![vec!["1"]], "by default `||` is logical OR");
 
+    // And is described as a connective rather than as a concatenation: MySQL
+    // calls `1 || 1` a LONGLONG and NOT NULL. Reading the token one way
+    // whatever the mode said announced VAR_STRING and nullable over an answer
+    // of 1, which the binary protocol sends by the announced type.
+    let described = engine.describe(&session, "SELECT 1 || 1", 0).unwrap();
+    assert_eq!(format!("{:?}", described[0].ty), "LongLong");
+    assert!(!described[0].nullable);
+
     // Which it means also decides how tightly it binds, and therefore what a
     // `DIV` beside it divides. As OR it is looser, so the divisor comes out of
     // it and this is `(7 DIV 2) || 3`.
     assert_eq!(
         rows(&engine, &mut session, "SELECT 7 DIV 2 || 3"),
+        vec![vec!["1"]]
+    );
+
+    // Looser than `AND` too, and by the same measurement: `(1 || 1) AND 0` is
+    // 0 and MySQL says 1.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 1 || 1 AND 0"),
         vec![vec!["1"]]
     );
 
@@ -8257,6 +8272,327 @@ fn integer_division_binds_as_tightly_as_multiplication() {
         .unwrap();
     let codes: Vec<String> = described.iter().map(|c| format!("{:?}", c.ty)).collect();
     assert_eq!(codes, vec!["LongLong", "LongLong", "NewDecimal"]);
+}
+
+/// `XOR` is the third of MySQL's logical connectives and the only one whose
+/// answer no single operand can settle. Every answer here was read off MySQL
+/// 8.3.
+#[test]
+fn xor_is_true_when_exactly_one_operand_is() {
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        ("SELECT 1 XOR 0", "1"),
+        ("SELECT 0 XOR 1", "1"),
+        ("SELECT 0 XOR 0", "0"),
+        ("SELECT 1 XOR 1", "0"),
+        // Unknown on either side is unknown, which is where XOR parts company
+        // with the other two: `0 AND NULL` is 0 and `1 OR NULL` is 1, because
+        // one operand settles those. Flipping an unknown XOR operand flips the
+        // answer, so nothing settles this.
+        ("SELECT NULL XOR 1", "NULL"),
+        ("SELECT 1 XOR NULL", "NULL"),
+        ("SELECT NULL XOR 0", "NULL"),
+        ("SELECT 0 XOR NULL", "NULL"),
+        ("SELECT NULL XOR NULL", "NULL"),
+        // The operands are truth values and not bits: `5 XOR 3` is 0 where the
+        // bitwise `5 ^ 3` is 6, and a decimal and a string are read for their
+        // truth the same way a `WHERE` reads them.
+        ("SELECT 2 XOR 0", "1"),
+        ("SELECT 0 XOR 2", "1"),
+        ("SELECT 5 XOR 3", "0"),
+        ("SELECT 2.5 XOR 0", "1"),
+        ("SELECT 0.0 XOR 1", "1"),
+        ("SELECT 'abc' XOR 1", "1"),
+        ("SELECT 'abc' XOR 0", "0"),
+        ("SELECT '1x' XOR 0", "1"),
+        // Left-associative, which is not the same answer read the other way:
+        // `1 XOR 0 XOR 1` is `(1 XOR 0) XOR 1`.
+        ("SELECT 1 XOR 0 XOR 1", "0"),
+        ("SELECT 1 XOR 1 XOR 1", "1"),
+        ("SELECT 0 XOR 1 XOR 1", "0"),
+        ("SELECT 1 XOR 0 XOR 0 XOR 0", "1"),
+        // A SQL boolean where a document can tell one from the number 1, which
+        // is the funnel #0083 built and this goes through.
+        ("SELECT JSON_ARRAY(1 XOR 0)", "[true]"),
+        ("SELECT JSON_ARRAY(0 XOR 0)", "[false]"),
+        ("SELECT JSON_ARRAY(NULL XOR 1)", "[null]"),
+        ("SELECT CAST('true' AS JSON) = (1 XOR 0)", "1"),
+        // And an integer everywhere else. A `Value::Bool` that missed the
+        // integer paths answers a float under a LONGLONG code, which is
+        // invisible in a SELECT and visible on the binary protocol.
+        ("SELECT -(1 XOR 0)", "-1"),
+        ("SELECT (1 XOR 0) + 1", "2"),
+        ("SELECT ABS(1 XOR 0)", "1"),
+        ("SELECT SUM(1 XOR 0)", "1"),
+        ("SELECT CONCAT(1 XOR 0)", "1"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // Described exactly as `AND` is, which was measured rather than assumed:
+    // a LONGLONG, NOT NULL only when neither operand can be NULL, and never
+    // UNSIGNED however unsigned an operand is.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE X (a INT NOT NULL, b INT NULL, u INT UNSIGNED NOT NULL)",
+    );
+    let sql = "SELECT 1 XOR 0, NULL XOR 1, a XOR a, a XOR b, u XOR a, a AND b FROM X";
+    let described = engine.describe(&session, sql, 0).unwrap();
+    let shape: Vec<(String, bool, bool)> = described
+        .iter()
+        .map(|c| (format!("{:?}", c.ty), c.nullable, c.unsigned))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("LongLong".to_string(), false, false),
+            ("LongLong".to_string(), true, false),
+            ("LongLong".to_string(), false, false),
+            ("LongLong".to_string(), true, false),
+            ("LongLong".to_string(), false, false),
+            ("LongLong".to_string(), true, false),
+        ]
+    );
+    // And named after the text it was written as, spacing and case included.
+    let names: Vec<&str> = described.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "1 XOR 0",
+            "NULL XOR 1",
+            "a XOR a",
+            "a XOR b",
+            "u XOR a",
+            "a AND b"
+        ]
+    );
+
+    // The corrected shape decides the flags too, not the root as parsed:
+    // `a XOR b IS NULL` means `a XOR (b IS NULL)`, which is nullable because
+    // `a` is — where anything ending in `IS NULL` is NOT NULL on its own.
+    let described = engine
+        .describe(
+            &session,
+            "SELECT b IS NULL, b XOR 1 IS NULL, a XOR 1 IS NULL FROM X",
+            0,
+        )
+        .unwrap();
+    let nullable: Vec<bool> = described.iter().map(|c| c.nullable).collect();
+    assert_eq!(nullable, vec![false, true, false]);
+}
+
+/// MySQL puts `XOR` between `OR` and `AND`; sqlparser puts it between `+` and
+/// `&`, which is eight levels away and on the wrong side of every comparison,
+/// every bitwise operator, `AND`, and every construct that reads as a
+/// comparison. So the shape that arrives means something else for nearly
+/// everything it can be written beside.
+///
+/// Every answer here was read off MySQL 8.3, and every comment says what the
+/// parsed shape would have answered instead.
+#[test]
+fn xor_binds_looser_than_a_comparison_and_tighter_than_or() {
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        // `(2 XOR 3) AND 0`, which is 0. AND binds tighter, so this is
+        // `2 XOR (3 AND 0)`.
+        ("SELECT 2 XOR 3 AND 0", "1"),
+        ("SELECT 0 XOR 1 AND 0", "0"),
+        ("SELECT 1 AND 1 XOR 1", "0"),
+        ("SELECT 0 AND 1 XOR 1", "1"),
+        // All three in one chain: `(0 AND (1 XOR 1)) OR 0` is 0.
+        ("SELECT 0 AND 1 XOR 1 OR 0", "1"),
+        // OR binds looser, which sqlparser agrees about — the control for the
+        // two above.
+        ("SELECT 1 OR 1 XOR 1", "1"),
+        ("SELECT 1 XOR 1 OR 1", "1"),
+        ("SELECT 1 XOR (1 OR 0)", "0"),
+        ("SELECT (1 XOR 1) OR 1", "1"),
+        // `(0 XOR 2) = 2`, which is 0: a comparison binds tighter.
+        ("SELECT 0 XOR 2 = 2", "1"),
+        ("SELECT 0 XOR 2 > 1", "1"),
+        ("SELECT 1 XOR 2 = 2", "0"),
+        // And on the other side of one: `1 = (2 XOR 3)` is 0.
+        ("SELECT 1 = 2 XOR 3", "1"),
+        // `(1 XOR 2) | 0` is 1, `(1 XOR 2) & 3` is 1, `(1 XOR 3) ^ 3` is 3 and
+        // `(0 XOR 1) << 1` is 2: every bitwise operator binds tighter.
+        ("SELECT 1 XOR 2 | 0", "0"),
+        ("SELECT 1 XOR 2 & 3", "0"),
+        ("SELECT 1 XOR 3 ^ 3", "1"),
+        ("SELECT 0 XOR 1 << 1", "1"),
+        // Arithmetic binds tighter in both readings — the control for those.
+        ("SELECT 1 XOR 2 - 2", "1"),
+        ("SELECT 1 XOR 2 * 0", "1"),
+        ("SELECT 1 XOR 7 DIV 2", "0"),
+        ("SELECT 7 DIV 2 XOR 0", "1"),
+        // `NOT` binds tighter than XOR in MySQL and looser in sqlparser, so
+        // the whole XOR chain arrives inside it. On a chain of exactly two
+        // terms that is invisible — `¬a XOR b` and `¬(a XOR b)` are the same
+        // function, NULL included — which is why these two agree either way
+        // and are the control rather than the claim.
+        ("SELECT NOT 0 XOR 0", "1"),
+        ("SELECT 1 XOR NOT 0", "0"),
+        // The equivalence stops as soon as anything is left outside the NOT.
+        // `NOT 0 XOR 1 AND 0` is `(NOT 0) XOR (1 AND 0)` — the AND is *inside*
+        // the XOR and outside the NOT — where the parsed
+        // `NOT (0 XOR 1) AND 0` is 0. Same for a third XOR term and for OR.
+        ("SELECT NOT 0 XOR 1 AND 0", "1"),
+        ("SELECT NOT 0 XOR 0 AND 0", "1"),
+        ("SELECT NOT 1 XOR 1 AND 1", "1"),
+        ("SELECT NOT NULL XOR 1 AND 0", "NULL"),
+        ("SELECT NOT 0 XOR 1 XOR 1", "1"),
+        ("SELECT NOT 1 XOR 0 XOR 1", "1"),
+        ("SELECT NOT 0 XOR 1 OR 0", "0"),
+        ("SELECT NOT 1 AND 0 XOR 1", "1"),
+        ("SELECT NOT NOT 0 XOR 1 AND 0", "0"),
+        // Everything tighter than NOT stays inside it, which is the other
+        // half and the reason this is a sink and not `~`'s walk: `NOT 1 + 2`
+        // is `NOT (1 + 2)` in MySQL too, and pulling the `+` out would say 1.
+        ("SELECT NOT 0 = 0", "0"),
+        ("SELECT NOT 1 + 2", "0"),
+        ("SELECT NOT 0 | 1", "0"),
+        ("SELECT NOT 3 & 1", "0"),
+        ("SELECT NOT 2 IS NULL", "1"),
+        ("SELECT NOT 0 XOR 2 IN (2)", "0"),
+        ("SELECT NOT 3 XOR 1 LIKE '1'", "1"),
+        ("SELECT NOT 0 XOR 1 | 0", "0"),
+        // Parentheses are their own node and nothing rotates through them.
+        ("SELECT NOT (0 XOR 1) AND 0", "0"),
+        // The chain the NOT is holding need not be at the root of what it
+        // holds: this arrives as `NOT ((2 || NULL) IN (1))`, and only once
+        // the `IN` has sunk past the `||` is there a `||` to sink the NOT
+        // past. The parsed shape says 0.
+        ("SELECT NOT 2 || NULL IN (1)", "NULL"),
+        ("SELECT NOT NOT 1 IS NULL || NULL", "NULL"),
+        // And the answer is still a SQL boolean where a document sees one.
+        ("SELECT JSON_ARRAY(NOT 0 XOR 1 AND 0)", "[true]"),
+        // `||` is OR under the default mode, and sqlparser reads the token at
+        // the precedence it gives `*` whichever it means. So this was wrong
+        // before XOR existed: `(1 || 1) AND 0` is 0.
+        ("SELECT 1 || 1 AND 0", "1"),
+        ("SELECT 1 OR 1 AND 0", "1"),
+        ("SELECT 1 || 0 XOR 1", "1"),
+        ("SELECT 1 XOR 1 || 1", "1"),
+        ("SELECT 1 || 1 XOR 1", "1"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+/// The same disagreement, against the constructs that are not operators.
+///
+/// `IS NULL`, `IN`, `BETWEEN`, `LIKE` and `REGEXP` bind where a comparison
+/// binds, and sqlparser puts every one of them below `XOR`. None of them is a
+/// `BinaryOp`, so the correction the operators get never reaches them: these
+/// arrive with the construct at the root of the tree and the `XOR` inside it,
+/// which is the wrong way round.
+///
+/// Every answer was read off MySQL 8.3.
+#[test]
+fn a_postfix_test_binds_tighter_than_xor() {
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        // `(1 XOR 2) IS NULL` is 0. MySQL means `1 XOR (2 IS NULL)`.
+        ("SELECT 1 XOR 2 IS NULL", "1"),
+        ("SELECT 1 XOR 0 IS NULL", "1"),
+        ("SELECT 1 XOR 2 IS NOT NULL", "0"),
+        ("SELECT 1 XOR 2 IS TRUE", "0"),
+        ("SELECT 0 XOR 2 IN (2)", "1"),
+        ("SELECT 1 XOR 2 NOT IN (2)", "1"),
+        ("SELECT 0 XOR 2 BETWEEN 1 AND 3", "1"),
+        ("SELECT 0 XOR 'a' LIKE 'a'", "1"),
+        ("SELECT 0 XOR 'a' REGEXP 'a'", "1"),
+        // The operand *after* the keyword swallows one instead, which is the
+        // same problem `DIV` has and takes the same walk out:
+        // `'a' LIKE ('a' XOR 0)` is 0 and `1 BETWEEN 0 AND (2 XOR 1)` is 1.
+        ("SELECT 'a' LIKE 'a' XOR 0", "1"),
+        ("SELECT 'a' REGEXP 'a' XOR 0", "1"),
+        ("SELECT 1 BETWEEN 0 AND 2 XOR 1", "0"),
+        // The upper bound has to come out whole rather than be recomputed:
+        // `2 BETWEEN 0 AND (3 XOR 0)` is `2 BETWEEN 0 AND 1`, which is 0.
+        ("SELECT 2 BETWEEN 0 AND 3 XOR 0", "1"),
+        ("SELECT 2 BETWEEN 0 AND 3 XOR 1", "0"),
+        // That half needed no XOR to go wrong and was wrong before this:
+        // `'a' LIKE ('a' = 1)` is 0, where LIKE and `=` tie in MySQL and are
+        // read left to right.
+        ("SELECT 'a' LIKE 'a' = 1", "1"),
+        // The construct has to rejoin the chain rather than only come out of
+        // it. `1 AND 'a' LIKE 'a' XOR 0` means `(1 AND ('a' LIKE 'a')) XOR 0`
+        // — the AND stays outside the LIKE and inside the XOR, and pulling it
+        // in either direction answers 0.
+        ("SELECT 1 AND 'a' LIKE 'a' XOR 0", "1"),
+        ("SELECT 1 XOR 2 IS NULL AND 3", "1"),
+        // The same two with operands that tell the two groupings apart:
+        // `0 AND (('a' LIKE 'a') XOR 1)` is 0 and `(1 XOR (2 IS NULL)) AND 0`
+        // is 0, and lifting the construct out without putting it back into
+        // the chain answers exactly that.
+        ("SELECT 0 AND 'a' LIKE 'a' XOR 1", "1"),
+        ("SELECT 1 XOR 2 IS NULL AND 0", "1"),
+        // Two levels of it: the `|` has to be corrected before the `XOR` is
+        // the operator to sink the `IS NULL` past.
+        ("SELECT 1 XOR 2 | 3 IS NULL", "1"),
+        // The other side of the same level: a comparison ties with the
+        // construct and so stays outside it, where sinking it in would make
+        // this `0 = (0 IS NULL)` — 1.
+        ("SELECT 0 = 0 IS NULL", "0"),
+        ("SELECT 0 = 0 IS TRUE", "1"),
+        ("SELECT 1 | 0 IS NULL", "0"),
+        // `IN`, `BETWEEN`, `LIKE` and `REGEXP` are a level tighter still:
+        // MySQL's grammar makes them a `predicate`, which a comparison
+        // compares *to*. So this is `2 = (2 IN (1))` — 0 — where reading them
+        // at the comparison level and letting left-associativity decide gives
+        // `(2 = 2) IN (1)`, which is 1. Wrong here before #0056 as well.
+        ("SELECT 2 = 2 IN (1)", "0"),
+        ("SELECT 2 = 2 LIKE 1", "0"),
+        ("SELECT 2 = 2 REGEXP '1'", "0"),
+        ("SELECT 3 = 3 BETWEEN 0 AND 1", "0"),
+        // One of them holding another. `((1 XOR 2) IS NULL) IS NULL` is 0;
+        // MySQL means `1 XOR ((2 IS NULL) IS NULL)`, so the inner one has to
+        // give the XOR up before the outer one has a chain to sink past.
+        ("SELECT 1 XOR 2 IS NULL IS NULL", "1"),
+        ("SELECT 1 XOR 2 IS NULL IS NOT NULL", "0"),
+        ("SELECT 0 XOR 2 IS NULL IS NULL", "0"),
+        ("SELECT 1 XOR 2 IN (2) IS NULL", "1"),
+        ("SELECT 1 XOR 2 IS NULL = 1", "1"),
+        // A `LIKE` pattern is the one trailing operand that can swallow
+        // another construct: MySQL reads it as a `simple_expr` — `2 LIKE 1+1`
+        // is a 1064 there — where sqlparser reads it below `=`, `IN` and
+        // `BETWEEN`. So the walk out of it has to step through a construct of
+        // its own level, which left-associativity says belongs outside it.
+        // `3 LIKE (('2' = 3) IN (1, 1))` is 0.
+        ("SELECT 3 LIKE '2' = 3 IN (1, 1)", "1"),
+        ("SELECT 0 LIKE '2' <> 2 IN (2, 1)", "1"),
+        ("SELECT 2 LIKE 1 = 1", "0"),
+        // And what comes out of that walk has to be regrouped, not answered:
+        // the walk lifts the *leftmost* operator to the root and MySQL groups
+        // by the loosest. `((1 LIKE '2') = 0) XOR (1 IS NULL)` is what this
+        // means; leaving the walk's `(1 LIKE '2') = (0 XOR (1 IS NULL))` says
+        // 0, and hides the XOR from the `IS NULL` that has to sink past it.
+        ("SELECT 1 LIKE '2' = 0 XOR 1 IS NULL", "1"),
+        ("SELECT 0 + NULL LIKE '2' = 1 XOR 3 IS NULL", "NULL"),
+        ("SELECT 3 LIKE '3' <> 3 XOR NULL IS NOT NULL", "1"),
+        ("SELECT 1 LIKE '3' XOR 0 + 3 IN (3, 2)", "1"),
+        ("SELECT 2 | 0 LIKE 'NULL' XOR 3 IN (3, 3)", "1"),
+        // The postfix tests DIV swallows, which are corrected the other way
+        // round and must stay so.
+        ("SELECT 7 DIV 2 IS NULL", "0"),
+        ("SELECT 7 DIV 2 IN (3)", "1"),
+        ("SELECT 7 DIV 2 LIKE '3'", "1"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
 }
 
 #[test]
