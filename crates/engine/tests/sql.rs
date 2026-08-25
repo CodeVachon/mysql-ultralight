@@ -8164,6 +8164,326 @@ fn a_computed_column_is_named_after_the_text_it_was_written_as() {
     assert_eq!(names, vec!["total", "doc"]);
 }
 
+/// Every expected name here was read off MySQL 8.3, because the rule is not
+/// one anybody would guess: a literal is the single place MySQL does *not*
+/// name an unaliased column after its source text.
+#[test]
+fn a_literal_column_is_named_by_its_contents() {
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        // A string is named by what it holds, not by the text that spelled it
+        // — so the quotes go, a doubled quote is one quote, and an escape is
+        // the character it stands for.
+        ("SELECT 'abc'", "abc"),
+        ("SELECT \"abc\"", "abc"),
+        ("SELECT ''", ""),
+        ("SELECT 'it''s'", "it's"),
+        ("SELECT 'a\\'b'", "a'b"),
+        ("SELECT 'a\\nb'", "a\nb"),
+        ("SELECT N'a'", "a"),
+        // The *first* of an adjacent run: MySQL joins the run into one string
+        // only after the column already has its name.
+        ("SELECT 'a' 'b' 'c'", "a"),
+        ("SELECT 'a'  'b'", "a"),
+        // A run whose first literal is escaped, which is the shape that
+        // defeats reading a run off the lengths alone: the doubled quote
+        // makes the first token one byte longer than what it decodes to and
+        // the appended `'b'` makes the joined value one byte longer than the
+        // first, so the two balance and only the text tells them apart.
+        ("SELECT 'a''a' 'b'", "a'a"),
+        ("SELECT 'a\\'a' 'b'", "a'a"),
+        ("SELECT 'a' 'a''a'", "a"),
+        ("SELECT '' 'x'", ""),
+        ("SELECT '' ''", ""),
+        ("SELECT 'aa' ''", "aa"),
+        // Leading characters that are not printable ASCII go; trailing ones
+        // stay, which is not symmetric and is what 8.3 does.
+        ("SELECT '  a'", "a"),
+        ("SELECT 'a  '", "a  "),
+        ("SELECT '   '", ""),
+        ("SELECT ' a '", "a "),
+        // Parentheses and unary plus hand the literal straight back, however
+        // many of them there are, so the literal's own name is what surfaces.
+        ("SELECT ('abc')", "abc"),
+        ("SELECT ( 'abc' )", "abc"),
+        ("SELECT (('abc'))", "abc"),
+        ("SELECT +'abc'", "abc"),
+        ("SELECT + +'abc'", "abc"),
+        ("SELECT +('abc')", "abc"),
+        ("SELECT + 'a' 'b'", "a"),
+        // A number is named by the token as written, and the plus in front of
+        // it is not part of that token.
+        ("SELECT 1", "1"),
+        ("SELECT +1", "1"),
+        ("SELECT + 1", "1"),
+        ("SELECT ++1", "1"),
+        ("SELECT +1.5", "1.5"),
+        ("SELECT +.5", ".5"),
+        ("SELECT +1e3", "1e3"),
+        ("SELECT +1E3", "1E3"),
+        ("SELECT ( +1 )", "1"),
+        ("SELECT +( 1 )", "1"),
+        ("SELECT (1)", "1"),
+        // NULL is the one literal MySQL renames rather than quoting back.
+        ("SELECT NULL", "NULL"),
+        ("SELECT null", "NULL"),
+        ("SELECT NuLl", "NULL"),
+        ("SELECT +NULL", "NULL"),
+        ("SELECT (null)", "NULL"),
+        // The boundary. Unary minus is an operator MySQL records, so the name
+        // is the text again — down to the space, which no literal name has.
+        ("SELECT -'abc'", "-'abc'"),
+        ("SELECT -1", "-1"),
+        ("SELECT - 1", "- 1"),
+        ("SELECT -(1)", "-(1)"),
+        ("SELECT -1e3", "-1e3"),
+        // A keyword boolean and the byte literals carry no parse-time name,
+        // which is why the plus stays on these and not on a number.
+        ("SELECT TRUE", "TRUE"),
+        ("SELECT true", "true"),
+        ("SELECT +TRUE", "+TRUE"),
+        ("SELECT X'41'", "X'41'"),
+        ("SELECT +X'41'", "+X'41'"),
+        ("SELECT 0x41", "0x41"),
+        ("SELECT +0x41", "+0x41"),
+        // Peeling chooses which item to ask, never the name: with anything
+        // but a literal underneath, the whole written text is the name again.
+        ("SELECT +(1+2)", "+(1+2)"),
+        ("SELECT (1+2)", "(1+2)"),
+        ("SELECT +-1", "+-1"),
+        ("SELECT -+1", "-+1"),
+        ("SELECT 1 + +1", "1 + +1"),
+        ("SELECT 'a' = 'a'", "'a' = 'a'"),
+        ("SELECT 'a' 'b' = 'ab'", "'a' 'b' = 'ab'"),
+        ("SELECT 'a' IS NULL", "'a' IS NULL"),
+        ("SELECT CONCAT('a')", "CONCAT('a')"),
+        ("SELECT BINARY 'a'", "BINARY 'a'"),
+        ("SELECT (SELECT 'abc')", "(SELECT 'abc')"),
+        // An alias still wins over all of it.
+        ("SELECT 'abc' AS x", "x"),
+        // And the name a client keys by is the same one whether the statement
+        // was prepared or run, through a derived table, a CTE and a union.
+        ("SELECT * FROM (SELECT 'abc') t", "abc"),
+        ("SELECT * FROM (SELECT +'abc') t", "abc"),
+        ("WITH c AS (SELECT 'abc') SELECT * FROM c", "abc"),
+        ("SELECT 'a' UNION SELECT 'b'", "a"),
+        ("SELECT 'a' 'b' UNION SELECT 'c'", "a"),
+    ] {
+        let described = engine.describe(&session, sql, 0).unwrap().unwrap();
+        assert_eq!(described[0].name, expected, "describing {sql}");
+        let Outcome::Rows(executed) = run(&engine, &mut session, sql) else {
+            panic!("expected rows from {sql}");
+        };
+        assert_eq!(executed.columns[0].name, expected, "running {sql}");
+    }
+}
+
+/// A view is the fourth path a name has to survive, and the only one where it
+/// used to be re-derived from text the engine wrote rather than text the
+/// client did.
+#[test]
+fn a_view_keeps_the_name_its_definition_was_written_with() {
+    let (engine, mut session) = engine();
+    for (body, expected) in [
+        // sqlparser renders an adjacent run as the one string it denotes, so
+        // a view stored as the rendered tree lost the boundary the name comes
+        // from and came back `ab`.
+        ("SELECT 'a' 'b'", "a"),
+        ("SELECT +'abc'", "abc"),
+        ("SELECT '  a'", "a"),
+        ("SELECT 'a''b'", "a'b"),
+        // The rewriter's spelling, which the rendered tree also loses: the
+        // parser is handed `%` and MySQL names the column `1 MOD 3`.
+        ("SELECT 1 MOD 3", "1 MOD 3"),
+        // A union takes its names from its first branch, so that is the
+        // branch the definition has to pin.
+        ("SELECT 'a' 'b' UNION SELECT 'c'", "a"),
+        // A parenthesised body, which is its own node in the tree.
+        ("(SELECT 'a' 'b')", "a"),
+        // And the names a `SELECT *` reads out of something further down.
+        // These are the shapes the top-level projection cannot reach: it is a
+        // wildcard, so there is nothing there to pin.
+        ("SELECT * FROM (SELECT 'a' 'b') d", "a"),
+        ("SELECT d.* FROM (SELECT +'abc') d", "abc"),
+        ("SELECT * FROM (SELECT 'a' 'b' UNION SELECT 'c') d", "a"),
+        ("WITH c AS (SELECT 'a' 'b') SELECT * FROM c", "a"),
+        (
+            "WITH c AS (SELECT 'a' 'b') SELECT * FROM (SELECT * FROM c) d",
+            "a",
+        ),
+        // Both a CTE and a body with something to pin, so neither walk may
+        // stop because the other one already found something.
+        ("WITH c AS (SELECT 'a' 'b') SELECT 'x' 'y' FROM c", "x"),
+        // Names that have to be escaped to be written back as an identifier.
+        // The first is pinned, because one backtick doubles cleanly. The
+        // second is not: the renderer sees a doubled backtick, decides the
+        // value is already escaped and leaves it, and the alias would read
+        // back as one backtick — so the guard rejects it and the view falls
+        // back to text that happens to name it correctly anyway. Both answers
+        // are MySQL's, by two different routes.
+        ("SELECT 'a`b'", "a`b"),
+        ("SELECT 'a``b'", "a``b"),
+        ("SELECT 'a\\\\b'", "a\\b"),
+    ] {
+        run(&engine, &mut session, "DROP VIEW IF EXISTS V");
+        run(&engine, &mut session, &format!("CREATE VIEW V AS {body}"));
+        let described = engine
+            .describe(&session, "SELECT * FROM V", 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(described[0].name, expected, "describing view over {body}");
+        let Outcome::Rows(executed) = run(&engine, &mut session, "SELECT * FROM V") else {
+            panic!("expected rows from a view over {body}");
+        };
+        assert_eq!(
+            executed.columns[0].name, expected,
+            "reading view over {body}"
+        );
+        // Inline and through the view are the same name, which is the whole
+        // claim: the view used to be the one place they disagreed.
+        let inline = engine.describe(&session, body, 0).unwrap().unwrap();
+        assert_eq!(inline[0].name, expected, "inline {body}");
+    }
+
+    // What the pinning actually writes, and the one name it declines to
+    // write. No identifier spells the empty string, so a view over `SELECT ''`
+    // is stored unpinned rather than with an empty alias MySQL would refuse to
+    // read back. MySQL names that column `Name_exp_1` and this engine names it
+    // with the empty string, which is a divergence of its own and not one to
+    // paper over by inventing an identifier here.
+    for (body, definition) in [
+        ("SELECT 'a' 'b'", "SELECT 'ab' AS `a`"),
+        ("SELECT ''", "SELECT ''"),
+    ] {
+        run(&engine, &mut session, "DROP VIEW IF EXISTS V");
+        run(&engine, &mut session, &format!("CREATE VIEW V AS {body}"));
+        assert_eq!(
+            rows(
+                &engine,
+                &mut session,
+                "SELECT VIEW_DEFINITION FROM information_schema.VIEWS WHERE TABLE_NAME = 'V'"
+            ),
+            vec![vec![definition.to_owned()]],
+            "{body}"
+        );
+    }
+
+    // An explicit column list still wins over the pinned name.
+    run(&engine, &mut session, "DROP VIEW IF EXISTS V");
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW V (only) AS SELECT 'a' 'b'",
+    );
+    let described = engine
+        .describe(&session, "SELECT * FROM V", 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(described[0].name, "only");
+
+    // A wildcard is left alone, so a view over one still grows a column when
+    // the table under it does.
+    run(&engine, &mut session, "CREATE TABLE T (a INT)");
+    run(&engine, &mut session, "DROP VIEW IF EXISTS W");
+    run(&engine, &mut session, "CREATE VIEW W AS SELECT * FROM T");
+    run(&engine, &mut session, "ALTER TABLE T ADD COLUMN b INT");
+    let described = engine
+        .describe(&session, "SELECT * FROM W", 0)
+        .unwrap()
+        .unwrap();
+    let names: Vec<&str> = described.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["a", "b"]);
+}
+
+/// Pins a divergence rather than claiming a fix.
+///
+/// A parameter is spliced into the statement text before parsing, so by the
+/// time a column is named there is no placeholder left to name it after — the
+/// name is the *value's*. MySQL names that column `?` and nothing else,
+/// measured on 8.3 through a real prepared statement: `?` in the prepare
+/// response and `?` on every execute, whatever is bound. So this engine
+/// disagrees with MySQL and, worse, with itself: describing binds NULL and
+/// answers `NULL` where executing answers the value.
+///
+/// Naming a spliced parameter `?` needs the binder to report where it wrote,
+/// through a normaliser that does not preserve offsets — the same missing
+/// offset mapping as #0060 — so it is not fixed here. This test exists so the
+/// behaviour cannot drift unnoticed while it waits. See also the `SELECT ?`
+/// assertion in `crates/engine/tests/describe.rs`.
+#[test]
+fn a_bound_parameter_column_is_named_after_its_value_where_mysql_says_question_mark() {
+    let (engine, mut session) = engine();
+
+    // MySQL: `?`.
+    assert_eq!(
+        engine.describe(&session, "SELECT ?", 1).unwrap().unwrap()[0].name,
+        "NULL"
+    );
+
+    for (bound, name) in [
+        (Value::Text("hello world".to_owned()), "hello world"),
+        // The literal-naming rules reach a value nobody wrote as a literal:
+        // this is the leading-whitespace trim applied to a bound string.
+        (Value::Text("  x".to_owned()), "x"),
+        (Value::Int(7), "7"),
+        (Value::Null, "NULL"),
+    ] {
+        let Ok(Outcome::Rows(executed)) =
+            engine.execute(&mut session, "SELECT ?", std::slice::from_ref(&bound))
+        else {
+            panic!("expected rows for {bound:?}");
+        };
+        // MySQL: `?`.
+        assert_eq!(executed.columns[0].name, name, "{bound:?}");
+    }
+
+    // And the 255-byte cut lands on a bound value too.
+    let Ok(Outcome::Rows(executed)) =
+        engine.execute(&mut session, "SELECT ?", &[Value::Text("z".repeat(300))])
+    else {
+        panic!("expected rows for a long bound string");
+    };
+    assert_eq!(executed.columns[0].name.len(), 255);
+
+    // An alias is the one spelling that agrees with MySQL, because it never
+    // looks at the value.
+    let Ok(Outcome::Rows(executed)) = engine.execute(
+        &mut session,
+        "SELECT ? AS lit",
+        &[Value::Text("q".to_owned())],
+    ) else {
+        panic!("expected rows for an aliased parameter");
+    };
+    assert_eq!(executed.columns[0].name, "lit");
+}
+
+/// MySQL reports at most 255 bytes of a generated column name, and cuts on a
+/// character boundary rather than through one. Measured on 8.3, where a
+/// 256-byte literal and a 256-byte call both come back 255 bytes long.
+#[test]
+fn a_generated_column_name_stops_at_255_bytes() {
+    let (engine, mut session) = engine();
+    let long = "a".repeat(300);
+    let call = format!("CONCAT('{long}')");
+    // Two bytes each, so 128 of them overrun 255 by one byte: MySQL reports
+    // 127 characters, not 127 and a half.
+    let wide = "é".repeat(128);
+    for (sql, expected) in [
+        (format!("SELECT '{long}'"), "a".repeat(255)),
+        (format!("SELECT {call}"), call[..255].to_owned()),
+        (format!("SELECT '{wide}'"), "é".repeat(127)),
+        // An alias is an identifier and is not this path: it is not cut here.
+        (format!("SELECT 1 AS {long}"), long.clone()),
+    ] {
+        let described = engine.describe(&session, &sql, 0).unwrap().unwrap();
+        assert_eq!(described[0].name, expected, "describing {sql}");
+        let Outcome::Rows(executed) = run(&engine, &mut session, &sql) else {
+            panic!("expected rows from {sql}");
+        };
+        assert_eq!(executed.columns[0].name, expected, "running {sql}");
+    }
+}
+
 /// `MOD` is the keyword spelling of `%`, and sqlparser's MySQL dialect
 /// implements only `DIV` in its infix hook, so the rewrite hands the parser
 /// the symbol instead. That is only sound if the two really are one operator

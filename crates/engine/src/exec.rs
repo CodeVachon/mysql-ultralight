@@ -599,7 +599,7 @@ impl Engine {
 
                 let view = crate::catalog::View {
                     name: name.clone(),
-                    definition: create.query.to_string(),
+                    definition: pinned_definition(&create.query),
                     columns: explicit,
                     shape,
                 };
@@ -7282,13 +7282,335 @@ fn object_name(name: &ObjectName) -> String {
 /// differently — `1!=2` and `1 <> 2` are one `NotEq`, and `doc->>'$.b'` and
 /// `doc ->> '$.b'` are one `LongArrow`. A client keys a row by this name, so a
 /// test reading the column back finds nothing.
+///
+/// A literal is the exception, and `literal_name` is where that lives.
 fn render_expr(e: &Expr) -> String {
     match e {
         Expr::Identifier(i) => i.value.clone(),
         Expr::CompoundIdentifier(parts) => {
             parts.last().map(|p| p.value.clone()).unwrap_or_default()
         }
-        other => source_text(other).unwrap_or_else(|| other.to_string()),
+        // Capped only here. A column reference carries the name the catalog
+        // holds, which is a different limit on a different path.
+        other => capped(
+            literal_name(other)
+                .or_else(|| source_text(other))
+                .unwrap_or_else(|| other.to_string()),
+        ),
+    }
+}
+
+/// The text a view is stored as, with every unaliased column's name pinned to
+/// it as an alias.
+///
+/// A view is kept as text and re-run on read, and the text is the parse tree
+/// rendered back — which loses the spellings a column name is taken from.
+/// sqlparser renders an adjacent literal run `'a' 'b'` as the one string it
+/// denotes, so a view over it came back named `ab` where MySQL says `a`, and
+/// the same expression written inline was named correctly. A view is the only
+/// path where the name survives neither, which is the worst of the two.
+///
+/// MySQL stores its own views this way, measured on 8.3: `CREATE VIEW w AS
+/// SELECT 'a' 'b'` is kept as ``select 'ab' AS `a` `` and `SELECT 1 MOD 3` as
+/// ``select (1 % 3) AS `1 MOD 3` ``. Pinning is also what makes the name
+/// survive `refresh_views` and the state image, both of which re-derive from
+/// this text.
+///
+/// Guarded rather than trusted, and guarded on the *names* rather than on the
+/// text. Rendering an identifier escapes it by a heuristic that cannot know
+/// how the value was escaped to begin with: a name already holding a doubled
+/// backtick is written back unchanged and reads as one backtick, and a name
+/// holding a backslash renders as text that no longer parses at all. Only the
+/// second of those is visible in the text, which is why the aliased query is
+/// re-parsed and its names held against the ones it was built from. A view
+/// that does not survive that keeps the text it would have had — a name from
+/// the rendered tree is recoverable, a mangled one is not, and a definition
+/// that will not parse is worse than either.
+fn pinned_definition(query: &Query) -> String {
+    let plain = query.to_string();
+    let Some(pinned) = pin_column_names(query) else {
+        return plain;
+    };
+    let text = pinned.to_string();
+    let intended = pinned_names(&pinned);
+    let survives = Parser::new(&MySqlDialect {})
+        .try_with_sql(&text)
+        .and_then(|mut p| p.parse_query())
+        .is_ok_and(|reparsed| pinned_names(&reparsed) == intended);
+    if survives {
+        text
+    } else {
+        plain
+    }
+}
+
+/// Every name the pinning wrote, in the order it walked them.
+///
+/// `None` for a select item that carries no alias, so a name that was pinned
+/// and came back unpinned compares unequal rather than being skipped. The
+/// walk is `pin_in_query`'s, position for position, which is the only reason
+/// two of these can be compared at all.
+fn pinned_names(query: &Query) -> Vec<Option<String>> {
+    let mut out = Vec::new();
+    collect_names(query, &mut out);
+    out
+}
+
+fn collect_names(query: &Query, out: &mut Vec<Option<String>>) {
+    if let Some(with) = query.with.as_ref() {
+        for cte in &with.cte_tables {
+            collect_names(&cte.query, out);
+        }
+    }
+    collect_body_names(&query.body, out);
+}
+
+fn collect_body_names(body: &SetExpr, out: &mut Vec<Option<String>>) {
+    match body {
+        SetExpr::Select(select) => {
+            for item in &select.projection {
+                match item {
+                    SelectItem::ExprWithAlias { alias, .. } => out.push(Some(alias.value.clone())),
+                    SelectItem::UnnamedExpr(_) => out.push(None),
+                    _ => {}
+                }
+            }
+            for table in &select.from {
+                collect_table_names(&table.relation, out);
+                for join in &table.joins {
+                    collect_table_names(&join.relation, out);
+                }
+            }
+        }
+        SetExpr::Query(inner) => collect_names(inner, out),
+        SetExpr::SetOperation { left, .. } => collect_body_names(left, out),
+        _ => {}
+    }
+}
+
+fn collect_table_names(factor: &TableFactor, out: &mut Vec<Option<String>>) {
+    match factor {
+        TableFactor::Derived { subquery, .. } => collect_names(subquery, out),
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            collect_table_names(&table_with_joins.relation, out);
+            for join in &table_with_joins.joins {
+                collect_table_names(&join.relation, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A copy of the query with each unaliased select item carrying its name.
+///
+/// `None` when there was nothing to pin, so the caller keeps the text it
+/// already had rather than paying for a round trip that cannot change it.
+fn pin_column_names(query: &Query) -> Option<Query> {
+    let mut copy = query.clone();
+    pin_in_query(&mut copy).then_some(copy)
+}
+
+/// Pins names everywhere they can be read back out.
+///
+/// A view's own columns come from the deciding select, but a derived table or
+/// a CTE inside it names columns too and a `SELECT *` over one takes its names
+/// from there — so a run buried in a subquery reaches the client just the
+/// same. MySQL pins every select in a stored view for the same reason,
+/// measured on 8.3: `CREATE VIEW w AS SELECT * FROM (SELECT 'a' 'b') d` is
+/// kept as ``select `d`.`a` AS `a` from (select 'ab' AS `a`) `d` ``.
+///
+/// A subquery in an *expression* is deliberately not walked: its columns are
+/// consumed by the expression around it and never named to a client.
+fn pin_in_query(query: &mut Query) -> bool {
+    let mut pinned = false;
+    if let Some(with) = query.with.as_mut() {
+        for cte in &mut with.cte_tables {
+            pinned |= pin_in_query(&mut cte.query);
+        }
+    }
+    // Not `||`: the body has to be walked whether or not a CTE was pinned.
+    pinned | pin_in_body(&mut query.body)
+}
+
+fn pin_in_body(body: &mut SetExpr) -> bool {
+    match body {
+        SetExpr::Select(select) => {
+            let mut pinned = false;
+            for item in &mut select.projection {
+                let SelectItem::UnnamedExpr(e) = item else {
+                    continue;
+                };
+                let name = render_expr(e);
+                // No identifier spells the empty name. MySQL calls that column
+                // `Name_exp_1`, and inventing one here would be a second
+                // divergence rather than a fix for this one.
+                if name.is_empty() {
+                    continue;
+                }
+                *item = SelectItem::ExprWithAlias {
+                    expr: e.clone(),
+                    alias: sqlparser::ast::Ident::with_quote('`', name),
+                };
+                pinned = true;
+            }
+            for table in &mut select.from {
+                pinned |= pin_in_table(&mut table.relation);
+                for join in &mut table.joins {
+                    pinned |= pin_in_table(&mut join.relation);
+                }
+            }
+            pinned
+        }
+        SetExpr::Query(inner) => pin_in_query(inner),
+        // The leftmost branch of a set operation and nothing else: a union
+        // takes its column names from its first branch, so aliasing the others
+        // would rename nothing and change the text of every view over one.
+        SetExpr::SetOperation { left, .. } => pin_in_body(left),
+        _ => false,
+    }
+}
+
+fn pin_in_table(factor: &mut TableFactor) -> bool {
+    match factor {
+        TableFactor::Derived { subquery, .. } => pin_in_query(subquery),
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            let mut pinned = pin_in_table(&mut table_with_joins.relation);
+            for join in &mut table_with_joins.joins {
+                pinned |= pin_in_table(&mut join.relation);
+            }
+            pinned
+        }
+        _ => false,
+    }
+}
+
+/// The longest generated column name MySQL will report, in bytes.
+///
+/// Measured on 8.3: `SELECT '<256 a>'` and `SELECT CONCAT('<256 a>')` both
+/// come back with a 255-byte name, and 128 two-byte characters come back as
+/// 127 of them rather than a half character, so the cut is on a boundary. An
+/// *alias* is an identifier and is cut at 256 instead, which is a different
+/// path and is not this.
+const MAX_GENERATED_NAME: usize = 255;
+
+/// Cuts a generated name to what MySQL would report.
+fn capped(mut name: String) -> String {
+    if name.len() > MAX_GENERATED_NAME {
+        let mut at = MAX_GENERATED_NAME;
+        while !name.is_char_boundary(at) {
+            at -= 1;
+        }
+        name.truncate(at);
+    }
+    name
+}
+
+/// The name MySQL's parser attaches to a literal, if this item is one.
+///
+/// MySQL names most unaliased items after their source text, but a literal is
+/// named as it is read and carries that name from then on — so a string is
+/// named by its *contents* rather than by the text that spelled them:
+/// `SELECT 'abc'` is `abc`, `SELECT 'it''s'` is `it's`, and `SELECT 'a\nb'` is
+/// named with a real newline in it.
+///
+/// The name survives the two constructs that hand an item straight back,
+/// parentheses and unary plus, which is why they are peeled here: `SELECT
+/// ('abc')`, `SELECT +'abc'` and `SELECT + +'abc'` are all `abc`, and `SELECT
+/// +1` is `1`. Peeling only chooses *which* item to ask, never the name —
+/// anything that is not a literal underneath still gets the whole written
+/// text, so `SELECT +(1+2)` is `+(1+2)` and `SELECT +TRUE` is `+TRUE`. All
+/// measured on 8.3.
+///
+/// Unary minus is not peeled, and is not an oversight: `SELECT -1` is `-1` but
+/// `SELECT - 1` is `- 1`, which is the source text and not the literal.
+fn literal_name(e: &Expr) -> Option<String> {
+    let mut inner = e;
+    loop {
+        inner = match inner {
+            Expr::Nested(nested) => nested,
+            Expr::UnaryOp {
+                op: sqlparser::ast::UnaryOperator::Plus,
+                expr,
+            } => expr,
+            _ => break,
+        };
+    }
+    let Expr::Value(value) = inner else {
+        return None;
+    };
+    use sqlparser::ast::Value as V;
+    match &value.value {
+        V::SingleQuotedString(s) | V::DoubleQuotedString(s) | V::NationalStringLiteral(s) => Some(
+            string_literal_name(first_adjacent_literal(value, s).as_deref().unwrap_or(s)),
+        ),
+        // The token as it was written, not the value it denotes: `SELECT 1e3`
+        // is named `1e3` and `SELECT 1E3` is named `1E3`.
+        V::Number(n, _) => Some(n.to_string()),
+        // The one literal MySQL canonicalises: `SELECT NuLl` is named `NULL`.
+        V::Null => Some("NULL".to_owned()),
+        // Everything else is named by its source text, `TRUE`, `X'41'`, `b'1'`
+        // and `0x41` included — none of them carry a parse-time name, which is
+        // why `SELECT +TRUE` keeps its plus where `SELECT +1` does not.
+        _ => None,
+    }
+}
+
+/// A string literal's contents as MySQL would name a column with them.
+///
+/// Leading characters that are not printable ASCII are dropped, trailing ones
+/// are kept: `SELECT '  a'` is named `a`, `SELECT 'a  '` is named `a  `, and
+/// `SELECT '   '` has an empty name. Only ASCII, because MySQL classifies by a
+/// character-set ctype table that stops at 128 — a leading no-break space
+/// survives into the name.
+fn string_literal_name(contents: &str) -> String {
+    contents
+        .trim_start_matches(|c: char| c.is_ascii() && !c.is_ascii_graphic())
+        .to_owned()
+}
+
+/// The contents of the *first* literal in an adjacent-literal concatenation.
+///
+/// `SELECT 'a' 'b' 'c'` is one string `abc` in MySQL and is named `a`: the
+/// name is fixed when the first literal is read and the rest are appended to
+/// the value afterwards. sqlparser joins them into a single `Value` and the
+/// boundary is gone from the tree, but the value's span still covers only the
+/// first token, so the token is read back out of the statement text.
+///
+/// `None` when the text or the offsets are not there, and the caller falls
+/// back to `joined` — which is the same string whenever there was only one
+/// literal, and that is every statement but this one.
+///
+/// Which is also why it settles the common case without tokenizing anything.
+/// A span holding the joined value between two quotes and nothing else cannot
+/// be the first of a run: a run makes the joined value *longer* than the first
+/// token while the span still covers only that token, so the two lengths part
+/// company. The comparison is against the decoded value rather than only its
+/// length, because a length can be made to match — `'a''a' 'b'` has one byte
+/// of quote doubling in the first token and one byte of `'b'` in the joined
+/// value, so it balances and the interiors are what separate them.
+fn first_adjacent_literal(value: &sqlparser::ast::ValueWithSpan, joined: &str) -> Option<String> {
+    let sql = SOURCE.with(|s| s.borrow().as_ref().map(|c| c.sql.clone()))?;
+    let start = rewrite::byte_offset(&sql, value.span.start)?;
+    let end = rewrite::byte_offset(&sql, value.span.end)?;
+    let first = sql.get(start..end)?;
+    if first.len() == joined.len() + 2 && first.get(1..first.len() - 1) == Some(joined) {
+        return None;
+    }
+    // Tokenized rather than unquoted by hand: which backslash escapes and
+    // which doubled quotes a literal decodes is the tokenizer's answer, and a
+    // second copy of it here would only be a second copy to get wrong.
+    let tokens = sqlparser::tokenizer::Tokenizer::new(&MySqlDialect {}, first)
+        .tokenize()
+        .ok()?;
+    match tokens.first()? {
+        sqlparser::tokenizer::Token::SingleQuotedString(s)
+        | sqlparser::tokenizer::Token::DoubleQuotedString(s)
+        | sqlparser::tokenizer::Token::NationalStringLiteral(s) => Some(s.clone()),
+        _ => None,
     }
 }
 

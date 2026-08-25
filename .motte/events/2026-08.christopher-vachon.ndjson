@@ -197,3 +197,8 @@
 {"at":"2026-08-25T14:48:58Z","id":102,"by":"Christopher Vachon","as":"user","type":"created","title":"DML does not resolve its qualifiers over an empty table","state":"Todo"}
 {"at":"2026-08-25T14:48:58Z","id":103,"by":"Christopher Vachon","as":"user","type":"created","title":"HAVING without an aggregate is treated as a grouped query","state":"Todo"}
 {"at":"2026-08-25T14:48:58Z","id":104,"by":"Christopher Vachon","as":"user","type":"created","title":"A scalar subquery in the projection is typed VAR_STRING","state":"Todo"}
+{"at":"2026-08-25T15:46:31Z","id":58,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-25T16:39:34Z","id":105,"by":"Christopher Vachon","as":"user","type":"created","title":"A hex literal column is described signed","state":"Todo"}
+{"at":"2026-08-25T16:39:34Z","id":106,"by":"Christopher Vachon","as":"user","type":"created","title":"Unary minus over a string is typed VAR_STRING","state":"Todo"}
+{"at":"2026-08-25T16:39:41Z","id":107,"by":"Christopher Vachon","as":"user","type":"created","title":"An identifier longer than MySQL allows is accepted","state":"Todo"}
+{"at":"2026-08-25T17:00:04Z","id":108,"by":"Christopher Vachon","as":"user","type":"created","title":"The image tests collide in the shared temp directory","state":"Todo"}

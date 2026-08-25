@@ -402,6 +402,97 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // MySQL names an unaliased column after its source text everywhere
+        // except here. A literal is named as it is read, so a string comes
+        // back named by its *contents* and the quotes are gone -- and unary
+        // plus and parentheses hand the literal straight back, so they are
+        // gone too. #0059. The harness compares column names, which is the
+        // only thing most of these are asking about.
+        name: "how a literal names its column",
+        setup: &[
+            "CREATE TABLE L (id INT NOT NULL, t VARCHAR(30) NULL, PRIMARY KEY (id))",
+            "INSERT INTO L VALUES (1, 'x')",
+            // A view is stored as text and re-run on read, so it is the one
+            // path where a name has to survive being written back out.
+            "CREATE VIEW LV AS SELECT 'a' 'b'",
+            "CREATE VIEW LP AS SELECT +'abc'",
+            "CREATE VIEW LE AS SELECT 'a''b'",
+            "CREATE VIEW LU AS SELECT 'a' 'b' UNION SELECT 'c'",
+            // Names an identifier cannot hold without escaping. The first
+            // doubles cleanly and is pinned into the definition; the second
+            // does not survive being written back and falls back to the
+            // unpinned text. Both have to come out named the way MySQL names
+            // them, which is what makes the guard worth having.
+            // A wildcard over something further down: the view's own
+            // projection has nothing to pin, so the name has to survive
+            // inside the derived table and the CTE instead.
+            "CREATE VIEW LD AS SELECT * FROM (SELECT 'a' 'b') d",
+            "CREATE VIEW LC AS WITH c AS (SELECT 'a' 'b') SELECT * FROM c",
+            "CREATE VIEW LB AS SELECT 'a`b'",
+            "CREATE VIEW LBB AS SELECT 'a``b'",
+        ],
+        cases: &[
+            same("SELECT 'abc', \"abc\", '', 'it''s'"),
+            // The escape is decoded into the name: the second column here is
+            // named with a real newline in it.
+            same("SELECT 'a\\'b', 'a\\nb', N'a'"),
+            // An adjacent run is one string, named after the first of them.
+            same("SELECT 'a' 'b' 'c', 'a'  'b', ('a' 'b'), 'a' 'b' = 'ab'"),
+            // Leading characters that are not printable ASCII go, trailing
+            // ones stay, and a name can end up empty.
+            same("SELECT '  a', 'a  ', '   ', ' a '"),
+            same("SELECT ('abc'), (('abc')), +'abc', + +'abc', +('abc')"),
+            // A number is named by the token as written, and the plus in
+            // front of it is not part of that token.
+            same("SELECT +1, + 1, ++1, +1.5, +.5, +1e3, +1E3"),
+            same("SELECT (1), ( +1 ), +( 1 ), (1+2), +(1+2)"),
+            // The one literal MySQL renames rather than quoting back.
+            same("SELECT NULL, null, NuLl, +NULL, (null)"),
+            // The boundary. Unary minus is an operator MySQL records, so
+            // these are the source text again, spacing included.
+            same("SELECT -1, - 1, -(1), +-1, -+1"),
+            // A keyword boolean carries no parse-time name at all, which is
+            // why the plus stays on it where it comes off a number.
+            //
+            // `X'41'` and `0x41` belong beside these and are not here: MySQL
+            // reports a hex literal's column UNSIGNED and this engine reports
+            // it signed, and `-'abc'` is a DOUBLE `-0` there against a string
+            // here. Both are real divergences and neither is about naming, so
+            // they are covered in `crates/engine/tests/sql.rs` rather than
+            // parked in a baseline this file says only ever shrinks.
+            same("SELECT TRUE, true, +TRUE"),
+            same("SELECT 'a' = 'a', 'a' IS NULL, CONCAT('a'), BINARY 'a'"),
+            same("SELECT t, 'abc', +'abc' FROM L ORDER BY id"),
+            // A run whose first literal is escaped: the doubled quote and the
+            // appended literal cancel out in the lengths, so only the text
+            // separates a run from a literal that merely looks like one.
+            same("SELECT 'a''a' 'b', 'a\\'a' 'b', 'a' 'a''a'"),
+            same("SELECT '' 'x', '' '', 'aa' ''"),
+            same("SELECT * FROM (SELECT 'abc') d"),
+            same("SELECT * FROM LV"),
+            same("SELECT * FROM LP"),
+            same("SELECT * FROM LE"),
+            // A view over `1 MOD 3` belongs here too and is not here: MySQL
+            // materialises that column as INT and this engine as BIGINT,
+            // which is about a view's shape rather than about naming. It is
+            // covered by name in `crates/engine/tests/sql.rs`.
+            same("SELECT * FROM LU ORDER BY 1"),
+            same("SELECT * FROM LD"),
+            same("SELECT * FROM LC"),
+            same("SELECT * FROM LB"),
+            same("SELECT * FROM LBB"),
+            same("WITH c AS (SELECT +'abc') SELECT * FROM c"),
+            same("SELECT 'a' UNION SELECT 'b'"),
+            // Past the 255 bytes MySQL will report a generated name in, both
+            // for a literal's contents and for a call's source text.
+            same("SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"),
+            same("SELECT CONCAT('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')"),
+            // 256 bytes as 128 two-byte characters, so the cut lands inside
+            // one: MySQL reports 127 of them rather than half of the 128th.
+            same("SELECT 'éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé'"),
+        ],
+    },
+    Group {
         name: "bitwise operators",
         setup: &[
             "CREATE TABLE B (id INT NOT NULL, n INT NULL, neg INT NULL, u BIGINT UNSIGNED NULL, \
