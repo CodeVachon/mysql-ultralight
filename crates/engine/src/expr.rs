@@ -2,7 +2,7 @@
 
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, DateTimeField, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    Query, UnaryOperator, Value as AstValue,
+    Query, SelectItem, SetExpr, UnaryOperator, Value as AstValue,
 };
 
 use crate::error::{unsupported, EngineError, EngineResult};
@@ -193,6 +193,71 @@ pub fn probing<T>(f: impl FnOnce() -> T) -> T {
     let out = f();
     PROBING.with(|p| p.set(false));
     out
+}
+
+/// An EXISTS subquery with its qualified `*` items replaced, or `None` when it
+/// has none to replace.
+///
+/// `None` rather than an unconditional copy because this runs once per row the
+/// enclosing query filters, and a subquery without a qualified wildcard in it
+/// — which is nearly all of them — must not pay for a clone of the tree.
+fn wildcards_discarded(query: &Query) -> Option<Box<Query>> {
+    if !discardable(&query.body) {
+        return None;
+    }
+    let mut copy = query.clone();
+    discard(&mut copy.body);
+    Some(Box::new(copy))
+}
+
+/// Whether any branch of a query body has a qualified `*` in its select list.
+///
+/// Only asks whether there is anything to look at, so that the copy below can
+/// be skipped; which of them are actually discarded is `discard`'s decision
+/// and is made in one place. A `true` here that `discard` then leaves alone
+/// costs a copy and changes no answer.
+fn discardable(body: &SetExpr) -> bool {
+    match body {
+        SetExpr::Select(select) => select
+            .projection
+            .iter()
+            .any(|i| matches!(i, SelectItem::QualifiedWildcard(..))),
+        SetExpr::Query(inner) => discardable(&inner.body),
+        SetExpr::SetOperation { left, right, .. } => discardable(left) || discardable(right),
+        _ => false,
+    }
+}
+
+/// Replaces every qualified `*` with the literal MySQL replaces it with.
+///
+/// One column, not none: the arity a branch of a UNION is compared at comes
+/// from what is left, and `SELECT nope.* FROM B UNION SELECT id, aid FROM B`
+/// is 1222 on 8.3 — which is only true if the first branch became one column
+/// rather than zero.
+fn discard(body: &mut SetExpr) {
+    match body {
+        SetExpr::Select(select) => {
+            // The same two conditions `discardable` asks, because a HAVING
+            // reads the select list and so keeps every item in it alive.
+            if select.having.is_some() {
+                return;
+            }
+            select
+                .projection
+                .retain(|i| !matches!(i, SelectItem::QualifiedWildcard(..)));
+            if select.projection.is_empty() {
+                select.projection.push(SelectItem::UnnamedExpr(Expr::Value(
+                    AstValue::Number("1".to_owned(), false).into(),
+                )));
+            }
+        }
+        SetExpr::Query(inner) => discard(&mut inner.body),
+        SetExpr::SetOperation { left, right, .. } => {
+            discard(left);
+            discard(right);
+        }
+        _ => {}
+    }
 }
 
 /// The functions a probe must not call, because they outlive their result.
@@ -457,7 +522,19 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
         }
 
         Expr::Exists { subquery, negated } => {
-            let rows = ctx.run(subquery)?;
+            // MySQL throws an EXISTS subquery's select list away before it
+            // expands any `*` in it, so `EXISTS (SELECT o.* FROM t)` is legal
+            // on 8.3 even where nothing `t` provides is called `o`. Measured:
+            // it holds through DISTINCT, GROUP BY, ORDER BY and a UNION, a
+            // *named* column in the same position is still resolved and still
+            // 1054, and a HAVING keeps the list alive long enough for the `*`
+            // to be resolved after all.
+            //
+            // Done here rather than by softening the projection's own check,
+            // because this is the only place that knows the columns will
+            // never be looked at.
+            let discarded = wildcards_discarded(subquery);
+            let rows = ctx.run(discarded.as_deref().unwrap_or(subquery))?;
             Ok(bool_value(!rows.is_empty() != *negated))
         }
 

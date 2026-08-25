@@ -34,6 +34,22 @@ impl EngineError {
         )
     }
 
+    /// ER_BAD_TABLE_ERROR.
+    ///
+    /// Distinct from `no_such_table`: 1146 is a table the catalog does not
+    /// hold, and this is a qualifier the *statement* does not put in scope.
+    /// `SELECT a.* FROM J2` is 1051 on 8.3 even where a table `a` exists,
+    /// because the FROM clause did not name it.
+    ///
+    /// Named for the code rather than for the message it prints: MySQL has a
+    /// second "Unknown table" error, ER_UNKNOWN_TABLE at 1109, which carries
+    /// the clause as well — `Unknown table 'a' in field list`, which 8.3
+    /// answers `SELECT a.b` with. That one is #0101, and this name is not
+    /// the one it wants.
+    pub fn bad_table(name: &str) -> Self {
+        Self::new(1051, "42S02", format!("Unknown table '{name}'"))
+    }
+
     /// ER_TABLE_EXISTS_ERROR.
     pub fn table_exists(name: &str) -> Self {
         Self::new(1050, "42S01", format!("Table '{name}' already exists"))

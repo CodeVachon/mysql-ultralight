@@ -81,27 +81,37 @@ impl Engine {
     ///
     /// Only a read can be probed, and it is run with every parameter bound to
     /// NULL, because a statement's shape does not depend on its arguments.
-    /// `None` means the shape could not be established without running
+    /// `Ok(None)` means the shape could not be established without running
     /// something that might write — the caller then declares no columns, which
     /// is where this started but is at least not a wrong answer.
+    ///
+    /// `Err` is the other thing MySQL does at prepare time: refuse. A name
+    /// that resolves against nothing is refused there before the statement is
+    /// ever executed, and a client that prepares its statements up front —
+    /// which is what the binary protocol is for — should learn about it then
+    /// rather than one round trip later. Which refusals qualify is
+    /// `refused_at_prepare`'s decision, because most of what a probe turns
+    /// down it turns down for being a probe.
     pub fn describe(
         &self,
         session: &Session,
         sql: &str,
         parameters: usize,
-    ) -> Option<Vec<OutColumn>> {
+    ) -> EngineResult<Option<Vec<OutColumn>>> {
         let bound = params::bind(sql, &vec![Value::Null; parameters]);
         if rewrite::intercept(&bound).is_some() {
-            return None;
+            return Ok(None);
         }
 
         let normalised = rewrite::normalise(&bound, session.sql_mode());
         // Held for the whole call: a computed column is named after the text
         // it was written as, and that text is only available here.
         let _source = Source::set(&normalised, session.sql_mode());
-        let statements = Parser::parse_sql(&MySqlDialect {}, &normalised.sql).ok()?;
+        let Ok(statements) = Parser::parse_sql(&MySqlDialect {}, &normalised.sql) else {
+            return Ok(None);
+        };
         let [Statement::Query(query)] = statements.as_slice() else {
-            return None;
+            return Ok(None);
         };
         // `WITH ... UPDATE` is a query whose body writes, and probing it would
         // apply the statement twice.
@@ -109,7 +119,7 @@ impl Engine {
             query.body.as_ref(),
             SetExpr::Update(_) | SetExpr::Insert(_) | SetExpr::Delete(_)
         ) {
-            return None;
+            return Ok(None);
         }
 
         // Run as a probe over no rows: a SELECT is not automatically free of
@@ -122,11 +132,11 @@ impl Engine {
         // than from a value, so the same code answers the same way over an
         // empty table — and preparing a query stops costing as much as running
         // it. `describe_matches_execute` holds the two to each other.
-        Some(
-            expr::probing(|| shaping(|| self.query(session, query)))
-                .ok()?
-                .columns,
-        )
+        match expr::probing(|| shaping(|| self.query(session, query))) {
+            Ok(result) => Ok(Some(result.columns)),
+            Err(e) if refused_at_prepare(&e) => Err(e),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Re-resolves every view in a database against the schema as it now is.
@@ -1227,6 +1237,17 @@ impl Engine {
         });
         let source: &Vec<Vec<Value>> = widened.as_ref().unwrap_or(&relation.rows);
 
+        // Resolved before the loop, not inside it. A predicate is only
+        // evaluated once per row, so over a table with no rows -- an empty
+        // one, or any statement being described -- a name nothing answers to
+        // was never looked up at all, and `SELECT b FROM t WHERE a.b = 1`
+        // came back as an empty result where MySQL raises 1054.
+        if let Some(predicate) = &select.selection {
+            if let Some(name) = unresolved_column(predicate, &refs) {
+                return Err(EngineError::unknown_column(&name, "where clause"));
+            }
+        }
+
         let mut matching: Vec<&Vec<Value>> = Vec::new();
         for row in source {
             let ctx = Context {
@@ -1941,11 +1962,55 @@ impl Engine {
             match item {
                 SelectItem::Wildcard(_) => push_all(&mut columns, &mut plan, None),
                 SelectItem::QualifiedWildcard(kind, _) => {
-                    let name = kind.to_string();
-                    let table = name.trim_end_matches(".*").rsplit('.').next().unwrap_or("");
+                    // Read off the identifiers rather than the rendered
+                    // text. Display keeps an identifier's quotes, so a
+                    // back-quoted qualifier came back with the quotes still
+                    // on it — which matches no table, and once the check
+                    // below existed refused a statement MySQL answers.
+                    // `object_name` is the same unquoting `using_condition`
+                    // already does for a USING list.
+                    let qualifier = match kind {
+                        sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => {
+                            object_name(name)
+                        }
+                        // `expr.*`, which only BigQuery and Snowflake parse —
+                        // `supports_select_expr_star` is false for MySQL, so
+                        // this arm is unreachable here and renders rather
+                        // than inventing a name for something that is not a
+                        // table qualifier at all.
+                        other => other.to_string().trim_end_matches(".*").to_owned(),
+                    };
+                    let table = qualifier.rsplit('.').next().unwrap_or("");
+                    // A qualifier this query's own FROM clause does not
+                    // provide is 1051, not an empty column list: `SELECT a.*
+                    // FROM J2` and `SELECT J2.* FROM J2 x` both raise it on
+                    // 8.3, and this engine used to return a result set with
+                    // no columns in it at all.
+                    //
+                    // Asked of the relation and not of `refs`, because a `*`
+                    // does not see the enclosing query the way a named column
+                    // does: `SELECT id FROM A WHERE 1 IN (SELECT A.* FROM B)`
+                    // is `Unknown table 'A'` on 8.3 even though `A` is right
+                    // there in the outer FROM. The one place an out-of-scope
+                    // qualifier is legal is inside EXISTS, where the select
+                    // list is discarded before any `*` in it is expanded —
+                    // handled where that happens, in `expr::eval`.
+                    let own_from = &relation.columns;
+                    if !own_from.iter().any(|c| c.table.eq_ignore_ascii_case(table)) {
+                        return Err(EngineError::bad_table(&qualifier));
+                    }
                     push_all(&mut columns, &mut plan, Some(table));
                 }
                 SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                    // Ahead of every other reading of the item, because the
+                    // expression path only resolves a name when it evaluates
+                    // one, and it evaluates one per row. With no rows -- an
+                    // empty table, a filter nothing survived, or a statement
+                    // being described -- `SELECT a.b FROM J2` declared a
+                    // column called `b` and returned successfully.
+                    if let Some(name) = unresolved_column(e, refs) {
+                        return Err(EngineError::unknown_column(&name, "field list"));
+                    }
                     let alias = match item {
                         SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
                         _ => None,
@@ -2364,6 +2429,13 @@ impl Engine {
         }
 
         let items = projected_items(&select.projection)?;
+
+        // Before the grouping rules, because MySQL resolves names first:
+        // `SELECT a.b, COUNT(*) FROM J2 GROUP BY b` is 1054 there and would
+        // be 1055 if this ran after `check_full_group_by`.
+        if let Some(name) = items.iter().find_map(|(_, e)| unresolved_column(e, refs)) {
+            return Err(EngineError::unknown_column(&name, "field list"));
+        }
 
         // Under ONLY_FULL_GROUP_BY a selected column must be grouped by or
         // aggregated. Silently evaluating it against the group's first row
@@ -6805,6 +6877,97 @@ fn column_slot(refs: &[ColumnRef], e: &Expr) -> Option<usize> {
     refs.iter().position(|c| {
         c.name.eq_ignore_ascii_case(name) && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
     })
+}
+
+/// Whether a failed probe is the statement's fault rather than the probe's.
+///
+/// A probe refuses things a real execution would not — a function with
+/// consequences, a body that writes — and reporting those at prepare time
+/// would fail statements that run perfectly well. It also runs over no rows,
+/// so anything a row could have caused is absent rather than proven.
+///
+/// A name that resolves against nothing is neither. No row and no bound
+/// argument can make `a.b` find a table `a` that the FROM clause never named,
+/// which is why MySQL raises 1054 and 1051 at prepare time too — and why a
+/// client that prepares its statements up front should hear about it there.
+fn refused_at_prepare(e: &EngineError) -> bool {
+    // ER_BAD_FIELD_ERROR and ER_BAD_TABLE_ERROR. Listed rather than matched on
+    // a range: every other code this engine raises is either about a value or
+    // about the probe, and a new one has to be considered rather than
+    // inherited.
+    matches!(e.code, 1054 | 1051)
+}
+
+/// The first column reference in `e` that nothing in scope answers to.
+///
+/// Returned as MySQL prints it in 1054 — qualified where it was written
+/// qualified, so `SELECT a.b` reports `a.b` and not `b`.
+///
+/// The evaluator resolves a name only when it evaluates one, and it evaluates
+/// one per row. Over no rows nothing is resolved, so the statements this
+/// catches are the ones a client prepares, or runs against an empty table, and
+/// is told are fine. `refs` is the same scope `expr::eval` would read: this
+/// query's relation followed by any enclosing row, so a correlated reference
+/// resolves here exactly as it does there.
+///
+/// Deliberately conservative, and built on `subexpressions` so it stays that
+/// way. A variant missing from that list is a place this looks at nothing and
+/// answers `None` — the statement is then accepted as it is today. The failure
+/// mode is the safe one: refusing a legal query is worse than the gap this
+/// closes, because it turns working SQL into an error.
+fn unresolved_column(e: &Expr, refs: &[ColumnRef]) -> Option<String> {
+    match e {
+        // Not columns. `@@GLOBAL.version` parses as a compound identifier, so
+        // both spellings have to be let through.
+        Expr::Identifier(i) if i.value.starts_with('@') => None,
+        Expr::CompoundIdentifier(parts)
+            if parts.first().is_some_and(|p| p.value.starts_with('@')) =>
+        {
+            None
+        }
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            column_slot(refs, e).is_none().then(|| written_name(e))
+        }
+        // A function's arguments are read in this scope, including an
+        // aggregate's and a window function's: `SUM(a.b) OVER (ORDER BY b)`
+        // is 1054 "in 'field list'" on 8.3.
+        //
+        // `value_arguments` rather than every argument, because
+        // `TIMESTAMPDIFF(DAY, a, b)` writes its unit as a bare keyword that
+        // parses as an identifier — refusing it would reject a legal
+        // statement for naming a column `DAY`, which the suite caught.
+        //
+        // The OVER clause's own PARTITION BY and ORDER BY are left alone.
+        // MySQL resolves them too, but names them `window partition by` and
+        // `window order by` in the message rather than `field list`, and a
+        // right refusal under the wrong clause name is a divergence traded for
+        // a divergence.
+        Expr::Function(f) => value_arguments(f)
+            .iter()
+            .find_map(|a| unresolved_column(a, refs)),
+        // A subquery resolves its own columns in its own scope, which is why
+        // `subexpressions` does not descend into one.
+        other => subexpressions(other)
+            .into_iter()
+            .find_map(|s| unresolved_column(s, refs)),
+    }
+}
+
+/// A column reference as it was written, for an error message.
+///
+/// Every part joined, not just the last: MySQL reports `Unknown column
+/// 'nodb.J2.b'` and naming the column alone would hide which qualifier was
+/// the problem.
+fn written_name(e: &Expr) -> String {
+    match e {
+        Expr::Identifier(i) => i.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts
+            .iter()
+            .map(|p| p.value.as_str())
+            .collect::<Vec<_>>()
+            .join("."),
+        other => other.to_string(),
+    }
 }
 
 /// Rejects a selected expression that is neither aggregated nor grouped by.

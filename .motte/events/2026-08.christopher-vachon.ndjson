@@ -188,3 +188,12 @@
 {"at":"2026-08-25T13:13:52Z","id":94,"by":"Christopher Vachon","as":"user","type":"created","title":"EXTRACT's compound units do not parse","state":"Todo"}
 {"at":"2026-08-25T13:13:52Z","id":95,"by":"Christopher Vachon","as":"user","type":"created","title":"SET accepts values MySQL refuses or clamps","state":"Todo"}
 {"at":"2026-08-25T13:13:52Z","id":96,"by":"Christopher Vachon","as":"user","type":"created","title":"SHOW VARIABLES ignores its LIKE pattern","state":"Todo"}
+{"at":"2026-08-25T13:45:17Z","id":57,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-25T13:45:18Z","id":97,"by":"Christopher Vachon","as":"user","type":"created","title":"String functions clamp a huge count to zero","state":"Todo"}
+{"at":"2026-08-25T14:48:39Z","id":98,"by":"Christopher Vachon","as":"user","type":"created","title":"A database qualifier is ignored in a column reference","state":"Todo"}
+{"at":"2026-08-25T14:48:39Z","id":99,"by":"Christopher Vachon","as":"user","type":"created","title":"The 1054 message names the wrong clause","state":"Todo"}
+{"at":"2026-08-25T14:48:39Z","id":100,"by":"Christopher Vachon","as":"user","type":"created","title":"Clauses other than the field list and WHERE are not resolved at prepare","state":"Todo"}
+{"at":"2026-08-25T14:48:58Z","id":101,"by":"Christopher Vachon","as":"user","type":"created","title":"A qualified name with no FROM is 1054 where MySQL says 1109","state":"Todo"}
+{"at":"2026-08-25T14:48:58Z","id":102,"by":"Christopher Vachon","as":"user","type":"created","title":"DML does not resolve its qualifiers over an empty table","state":"Todo"}
+{"at":"2026-08-25T14:48:58Z","id":103,"by":"Christopher Vachon","as":"user","type":"created","title":"HAVING without an aggregate is treated as a grouped query","state":"Todo"}
+{"at":"2026-08-25T14:48:58Z","id":104,"by":"Christopher Vachon","as":"user","type":"created","title":"A scalar subquery in the projection is typed VAR_STRING","state":"Todo"}

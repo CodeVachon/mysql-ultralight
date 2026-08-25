@@ -1053,7 +1053,10 @@ fn pipes_follow_sql_mode() {
     // calls `1 || 1` a LONGLONG and NOT NULL. Reading the token one way
     // whatever the mode said announced VAR_STRING and nullable over an answer
     // of 1, which the binary protocol sends by the announced type.
-    let described = engine.describe(&session, "SELECT 1 || 1", 0).unwrap();
+    let described = engine
+        .describe(&session, "SELECT 1 || 1", 0)
+        .unwrap()
+        .unwrap();
     assert_eq!(format!("{:?}", described[0].ty), "LongLong");
     assert!(!described[0].nullable);
 
@@ -1188,6 +1191,7 @@ fn real_as_float_narrows_what_real_declares() {
     // was declared.
     let described = engine
         .describe(&session, "SELECT Narrow.r, Wide.r FROM Narrow, Wide", 0)
+        .unwrap()
         .unwrap();
     let codes: Vec<String> = described.iter().map(|c| format!("{:?}", c.ty)).collect();
     assert_eq!(codes, vec!["Float", "Double"]);
@@ -1267,6 +1271,7 @@ fn real_as_float_narrows_a_cast_to_real() {
     // under the flag and DOUBLE without it.
     let described = engine
         .describe(&session, "SELECT CAST(1.234567890123 AS REAL)", 0)
+        .unwrap()
         .unwrap();
     assert_eq!(format!("{:?}", described[0].ty), "Float");
 
@@ -4836,6 +4841,7 @@ fn modulo_takes_its_sign_from_its_left_operand_alone() {
     let signs: Vec<bool> = engine
         .describe(&session, "SELECT iu MOD -1, -1 MOD iu FROM U", 0)
         .unwrap()
+        .unwrap()
         .iter()
         .map(|c| c.unsigned)
         .collect();
@@ -5037,6 +5043,7 @@ fn an_else_is_a_candidate_for_the_sign_like_every_other_branch() {
     let signs: Vec<bool> = engine
         .describe(&session, sql, 0)
         .unwrap()
+        .unwrap()
         .iter()
         .map(|c| c.unsigned)
         .collect();
@@ -5050,6 +5057,7 @@ fn an_else_is_a_candidate_for_the_sign_like_every_other_branch() {
             "SELECT CASE WHEN 0 THEN NULL ELSE 1 END, CASE WHEN 1 THEN bu ELSE 1 END FROM W",
             0,
         )
+        .unwrap()
         .unwrap()
         .iter()
         .map(|c| c.unsigned)
@@ -5084,7 +5092,7 @@ fn a_table_value_constructor_describes_an_unsigned_value_as_an_integer() {
             "NewDecimal false",
         ),
     ] {
-        let described = engine.describe(&session, sql, 0).unwrap();
+        let described = engine.describe(&session, sql, 0).unwrap().unwrap();
         assert_eq!(
             format!("{:?} {}", described[0].ty, described[0].unsigned),
             expected,
@@ -5181,6 +5189,7 @@ fn a_conditional_over_both_signs_widens_rather_than_wrapping() {
     let codes: Vec<String> = engine
         .describe(&session, sql, 0)
         .unwrap()
+        .unwrap()
         .iter()
         .map(|c| format!("{:?} {}", c.ty, c.unsigned))
         .collect();
@@ -5194,6 +5203,7 @@ fn a_conditional_over_both_signs_widens_rather_than_wrapping() {
             "SELECT COALESCE(iu, i), COALESCE(iu, b), COALESCE(iu, iu) FROM M",
             0,
         )
+        .unwrap()
         .unwrap()
         .iter()
         .map(|c| format!("{:?} {}", c.ty, c.unsigned))
@@ -5214,6 +5224,7 @@ fn a_conditional_over_both_signs_widens_rather_than_wrapping() {
             "SELECT COALESCE(i, iu, bu), COALESCE(i, iu) FROM M",
             0,
         )
+        .unwrap()
         .unwrap()
         .iter()
         .map(|c| format!("{:?} {}", c.ty, c.unsigned))
@@ -5497,6 +5508,7 @@ fn no_unsigned_subtraction_moves_the_domain_of_one_operator() {
     let signs: Vec<bool> = engine
         .describe(&session, "SELECT iu - 100, iu + 1 FROM U", 0)
         .unwrap()
+        .unwrap()
         .iter()
         .map(|c| c.unsigned)
         .collect();
@@ -5553,6 +5565,7 @@ fn a_literal_above_the_signed_range_is_unsigned() {
             "SELECT 18446744073709551615 - 1, 9223372036854775807 - 1",
             0,
         )
+        .unwrap()
         .unwrap()
         .iter()
         .map(|c| c.unsigned)
@@ -5624,6 +5637,7 @@ fn a_statement_describes_its_columns_before_it_runs() {
 
     let described = engine
         .describe(&session, "SELECT id, name FROM Widget", 0)
+        .unwrap()
         .unwrap();
     assert_eq!(
         described.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
@@ -5634,6 +5648,7 @@ fn a_statement_describes_its_columns_before_it_runs() {
     // the shape — it is bound to NULL for the probe.
     let described = engine
         .describe(&session, "SELECT count AS n FROM Widget WHERE id = ?", 1)
+        .unwrap()
         .unwrap();
     assert_eq!(
         described.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
@@ -5657,7 +5672,7 @@ fn describing_never_runs_a_write() {
         "DROP TABLE Widget",
     ] {
         assert!(
-            engine.describe(&session, sql, 0).is_none(),
+            engine.describe(&session, sql, 0).unwrap().is_none(),
             "described a write: {sql}"
         );
     }
@@ -5686,6 +5701,7 @@ fn describing_leaves_the_session_alone() {
 
     engine
         .describe(&session, "SELECT id FROM Widget", 0)
+        .unwrap()
         .unwrap();
     assert_eq!(session.affected_rows, affected_before);
 }
@@ -6556,7 +6572,10 @@ fn a_float_column_holds_and_prints_four_bytes() {
 
     // And it says so on the wire, which is what makes the binary protocol send
     // four bytes rather than eight.
-    let described = engine.describe(&session, "SELECT f, d FROM F", 0).unwrap();
+    let described = engine
+        .describe(&session, "SELECT f, d FROM F", 0)
+        .unwrap()
+        .unwrap();
     let codes: Vec<String> = described.iter().map(|c| format!("{:?}", c.ty)).collect();
     assert_eq!(codes, vec!["Float", "Double"]);
 
@@ -6617,7 +6636,7 @@ fn a_float_expression_is_typed_the_way_its_value_is_tagged() {
     ];
     for (expression, expected_type, expected_text) in cases {
         let sql = format!("SELECT {expression} AS v FROM F");
-        let described = engine.describe(&session, &sql, 0).unwrap();
+        let described = engine.describe(&session, &sql, 0).unwrap().unwrap();
         assert_eq!(
             format!("{:?}", described[0].ty),
             expected_type,
@@ -6908,6 +6927,7 @@ fn a_null_branch_of_a_union_contributes_no_type() {
         engine
             .describe(session, sql, 0)
             .unwrap()
+            .unwrap()
             .iter()
             .map(|c| (format!("{:?}", c.ty), !c.nullable, c.unsigned))
             .collect()
@@ -6998,6 +7018,7 @@ fn a_null_branch_of_a_union_contributes_no_type() {
     // little-endian integer is the difference a client sees.
     let described = engine
         .describe(&session, "SELECT id FROM N UNION SELECT NULL ORDER BY 1", 0)
+        .unwrap()
         .unwrap();
     let outcome = run(
         &engine,
@@ -7044,6 +7065,7 @@ fn a_scale_argument_is_not_a_value_being_measured() {
     let codes = |session: &Session, sql: &str| -> Vec<String> {
         engine
             .describe(session, sql, 0)
+            .unwrap()
             .unwrap()
             .iter()
             .map(|c| format!("{:?}", c.ty))
@@ -7349,6 +7371,7 @@ fn information_schema_declares_its_own_columns() {
              WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'T' ORDER BY ORDINAL_POSITION",
             0,
         )
+        .unwrap()
         .unwrap();
     let shape: Vec<(String, bool, bool)> = described
         .iter()
@@ -7384,6 +7407,7 @@ fn information_schema_declares_its_own_columns() {
              FROM information_schema.statistics WHERE TABLE_SCHEMA = 'testdb'",
             0,
         )
+        .unwrap()
         .unwrap();
     let codes: Vec<(String, bool)> = stats
         .iter()
@@ -7418,6 +7442,7 @@ fn a_computed_column_keeps_the_unsigned_flag() {
     let signs = |session: &Session, sql: &str| -> Vec<bool> {
         engine
             .describe(session, sql, 0)
+            .unwrap()
             .unwrap()
             .iter()
             .map(|c| c.unsigned)
@@ -7527,6 +7552,7 @@ fn a_computed_column_keeps_the_unsigned_flag() {
             0,
         )
         .unwrap()
+        .unwrap()
         .iter()
         .map(|c| !c.nullable)
         .collect();
@@ -7607,6 +7633,7 @@ fn a_column_that_cannot_be_null_is_described_that_way() {
     let flags = |session: &Session, sql: &str| -> Vec<bool> {
         engine
             .describe(session, sql, 0)
+            .unwrap()
             .unwrap()
             .iter()
             .map(|c| !c.nullable)
@@ -8019,6 +8046,7 @@ fn ceil_and_floor_are_reachable_from_sql() {
                     ABS(d), ABS(s), ROUND(d, 1), CEIL(NULL) FROM E",
             0,
         )
+        .unwrap()
         .unwrap();
     let codes: Vec<String> = described.iter().map(|c| format!("{:?}", c.ty)).collect();
     assert_eq!(
@@ -8123,13 +8151,14 @@ fn a_computed_column_is_named_after_the_text_it_was_written_as() {
     ] {
         let written = sql.strip_prefix("SELECT ").unwrap();
         let written = written.strip_suffix(" FROM J").unwrap_or(written);
-        let described = engine.describe(&session, sql, 0).unwrap();
+        let described = engine.describe(&session, sql, 0).unwrap().unwrap();
         assert_eq!(described[0].name, written, "{sql}");
     }
 
     // An alias still wins, and a plain column is named without its table.
     let described = engine
         .describe(&session, "SELECT 1 + 1 AS total, J.doc FROM J", 0)
+        .unwrap()
         .unwrap();
     let names: Vec<&str> = described.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["total", "doc"]);
@@ -8187,6 +8216,7 @@ fn mod_spelled_as_a_keyword_is_the_percent_operator() {
     // the lowercase it was given, and this engine keeps case everywhere else.
     let described = engine
         .describe(&session, "SELECT 7 MOD 3, 1 + 8 mod 3, 7 % 3", 0)
+        .unwrap()
         .unwrap();
     let names: Vec<&str> = described.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["7 MOD 3", "1 + 8 mod 3", "7 % 3"]);
@@ -8269,6 +8299,7 @@ fn integer_division_binds_as_tightly_as_multiplication() {
     // multiply is a decimal.
     let described = engine
         .describe(&session, "SELECT 7 DIV 2, 7.5 DIV 2, 7 DIV 2 * 1.5", 0)
+        .unwrap()
         .unwrap();
     let codes: Vec<String> = described.iter().map(|c| format!("{:?}", c.ty)).collect();
     assert_eq!(codes, vec!["LongLong", "LongLong", "NewDecimal"]);
@@ -8342,7 +8373,7 @@ fn xor_is_true_when_exactly_one_operand_is() {
         "CREATE TABLE X (a INT NOT NULL, b INT NULL, u INT UNSIGNED NOT NULL)",
     );
     let sql = "SELECT 1 XOR 0, NULL XOR 1, a XOR a, a XOR b, u XOR a, a AND b FROM X";
-    let described = engine.describe(&session, sql, 0).unwrap();
+    let described = engine.describe(&session, sql, 0).unwrap().unwrap();
     let shape: Vec<(String, bool, bool)> = described
         .iter()
         .map(|c| (format!("{:?}", c.ty), c.nullable, c.unsigned))
@@ -8381,6 +8412,7 @@ fn xor_is_true_when_exactly_one_operand_is() {
             "SELECT b IS NULL, b XOR 1 IS NULL, a XOR 1 IS NULL FROM X",
             0,
         )
+        .unwrap()
         .unwrap();
     let nullable: Vec<bool> = described.iter().map(|c| c.nullable).collect();
     assert_eq!(nullable, vec![false, true, false]);
@@ -8650,6 +8682,7 @@ fn the_bitwise_operators_answer_over_unsigned_bits() {
     // which is MySQL's answer for `-(7 ^ 3)` too.
     let described = engine
         .describe(&session, "SELECT ~-1, 7 ^ 3, NULL & 1, -(7 ^ 3)", 0)
+        .unwrap()
         .unwrap();
     let shape: Vec<String> = described
         .iter()
@@ -8986,6 +9019,7 @@ fn arithmetic_over_a_temporal_is_typed_by_its_packed_number() {
         engine
             .describe(session, sql, 0)
             .unwrap()
+            .unwrap()
             .iter()
             .map(|c| format!("{:?}", c.ty))
             .collect()
@@ -9038,6 +9072,7 @@ fn arithmetic_over_a_temporal_is_typed_by_its_packed_number() {
     let unsigned = |sql: &str| -> Vec<bool> {
         engine
             .describe(&session, sql, 0)
+            .unwrap()
             .unwrap()
             .iter()
             .map(|c| c.to_wire().flags & mysql_ultralight_protocol::column::flags::UNSIGNED != 0)
@@ -9313,6 +9348,7 @@ fn a_temporal_under_an_approximate_code_is_sent_as_one() {
     let codes: Vec<String> = engine
         .describe(&session, sql, 0)
         .unwrap()
+        .unwrap()
         .iter()
         .map(|c| format!("{:?}", c.ty))
         .collect();
@@ -9368,6 +9404,7 @@ fn a_set_operation_does_not_carry_an_enum_through_it() {
     let codes = |sql: &str| -> Vec<String> {
         engine
             .describe(&session, sql, 0)
+            .unwrap()
             .unwrap()
             .iter()
             .map(|c| format!("{:?}", c.ty))
@@ -9440,6 +9477,7 @@ fn an_enum_expression_is_typed_the_way_mysql_types_it() {
     let codes = |sql: &str| -> Vec<String> {
         engine
             .describe(&session, sql, 0)
+            .unwrap()
             .unwrap()
             .iter()
             .map(|c| format!("{:?}", c.ty))
@@ -9859,6 +9897,7 @@ fn the_clock_functions_read_their_precision_argument() {
         engine
             .describe(&session, sql, 0)
             .unwrap()
+            .unwrap()
             .iter()
             .map(|c| c.to_wire().flags & mysql_ultralight_protocol::column::flags::NOT_NULL == 0)
             .collect()
@@ -10156,6 +10195,7 @@ fn the_bitwise_operators_bind_the_way_mysql_binds_them() {
     // 0.5.
     let described = engine
         .describe(&session, "SELECT 2 ^ 3 / 2, 2 ^ 3 + 1", 0)
+        .unwrap()
         .unwrap();
     let shape: Vec<String> = described
         .iter()
@@ -10300,6 +10340,7 @@ fn an_aggregate_keeps_the_type_of_what_it_folds() {
             "SELECT COUNT(*), SUM(count), MAX(count), MIN(name), AVG(count) FROM Widget",
             0,
         )
+        .unwrap()
         .unwrap();
     let types: Vec<String> = described.iter().map(|c| format!("{:?}", c.ty)).collect();
     // MIN and MAX keep the argument's type, so folding an INTEGER gives
@@ -12046,7 +12087,10 @@ fn a_column_is_described_with_the_type_code_its_width_earns() {
     // kind with one code told a typed client the wrong width for nearly every
     // column. Each of these was checked against MySQL 8.3 rather than read off
     // a table.
-    let described = engine.describe(&session, "SELECT * FROM W", 0).unwrap();
+    let described = engine
+        .describe(&session, "SELECT * FROM W", 0)
+        .unwrap()
+        .unwrap();
     let codes: Vec<String> = described.iter().map(|c| format!("{:?}", c.ty)).collect();
     assert_eq!(
         codes,
@@ -12164,6 +12208,7 @@ fn a_column_that_cannot_hold_a_value_is_not_described_as_if_it_could() {
             "SELECT SUM(t), AVG(t), MIN(t), MAX(t), COUNT(t) FROM Q",
             0,
         )
+        .unwrap()
         .unwrap();
     let codes: Vec<String> = described.iter().map(|c| format!("{:?}", c.ty)).collect();
     assert_eq!(
@@ -12177,7 +12222,10 @@ fn a_column_that_cannot_hold_a_value_is_not_described_as_if_it_could() {
 
     // An UNSIGNED column has to say so, or the binary protocol reads its bytes
     // back signed and three billion arrives negative.
-    let described = engine.describe(&session, "SELECT iu FROM Q", 0).unwrap();
+    let described = engine
+        .describe(&session, "SELECT iu FROM Q", 0)
+        .unwrap()
+        .unwrap();
     assert!(described[0].to_wire().flags & 0x0020 != 0, "UNSIGNED_FLAG");
 
     // A YEAR is two bytes, and was the one integer still able to outgrow its
@@ -12234,7 +12282,10 @@ fn a_union_is_described_as_what_holds_both_branches() {
     // signed/unsigned pair is the one that looks like it needs no widening:
     // both are `LONG`, and neither range holds the other's.
     let code = |engine: &Engine, session: &mut Session, sql: &str| {
-        format!("{:?}", engine.describe(session, sql, 0).unwrap()[0].ty)
+        format!(
+            "{:?}",
+            engine.describe(session, sql, 0).unwrap().unwrap()[0].ty
+        )
     };
     for (sql, expected) in [
         ("SELECT s FROM U UNION SELECT b FROM U", "LongLong"),
@@ -12252,6 +12303,7 @@ fn a_union_is_described_as_what_holds_both_branches() {
     // here announced the column as binary and Prisma base64'd it.
     let described = engine
         .describe(&session, "SELECT t FROM U UNION SELECT lt FROM U", 0)
+        .unwrap()
         .unwrap();
     assert_eq!(format!("{:?}", described[0].ty), "Blob");
     assert_ne!(described[0].to_wire().charset, 63, "should carry text");
@@ -12279,6 +12331,7 @@ fn a_not_null_column_says_so_whatever_its_type() {
     let nullable = |engine: &Engine, session: &Session, sql: &str| -> Vec<bool> {
         engine
             .describe(session, sql, 0)
+            .unwrap()
             .unwrap()
             .iter()
             .map(|c| c.to_wire().flags & mysql_ultralight_protocol::column::flags::NOT_NULL == 0)
@@ -12383,6 +12436,7 @@ fn a_computed_column_is_described_by_its_expression() {
     let codes = |engine: &Engine, session: &Session, sql: &str| -> Vec<String> {
         engine
             .describe(session, sql, 0)
+            .unwrap()
             .unwrap()
             .iter()
             .map(|c| format!("{:?}", c.ty))
@@ -12643,6 +12697,7 @@ fn every_yes_or_no_answer_is_a_boolean() {
                 0
             )
             .unwrap()
+            .unwrap()
             .iter()
             .map(|c| format!("{:?}", c.ty))
             .collect::<Vec<_>>(),
@@ -12654,6 +12709,7 @@ fn every_yes_or_no_answer_is_a_boolean() {
     let nullable = |sql: &str| -> Vec<bool> {
         engine
             .describe(&session, sql, 0)
+            .unwrap()
             .unwrap()
             .iter()
             .map(|c| c.nullable)
@@ -12739,6 +12795,7 @@ fn a_boolean_reads_as_one_or_zero_everywhere_but_a_document() {
         engine
             .describe(&session, sql, 0)
             .unwrap()
+            .unwrap()
             .iter()
             .map(|c| format!("{:?}", c.ty))
             .collect()
@@ -12754,6 +12811,7 @@ fn a_boolean_reads_as_one_or_zero_everywhere_but_a_document() {
     assert!(
         !engine
             .describe(&session, "SELECT NULL <=> NULL", 0)
+            .unwrap()
             .unwrap()[0]
             .nullable
     );
@@ -12912,6 +12970,7 @@ fn a_boolean_does_not_survive_being_put_anywhere() {
         engine
             .describe(&session, sql, 0)
             .unwrap()
+            .unwrap()
             .iter()
             .map(|c| format!("{:?}", c.ty))
             .collect()
@@ -12924,6 +12983,7 @@ fn a_boolean_does_not_survive_being_put_anywhere() {
     let nullable = |sql: &str| -> Vec<bool> {
         engine
             .describe(&session, sql, 0)
+            .unwrap()
             .unwrap()
             .iter()
             .map(|c| c.nullable)

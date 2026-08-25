@@ -39,11 +39,20 @@ impl EngineHandler {
     /// whose shape cannot be established without running something that might
     /// write declares nothing, which is where this started but is at least not
     /// a wrong answer.
-    fn declared_columns(&self, sql: &str, param_count: u16) -> Vec<ColumnDef> {
-        self.engine
+    ///
+    /// An `Err` is the statement being refused rather than its shape being
+    /// unknown — a column reference nothing in scope answers to — and MySQL
+    /// refuses it at prepare time too.
+    fn declared_columns(&self, sql: &str, param_count: u16) -> Result<Vec<ColumnDef>, ErrPacket> {
+        match self
+            .engine
             .describe(&self.session, sql, param_count as usize)
-            .map(|columns| columns.iter().map(|c| c.to_wire()).collect())
-            .unwrap_or_default()
+        {
+            Ok(described) => Ok(described
+                .map(|columns| columns.iter().map(|c| c.to_wire()).collect())
+                .unwrap_or_default()),
+            Err(e) => Err(ErrPacket::from(e)),
+        }
     }
 
     /// Turns one engine outcome into the response the wire carries.
@@ -99,7 +108,7 @@ impl Handler for EngineHandler {
             id,
             sql: sql.to_owned(),
             param_count,
-            columns: self.declared_columns(sql, param_count),
+            columns: self.declared_columns(sql, param_count)?,
         })
     }
 
@@ -120,14 +129,20 @@ impl Handler for EngineHandler {
         // There is no cached metadata to have gone stale, and binding a wide
         // INSERT's placeholders only to parse the result and throw it away is
         // most of the cost of the insert itself.
-        if !stmt.columns.is_empty()
-            && self.declared_columns(&stmt.sql, stmt.param_count) != stmt.columns
-        {
-            return Err(ErrPacket::new(
-                1615,
-                "HY000",
-                "Prepared statement needs to be re-prepared",
-            ));
+        //
+        // A re-describe that now *refuses* is the same answer: the statement
+        // no longer prepares, so the cached metadata cannot be right. It is
+        // reported as 1615 rather than passed through, so the client takes the
+        // path it already has — re-prepare, and hear the real reason there.
+        if !stmt.columns.is_empty() {
+            let fresh = self.declared_columns(&stmt.sql, stmt.param_count);
+            if fresh.as_ref() != Ok(&stmt.columns) {
+                return Err(ErrPacket::new(
+                    1615,
+                    "HY000",
+                    "Prepared statement needs to be re-prepared",
+                ));
+            }
         }
 
         let bound: Vec<EngineValue> = params.iter().map(EngineValue::from_wire).collect();

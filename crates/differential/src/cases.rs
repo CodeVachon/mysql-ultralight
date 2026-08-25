@@ -1666,4 +1666,147 @@ pub const GROUPS: &[Group] = &[
                   EXTRACT(WEEK FROM '1901-01-01'), EXTRACT(WEEK FROM '2101-01-01')"),
         ],
     },
+    Group {
+        // #0058. `SELECT nope.k FROM S`, where nothing named `nope` is in
+        // scope, is refused by MySQL when the statement is *prepared*; this
+        // engine described it as one column called `k` and failed only when
+        // it ran. The harness records a refusal the same way whichever round
+        // trip carried it, so what these cases hold is the code and the
+        // SQLSTATE — the prepare-time half is held by
+        // `crates/engine/tests/describe.rs`.
+        //
+        // The second half of the group is the risk: resolving a qualifier at
+        // all means refusing something legal if the scope is read too
+        // narrowly, and every case below the divider is a place a name is in
+        // scope without being in this query's FROM clause.
+        name: "a qualifier that is not in scope",
+        setup: &[
+            "CREATE TABLE S (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE T (id INT NOT NULL, sid INT NULL, label VARCHAR(20) NULL, \
+             PRIMARY KEY (id))",
+            // Left empty on purpose: a name was resolved once per row, so a
+            // table with nothing in it answered `SELECT nope.k FROM Bare`
+            // with an empty result set rather than 1054.
+            "CREATE TABLE Bare (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+            "INSERT INTO S VALUES (1, 10), (2, 20)",
+            "INSERT INTO T VALUES (1, 1, 'p'), (2, 2, 'q')",
+        ],
+        cases: &[
+            same("SELECT nope.k FROM S"),
+            same("SELECT zz FROM S"),
+            same("SELECT S.zz FROM S"),
+            // A qualifier naming a table that exists but is not in the FROM
+            // clause. Being in the database is not being in scope.
+            same("SELECT T.label FROM S"),
+            // An alias replaces the table name rather than adding to it.
+            same("SELECT S.k FROM S x"),
+            same("SELECT UPPER(nope.k) FROM S"),
+            same("SELECT COUNT(nope.k) FROM S"),
+            // 1054 rather than the 1055 ONLY_FULL_GROUP_BY would give: MySQL
+            // resolves names before it applies the grouping rules.
+            same("SELECT nope.k, COUNT(*) FROM S GROUP BY k"),
+            same("SELECT k FROM S WHERE nope.k = 1"),
+            same("SELECT COUNT(*) FROM S WHERE nope.k = 1"),
+            // An output alias is not in scope in WHERE.
+            same("SELECT k + 1 AS x FROM S WHERE x > 1"),
+            same("WITH c AS (SELECT id FROM S) SELECT c.zz FROM c"),
+            same("SELECT d.zz FROM (SELECT id FROM S) d"),
+            // A wildcard's qualifier is a table rather than a column, so it
+            // is 1051 and not 1054. Both used to come back as a result set
+            // with no columns in it at all.
+            same("SELECT nope.* FROM S"),
+            same("SELECT S.* FROM S x"),
+            // Back-quoted, which is how a generated client writes every
+            // identifier. The quotes are part of the spelling and not of the
+            // name, and reading the qualifier off the rendered text instead
+            // of off its identifiers refused the legal half of this pair.
+            same("SELECT `nope`.`k` FROM S"),
+            same("SELECT `nope`.* FROM S"),
+            // A qualified `*` is read in the query that wrote it and in
+            // nothing else, unlike a named column: `S` is in the outer FROM
+            // and still 1051 here.
+            same("SELECT S.id FROM S WHERE 1 IN (SELECT S.* FROM T)"),
+            same("SELECT S.id FROM S WHERE 1 IN (SELECT nope.* FROM T)"),
+            same("SELECT S.id FROM S WHERE S.id = (SELECT S.* FROM T LIMIT 1)"),
+            // And a named column in an EXISTS select list is resolved even
+            // though a `*` in the same place is not.
+            same("SELECT COUNT(*) FROM S WHERE EXISTS (SELECT nope.k FROM T)"),
+            // The same statements over a relation that yields no rows, which
+            // is where the engine answered instead of refusing.
+            same("SELECT nope.k FROM Bare"),
+            same("SELECT k FROM Bare WHERE nope.k = 1"),
+            same("SELECT COUNT(nope.k) FROM Bare"),
+            same("SELECT nope.* FROM Bare"),
+            same("SELECT nope.k FROM S WHERE 1 = 0"),
+            same("SELECT nope.k FROM S LIMIT 0"),
+
+            // Legal from here down, and the reason this group is worth more
+            // than its refusals: each is a scope that does not come from the
+            // FROM clause of the query the reference is written in.
+            // Compared rather than selected: a scalar subquery projected on
+            // its own is described VAR_STRING by this engine where MySQL
+            // types it from the subquery's column, which is a divergence of
+            // its own and not this one.
+            same("SELECT S.k, (SELECT COUNT(*) FROM T WHERE T.sid = S.id) > 0 AS has \
+                  FROM S ORDER BY S.id"),
+            same("SELECT S.k FROM S WHERE EXISTS (SELECT 1 FROM T t WHERE t.sid = S.id) \
+                  ORDER BY S.k"),
+            same("SELECT S.k FROM S WHERE S.id IN (SELECT t.sid FROM T t WHERE t.id = S.id) \
+                  ORDER BY S.k"),
+            same("SELECT S.k FROM S WHERE S.id = (SELECT MAX(t.sid) FROM T t \
+                  WHERE t.id = S.id) ORDER BY S.k"),
+            same("WITH c AS (SELECT id, k FROM S) SELECT c.k FROM c ORDER BY c.id"),
+            same("SELECT d.k FROM (SELECT id, k FROM S) d ORDER BY d.id"),
+            same("SELECT x.k FROM S x ORDER BY x.id"),
+            // Back-quoted qualifiers, which must keep resolving.
+            same("SELECT `S`.`k` FROM S ORDER BY `S`.`id`"),
+            same("SELECT `S`.* FROM S ORDER BY S.id"),
+            same("SELECT `x`.* FROM S `x` ORDER BY x.id"),
+            same("SELECT `differential`.`S`.* FROM S ORDER BY S.id"),
+            // EXISTS throws its select list away before expanding any `*` in
+            // it, so a qualifier naming nothing at all is legal there —
+            // through DISTINCT, an extra item, GROUP BY, a UNION, ORDER BY
+            // and a negation. Every one of these answers on 8.3, and a
+            // wildcard check that did not know it would refuse them.
+            same("SELECT COUNT(*) FROM S WHERE EXISTS (SELECT S.* FROM T)"),
+            same("SELECT COUNT(*) FROM S WHERE EXISTS (SELECT nope.* FROM T)"),
+            same("SELECT COUNT(*) FROM S WHERE EXISTS (SELECT DISTINCT nope.* FROM T)"),
+            same("SELECT COUNT(*) FROM S WHERE EXISTS (SELECT nope.*, T.id FROM T)"),
+            same("SELECT COUNT(*) FROM S WHERE EXISTS (SELECT nope.* FROM T GROUP BY T.id)"),
+            same("SELECT COUNT(*) FROM S \
+                  WHERE EXISTS (SELECT nope.* FROM T UNION SELECT T.* FROM T)"),
+            same("SELECT COUNT(*) FROM S WHERE EXISTS (SELECT nope.* FROM T ORDER BY T.id)"),
+            // What replaces the `*` is one column, not none, and a UNION
+            // compares that arity: 8.3 answers the first and refuses the
+            // second with 1222.
+            same("SELECT COUNT(*) FROM S \
+                  WHERE EXISTS (SELECT nope.* FROM T UNION SELECT T.id FROM T)"),
+            same("SELECT COUNT(*) FROM S \
+                  WHERE EXISTS (SELECT nope.* FROM T UNION SELECT T.id, T.sid FROM T)"),
+            same("SELECT COUNT(*) FROM S WHERE EXISTS (SELECT nope.* FROM T WHERE T.id = 99)"),
+            same("SELECT COUNT(*) FROM S \
+                  WHERE NOT EXISTS (SELECT nope.* FROM T WHERE T.id = 99)"),
+            same("SELECT a1.k, a2.k AS second FROM S a1 JOIN S a2 ON a1.id = a2.id \
+                  ORDER BY a1.id"),
+            // USING merges the two `id` columns into one, and the qualified
+            // form still resolves against it.
+            same("SELECT S.id FROM S JOIN T USING (id) ORDER BY S.id"),
+            // An output alias *is* in scope in ORDER BY, unlike in WHERE.
+            same("SELECT k AS ali FROM S ORDER BY ali"),
+            // The database written out in front of the table, on both sides
+            // of the FROM.
+            same("SELECT S.k FROM differential.S ORDER BY S.id"),
+            same("SELECT differential.S.k FROM S ORDER BY S.id"),
+            same("SELECT S.* FROM S ORDER BY S.id"),
+            same("SELECT x.* FROM S x ORDER BY x.id"),
+            // A bare keyword that parses as an identifier and is not a
+            // column, in a statement that also reads one.
+            same("SELECT TIMESTAMPDIFF(DAY, '2026-01-01', '2026-03-05') AS d, S.k \
+                  FROM S ORDER BY S.id"),
+            // A system variable, in the spelling that parses as a qualified
+            // name. Compared as a predicate rather than as itself, because
+            // the two servers are different versions.
+            same("SELECT @@GLOBAL.version IS NOT NULL AS v, S.k FROM S ORDER BY S.id"),
+        ],
+    },
 ];

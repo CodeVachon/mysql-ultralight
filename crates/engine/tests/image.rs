@@ -569,7 +569,7 @@ fn describing_never_snapshots_restores_or_takes_a_lock() {
         "SELECT GET_LOCK('describe-probe', 0)".to_owned(),
     ] {
         assert!(
-            engine.describe(&session, &sql, 0).is_none(),
+            engine.describe(&session, &sql, 0).unwrap().is_none(),
             "described something with consequences: {sql}"
         );
     }
@@ -578,14 +578,16 @@ fn describing_never_snapshots_restores_or_takes_a_lock() {
     // schema and not the rows — so there is nothing to refuse, and a shape
     // comes back. What must still be true is the same thing: that describing
     // it changed nothing, which the assertions below check.
-    let shaped = engine.describe(
-        &session,
-        &format!(
-            "SELECT id FROM Parent WHERE ultralight_restore('{}') = 1",
-            path.display()
-        ),
-        0,
-    );
+    let shaped = engine
+        .describe(
+            &session,
+            &format!(
+                "SELECT id FROM Parent WHERE ultralight_restore('{}') = 1",
+                path.display()
+            ),
+            0,
+        )
+        .unwrap();
     assert_eq!(
         shaped.map(|columns| columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()),
         Some(vec!["id".to_owned()])
@@ -627,8 +629,14 @@ fn describing_does_not_move_a_generated_value() {
     // depending only on whether the client used a prepared statement.
     let (engine, mut session) = engine();
 
-    assert!(engine.describe(&session, "SELECT UUID()", 0).is_none());
-    assert!(engine.describe(&session, "SELECT RAND()", 0).is_none());
+    assert!(engine
+        .describe(&session, "SELECT UUID()", 0)
+        .unwrap()
+        .is_none());
+    assert!(engine
+        .describe(&session, "SELECT RAND()", 0)
+        .unwrap()
+        .is_none());
 
     let (other, mut other_session) = fresh_engine();
     assert_eq!(
@@ -690,6 +698,7 @@ fn describing_refuses_consequences_hidden_inside_a_view() {
     assert!(
         engine
             .describe(&session, "SELECT taken FROM Sneaky", 0)
+            .unwrap()
             .is_none(),
         "described a view that writes"
     );
