@@ -95,6 +95,10 @@ pub fn literal(value: &Value) -> String {
         // front of it — so this round trip loses the tag, exactly as the JSON
         // one below does. A bound parameter has no declared type to lose.
         Value::Temporal(v) => literal(&Value::Text(v.clone())),
+        // Quoted as its member, which loses the ordinal — the same round trip
+        // the temporal above makes, and for the same reason: SQL has no
+        // literal that spells an ENUM.
+        Value::Enum { member, .. } => literal(&Value::Text(member.clone())),
         Value::Float(v) => {
             // A bare `inf` or `nan` would not re-parse.
             if v.is_finite() {

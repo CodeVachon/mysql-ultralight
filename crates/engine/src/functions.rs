@@ -670,11 +670,18 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         // `GREATEST`, `LEAST` and `CASE` were measured too and do *not*
         // aggregate that way — they keep the temporal — which is why the rule
         // is written here and not shared with them.
-        "coalesce" => untag_mixed_temporal(&args, args.iter().find(|v| !v.is_null()).cloned())
-            .unwrap_or(Value::Null),
+        //
+        // An ENUM loses its ordinal here whatever it sits beside, which is not
+        // the same rule and so is not folded into the same helper:
+        // `COALESCE(e) + 0` is 0 on 8.3 with one argument and nothing to
+        // aggregate with, where `IF(1, e, 'z') + 0` is still the ordinal.
+        "coalesce" => {
+            let first = args.iter().find(|v| !v.is_null()).cloned();
+            untag_mixed_temporal(&args, first.map(Value::untag_enum)).unwrap_or(Value::Null)
+        }
         "ifnull" | "nvl" => {
             let chosen = if arg(0).is_null() { arg(1) } else { arg(0) };
-            untag_mixed_temporal(&args, Some(chosen)).unwrap_or(Value::Null)
+            untag_mixed_temporal(&args, Some(chosen.untag_enum())).unwrap_or(Value::Null)
         }
         "nullif" => {
             if arg(0).compare(&arg(1)) == Some(std::cmp::Ordering::Equal) {
@@ -820,12 +827,16 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
                 Value::Float(cut)
             }
         }
+        // The winner comes back untagged: `GREATEST(e, e) + 0` is 0 on 8.3
+        // where the bare `e + 0` is the ordinal. `IF` and `CASE` were measured
+        // beside it and do keep the tag, which is why this is written here.
         "greatest" | "least" => {
             if args.iter().any(Value::is_null) {
                 Value::Null
             } else {
                 let want_greater = name == "greatest";
                 args.into_iter()
+                    .map(Value::untag_enum)
                     .reduce(|a, b| {
                         let take_b = match a.compare(&b) {
                             Some(std::cmp::Ordering::Less) => want_greater,
@@ -1076,10 +1087,15 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
             let scale = crate::types::SqlType::from_ast(ty)?.scale.unwrap_or(0) as usize;
             // A temporal converts through its packed number, not its text:
             // `CAST(d AS DECIMAL(20,2))` is 20240105.00 in MySQL where reading
-            // `2024-01-05` as a number gives 2024.00.
-            let source = value
-                .temporal_number()
-                .map_or_else(|| value.as_text(), |number| number.as_text());
+            // `2024-01-05` as a number gives 2024.00. An ENUM converts through
+            // its ordinal for the same reason: `CAST(e AS DECIMAL(10,2))` is
+            // 1.00 for the first member where reading `a` gives 0.00.
+            let source = match &value {
+                Value::Enum { ordinal, .. } => ordinal.to_string(),
+                _ => value
+                    .temporal_number()
+                    .map_or_else(|| value.as_text(), |number| number.as_text()),
+            };
             Value::Decimal(crate::types::decimal_digits(&source, scale))
         }
         D::Char(_) | D::Varchar(_) | D::Text | D::CharacterVarying(_) | D::Character(_) => {

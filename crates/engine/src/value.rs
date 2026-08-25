@@ -66,6 +66,30 @@ pub enum Value {
     /// A YEAR is not one of these. MySQL reads it as the plain number it
     /// already is, and this engine stores it as `Int`.
     Temporal(String),
+    /// An ENUM member, with the 1-based position it was declared at.
+    ///
+    /// The same argument `Temporal` above makes, over a different number. An
+    /// ENUM *is* its ordinal in every numeric context — `ENUM('a','b')`
+    /// holding `'a'` reads 1, so `e + 0` is 1, `-e` is -1 and `e = 1` is true
+    /// — and it is its member everywhere else, so `SELECT e` shows `a` and
+    /// `e = 'a'` is true. Stored as text alone, the number had to be read out
+    /// of the characters, which answers 0 for every member that is not itself
+    /// a number.
+    ///
+    /// The ordinal is carried rather than looked up because the value is the
+    /// only thing that reaches the evaluator: `SqlType::variants` has the
+    /// declaration order, and by the time an operand is being added to
+    /// something its column is out of reach. It also settles the case that
+    /// proves the ordinal is not the text — `ENUM('7','8')` holding `'7'`
+    /// reads 1, not 7, measured on 8.3.
+    ///
+    /// Ordinal 0 with an empty member is MySQL's error value, which a column
+    /// holds after an assignment that matched no member. It is a legal state,
+    /// not a corrupt one: `g = '0'` stores it and it reads back as `''` and 0.
+    Enum {
+        member: String,
+        ordinal: u32,
+    },
 }
 
 impl Value {
@@ -93,6 +117,9 @@ impl Value {
                 Value::Decimal(text) => i64::try_from(crate::decimal::units(&text, 0)?).ok(),
                 _ => None,
             },
+            // Its ordinal, which is the whole point of the tag: a member
+            // that is not itself a number read 0 out of its own characters.
+            Value::Enum { ordinal, .. } => Some(i64::from(*ordinal)),
             Value::Float(v) => Some(*v as i64),
             Value::Float32(v) => Some(*v as i64),
             Value::Text(v) | Value::Json(v) | Value::Decimal(v) => {
@@ -111,6 +138,10 @@ impl Value {
             Value::Float(v) => Some(*v),
             Value::Float32(v) => Some(*v as f64),
             Value::Text(v) | Value::Json(v) | Value::Decimal(v) => v.trim().parse().ok(),
+            // Its ordinal, which is what makes `e = 1` true: a comparison
+            // against a number is numeric, and reading the member's text gave
+            // `None` here and sent the pair to the collation instead.
+            Value::Enum { ordinal, .. } => Some(f64::from(*ordinal)),
             // Its packed number, which is what makes `d = 20240105` true: a
             // comparison against a number is numeric, and reading the text
             // gave `None` here and sent the pair to the collation instead.
@@ -133,6 +164,7 @@ impl Value {
             Value::Float32(v) => *v as f64,
             Value::Text(v) | Value::Json(v) | Value::Decimal(v) => numeric_prefix(v),
             Value::Bytes(v) => numeric_prefix(&String::from_utf8_lossy(v)),
+            Value::Enum { ordinal, .. } => f64::from(*ordinal),
             // Its packed digits, and its leading number only where the text is
             // not a temporal at all — a DATE column can hold text this engine
             // never validated, and that is no reason to answer differently
@@ -160,6 +192,9 @@ impl Value {
             // The text it was stored as: only the *numeric* reading of a
             // temporal is packed, and `SELECT d` still shows `2024-01-05`.
             Value::Temporal(v) => v.clone(),
+            // The member, not the ordinal: only the *numeric* reading of an
+            // ENUM is its position, and `SELECT e` still shows `a`.
+            Value::Enum { member, .. } => member.clone(),
             // The document as it was serialised, which is what MySQL sends and
             // what a client reads back.
             Value::Json(v) | Value::Decimal(v) => v.clone(),
@@ -186,6 +221,10 @@ impl Value {
             // By the packed number, for the same reason arithmetic is: MySQL
             // asks a temporal the numeric question the way it converts one.
             Value::Temporal(_) => Some(self.as_number() != 0.0),
+            // By the ordinal, so `WHERE e` is true for every real member and
+            // false only for the error value. Read as text, the first member
+            // of `ENUM('a','b')` was false.
+            Value::Enum { ordinal, .. } => Some(*ordinal != 0),
         }
     }
 
@@ -231,6 +270,52 @@ impl Value {
             // Binary data is compared byte-exact; only text carries a collation.
             (Value::Bytes(a), Value::Bytes(b)) => Some(a.cmp(b)),
             _ => Some(collate(&self.as_text(), &other.as_text())),
+        }
+    }
+
+    /// The order MySQL *sorts* this value in, which for an ENUM is not the
+    /// order it *compares* in.
+    ///
+    /// Both halves are measured on 8.3, and they disagree. `ORDER BY e` over
+    /// `ENUM('b','a')` returns `b` before `a` — the declaration order, not the
+    /// alphabet — while `e1 < e2` over two columns of that same type answers
+    /// by the members: `'b' < 'a'` is false there where the ordinals 1 < 2
+    /// would make it true. `MIN` and `MAX` go with the comparison, not with
+    /// the sort, so `MIN(e)` over those two rows is `a`.
+    ///
+    /// So the sort cannot share `compare`, and only the pairing where both
+    /// sides are ENUM members is decided here; everything else, an ENUM beside
+    /// a string or a number included, is ordered the way it is compared.
+    ///
+    /// Two ordinals are only comparable when they count from the same
+    /// declaration, which is not written on the value. What made them meet was
+    /// a set operation — position 1 is `b` in `ENUM('b','a')` and `a` in
+    /// `ENUM('a','b','c')` — and MySQL does not carry an ENUM through one at
+    /// all, so the engine untags there and the pairing no longer arises. A sort
+    /// key is otherwise one expression evaluated per row, so both sides of it
+    /// come from the same column. `IF(c, e1, e2)` over two declarations is the
+    /// gap that remains, and MySQL answers that by the chosen argument's own
+    /// ordinal too — measured on 8.3 — so there is no obviously better answer
+    /// to give it than this one.
+    pub fn sort_cmp(&self, other: &Value) -> Option<Ordering> {
+        match (self, other) {
+            (Value::Enum { ordinal: a, .. }, Value::Enum { ordinal: b, .. }) => Some(a.cmp(b)),
+            _ => self.compare(other),
+        }
+    }
+
+    /// This value with any ENUM tag removed, leaving the member as text.
+    ///
+    /// For the places MySQL stops reading a value as its ordinal. It does not
+    /// do so everywhere: `IF`, `CASE` and `NULLIF` hand the ENUM through and
+    /// `IF(1, e, 'z') + 0` is still the ordinal, while `COALESCE`, `IFNULL`,
+    /// `GREATEST`, `LEAST`, `MIN` and `MAX` build a string result and
+    /// `COALESCE(e) + 0` is 0 — with one argument, so it is the function and
+    /// not a mixture of types that does it. All measured on 8.3.
+    pub fn untag_enum(self) -> Value {
+        match self {
+            Value::Enum { member, .. } => Value::Text(member),
+            other => other,
         }
     }
 
@@ -330,6 +415,10 @@ impl Value {
             // A temporal does too — the packed number is a reading, not a
             // representation, and a client asking for a DATE gets its text.
             Value::Json(v) | Value::Decimal(v) | Value::Temporal(v) => WireValue::Str(v.clone()),
+            // The member. A client asking for an ENUM column gets `a`, which
+            // is what MySQL sends for it; the ordinal is a reading, not a
+            // representation.
+            Value::Enum { member, .. } => WireValue::Str(member.clone()),
         }
     }
 
@@ -345,6 +434,16 @@ impl Value {
             WireValue::Bytes(v) => Value::Bytes(v.clone()),
         }
     }
+}
+
+/// Whether two strings are the same under the server's collation.
+///
+/// Shared with `collate` so that matching an ENUM member on the way into a
+/// column and comparing one on the way out cannot disagree: MySQL stores
+/// `INSERT ... VALUES ('A')` into `ENUM('a')` as `a`, which is the same
+/// case-insensitive rule `e = 'A'` answers by.
+pub(crate) fn collate_eq(a: &str, b: &str) -> bool {
+    collate(a, b) == Ordering::Equal
 }
 
 /// Compares two strings under the server's advertised collation.

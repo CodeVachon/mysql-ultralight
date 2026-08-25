@@ -311,6 +311,47 @@ fn a_temporal_survives_as_a_temporal() {
 }
 
 #[test]
+fn an_enum_survives_as_its_ordinal() {
+    // The ordinal has to be in the image, not only in the row that was
+    // inserted, and it cannot be recovered on the way back in: a value is
+    // loaded before anything asks which column it belongs to. Reloaded as text
+    // a member reads 0 in arithmetic where MySQL reads its position — the
+    // whole of #0068, reintroduced by a restart.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (id INTEGER NOT NULL, e ENUM('a','b','c') NOT NULL, \
+         r ENUM('b','a') NOT NULL, s VARCHAR(30) NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO T VALUES (1, 'c', 'b', 'c'), (2, 'a', 'a', 'a')",
+    );
+
+    // The sort is in here as well as the arithmetic, because the two read
+    // different halves of the value: `ORDER BY r` is the declared order and
+    // `e + 0` is the ordinal, and an image that kept one could still lose the
+    // other.
+    let sql = "SELECT e, e + 0, s + 0, r FROM T ORDER BY r, id";
+    let before = rows(&engine, &mut session, sql);
+    // Stated rather than only compared, so a reload that lost the tag on both
+    // sides could not pass by agreeing with itself.
+    assert_eq!(
+        before,
+        vec![vec!["c", "3", "0", "b"], vec!["a", "1", "0", "a"]]
+    );
+
+    let encoded = image::encode(&engine.catalog_snapshot().unwrap());
+    let decoded = image::decode(&encoded).unwrap();
+    let restored = Engine::from_catalog(decoded, ServerConfig::default()).unwrap();
+    let mut session = Session::new(ServerConfig::default(), 1);
+    session.current_database = Some("testdb".to_owned());
+    assert_eq!(rows(&restored, &mut session, sql), before);
+}
+
+#[test]
 fn a_truncated_image_is_refused() {
     let (engine, mut session) = engine();
     populate(&engine, &mut session);

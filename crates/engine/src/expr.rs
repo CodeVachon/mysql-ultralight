@@ -410,10 +410,14 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
                     "Subquery returns more than 1 row",
                 ));
             }
+            // Untagged on the way out, because a scalar subquery is one of
+            // the places MySQL stops reading an ENUM as its ordinal:
+            // `(SELECT e FROM t) + 0` is 0 there where the bare `e + 0` is 1.
             Ok(rows
                 .into_iter()
                 .next()
                 .and_then(|row| row.into_iter().next())
+                .map(Value::untag_enum)
                 .unwrap_or(Value::Null))
         }
 
@@ -1494,6 +1498,10 @@ fn bit_operand(v: &Value) -> EngineResult<u64> {
         // wrong side of every bit it is then masked with.
         Value::Decimal(text) => decimal_bits(text),
         Value::Text(s) | Value::Json(s) => integer_prefix(s),
+        // Its ordinal, through the same number arithmetic uses, so `e | 0` and
+        // `e + 0` cannot disagree about what a member is worth. It is a whole
+        // number already, so neither reading below would round it.
+        Value::Enum { ordinal, .. } => u64::from(*ordinal),
         Value::Bytes(_) => {
             return Err(unsupported("a bitwise operator over a binary string"));
         }

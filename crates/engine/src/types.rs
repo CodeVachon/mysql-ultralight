@@ -344,9 +344,20 @@ impl SqlType {
             TypeKind::Json => Value::Json("null".to_owned()),
             // An ENUM's implicit default is its first member, not an empty
             // string, which would not be a legal value at all.
+            //
+            // Tagged, like the temporal and the decimal above: a row filled
+            // from its default holds an ENUM like every other row, and left as
+            // text it would be the one member in the column that reads 0 in
+            // arithmetic instead of 1.
             TypeKind::Enum => match self.variants.first() {
-                Some(first) => Value::text(first),
-                None => Value::text(""),
+                Some(first) => Value::Enum {
+                    member: first.clone(),
+                    ordinal: 1,
+                },
+                None => Value::Enum {
+                    member: String::new(),
+                    ordinal: 0,
+                },
             },
             TypeKind::Text | TypeKind::Blob | TypeKind::Set => Value::text(""),
         }
@@ -470,16 +481,90 @@ impl SqlType {
                 Value::Bytes(b) => Value::Bytes(b),
                 other => Value::Bytes(other.as_text().into_bytes()),
             },
+            // Tagged with the position it was declared at, which is the
+            // number MySQL reads an ENUM as everywhere but a string context.
+            // `variants` is in declaration order and this is the last place it
+            // and the value are both in hand — an operand being added to
+            // something has no column left to ask.
+            //
+            // Assignment reads the same way round, which is measured: a member
+            // wins over an index, so `'2'` into `ENUM('2','1')` is the *first*
+            // member and not the second, while `'2'` into `ENUM('a','b','c')`
+            // is `b`. The match is case-insensitive and stores the declared
+            // spelling, so `'A'` into `ENUM('a')` reads back `a`.
             TypeKind::Enum => {
+                // A *number* is only ever an index, and never a member: `2`
+                // into `ENUM('2','1')` is the second member, `1`, and not the
+                // one whose text is `2`. It truncates towards zero rather than
+                // rounding, so 1.6 is still the first member and 0.4 is
+                // refused with the number 0.
+                let numeric = match &value {
+                    Value::Int(n) => Some(*n),
+                    Value::Float(_) | Value::Float32(_) | Value::Decimal(_) => {
+                        Some(value.as_number().trunc() as i64)
+                    }
+                    _ => None,
+                };
                 let text = value.as_text();
-                if !self.variants.is_empty() && !self.variants.contains(&text) {
-                    return Err(EngineError::new(
-                        1265,
-                        "01000",
-                        format!("Data truncated for column '{column}'"),
-                    ));
+                // The error member copied out of another ENUM. It is a legal
+                // stored value — `'0'` writes one — and MySQL carries it
+                // across: `UPDATE t SET g = g` and `INSERT ... SELECT` both
+                // keep it, and so does a copy into a column declared with
+                // different members. Nothing else may store an empty member,
+                // because `g = ''` is 1265 for a column that does not declare
+                // one, so the tag is what tells the two apart.
+                if matches!(&value, Value::Enum { ordinal: 0, .. }) {
+                    return Ok(Value::Enum {
+                        member: String::new(),
+                        ordinal: 0,
+                    });
                 }
-                Value::Text(text)
+                let member = |index: usize| Value::Enum {
+                    member: self.variants[index].clone(),
+                    ordinal: index as u32 + 1,
+                };
+                let by_index = |n: i64| match n {
+                    n if n >= 1 && (n as usize) <= self.variants.len() => {
+                        Some(member(n as usize - 1))
+                    }
+                    _ => None,
+                };
+                let stored = match numeric {
+                    Some(n) => by_index(n),
+                    None => self
+                        .variants
+                        .iter()
+                        .position(|v| crate::value::collate_eq(v, &text))
+                        .map(member)
+                        // Not a member, so a string is read as an index — but
+                        // only when it is a whole number, so `'2'` is the
+                        // second member where `'1.0'` and `'2abc'` are errors.
+                        .or_else(|| {
+                            let n = text.trim().parse::<i64>().ok()?;
+                            // Index 0 is MySQL's error member, the empty
+                            // string, and only a string reaches it: `'0'`
+                            // stores it where the number 0 above is refused.
+                            // Measured, and not a rule the rest of this would
+                            // predict.
+                            if n == 0 {
+                                return Some(Value::Enum {
+                                    member: String::new(),
+                                    ordinal: 0,
+                                });
+                            }
+                            by_index(n)
+                        }),
+                };
+                match stored {
+                    Some(value) => value,
+                    None => {
+                        return Err(EngineError::new(
+                            1265,
+                            "01000",
+                            format!("Data truncated for column '{column}'"),
+                        ))
+                    }
+                }
             }
             // A JSON column holds a document, so reading one and passing it to
             // a JSON function embeds it as a document. MySQL validates on the

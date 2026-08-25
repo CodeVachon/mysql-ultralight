@@ -1081,6 +1081,31 @@ impl Engine {
                 if !all {
                     dedupe(&mut left.rows);
                 }
+
+                // A set operation materialises its result, and MySQL does not
+                // carry an ENUM through one: measured on 8.3, the column of
+                // `SELECT e FROM t UNION ALL SELECT e FROM t` is VAR_STRING
+                // and `x + 0` over it is 0 — even with the *same* declaration
+                // on both sides, so it is the materialising and not a mixture
+                // that does it. Left tagged, the ordinals of two different
+                // declarations would also have met in one sort key, where
+                // position 1 means a different member on each side.
+                for column in &mut left.columns {
+                    if column.declared.as_ref().is_some_and(|d| {
+                        matches!(
+                            d.kind,
+                            crate::types::TypeKind::Enum | crate::types::TypeKind::Set
+                        )
+                    }) {
+                        column.ty = ColumnType::VarString;
+                        column.declared = None;
+                    }
+                }
+                for row in &mut left.rows {
+                    for value in row.iter_mut() {
+                        *value = std::mem::replace(value, Value::Null).untag_enum();
+                    }
+                }
                 Ok(left)
             }
             other => Err(unsupported(format!("query body `{other}`"))),
@@ -2306,15 +2331,15 @@ impl Engine {
         for group in &groups {
             let mut out = Vec::with_capacity(items.len());
             for (_, e) in &items {
-                out.push(self.eval_over_group(e, group, refs, session)?);
+                out.push(self.eval_over_group(e, group, refs, session, &[])?);
             }
 
             // HAVING is evaluated after the projection so it can reference an
             // output alias, which MySQL allows and reporting queries rely on.
             if let Some(having) = &select.having {
-                let resolved = substitute_aliases(having, &items, &out);
+                let resolved = substitute_aliases(having, &items);
                 if self
-                    .eval_over_group(&resolved, group, refs, session)?
+                    .eval_over_group(&resolved, group, refs, session, &out)?
                     .truthy()
                     != Some(true)
                 {
@@ -2331,8 +2356,8 @@ impl Engine {
                     key.push(match by_position {
                         Some(value) => value,
                         None => {
-                            let resolved = substitute_aliases(&item.expr, &items, &out);
-                            self.eval_over_group(&resolved, group, refs, session)?
+                            let resolved = substitute_aliases(&item.expr, &items);
+                            self.eval_over_group(&resolved, group, refs, session, &out)?
                         }
                     });
                 }
@@ -2363,6 +2388,7 @@ impl Engine {
         group: &[&Vec<Value>],
         refs: &[ColumnRef],
         session: &Session,
+        aliases: &[Value],
     ) -> EngineResult<Value> {
         let mut folded: Vec<Value> = Vec::new();
         let rewritten = self.fold_aggregates(e, group, refs, session, &mut folded)?;
@@ -2380,6 +2406,13 @@ impl Engine {
         for (index, value) in folded.into_iter().enumerate() {
             schema.push(ColumnRef::new("", folded_name(index)));
             values.push(value);
+        }
+        // The projection's own values, for whatever `substitute_aliases`
+        // rewrote into a reference to one. All of them, because which ones a
+        // HAVING or an ORDER BY reaches for is not worth working out twice.
+        for (index, value) in aliases.iter().enumerate() {
+            schema.push(ColumnRef::new("", alias_name(index)));
+            values.push(value.clone());
         }
 
         let ctx = Context {
@@ -2615,7 +2648,7 @@ impl Engine {
                     // `DECIMAL(10,2)` is a `DECIMAL(_,2)` — `4.00`, not `4`.
                     Value::Decimal(crate::decimal::render(total, scale))
                 } else {
-                    Value::Float(present.iter().filter_map(|v| v.as_float()).sum())
+                    Value::Float(approximate_total(&present))
                 }
             }
             "avg" => {
@@ -2633,21 +2666,24 @@ impl Engine {
                         .and_then(|n| crate::decimal::divide(n, present.len() as i128))
                     {
                         Some(mean) => Value::Decimal(crate::decimal::render(mean, scale)),
-                        None => Value::Float(
-                            present.iter().filter_map(|v| v.as_float()).sum::<f64>()
-                                / present.len() as f64,
-                        ),
+                        None => Value::Float(approximate_total(&present) / present.len() as f64),
                     }
                 } else {
-                    let total: f64 = present.iter().filter_map(|v| v.as_float()).sum();
-                    Value::Float(total / present.len() as f64)
+                    Value::Float(approximate_total(&present) / present.len() as f64)
                 }
             }
+            // By `compare` and not by the sort order, which is measured: over
+            // `ENUM('b','a')` holding both members, `ORDER BY e` puts `b`
+            // first and `MIN(e)` is `a`.
+            //
+            // The winner comes back untagged, which is measured too:
+            // `MIN(e) + 0` is 0 on 8.3 where the bare `e + 0` is the ordinal.
             "min" | "max" => {
                 let want_max = name == "max";
                 present
                     .into_iter()
                     .cloned()
+                    .map(Value::untag_enum)
                     .reduce(|a, b| {
                         let take_b = match a.compare(&b) {
                             Some(std::cmp::Ordering::Less) => want_max,
@@ -4482,7 +4518,9 @@ fn compare_keys(a: &[Value], b: &[Value], descending: &[bool]) -> std::cmp::Orde
             (true, true) => std::cmp::Ordering::Equal,
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
-            (false, false) => left.compare(right).unwrap_or(std::cmp::Ordering::Equal),
+            // `sort_cmp`, not `compare`: MySQL sorts an ENUM by its declared
+            // order and compares one by its member, and the two disagree.
+            (false, false) => left.sort_cmp(right).unwrap_or(std::cmp::Ordering::Equal),
         };
         let ord = if *desc { ord.reverse() } else { ord };
         if ord != std::cmp::Ordering::Equal {
@@ -5155,6 +5193,33 @@ fn exact_total(values: &[&Value]) -> Option<(i128, usize)> {
     Some((total, scale))
 }
 
+/// The inexact total of everything a `SUM` or an `AVG` no exact type covers
+/// was given.
+///
+/// Through `as_number`, which is MySQL's leading-number rule, and not through
+/// `as_float`, which parses the whole string or nothing. The two disagree on
+/// exactly the values this path exists for: over a TEXT column holding
+/// `'12abc'` and `'3.5x'`, MySQL answers `SUM` 15.5 and `AVG` 7.75 — the same
+/// numbers `t + 0` reads out of each row — where dropping what would not parse
+/// answered 0 and made one row and its total disagree inside one statement.
+/// `as_float` has no case for a binary string at all, so `SUM` over a BLOB was
+/// 0 whatever it held; MySQL reads one the same way it reads text.
+///
+/// Every value counts, so there is nothing to filter: MySQL's arithmetic has
+/// no "not a number" case and `as_number` answers 0 for text that has no
+/// leading number. NULLs are dropped before this is called.
+///
+/// That is also what fixed `SUM` over a column with nothing numeric in it
+/// answering `-0` where MySQL answers 0: `Iterator::sum` for `f64` starts at
+/// `-0.0`, which used to be the whole total once the filter had dropped every
+/// value. Every value contributing means there is always an addend and the
+/// seed cannot survive, so the explicit `0.0` below no longer decides
+/// anything — it is kept so that re-introducing a filter here cannot quietly
+/// bring the `-0` back, not because it is what makes the answer right.
+fn approximate_total(values: &[&Value]) -> f64 {
+    values.iter().fold(0.0, |total, v| total + v.as_number())
+}
+
 /// One aggregated value as the exact number it counts as, borrowed where it
 /// already is one.
 ///
@@ -5180,6 +5245,18 @@ fn exact_operand(value: &Value) -> Option<std::borrow::Cow<'_, Value>> {
 /// A NUL prefix keeps it out of any namespace a query could reference.
 fn folded_name(index: usize) -> String {
     format!("\u{0}agg{index}")
+}
+
+/// The name of the hidden column a projected alias is bound to.
+///
+/// Shares the NUL prefix with `folded_name` above, and shares its reason: an
+/// alias reaches HAVING and ORDER BY as a *value*, and there is no spelling of
+/// one that survives the trip through the syntax tree. A quoted string loses a
+/// temporal's packed number and an ENUM's ordinal, so `HAVING e = 1` compared
+/// the member against a number and matched no group at all; binary data would
+/// not survive being written as text either.
+fn alias_name(index: usize) -> String {
+    format!("\u{0}alias{index}")
 }
 
 /// The alias and expression of each projected item.
@@ -5217,21 +5294,24 @@ fn resolve_ordinal(e: &Expr, projection: &[SelectItem]) -> Option<Expr> {
     }
 }
 
-/// Replaces references to a select-list alias with the value already computed
-/// for it, so HAVING and ORDER BY can name one.
-fn substitute_aliases(e: &Expr, items: &[(String, Expr)], values: &[Value]) -> Expr {
+/// Rewrites references to a select-list alias into the hidden column carrying
+/// the value already computed for it, so HAVING and ORDER BY can name one.
+///
+/// A hidden column and not a rendered literal, for the reason `alias_name`
+/// gives: the value goes through unchanged, tag and all.
+fn substitute_aliases(e: &Expr, items: &[(String, Expr)]) -> Expr {
+    use sqlparser::ast::Ident;
+
     if let Expr::Identifier(ident) = e {
         if let Some(position) = items
             .iter()
             .position(|(alias, _)| alias.eq_ignore_ascii_case(&ident.value))
         {
-            if let Some(value) = values.get(position) {
-                return literal_expr(value);
-            }
+            return Expr::Identifier(Ident::new(alias_name(position)));
         }
     }
 
-    let recur = |inner: &Expr| Box::new(substitute_aliases(inner, items, values));
+    let recur = |inner: &Expr| Box::new(substitute_aliases(inner, items));
     match e {
         Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
             left: recur(left),
@@ -5257,49 +5337,6 @@ fn substitute_aliases(e: &Expr, items: &[(String, Expr)], values: &[Value]) -> E
             high: recur(high),
         },
         other => other.clone(),
-    }
-}
-
-/// Renders a value as a literal expression.
-///
-/// Only used for alias substitution, where the values involved are the ones a
-/// comparison in HAVING or ORDER BY will act on.
-fn literal_expr(value: &Value) -> Expr {
-    use sqlparser::ast::{Value as AstValue, ValueWithSpan};
-    let span = sqlparser::tokenizer::Span::empty();
-    let wrap = |v: AstValue| Expr::Value(ValueWithSpan { value: v, span });
-
-    match value {
-        Value::Null => wrap(AstValue::Null),
-        Value::Int(v) => wrap(AstValue::Number(v.to_string(), false)),
-        Value::Float(v) if v.is_finite() => wrap(AstValue::Number(format!("{v:?}"), false)),
-        // Widened, because that is what the value is once it stops being a
-        // column: MySQL reads `f + 0` as a double too.
-        Value::Float32(v) if v.is_finite() => {
-            wrap(AstValue::Number(format!("{:?}", *v as f64), false))
-        }
-        Value::Float32(_) => wrap(AstValue::Null),
-        Value::Float(_) => wrap(AstValue::Null),
-        Value::Text(v) => wrap(AstValue::SingleQuotedString(v.clone())),
-        // As a quoted string, because the AST has no temporal literal without
-        // a keyword in front of it — so this round trip loses the tag, and an
-        // alias substituted into HAVING is compared as the string it renders
-        // as. That is what it was before the tag existed, so nothing regressed
-        // here; it is a gap rather than a change.
-        Value::Temporal(v) => wrap(AstValue::SingleQuotedString(v.clone())),
-        // As a number, not a quoted string: a decimal that went back through
-        // here as text would be compared by its characters, which is the whole
-        // thing the tag exists to prevent.
-        Value::Decimal(v) => wrap(AstValue::Number(v.clone(), false)),
-        Value::Bytes(v) => wrap(AstValue::SingleQuotedString(
-            String::from_utf8_lossy(v).into_owned(),
-        )),
-        // As a string literal, because the AST has no JSON literal — so this
-        // round trip loses the tag, and a document that goes back through it
-        // comes out as text. Nothing reaches here with a document today; if
-        // something does, it needs a `CAST(... AS JSON)` around it rather than
-        // a comment promising otherwise.
-        Value::Json(v) => wrap(AstValue::SingleQuotedString(v.clone())),
     }
 }
 
@@ -5852,9 +5889,39 @@ fn temporal_precision(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::Re
     }
 }
 
+/// Whether a code is one MySQL computes over as a string.
+///
+/// A string has no numeric type of its own, so MySQL converts it to a double
+/// and the arithmetic over it is approximate whatever sat on the other side:
+/// `t + 0.0` and `SUM(t)` over a CHAR, TEXT, BLOB or JSON column are all
+/// DOUBLE on 8.3, not NEWDECIMAL. An ENUM is one of these — its code is
+/// `STRING` — which is how `e + 0.0` and `SUM(e)` get MySQL's answer without
+/// a rule of their own.
+///
+/// `VAR_STRING` is deliberately not in the list, and a VARCHAR therefore is
+/// not either. It is also `computed_column_type`'s answer for an expression it
+/// cannot type at all, so treating it as a string would make every *unknown*
+/// operand approximate: `SUM((SELECT n FROM t))` over an integer is NEWDECIMAL
+/// in MySQL, and calling it DOUBLE would have the binary protocol send eight
+/// bytes of a float for a value the evaluator still produces as an integer.
+/// Telling a VARCHAR from an unknown needs a code they do not share, which is
+/// its own change.
+fn is_textual_code(t: ColumnType) -> bool {
+    matches!(
+        t,
+        ColumnType::String
+            | ColumnType::Blob
+            | ColumnType::TinyBlob
+            | ColumnType::MediumBlob
+            | ColumnType::LongBlob
+            | ColumnType::Json
+    )
+}
+
 /// The wider of two numeric codes, for an operator with two operands.
 fn arithmetic_type(a: ColumnType, b: ColumnType) -> ColumnType {
-    let approximate = |t: ColumnType| matches!(t, ColumnType::Float | ColumnType::Double);
+    let approximate =
+        |t: ColumnType| matches!(t, ColumnType::Float | ColumnType::Double) || is_textual_code(t);
     let exact = |t: ColumnType| matches!(t, ColumnType::Decimal | ColumnType::NewDecimal);
     if approximate(a) || approximate(b) {
         ColumnType::Double
@@ -5948,6 +6015,11 @@ fn computed_column_type(
                         .map(|argument| computed_column_type(&argument, refs, input));
                     match argument {
                         Some(ColumnType::Float | ColumnType::Double) => ColumnType::Double,
+                        // A string has no exact type to total up, so the
+                        // total is approximate. Which codes count as one, and
+                        // why `VAR_STRING` is not among them, is on
+                        // `is_textual_code`.
+                        Some(t) if is_textual_code(t) => ColumnType::Double,
                         _ => ColumnType::NewDecimal,
                     }
                 }
@@ -6187,6 +6259,10 @@ fn computed_column_type(
                     // As with `ABS`: computing with a float widens it, and
                     // MySQL says so in the type as well as in the digits.
                     ColumnType::Float => ColumnType::Double,
+                    // A string converts to a double before it is negated, so
+                    // `-e` over an ENUM is a DOUBLE -1 and not the member's
+                    // own type. `-t` over a VARCHAR is DOUBLE beside it.
+                    t if is_textual_code(t) => ColumnType::Double,
                     t => t,
                 },
                 _ => ColumnType::VarString,

@@ -170,3 +170,5 @@
 {"at":"2026-08-24T19:24:53Z","id":78,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-24T20:58:12Z","id":79,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-24T20:58:12Z","id":84,"by":"Christopher Vachon","as":"user","type":"created","title":"A JSON scalar is not unquoted in a numeric context","state":"Todo"}
+{"at":"2026-08-25T00:52:41Z","id":54,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-25T00:52:51Z","id":85,"by":"Christopher Vachon","as":"user","type":"created","title":"Division does not use MySQL's scale","state":"Todo"}

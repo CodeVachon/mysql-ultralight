@@ -27,6 +27,12 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// not fail cleanly, it would silently produce a catalog with the wrong shape,
 /// and every test running against it would be wrong in a way nothing reports.
 ///
+/// v7 adds another: an ENUM member and the ordinal it was declared at, which a
+/// v6 image would reload as text — and a member read as text is 0 in
+/// arithmetic where MySQL says its position. The ordinal cannot be recovered
+/// on the way in either, because a value is loaded before anything asks which
+/// column it belongs to.
+///
 /// v6 adds another: a temporal, which a v5 image would reload as text — and a
 /// DATE read as text is 2024 in arithmetic where MySQL says 20240105.
 ///
@@ -45,7 +51,7 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// answering it, which is the wrong answer the version check exists to
 /// prevent. An image is a file a user keeps and boots from with `--state`, so
 /// the stale one has to fail rather than mislead.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
 /// Writes the whole catalog.
 pub fn encode(catalog: &Catalog) -> Vec<u8> {
@@ -482,6 +488,16 @@ fn write_value(w: &mut Writer, value: &Value) {
             w.u8(8);
             w.str(s);
         }
+        // Tag 9, appended like every tag before it. Both fields, in this
+        // order, because neither can be derived from the other here: the
+        // ordinal is the column's declaration order and a value is read back
+        // without one. An ENUM reloaded as a string reads 0 in arithmetic,
+        // which is the whole defect the tag closes.
+        Value::Enum { member, ordinal } => {
+            w.u8(9);
+            w.str(member);
+            w.u32(*ordinal);
+        }
     }
 }
 
@@ -517,6 +533,13 @@ fn read_value(r: &mut Reader<'_>) -> EngineResult<Value> {
         6 => Value::Decimal(r.str()?),
         7 => Value::Float32(f32::from_bits(r.u32()?)),
         8 => Value::Temporal(r.str()?),
+        // Bound in write order rather than built as a struct literal, so a
+        // reordering here is a compile error and not a silently swapped pair.
+        9 => {
+            let member = r.str()?;
+            let ordinal = r.u32()?;
+            Value::Enum { member, ordinal }
+        }
         other => return Err(malformed(format!("unknown value tag {other}"))),
     })
 }

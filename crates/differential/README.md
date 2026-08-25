@@ -72,7 +72,7 @@ Two things fail a run:
 
 So the file only ever shrinks, and it shrinks by fixing things.
 
-**It is empty.** All 418 statements answer exactly as MySQL 8.3 answers them,
+**It is empty.** All 510 statements answer exactly as MySQL 8.3 answers them,
 in both protocols — the rows, the column names, the type codes, and the
 nullability and signedness flags. It started at 108 divergences across 66
 statements.

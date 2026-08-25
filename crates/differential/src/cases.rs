@@ -727,6 +727,173 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // MySQL gives an ENUM a number — the 1-based position it was declared
+        // at — and this engine read the number out of the member's own text,
+        // so every member that is not itself a number answered 0.
+        //
+        // Three questions, and the answers do not agree with each other:
+        // arithmetic reads the ordinal, comparison reads the member, and the
+        // *sort* reads the ordinal again. `r` is declared out of alphabetical
+        // order so that those three cannot pass for one another.
+        name: "an enum in a numeric context",
+        setup: &[
+            "CREATE TABLE E (id INT NOT NULL, e ENUM('a','b','c') NULL, \
+             n ENUM('7','8','9') NULL, r ENUM('b','a') NULL, r2 ENUM('b','a') NULL, \
+             PRIMARY KEY (id))",
+            // `n`'s members are digits, which is the pairing that proves the
+            // ordinal is not the text: `n` holding '7' reads 1 and not 7.
+            "INSERT INTO E VALUES (1, 'a', '7', 'b', 'a'), (2, 'c', '9', 'a', 'b')",
+            // An all-NULL row, so every case below also says what each of
+            // these does with one.
+            "INSERT INTO E (id) VALUES (3)",
+            // No key, because every case runs twice — once through each
+            // protocol — and the second insert of the same row must not be
+            // refused for a reason that has nothing to do with ENUM.
+            "CREATE TABLE E2 (v ENUM('a','b','c') NULL)",
+            // Members that collide with their own ordinals, which is the only
+            // shape where "a member wins over an index" and "a number is
+            // always an index" can be told apart: `'2'` here is the *first*
+            // member and `2` is the second.
+            "CREATE TABLE E3 (v ENUM('2','1') NULL)",
+            // The same members in a different order, so copying a value in
+            // has to resolve it again rather than carry the position over.
+            "CREATE TABLE E4 (v ENUM('c','b','a') NULL)",
+            "CREATE TABLE E5 (t TEXT NULL, b BLOB NULL)",
+            "INSERT INTO E5 VALUES ('x', 'x'), ('y', 'y')",
+            // A leading number and a trailing tail, which is where the total
+            // and the row it came from can disagree.
+            "CREATE TABLE E6 (t TEXT NULL, b BLOB NULL)",
+            "INSERT INTO E6 VALUES ('12abc', '12abc'), ('3.5x', '3.5x')",
+            // A temporal whose *type* is not one: MySQL types `DATE_ADD` over
+            // a VARCHAR as a string and computes it as a double.
+            "CREATE TABLE E7 (id INT NOT NULL, v VARCHAR(40) NULL, dt6 DATETIME(6) NULL, \
+             PRIMARY KEY (id))",
+            "INSERT INTO E7 VALUES (1, '2026-01-02 06:07:08.500000', \
+             '2026-01-02 06:07:08.500000')",
+        ],
+        cases: &[
+            // The five readings the issue was written from.
+            same("SELECT id, e, e + 0, -e, e = 1, CAST(e AS SIGNED), e = 'a' FROM E ORDER BY id"),
+            // Digits for members: 1 and 3, not 7 and 9.
+            same("SELECT id, n, n + 0, n = '7', n = 1, n = 7 FROM E ORDER BY id"),
+            same("SELECT id, e * 2, e DIV 1, e | 0, e & 3, e + 0.0 FROM E ORDER BY id"),
+            same(
+                "SELECT id, CAST(e AS DECIMAL(10,2)), CAST(e AS CHAR), CONCAT(e, '') \
+                 FROM E ORDER BY id",
+            ),
+            same("SELECT SUM(e), AVG(e), COUNT(e), SUM(n), AVG(n) FROM E"),
+            // MIN and MAX go with the *comparison*, so over `r` they answer
+            // 'a' and 'b' where the sort below puts 'b' first — and the winner
+            // comes back without its ordinal.
+            same("SELECT MIN(r), MAX(r), MIN(r) + 0, MIN(e), MAX(e) FROM E"),
+            // The sort goes with the ordinal: 'b' is the first member of `r`.
+            same("SELECT id, r FROM E WHERE r IS NOT NULL ORDER BY r, id"),
+            same("SELECT id, r FROM E WHERE r IS NOT NULL ORDER BY r DESC, id"),
+            same("SELECT r, COUNT(*) FROM E GROUP BY r ORDER BY r"),
+            same("SELECT DISTINCT r FROM E ORDER BY r"),
+            // HAVING and an ORDER BY expression both name the projected value.
+            // Reaching it as the string it renders as, `HAVING r = 1` compared
+            // a member against a number and returned no group, while the
+            // SELECT beside it read the ordinal.
+            same("SELECT r, COUNT(*) FROM E GROUP BY r HAVING r = 1"),
+            same("SELECT r, COUNT(*) FROM E GROUP BY r HAVING r + 0 = 1"),
+            same("SELECT r, COUNT(*) FROM E GROUP BY r ORDER BY r + 0 DESC"),
+            same("SELECT e, COUNT(*) FROM E GROUP BY e HAVING e > 1 ORDER BY e"),
+            // Two ENUM columns of the same declaration compare by their
+            // members and not by their ordinals: 'b' beside 'a' is greater
+            // here, where the ordinals 1 and 2 would make it smaller.
+            same("SELECT id, r, r2, r = r2, r < r2, r > r2 FROM E ORDER BY id"),
+            // A member string is compared as a string and a number as the
+            // ordinal, in the same row.
+            same(
+                "SELECT id, r < 'a', r > 'a', r = 'zzz', r IN ('a','b'), r IN (1,2), \
+                 r BETWEEN 1 AND 2 FROM E ORDER BY id",
+            ),
+            // Truthiness follows the ordinal, so every real member is true.
+            same("SELECT id FROM E WHERE e ORDER BY id"),
+            // Which functions carry the ordinal through and which do not.
+            // `COALESCE` drops it with one argument and nothing to aggregate
+            // against, where `IF` beside it keeps it.
+            same(
+                "SELECT COALESCE(e) + 0, IFNULL(e, 'z') + 0, IF(1, e, 'z') + 0, \
+                 NULLIF(e, 'z') + 0, GREATEST(e, e) + 0, LEAST(e, e) + 0 \
+                 FROM E WHERE id = 1",
+            ),
+            same(
+                "SELECT (CASE WHEN 1 THEN e END) + 0, (SELECT e FROM E WHERE id = 1) + 0 \
+                 FROM E WHERE id = 1",
+            ),
+            same("SELECT x + 0 FROM (SELECT e AS x FROM E WHERE id = 1) d"),
+            // A document embeds the member, not the ordinal.
+            same("SELECT JSON_OBJECT('a', e), JSON_ARRAY(e) FROM E WHERE id = 1"),
+            // Assignment reads the same way round. A member wins over an
+            // index, a number is an index, and a string is an index only when
+            // it is a whole number.
+            same("INSERT INTO E2 (v) VALUES (2)"),
+            same("INSERT INTO E2 (v) VALUES ('2')"),
+            same("INSERT INTO E2 (v) VALUES ('A')"),
+            same("INSERT INTO E2 (v) VALUES (1.6)"),
+            same("INSERT INTO E2 (v) VALUES (NULL)"),
+            // Index 0 is the error member, the empty string — and only a
+            // *string* reaches it. The number 0 is refused.
+            same("INSERT INTO E2 (v) VALUES ('0')"),
+            same("INSERT INTO E2 (v) VALUES (0)"),
+            same("INSERT INTO E2 (v) VALUES (9)"),
+            same("INSERT INTO E2 (v) VALUES ('zzz')"),
+            same("INSERT INTO E2 (v) VALUES ('1.0')"),
+            // Ordered by the ordinal, and every row sharing one is the same
+            // row, so the order is total.
+            same("SELECT v, v + 0, LENGTH(v) FROM E2 ORDER BY v"),
+            same("INSERT INTO E3 (v) VALUES ('2')"),
+            same("INSERT INTO E3 (v) VALUES (2)"),
+            same("SELECT v, v + 0 FROM E3 ORDER BY v"),
+            // The error member has to survive being read back out and
+            // written again, into a declaration with the same members in a
+            // different order. The `UPDATE t SET v = v` half of this is in
+            // the engine's own tests instead: MySQL reports the rows it
+            // *changed* and this engine reports the rows it matched, which is
+            // a divergence of its own and not one about ENUM.
+            same("INSERT INTO E4 SELECT v FROM E2"),
+            same("SELECT v, v + 0, LENGTH(v) FROM E4 ORDER BY v"),
+            // A total over a column where nothing reads as a number is 0,
+            // not -0 — and a binary string is read the same way text is.
+            same("SELECT SUM(t), AVG(t), SUM(t) = 0, SUM(b), AVG(b) FROM E5"),
+            // A total reads each value by its leading number, the same rule
+            // the row beside it reads by: 12 and 3.5, so 15.5 and not 0.
+            same("SELECT SUM(t), AVG(t), SUM(b), AVG(b) FROM E6"),
+            same("SELECT t + 0, b + 0 FROM E6 ORDER BY t"),
+            // The value has to follow the code it is announced under: MySQL
+            // types this DOUBLE for the VARCHAR subject and NEWDECIMAL for
+            // the DATETIME(6) one, and the engine packs both exactly — so the
+            // first sent every declared digit through the text protocol and a
+            // rounded double through the binary one.
+            same(
+                "SELECT SUM(DATE_ADD(v, INTERVAL 1 DAY)), \
+                 SUM(DATE_ADD(dt6, INTERVAL 1 DAY)) FROM E7",
+            ),
+            // The VARCHAR subject only. The DATETIME(6) one beside it is a
+            // NEWDECIMAL in both, and diverges on the *scale* a decimal
+            // multiplication keeps — 30390154591062.7500000 against
+            // 30390154591062.75 — which is #0070 and not this.
+            same("SELECT DATE_ADD(v, INTERVAL 1 DAY) * 1.5 FROM E7"),
+            // A set operation materialises its result, and an ENUM does not
+            // survive one: the column is VAR_STRING, `x + 0` is 0 and the
+            // order is by the member — with the same declaration on both
+            // sides as well as with two different ones, whose ordinals would
+            // otherwise have met in one sort key meaning different members.
+            same("SELECT x FROM (SELECT r AS x FROM E UNION ALL SELECT e AS x FROM E) d ORDER BY x"),
+            same(
+                "SELECT x, x + 0 FROM (SELECT r AS x FROM E UNION ALL SELECT r AS x FROM E) d \
+                 ORDER BY x",
+            ),
+            // The bare set operation as well as the derived table, because
+            // only the bare one reports what the operation itself decided: a
+            // derived table's outer projection re-derives the column type.
+            same("SELECT r FROM E UNION ALL SELECT e FROM E ORDER BY r"),
+            same("SELECT r AS m FROM E UNION SELECT e AS m FROM E ORDER BY m"),
+        ],
+    },
+    Group {
         // The compound spelling, which is the one route to REAL_AS_FLOAT that
         // does not name it. `ANSI` is set on its own rather than added to the
         // mode in force, because that is what it means: MySQL replaces the

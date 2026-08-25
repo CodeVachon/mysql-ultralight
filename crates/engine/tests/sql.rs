@@ -7815,6 +7815,563 @@ fn arithmetic_over_a_temporal_is_typed_by_its_packed_number() {
 }
 
 #[test]
+fn an_enum_in_a_numeric_context_is_its_ordinal() {
+    // MySQL gives an ENUM a number: the 1-based position it was declared at.
+    // This engine stored the member as text and read the number out of those
+    // characters, so every member that is not itself a number answered 0.
+    // Measured on 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE E (id INT NOT NULL, e ENUM('a','b','c'), n ENUM('7','8','9'), \
+         r ENUM('b','a'), s VARCHAR(10), PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO E VALUES (1, 'a', '7', 'b', 'a'), (2, 'c', '9', 'a', 'c')",
+    );
+    for (sql, expected) in [
+        ("SELECT e + 0 FROM E WHERE id = 1", "1"),
+        ("SELECT e + 0 FROM E WHERE id = 2", "3"),
+        ("SELECT -e FROM E WHERE id = 1", "-1"),
+        ("SELECT e = 1 FROM E WHERE id = 1", "1"),
+        ("SELECT CAST(e AS SIGNED) FROM E WHERE id = 1", "1"),
+        ("SELECT e = 'a' FROM E WHERE id = 1", "1"),
+        // The case that proves the ordinal is not the text: `n` holds the
+        // characters `7` and its ordinal is 1, so `n + 0` is 1 and `n = 7` is
+        // false while `n = '7'` is true.
+        ("SELECT n + 0 FROM E WHERE id = 1", "1"),
+        ("SELECT n = 1 FROM E WHERE id = 1", "1"),
+        ("SELECT n = 7 FROM E WHERE id = 1", "0"),
+        ("SELECT n = '7' FROM E WHERE id = 1", "1"),
+        ("SELECT n + 0 FROM E WHERE id = 2", "3"),
+        // The counterweight: the same characters in a VARCHAR really are read
+        // by their leading number, which is what the tag exists to separate.
+        ("SELECT s + 0 FROM E WHERE id = 1", "0"),
+        ("SELECT 'a' + 0", "0"),
+        // Every other numeric reading goes through the same ordinal.
+        ("SELECT e * 2 FROM E WHERE id = 2", "6"),
+        ("SELECT e DIV 1 FROM E WHERE id = 2", "3"),
+        ("SELECT e MOD 2 FROM E WHERE id = 2", "1"),
+        ("SELECT e | 0 FROM E WHERE id = 2", "3"),
+        ("SELECT e & 1 FROM E WHERE id = 2", "1"),
+        (
+            "SELECT CAST(e AS DECIMAL(10,2)) FROM E WHERE id = 2",
+            "3.00",
+        ),
+        // A string context is the member, which is the distinction itself.
+        ("SELECT CAST(e AS CHAR) FROM E WHERE id = 2", "c"),
+        ("SELECT CONCAT(e, '') FROM E WHERE id = 2", "c"),
+        ("SELECT JSON_ARRAY(e) FROM E WHERE id = 2", "[\"c\"]"),
+        // A comparison against a number is numeric and one against a string is
+        // not, in the same column.
+        ("SELECT e IN (1, 2) FROM E WHERE id = 1", "1"),
+        ("SELECT e IN (1, 2) FROM E WHERE id = 2", "0"),
+        ("SELECT e IN ('a', 'b') FROM E WHERE id = 1", "1"),
+        ("SELECT e BETWEEN 1 AND 2 FROM E WHERE id = 1", "1"),
+        ("SELECT e = 'zzz' FROM E WHERE id = 1", "0"),
+        // Aggregates fold the ordinals.
+        ("SELECT SUM(e) FROM E", "4"),
+        ("SELECT AVG(e) FROM E", "2"),
+        ("SELECT SUM(n) FROM E", "4"),
+        // Truthiness asks the same number, which is the reading that made
+        // `WHERE e` skip every row whose member is not a digit.
+        ("SELECT IF(e, 'y', 'n') FROM E WHERE id = 1", "y"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+    // NULL stays NULL through all of it rather than becoming the error member.
+    run(&engine, &mut session, "INSERT INTO E (id) VALUES (3)");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT e, e + 0, e = 1 FROM E WHERE id = 3"
+        ),
+        vec![vec!["NULL", "NULL", "NULL"]]
+    );
+}
+
+#[test]
+fn an_enum_sorts_by_its_ordinal_and_compares_by_its_member() {
+    // Two answers from one value, and MySQL does not give the same one to
+    // both: `ORDER BY r` over `ENUM('b','a')` puts `b` first — the declared
+    // order — while `r1 < r2` over that same type answers by the members, so
+    // `'b' < 'a'` is false where the ordinals 1 and 2 would make it true.
+    // `MIN` and `MAX` go with the comparison. All measured on 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE R (id INT NOT NULL, r ENUM('b','a'), r2 ENUM('b','a'), PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO R VALUES (1, 'b', 'a'), (2, 'a', 'b')",
+    );
+    for (sql, expected) in [
+        // The sort: declared order, not the alphabet.
+        ("SELECT r FROM R ORDER BY r, id", vec![vec!["b"], vec!["a"]]),
+        (
+            "SELECT r FROM R ORDER BY r DESC, id",
+            vec![vec!["a"], vec!["b"]],
+        ),
+        (
+            "SELECT DISTINCT r FROM R ORDER BY r",
+            vec![vec!["b"], vec!["a"]],
+        ),
+        // Through a GROUP BY as well, where the ORDER BY names an output
+        // column: resolving that alias through a rendered literal dropped the
+        // ordinal and sorted this the other way round.
+        (
+            "SELECT r, COUNT(*) FROM R GROUP BY r ORDER BY r",
+            vec![vec!["b", "1"], vec!["a", "1"]],
+        ),
+        // The comparison: by the member, so it disagrees with the sort above.
+        ("SELECT r < r2 FROM R WHERE id = 1", vec![vec!["0"]]),
+        ("SELECT r > r2 FROM R WHERE id = 1", vec![vec!["1"]]),
+        ("SELECT r > 'a' FROM R WHERE id = 1", vec![vec!["1"]]),
+        ("SELECT r < 'a' FROM R WHERE id = 1", vec![vec!["0"]]),
+        // MIN and MAX side with the comparison, and hand the winner back
+        // without its ordinal — `MIN(r) + 0` is 0 in MySQL where `r + 0` is
+        // the position.
+        ("SELECT MIN(r) FROM R", vec![vec!["a"]]),
+        ("SELECT MAX(r) FROM R", vec![vec!["b"]]),
+        ("SELECT MIN(r) + 0 FROM R", vec![vec!["0"]]),
+        // HAVING and an ORDER BY *expression* both name the projected value,
+        // which reaches them as a hidden column rather than as a literal
+        // spelling. Written as a quoted member instead, `HAVING r = 1`
+        // compared `'b'` against the number and returned no group at all,
+        // while the `SELECT` beside it read the ordinal — one statement
+        // answering the same question two ways.
+        (
+            "SELECT r, COUNT(*) FROM R GROUP BY r HAVING r = 1",
+            vec![vec!["b", "1"]],
+        ),
+        (
+            "SELECT r, COUNT(*) FROM R GROUP BY r HAVING r + 0 = 1",
+            vec![vec!["b", "1"]],
+        ),
+        (
+            "SELECT r, COUNT(*) FROM R GROUP BY r ORDER BY r + 0 DESC",
+            vec![vec!["a", "1"], vec!["b", "1"]],
+        ),
+    ] {
+        assert_eq!(rows(&engine, &mut session, sql), expected, "{sql}");
+    }
+}
+
+#[test]
+fn an_enum_column_can_hold_and_copy_the_error_member() {
+    // Index 0 is MySQL's error member, the empty string, and a column really
+    // does hold it: `'0'` writes one. It has to survive being read back out
+    // and written again — `UPDATE t SET g = g` and `INSERT ... SELECT` both
+    // keep it on 8.3, including into a column declared with different members
+    // — while `g = ''` stays 1265 for a column that declares no empty member.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Z (id INT NOT NULL, g ENUM('a','b','c'), PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Z2 (id INT NOT NULL, g ENUM('c','b','a'), PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Z VALUES (1, '0'), (2, 'a')",
+    );
+    run(&engine, &mut session, "UPDATE Z SET g = g");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT g, g + 0 FROM Z ORDER BY id"),
+        vec![vec!["", "0"], vec!["a", "1"]]
+    );
+    // Into a different declaration the member is resolved again, so `a`
+    // becomes 3 — and the error member stays the error member.
+    run(&engine, &mut session, "INSERT INTO Z2 SELECT id, g FROM Z");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT g, g + 0 FROM Z2 ORDER BY id"),
+        vec![vec!["", "0"], vec!["a", "3"]]
+    );
+}
+
+#[test]
+fn an_inexact_total_reads_each_value_the_way_a_row_does() {
+    // `SUM` and `AVG` over a string read each value by its leading number,
+    // which is the same rule `t + 0` reads a row by: `'12abc'` and `'3.5x'`
+    // total 15.5 on 8.3, and a BLOB is read exactly as the TEXT beside it is.
+    // Dropping whatever would not parse as a whole number answered 0 for both,
+    // so one statement disagreed with itself about the same two values — and a
+    // binary string, which has no whole-string parse at all, always did.
+    //
+    // With nothing numeric in the column the answer is 0 and not `-0`: Rust's
+    // `Sum for f64` folds from `-0.0`, and the average shows it too because
+    // `-0.0` over a count is still `-0.0`.
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE S (t TEXT, b BLOB)");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO S VALUES ('12abc', '12abc'), ('3.5x', '3.5x')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT SUM(t), AVG(t), SUM(b), AVG(b) FROM S"
+        ),
+        vec![vec!["15.5", "7.75", "15.5", "7.75"]]
+    );
+    // The row beside the total, which is the half that has to agree with it.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT t + 0, b + 0 FROM S ORDER BY t"
+        ),
+        vec![vec!["12", "12"], vec!["3.5", "3.5"]]
+    );
+    run(&engine, &mut session, "CREATE TABLE Z (t TEXT)");
+    run(&engine, &mut session, "INSERT INTO Z VALUES ('x'), ('y')");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT SUM(t), AVG(t) FROM Z"),
+        vec![vec!["0", "0"]]
+    );
+}
+
+#[test]
+fn a_temporal_under_an_approximate_code_is_sent_as_one() {
+    // `DATE_ADD` over a VARCHAR is typed a *string* by MySQL and computed as a
+    // double — `SUM` of it is DOUBLE 20260103060708.5 — while the engine packs
+    // the temporal and totals it exactly. The value and the code then
+    // disagreed, and the two protocols cannot both send that: the text one
+    // writes every declared digit and the binary one parses them into an f64.
+    //
+    // The DATETIME(6) column beside it is the counterweight: there the type
+    // really is exact, and the extra digits stay.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (id INT NOT NULL, v VARCHAR(40), dt6 DATETIME(6), PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO T VALUES (1, '2026-01-02 06:07:08.500000', '2026-01-02 06:07:08.500000')",
+    );
+    let sql = "SELECT SUM(DATE_ADD(v, INTERVAL 1 DAY)), SUM(DATE_ADD(dt6, INTERVAL 1 DAY)) FROM T";
+    assert_eq!(
+        rows(&engine, &mut session, sql),
+        vec![vec!["20260103060708.5", "20260103060708.500000"]]
+    );
+    let codes: Vec<String> = engine
+        .describe(&session, sql, 0)
+        .unwrap()
+        .iter()
+        .map(|c| format!("{:?}", c.ty))
+        .collect();
+    assert_eq!(codes, vec!["Double", "NewDecimal"]);
+}
+
+#[test]
+fn a_set_operation_does_not_carry_an_enum_through_it() {
+    // MySQL materialises a set operation, and an ENUM does not survive one:
+    // the column comes out VAR_STRING, `x + 0` over it is 0 and the order is
+    // by the member. Measured with the *same* declaration on both sides as
+    // well as with two different ones, so it is the materialising and not a
+    // mixture of types that does it.
+    //
+    // The mixed pair is also the only way two ordinals meaning different
+    // members reached one sort key: position 1 is `b` in one column and `a` in
+    // the other, and ordering by them compared numbers that are not
+    // comparable.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE E (id INT NOT NULL, e ENUM('a','b','c'), r ENUM('b','a'),          PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO E VALUES (1,'a','b'), (2,'c','a')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT x FROM (SELECT r AS x FROM E UNION ALL SELECT e AS x FROM E) d ORDER BY x"
+        ),
+        vec![vec!["a"], vec!["a"], vec!["b"], vec!["c"]]
+    );
+    let sql = "SELECT x, x + 0 FROM (SELECT r AS x FROM E UNION ALL SELECT r AS x FROM E) d                ORDER BY x";
+    assert_eq!(
+        rows(&engine, &mut session, sql),
+        vec![
+            vec!["a", "0"],
+            vec!["a", "0"],
+            vec!["b", "0"],
+            vec!["b", "0"]
+        ]
+    );
+    // The column is described as a plain string too, not as the ENUM either
+    // branch declared — asserted on the bare set operation, because a derived
+    // table's outer projection re-derives the type from the relation and would
+    // hide what the operation itself reported. MySQL says VAR_STRING for both
+    // shapes and for both the mixed and the matching pair.
+    let codes = |sql: &str| -> Vec<String> {
+        engine
+            .describe(&session, sql, 0)
+            .unwrap()
+            .iter()
+            .map(|c| format!("{:?}", c.ty))
+            .collect()
+    };
+    assert_eq!(
+        codes("SELECT r FROM E UNION ALL SELECT e FROM E"),
+        vec!["VarString"]
+    );
+    assert_eq!(
+        codes("SELECT r FROM E UNION ALL SELECT r FROM E"),
+        vec!["VarString"]
+    );
+    // And the bare column beside it keeps the ENUM code it was declared with.
+    assert_eq!(codes("SELECT r FROM E"), vec!["String"]);
+    assert_eq!(codes(sql), vec!["VarString", "Double"]);
+}
+
+#[test]
+fn an_enum_keeps_its_ordinal_through_some_functions_and_not_others() {
+    // Which is measured rather than derived, because the two lists do not
+    // follow from anything: `IF`, `CASE` and `NULLIF` hand the ENUM through
+    // and keep the ordinal, while `COALESCE`, `IFNULL`, `GREATEST`, `LEAST`
+    // and a scalar subquery build a string result and lose it. `COALESCE(e)`
+    // has one argument and nothing to aggregate against, and still loses it.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE F (id INT NOT NULL, e ENUM('a','b','c'), PRIMARY KEY (id))",
+    );
+    run(&engine, &mut session, "INSERT INTO F VALUES (1, 'c')");
+    for (sql, expected) in [
+        ("SELECT e + 0 FROM F", "3"),
+        ("SELECT IF(1, e, 'z') + 0 FROM F", "3"),
+        ("SELECT (CASE WHEN 1 THEN e END) + 0 FROM F", "3"),
+        ("SELECT NULLIF(e, 'z') + 0 FROM F", "3"),
+        ("SELECT COALESCE(e) + 0 FROM F", "0"),
+        ("SELECT COALESCE(e, 'z') + 0 FROM F", "0"),
+        ("SELECT IFNULL(e, 'z') + 0 FROM F", "0"),
+        ("SELECT GREATEST(e, e) + 0 FROM F", "0"),
+        ("SELECT LEAST(e, e) + 0 FROM F", "0"),
+        ("SELECT (SELECT e FROM F WHERE id = 1) + 0", "0"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn an_enum_expression_is_typed_the_way_mysql_types_it() {
+    // The value and the type are decided in different code for the same
+    // expression, and the binary protocol encodes by the *type* — so an
+    // ordinal under a STRING code reaches a client as the member's characters.
+    // Every code here measured on 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE E (e ENUM('a','b','c'), t TEXT, b BLOB, j JSON, c CHAR(4))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE I (id INT NOT NULL, n INT, PRIMARY KEY (id))",
+    );
+    let codes = |sql: &str| -> Vec<String> {
+        engine
+            .describe(&session, sql, 0)
+            .unwrap()
+            .iter()
+            .map(|c| format!("{:?}", c.ty))
+            .collect()
+    };
+    for (sql, expected) in [
+        // The column itself is a STRING, as MySQL reports it — the ENUM flag
+        // that goes with it there is not set by this engine.
+        ("SELECT e FROM E", "String"),
+        // An ENUM has no numeric type of its own, so it converts to a double
+        // and everything computed from it is approximate. `e + 0.0` is a
+        // DOUBLE and not the NEWDECIMAL two exact operands would give.
+        ("SELECT e + 0 FROM E", "Double"),
+        ("SELECT e + 0.0 FROM E", "Double"),
+        ("SELECT -e FROM E", "Double"),
+        ("SELECT SUM(e) FROM E", "Double"),
+        ("SELECT AVG(e) FROM E", "Double"),
+        // The same is true of the string types beside it, which is how the
+        // ENUM gets MySQL's answer without a rule of its own — measured
+        // across the family rather than assumed from the type that prompted
+        // it. A VARCHAR is missing on purpose: its code is what
+        // `computed_column_type` also answers for an expression it cannot
+        // type, so it stays exact here and diverges from MySQL, which is a
+        // gap this change does not close.
+        ("SELECT t + 0.0 FROM E", "Double"),
+        ("SELECT SUM(b) FROM E", "Double"),
+        ("SELECT -j FROM E", "Double"),
+        ("SELECT SUM(c) FROM E", "Double"),
+        // A cast says what it wants, and MIN keeps what it folded.
+        ("SELECT CAST(e AS SIGNED) FROM E", "LongLong"),
+        ("SELECT MIN(e) FROM E", "String"),
+        // The counterweight to the rule above: `VAR_STRING` is also the
+        // answer for an expression this cannot type at all, so it must stay
+        // *out* of the string family. MySQL types this NEWDECIMAL, and the
+        // evaluator still produces an integer for it — announcing DOUBLE
+        // would have the binary protocol send eight bytes of a float.
+        (
+            "SELECT SUM((SELECT n FROM I WHERE id = 1)) FROM I",
+            "NewDecimal",
+        ),
+    ] {
+        assert_eq!(codes(sql), vec![expected.to_owned()], "{sql}");
+    }
+
+    // What a client actually reads, which is a second rendering: `rows` above
+    // reads the engine's and the protocol has its own. The ordinal is a
+    // reading and not a representation, so the wire carries the member — a
+    // column described STRING that sent `3` would be a number under a string
+    // code, which the binary protocol cannot even encode.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO E VALUES ('c', 't', 'b', '1', 'c')",
+    );
+    let Outcome::Rows(result) = run(&engine, &mut session, "SELECT e, e + 0 FROM E") else {
+        panic!("expected rows")
+    };
+    let encoded = |value: &Value| {
+        let mut text = mysql_ultralight_protocol::BufWriter::new();
+        value.to_wire().encode_text(&mut text);
+        // A length-encoded string: one byte of length, then the bytes.
+        String::from_utf8_lossy(&text.into_inner()[1..]).into_owned()
+    };
+    assert_eq!(encoded(&result.rows[0][0]), "c");
+    assert_eq!(encoded(&result.rows[0][1]), "3");
+}
+
+#[test]
+fn an_enum_is_assigned_by_member_first_and_by_index_second() {
+    // The write side of the same fact. A member wins over an index, so `'2'`
+    // into `ENUM('2','1')` is the *first* member; a number is always an index,
+    // so `2` into that same column is the second. Index 0 is MySQL's error
+    // member, the empty string, and only a string reaches it — the number 0 is
+    // refused. All measured on 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE A (id INT NOT NULL, g ENUM('a','b','c'), d ENUM('2','1'), PRIMARY KEY (id))",
+    );
+    for (id, sql, member, ordinal) in [
+        (1, "INSERT INTO A (id, g) VALUES (1, 2)", "b", "2"),
+        (2, "INSERT INTO A (id, g) VALUES (2, '2')", "b", "2"),
+        // Case-insensitively, and stored in the spelling the column declared.
+        (3, "INSERT INTO A (id, g) VALUES (3, 'A')", "a", "1"),
+        // A number truncates towards zero rather than rounding, so 1.6 is
+        // still the first member.
+        (4, "INSERT INTO A (id, g) VALUES (4, 1.6)", "a", "1"),
+        // The error member, reachable only through a string.
+        (5, "INSERT INTO A (id, g) VALUES (5, '0')", "", "0"),
+    ] {
+        run(&engine, &mut session, sql);
+        assert_eq!(
+            rows(
+                &engine,
+                &mut session,
+                &format!("SELECT g, g + 0 FROM A WHERE id = {id}")
+            ),
+            vec![vec![member, ordinal]],
+            "{sql}"
+        );
+    }
+    // A member wins over an index, which is only visible where the two would
+    // disagree: `'2'` is `d`'s first member and its second is `1`.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO A (id, d) VALUES (6, '2')",
+    );
+    run(&engine, &mut session, "INSERT INTO A (id, d) VALUES (7, 2)");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT d, d + 0 FROM A WHERE id IN (6, 7) ORDER BY id"
+        ),
+        vec![vec!["2", "1"], vec!["1", "2"]]
+    );
+    // Everything that is neither a member nor an index in range is 1265, and
+    // that includes the number 0 and a string that is not a whole number.
+    for sql in [
+        "INSERT INTO A (id, g) VALUES (8, 0)",
+        "INSERT INTO A (id, g) VALUES (8, 9)",
+        "INSERT INTO A (id, g) VALUES (8, -1)",
+        "INSERT INTO A (id, g) VALUES (8, 'zzz')",
+        "INSERT INTO A (id, g) VALUES (8, '1.0')",
+        "INSERT INTO A (id, g) VALUES (8, '')",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1265, "{sql}");
+    }
+    // NULL is not an assignment to convert at all.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO A (id, g) VALUES (9, NULL)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT g, g + 0 FROM A WHERE id = 9"),
+        vec![vec!["NULL", "NULL"]]
+    );
+}
+
+#[test]
+fn a_column_filled_from_its_implicit_default_holds_an_enum() {
+    // The value an `INSERT IGNORE` writes into a NOT NULL column it was not
+    // given. It goes into the row without passing `coerce`, so it has to carry
+    // the ordinal on its own — otherwise it is the one member in the column
+    // that reads 0 in arithmetic while every other row reads its position.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE D (id INT NOT NULL, e ENUM('a','b') NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT IGNORE INTO D (id) VALUES (1)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT e, e + 0 FROM D"),
+        vec![vec!["a", "1"]]
+    );
+}
+
+#[test]
 fn a_column_filled_from_its_implicit_default_holds_a_temporal() {
     // The value an `INSERT IGNORE` writes into a NOT NULL column it was not
     // given. It goes into the row without passing `coerce`, so it has to carry

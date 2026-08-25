@@ -141,9 +141,10 @@ impl ResultSet {
     /// instead — every result passes through this on its way out.
     ///
     /// The approximate types, because they are the ones where the same number
-    /// has two spellings — and one exact pairing, a fraction under an integer
-    /// code, which is the one combination the two protocols cannot both send
-    /// at all. Nothing else is touched: a wrongly *tagged* value is a bug to
+    /// has two spellings — and two exact pairings under a code that is not
+    /// exact: a fraction under an integer code, which is the one combination
+    /// the two protocols cannot both send at all, and a decimal under a
+    /// DOUBLE. Nothing else is touched: a wrongly *tagged* value is a bug to
     /// find, not one to paper over.
     pub fn reconcile(&mut self) {
         for (index, column) in self.columns.iter().enumerate() {
@@ -154,6 +155,20 @@ impl ResultSet {
                 match (column.ty, &value) {
                     (ColumnType::Float, Value::Float(v)) => *value = Value::Float32(*v as f32),
                     (ColumnType::Double, Value::Float32(v)) => *value = Value::Float(f64::from(*v)),
+                    // An exact value under an approximate code. Reachable
+                    // wherever the operand's *type* is not a temporal but its
+                    // value is one: `DATE_ADD(v, INTERVAL 1 DAY)` over a
+                    // VARCHAR is typed STRING by MySQL and computes as a
+                    // double — `SUM` of it is DOUBLE 20260103060708.5 — while
+                    // the engine packs the temporal and totals it exactly, so
+                    // the text protocol wrote every declared digit and the
+                    // binary one sent a rounded f64 of them. Same split the
+                    // integer pairing below closes, in the other direction.
+                    (ColumnType::Double, Value::Decimal(text)) => {
+                        if let Ok(n) = text.parse::<f64>() {
+                            *value = Value::Float(n);
+                        }
+                    }
                     // A decimal column never carries an exponent, whatever the
                     // float behind it renders as. See `decimal::plain`.
                     (ColumnType::NewDecimal | ColumnType::Decimal, Value::Float(v)) => {
