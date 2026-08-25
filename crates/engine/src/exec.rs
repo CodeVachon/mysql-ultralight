@@ -899,6 +899,14 @@ impl Engine {
             }
             rows.push(out);
         }
+        // A table value constructor is a table-shaped result like a derived
+        // table or a CTE, so it takes the boolean tag off for the same reason
+        // they do — the value is given a column to live in. Before the columns
+        // are derived, not after: `wire_type` below reads the first row, and a
+        // boolean is not a `Value::Int`, so `VALUES ROW(TRUE)` fell to its
+        // VAR_STRING catch-all and was described a string while carrying 1.
+        // MySQL types that constructor's `column_0` LONGLONG.
+        let rows = untagged_booleans(rows);
 
         let width = rows.first().map(|r| r.len()).unwrap_or(0);
         // A ragged constructor would produce rows the wire cannot frame, and
@@ -918,7 +926,17 @@ impl Engine {
                     .and_then(|r| r.get(i))
                     .map(wire_type)
                     .unwrap_or(ColumnType::VarString);
-                OutColumn::new(format!("column_{i}"), ty)
+                let mut column = OutColumn::new(format!("column_{i}"), ty);
+                // From the expressions rather than from the values, which is
+                // where every other projection reads it: MySQL describes
+                // `VALUES ROW(1)` NOT NULL, and the column was announced
+                // nullable whatever it held. A constructor is NOT NULL only
+                // if *every* row's expression is, since they share one column.
+                column.nullable = !values
+                    .rows
+                    .iter()
+                    .all(|row| row.content.get(i).is_some_and(|e| never_null(e, &[], &[])));
+                column
             })
             .collect();
 
@@ -1101,9 +1119,16 @@ impl Engine {
                         column.declared = None;
                     }
                 }
+                // A boolean goes the same way, for the reason a derived
+                // table takes it off too: the operation gives the value a
+                // column to live in. Measured on 8.3, `SELECT JSON_ARRAY(x)
+                // FROM (SELECT TRUE AS x UNION SELECT FALSE) t` is `[0]` and
+                // `[1]`, never `[false]` and `[true]`.
                 for row in &mut left.rows {
                     for value in row.iter_mut() {
-                        *value = std::mem::replace(value, Value::Null).untag_enum();
+                        *value = std::mem::replace(value, Value::Null)
+                            .untag_enum()
+                            .untag_bool();
                     }
                 }
                 Ok(left)
@@ -1762,7 +1787,7 @@ impl Engine {
                         .collect(),
                     // A derived table has no base row to write back to.
                     origins: vec![Vec::new(); inner.rows.len()],
-                    rows: inner.rows,
+                    rows: untagged_booleans(inner.rows),
                     sources: Vec::new(),
                     base_tables: Vec::new(),
                 })
@@ -2103,11 +2128,16 @@ impl Engine {
                             format!("Incorrect arguments to {name}"),
                         ));
                     }
+                    // Untagged like the subject below: `LAG(1, 1, TRUE)` over
+                    // a window whose offset falls outside the partition is
+                    // `[1]` on 8.3, never `[true]`.
                     let fallback = match args.get(2) {
                         None => Value::Null,
-                        Some(argument) => expr::literal_of(argument).ok_or_else(|| {
-                            unsupported(format!("a non-constant default in {name}()"))
-                        })?,
+                        Some(argument) => expr::literal_of(argument)
+                            .map(Value::untag_bool)
+                            .ok_or_else(|| {
+                                unsupported(format!("a non-constant default in {name}()"))
+                            })?,
                     };
 
                     for (position, (_, index)) in ordered.iter().enumerate() {
@@ -2122,11 +2152,22 @@ impl Engine {
                             // current row.
                             _ => frame_end[position] as i64,
                         };
-                        out[*index] =
-                            match usize::try_from(target).ok().and_then(|t| ordered.get(t)) {
-                                Some((_, source)) => evaluate(subject, matching[*source])?,
-                                None => fallback.clone(),
-                            };
+                        // A window function is a window function: measured on
+                        // 8.3, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, `LAG`
+                        // and `LEAD` over `TRUE` are all `[1]`, exactly as
+                        // `MAX` and `SUM` over one are. These read their
+                        // subject straight out of a row rather than through
+                        // `fold`, which is where the aggregates lose the tag,
+                        // so without this the same query family answered two
+                        // ways — `FIRST_VALUE(TRUE)` matched a document of
+                        // `true` where `MAX(TRUE)` beside it did not.
+                        out[*index] = match usize::try_from(target)
+                            .ok()
+                            .and_then(|t| ordered.get(t))
+                        {
+                            Some((_, source)) => evaluate(subject, matching[*source])?.untag_bool(),
+                            None => fallback.clone(),
+                        };
                     }
                 }
                 other if is_aggregate(other) => {
@@ -2620,7 +2661,13 @@ impl Engine {
                     session,
                     executor: Some(self),
                 };
-                values.push(expr::eval(arg, &ctx)?);
+                // Untagged here rather than in each fold below, because no
+                // aggregate keeps a boolean: measured on 8.3,
+                // `JSON_ARRAY(MIN(TRUE))`, `MAX`, `SUM` and `COUNT` are all
+                // `[1]` and never `[true]`. Left tagged, `SUM` also missed its
+                // own integer path and answered `[2.0]` where MySQL says
+                // `[2]`, because a boolean is not a `Value::Int`.
+                values.push(expr::eval(arg, &ctx)?.untag_bool());
             }
         }
 
@@ -3973,7 +4020,7 @@ impl Engine {
         Ok(Relation {
             origins: vec![Vec::new(); rows.rows.len()],
             columns,
-            rows: rows.rows,
+            rows: untagged_booleans(rows.rows),
             sources: Vec::new(),
             base_tables: Vec::new(),
         })
@@ -5536,6 +5583,12 @@ const ARGUMENT_FOLLOWING: &[&str] = &[
     "locate",
     "octet_length",
     "ord",
+    // NULL for a NULL argument — `REGEXP_LIKE(NULL, 'a')` is NULL on 8.3 —
+    // and NOT NULL otherwise, which is the whole of this list. Its sibling
+    // predicates are not here: `JSON_VALID('1')` is described *nullable*
+    // there even though it cannot be, and agreeing with MySQL beats being
+    // consistent with it.
+    "regexp_like",
     "round",
     "sign",
     "truncate",
@@ -5655,6 +5708,11 @@ fn never_null(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]
                 | B::And
                 | B::Or
                 | B::Xor => recur(left) && recur(right),
+                // `<=>` is the one comparison that answers whatever it is
+                // given, NULL included, so it is NOT NULL however nullable its
+                // operands are — which is why it is here and not in the list
+                // above.
+                B::Spaceship => true,
                 _ => false,
             }
         }
@@ -5743,7 +5801,11 @@ fn function_result_type(name: &str) -> Option<ColumnType> {
         "json_object" | "json_array" | "json_extract" | "json_set" | "json_array_append"
         | "json_merge_patch" | "json_keys" | "json_arrayagg" => ColumnType::Json,
         "json_unquote" | "group_concat" => ColumnType::LongBlob,
-        "json_valid" | "json_length" | "json_contains" => ColumnType::LongLong,
+        // Every predicate answers an integer. `regexp_like` had been left out
+        // and was described VAR_STRING while answering 0 or 1 — the same
+        // defect `<=>` had, found the same way. `isnull` is typed with the
+        // argument-dependent group above rather than here.
+        "json_valid" | "json_length" | "json_contains" | "regexp_like" => ColumnType::LongLong,
         // Everything that hands back a string.
         "concat" | "concat_ws" | "upper" | "ucase" | "lower" | "lcase" | "ltrim" | "rtrim"
         | "mid" | "left" | "right" | "replace" | "reverse" | "space" | "lpad" | "rpad" | "md5"
@@ -6211,10 +6273,21 @@ fn computed_column_type(
                 return computed_column_type(&fixed, refs, input);
             }
             match op {
-                // A comparison or a logical connective is 0 or 1.
-                B::Eq | B::NotEq | B::Lt | B::LtEq | B::Gt | B::GtEq | B::And | B::Or | B::Xor => {
-                    ColumnType::LongLong
-                }
+                // A comparison or a logical connective is 0 or 1. `<=>` is
+                // one of them and had been left out, so it was described
+                // VAR_STRING while answering an integer — found by putting it
+                // in the corpus for #0061, where every other comparison was
+                // already right.
+                B::Eq
+                | B::NotEq
+                | B::Lt
+                | B::LtEq
+                | B::Gt
+                | B::GtEq
+                | B::Spaceship
+                | B::And
+                | B::Or
+                | B::Xor => ColumnType::LongLong,
                 // Division is exact in MySQL, so it answers a decimal even
                 // over two integers — where `DIV` is integer division and is a
                 // LONGLONG whatever it divided, including two decimals.
@@ -7165,4 +7238,19 @@ fn poisoned() -> EngineError {
         "HY000",
         "engine state was poisoned by a previous panic",
     )
+}
+
+/// The rows of a table-shaped result, with the boolean tag taken off.
+///
+/// A derived table and a CTE both give an expression a *column* to live in,
+/// and MySQL stops calling it a boolean at that point: measured on 8.3,
+/// `SELECT JSON_ARRAY(x) FROM (SELECT TRUE AS x) t` is `[1]` where the bare
+/// `SELECT JSON_ARRAY(TRUE)` is `[true]`, and a CTE answers the same. A
+/// *scalar* subquery is not one of these and does keep it — `(SELECT TRUE) =
+/// CAST('true' AS JSON)` is 1 there — which is the opposite of the rule an
+/// ENUM follows, so the two are stripped in different places.
+fn untagged_booleans(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+    rows.into_iter()
+        .map(|row| row.into_iter().map(Value::untag_bool).collect())
+        .collect()
 }

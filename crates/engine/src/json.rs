@@ -512,6 +512,12 @@ pub fn from_value(value: &Value) -> Json {
         // `{"a": "b"}` on 8.3 and not the ordinal. The tag changes the
         // *numeric* reading of an ENUM and nothing else.
         Value::Enum { member, .. } => Json::String(member.clone()),
+        // The one place the boolean tag is visible at all. MySQL converts the
+        // keyword to the JSON boolean and the literal 1 to the JSON number, so
+        // `CAST('true' AS JSON) = TRUE` is 1 and `= 1` is 0 — and the same for
+        // every comparison and logical operator: `JSON_ARRAY(1 = 1)` is
+        // `[true]` there, not `[1]`.
+        Value::Bool(b) => Json::Bool(*b),
         Value::Bytes(b) => Json::String(String::from_utf8_lossy(b).into_owned()),
         // A number rather than a string: `JSON_OBJECT('a', decimal_column)`
         // gives `{"a": 2.5}` and not `{"a": "2.50"}`. The scale is lost on the

@@ -153,8 +153,15 @@ impl Session {
         self.parsed_mode = crate::dialect::SqlMode::parse(&self.config.sql_mode);
     }
 
+    /// A user variable holds 1 or 0, never a boolean.
+    ///
+    /// Measured on 8.3: after `SET @x = TRUE`, `JSON_ARRAY(@x)` is `[1]` and
+    /// `CAST('true' AS JSON) = @x` is 0, where the bare keyword answers
+    /// `[true]` and 1. A variable is somewhere to *put* a value, and the tag
+    /// does not survive being put anywhere.
     pub fn set_user_variable(&mut self, name: &str, value: Value) {
-        self.user_variables.insert(name.to_ascii_lowercase(), value);
+        self.user_variables
+            .insert(name.to_ascii_lowercase(), value.untag_bool());
     }
 
     /// Unset user variables read as NULL rather than erroring, as in MySQL.

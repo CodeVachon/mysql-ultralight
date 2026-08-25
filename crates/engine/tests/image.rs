@@ -868,3 +868,50 @@ fn an_older_image_s_documents_are_canonicalised_on_load() {
         table.rows[0][1]
     );
 }
+
+#[test]
+fn a_boolean_never_reaches_the_image_and_is_written_as_its_integer_if_it_does() {
+    // Why #0061 costs no format version. Every value entering a row goes
+    // through `SqlType::coerce`, and no column type it knows how to build is a
+    // boolean — MySQL agrees, because `BOOLEAN` there is a `TINYINT(1)` and
+    // `JSON_ARRAY(b)` over one holding 1 is `[1]`, not `[true]`.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (id INTEGER NOT NULL, f BOOLEAN, t TINYINT(1), n INTEGER, \
+         v VARCHAR(10), b BLOB, d DECIMAL(4,2), g ENUM('2','1'), PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO T VALUES (1, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE)",
+    );
+
+    let mut catalog = engine.catalog_snapshot().unwrap();
+    let stored = &catalog.database("testdb").unwrap().table("T").unwrap().rows[0];
+    assert!(
+        !stored.iter().any(|v| matches!(v, Value::Bool(_))),
+        "a boolean reached a row: {stored:?}"
+    );
+
+    // Put one there anyway and encode it, because "cannot happen" is a claim
+    // about today's `coerce` and the writer has to have an answer either way.
+    // It writes the integer under the tag the column would already have used,
+    // so nothing is lost and no reader has to learn a tenth tag.
+    catalog
+        .database_mut("testdb")
+        .unwrap()
+        .table_mut("T")
+        .unwrap()
+        .rows[0][1] = Value::Bool(true);
+    let decoded = image::decode(&image::encode(&catalog)).unwrap();
+    assert_eq!(
+        decoded.database("testdb").unwrap().table("T").unwrap().rows[0][1],
+        Value::Int(1)
+    );
+
+    // And the format is the one the previous build wrote, so a `--state` image
+    // taken before #0061 still loads.
+    assert_eq!(image::FORMAT_VERSION, 7);
+}

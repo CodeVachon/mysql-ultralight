@@ -499,7 +499,12 @@ impl SqlType {
                 // rounding, so 1.6 is still the first member and 0.4 is
                 // refused with the number 0.
                 let numeric = match &value {
+                    // A boolean is a number here, which is measured: `TRUE`
+                    // into `ENUM('2','1')` stores the *first* member, `2`,
+                    // exactly as the literal 1 does — where reading it as the
+                    // text `1` would have matched the member `1` instead.
                     Value::Int(n) => Some(*n),
+                    Value::Bool(b) => Some(i64::from(*b)),
                     Value::Float(_) | Value::Float32(_) | Value::Decimal(_) => {
                         Some(value.as_number().trunc() as i64)
                     }

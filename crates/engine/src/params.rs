@@ -99,6 +99,11 @@ pub fn literal(value: &Value) -> String {
         // the temporal above makes, and for the same reason: SQL has no
         // literal that spells an ENUM.
         Value::Enum { member, .. } => literal(&Value::Text(member.clone())),
+        // The keyword, which is the one tag here that SQL *can* spell — so
+        // this round trip keeps it where the two above lose theirs. Writing
+        // `1` would turn a bound boolean into a number, and against a JSON
+        // column that is a different question with a different answer.
+        Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_owned(),
         Value::Float(v) => {
             // A bare `inf` or `nan` would not re-parse.
             if v.is_finite() {
@@ -187,6 +192,19 @@ mod tests {
     fn hash_comments_are_left_alone() {
         let bound = bind("SELECT ? # note ?\n, ?", &[Value::Int(1), Value::Int(2)]);
         assert_eq!(bound, "SELECT 1 # note ?\n, 2");
+    }
+
+    /// A boolean cannot reach here today — `Value::from_wire` builds
+    /// integers and strings and never a `Value::Bool` — so this asserts the
+    /// arm at its own level rather than through a statement that could not be
+    /// written. It matters because `TRUE` is the one literal spelling that
+    /// keeps the tag, and rendering `1` instead would turn a bound boolean
+    /// into a number the moment a client protocol grows one.
+    #[test]
+    fn a_boolean_binds_as_the_keyword_that_keeps_its_tag() {
+        assert_eq!(literal(&Value::Bool(true)), "TRUE");
+        assert_eq!(literal(&Value::Bool(false)), "FALSE");
+        assert_eq!(bind("SELECT ?", &[Value::Bool(true)]), "SELECT TRUE");
     }
 
     #[test]

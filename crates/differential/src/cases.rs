@@ -894,6 +894,156 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // MySQL reads the keyword TRUE as the JSON value `true` and the
+        // literal 1 as the JSON number 1, so the two compare against different
+        // documents and only one of the four pairings below differs. This
+        // engine had no boolean value, so both sides evaluated to 1 and it
+        // answered the numeric row twice.
+        //
+        // The keyword is the smaller half. Every comparison, logical operator,
+        // postfix test and predicate function is typed boolean there too, and
+        // the tag survives only inside the expression that asked the question
+        // — a column, a derived table, a CTE, a set operation or a user
+        // variable all take it off, which is what keeps a stored 1 from
+        // suddenly matching a document of `true`.
+        name: "a boolean beside a document",
+        setup: &[
+            // `f` is spelled BOOLEAN and `t` TINYINT(1) because MySQL makes
+            // them the same column; both are here so the corpus says so.
+            "CREATE TABLE B (id INT NOT NULL, f BOOLEAN NULL, t TINYINT(1) NULL, \
+             n INT NULL, j JSON NULL, PRIMARY KEY (id))",
+            "INSERT INTO B VALUES (1, TRUE, 1, 1, CAST('true' AS JSON)), \
+             (2, FALSE, 0, 0, CAST('false' AS JSON))",
+            // No key, so the second run of the same case through the other
+            // protocol is not refused for a reason unrelated to booleans.
+            "CREATE TABLE BE (v ENUM('2','1') NULL)",
+            // A variable is somewhere to put a value, and the tag does not
+            // survive being put anywhere. Set here rather than in a case so
+            // both protocols read the same one.
+            "SET @b = TRUE",
+        ],
+        cases: &[
+            // The four rows of #0061, and the same four for FALSE.
+            same("SELECT CAST('true' AS JSON) = TRUE, CAST('true' AS JSON) = 1"),
+            same("SELECT CAST('1' AS JSON) = TRUE, CAST('1' AS JSON) = 1"),
+            same("SELECT CAST('false' AS JSON) = FALSE, CAST('false' AS JSON) = 0"),
+            same("SELECT CAST('0' AS JSON) = FALSE, CAST('0' AS JSON) = 0"),
+            // Both directions, the NULL-safe spelling, and IN.
+            same("SELECT TRUE = CAST('true' AS JSON), 1 = CAST('true' AS JSON)"),
+            same("SELECT CAST('true' AS JSON) <=> TRUE, CAST('true' AS JSON) <> TRUE"),
+            // `<=>` answers whatever it is given, so it is NOT NULL over
+            // nullable columns and over two NULLs — the metadata half of the
+            // same operator, which was described VAR_STRING and nullable
+            // until this group asked.
+            same("SELECT id, f <=> t, f <=> NULL FROM B ORDER BY id"),
+            same("SELECT NULL <=> NULL, 1 <=> 1"),
+            same("SELECT CAST('true' AS JSON) IN (TRUE), CAST('true' AS JSON) IN (1)"),
+            // JSON's type order puts a boolean above a number, so an
+            // inequality against a document has a direction and not only a
+            // truth value.
+            same("SELECT CAST('1' AS JSON) < TRUE, CAST('true' AS JSON) < TRUE"),
+            // The conversion rather than the comparison.
+            same("SELECT CAST(TRUE AS JSON), CAST(FALSE AS JSON), CAST(1 AS JSON)"),
+            same("SELECT JSON_TYPE(CAST(TRUE AS JSON)), JSON_TYPE(CAST(1 AS JSON))"),
+            same("SELECT JSON_ARRAY(TRUE, FALSE, 1, 0), JSON_OBJECT('a', TRUE)"),
+            // Every yes-or-no answer is one, not just the keyword.
+            same("SELECT JSON_ARRAY(1 = 1), JSON_ARRAY(1 < 2), JSON_ARRAY(1 <=> 1)"),
+            same("SELECT JSON_ARRAY(1 IN (1, 2)), JSON_ARRAY(1 BETWEEN 0 AND 2)"),
+            same("SELECT JSON_ARRAY('a' LIKE 'a'), JSON_ARRAY('a' NOT LIKE 'b')"),
+            same("SELECT JSON_ARRAY(1 IS NULL), JSON_ARRAY(1 IS NOT NULL), JSON_ARRAY(1 IS TRUE)"),
+            same("SELECT JSON_ARRAY(NOT 0), JSON_ARRAY(1 AND 1), JSON_ARRAY(1 OR 0)"),
+            same("SELECT JSON_ARRAY(EXISTS(SELECT 1)), JSON_ARRAY(ISNULL(1))"),
+            same("SELECT JSON_ARRAY(JSON_CONTAINS('[1]', '1')), JSON_ARRAY(JSON_VALID('1'))"),
+            same("SELECT JSON_ARRAY(REGEXP_LIKE('a', 'a'))"),
+            // Unwrapped as well as wrapped: `JSON_ARRAY` exercises the value
+            // and hides the column code, which is how `REGEXP_LIKE` stayed
+            // VAR_STRING here while answering 0 or 1.
+            same("SELECT REGEXP_LIKE('a', 'a'), ISNULL(1), JSON_VALID('1'), JSON_CONTAINS('[1]', '1')"),
+            same("SELECT CAST('true' AS JSON) = (1 = 1), CAST('true' AS JSON) = (1 AND 1)"),
+            // NULL is not false: a three-valued answer stays JSON null.
+            same("SELECT JSON_ARRAY(NOT NULL), JSON_ARRAY(TRUE OR NULL), JSON_ARRAY(NULL AND 0)"),
+            // The counterweight, so the tag cannot be read as "anything that
+            // answers a small number".
+            same("SELECT JSON_ARRAY(LOCATE('a', 'ba')), JSON_ARRAY(CHAR_LENGTH('a'))"),
+            // It reads as 1 or 0 everywhere else, and the arithmetic stays
+            // exact — `TRUE + 0` is a LONGLONG there, and a double would show
+            // as `1.0` inside a document while rendering `1` in a column.
+            same("SELECT TRUE, FALSE, TRUE = 1, TRUE + 0, -TRUE, TRUE + TRUE"),
+            same("SELECT JSON_ARRAY(TRUE + 0), JSON_ARRAY(-TRUE), JSON_ARRAY(TRUE + TRUE)"),
+            same("SELECT JSON_ARRAY(TRUE & 1), JSON_ARRAY(TRUE << 1), JSON_ARRAY(TRUE DIV 1)"),
+            // `ABS` has an integer fast path of its own where the rest of
+            // these build their answer from a double, so it is the one a
+            // boolean fell out of — as a float under a LONGLONG code, which
+            // the two protocols disagree about.
+            same("SELECT ABS(TRUE), JSON_ARRAY(ABS(TRUE)), JSON_ARRAY(ROUND(TRUE))"),
+            same("SELECT JSON_ARRAY(FLOOR(TRUE)), JSON_ARRAY(CEIL(TRUE)), JSON_ARRAY(MOD(TRUE, 2))"),
+            same("SELECT CAST(TRUE AS CHAR), CAST(TRUE AS SIGNED), CONCAT(TRUE, '')"),
+            // The spellings that separate the numeric reading from the
+            // collated one.
+            same("SELECT '1' = TRUE, '1.0' = TRUE, '01' = TRUE, 'abc' = TRUE, 1.0 = TRUE"),
+            // The tag comes off at every boundary — and the list is not the
+            // one an ENUM follows, which is why each is asked separately.
+            same("SELECT JSON_ARRAY(IF(1, TRUE, FALSE)), JSON_ARRAY(IF(0, 1, TRUE))"),
+            same("SELECT JSON_ARRAY(CASE WHEN 1 THEN TRUE ELSE FALSE END)"),
+            same("SELECT JSON_ARRAY(CASE WHEN 0 THEN 1 ELSE TRUE END)"),
+            same("SELECT JSON_ARRAY(NULLIF(TRUE, 0)), JSON_ARRAY(COALESCE(TRUE))"),
+            same("SELECT JSON_ARRAY(COALESCE(NULL, TRUE)), JSON_ARRAY(IFNULL(TRUE, 0))"),
+            same("SELECT JSON_ARRAY(GREATEST(TRUE, FALSE)), JSON_ARRAY(LEAST(TRUE, FALSE))"),
+            same("SELECT JSON_ARRAY(MIN(TRUE)), JSON_ARRAY(MAX(TRUE)) FROM B"),
+            same("SELECT JSON_ARRAY(SUM(TRUE)), JSON_ARRAY(COUNT(TRUE)) FROM B"),
+            same("SELECT JSON_ARRAY(x) FROM (SELECT TRUE AS x) d"),
+            same("WITH c AS (SELECT TRUE AS x) SELECT JSON_ARRAY(x) FROM c"),
+            same("SELECT JSON_ARRAY(@b), CAST('true' AS JSON) = @b"),
+            // A window function, positional as well as aggregate. The
+            // positional ones read their subject straight out of a row where
+            // the aggregates go through the fold, so they were the family
+            // that answered two ways. Read back through a scalar subquery —
+            // the one wrapper that keeps the tag — so anything still tagged
+            // would answer 1 rather than 0.
+            same(
+                "SELECT CAST('true' AS JSON) = (SELECT FIRST_VALUE(TRUE) OVER () FROM B LIMIT 1),                  CAST('true' AS JSON) = (SELECT LAST_VALUE(TRUE) OVER () FROM B LIMIT 1)",
+            ),
+            same(
+                "SELECT CAST('true' AS JSON) = (SELECT LEAD(TRUE) OVER (ORDER BY id)                  FROM B LIMIT 1),                  CAST('true' AS JSON) = (SELECT LAG(1, 1, TRUE) OVER (ORDER BY id)                  FROM B LIMIT 1),                  CAST('true' AS JSON) = (SELECT MAX(TRUE) OVER () FROM B LIMIT 1)",
+            ),
+            // A table value constructor is table-shaped too, and the only one
+            // whose *column type* the tag reached: it is derived from the
+            // first row, and a boolean is not a `Value::Int`. Both spellings
+            // are here so the harness compares the two codes as well as the
+            // two values.
+            same("VALUES ROW(TRUE), ROW(FALSE)"),
+            same("VALUES ROW(1), ROW(0)"),
+            // A constructor is NOT NULL only if every row's expression is,
+            // since they share one column — so this one is nullable where the
+            // two above are not.
+            same("VALUES ROW(TRUE), ROW(NULL)"),
+            same("SELECT column_0 = CAST('true' AS JSON) FROM (VALUES ROW(TRUE)) v"),
+            // Reached through a scalar subquery, because a set operation on
+            // its own has nothing outside it to read the tag — and the
+            // subquery is the one wrapper that keeps it, which is what makes
+            // this the case that isolates the operation.
+            same("SELECT JSON_ARRAY((SELECT TRUE UNION SELECT TRUE))"),
+            same("SELECT (SELECT TRUE UNION SELECT TRUE) = CAST('true' AS JSON)"),
+            same("SELECT CAST('true' AS JSON) IN (SELECT TRUE)"),
+            // And the counterweights, so the rule is not read as "the tag
+            // never survives anything".
+            same("SELECT JSON_ARRAY((SELECT TRUE)), JSON_ARRAY((TRUE)), JSON_ARRAY(+TRUE)"),
+            same(
+                "SELECT (SELECT TRUE) = CAST('true' AS JSON), \
+                 (SELECT x FROM (SELECT TRUE AS x) d) = CAST('true' AS JSON)",
+            ),
+            // The crux: a column holding 1 is the number 1 however it was
+            // written, so it does not match a document of `true` where the
+            // keyword beside it does.
+            same("SELECT id, j = f, j = t, j = n, j = TRUE, j = 1 FROM B ORDER BY id"),
+            same("SELECT id, JSON_ARRAY(f), JSON_ARRAY(t), JSON_ARRAY(n) FROM B ORDER BY id"),
+            // Assignment reads the keyword as the number it is, which is the
+            // one place a column can tell 1 from '1'.
+            same("INSERT INTO BE VALUES (TRUE)"),
+            same("SELECT v FROM BE ORDER BY v"),
+        ],
+    },
+    Group {
         // The compound spelling, which is the one route to REAL_AS_FLOAT that
         // does not name it. `ANSI` is set on its own rather than added to the
         // mode in force, because that is what it means: MySQL replaces the

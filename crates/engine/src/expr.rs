@@ -275,7 +275,11 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
                 // NULL here became a wrong answer rather than a poor one once
                 // the column was described NOT NULL — the flag promised a
                 // value the evaluator would not produce.
-                UnaryOperator::Minus => Ok(match value {
+                // Untagged first, so `-TRUE` is the integer -1 and not the
+                // double -1.0 the fallback would build. MySQL types it
+                // LONGLONG, and the difference is visible: `JSON_ARRAY(-TRUE)`
+                // is `[-1]` there and would have been `[-1.0]`.
+                UnaryOperator::Minus => Ok(match value.untag_bool() {
                     Value::Null => Value::Null,
                     Value::Int(v) => Value::Int(-v),
                     other => Value::Float(-other.as_number()),
@@ -384,11 +388,16 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
                     None => eval(condition, ctx)?.truthy() == Some(true),
                 };
                 if hit {
-                    return eval(result, ctx);
+                    // Untagged, because `CASE` builds a result type out of
+                    // its branches and a boolean is not one of the types it
+                    // can build: `JSON_ARRAY(CASE WHEN 1 THEN TRUE ELSE FALSE
+                    // END)` is `[1]` on 8.3. An ENUM survives the same
+                    // construct, so the two tags part company here.
+                    return Ok(eval(result, ctx)?.untag_bool());
                 }
             }
             match else_result {
-                Some(e) => eval(e, ctx),
+                Some(e) => Ok(eval(e, ctx)?.untag_bool()),
                 None => Ok(Value::Null),
             }
         }
@@ -748,7 +757,11 @@ pub fn literal(value: &AstValue) -> EngineResult<Value> {
                 .collect();
             Value::Bytes(bytes)
         }
-        AstValue::Boolean(b) => Value::Int(i64::from(*b)),
+        // Tagged, not `Int(0|1)`: MySQL converts the keyword to the JSON
+        // boolean and the literal 1 to the JSON number, so `CAST('true' AS
+        // JSON) = TRUE` is 1 there and `= 1` is 0. Untagged the two operands
+        // were the same value and the first answered 0.
+        AstValue::Boolean(b) => Value::Bool(*b),
         AstValue::Null => Value::Null,
         AstValue::Placeholder(p) => {
             return Err(EngineError::parse(format!(
@@ -796,9 +809,20 @@ pub fn literal_of(e: &Expr) -> Option<Value> {
     }
 }
 
-/// SQL booleans are 1 and 0.
+/// The answer to a yes-or-no question, tagged as one.
+///
+/// It reads as 1 or 0 everywhere a client can see — `SELECT 1 = 1` sends the
+/// character `1` and is a LONGLONG column — and as a JSON boolean inside a
+/// document, which is the one place MySQL keeps the two apart. Measured on
+/// 8.3: `JSON_ARRAY(1 = 1)`, `JSON_ARRAY(NOT 0)`, `JSON_ARRAY(1 AND 1)`,
+/// `JSON_ARRAY(1 IS TRUE)` and `JSON_ARRAY(1 IN (1, 2))` are all `[true]`.
+///
+/// Every comparison, logical operator, postfix test and `EXISTS` already came
+/// through here, which is why the tag is applied at this one funnel rather
+/// than at the `TRUE` keyword alone — the keyword is the smaller half of the
+/// surface.
 pub fn bool_value(b: bool) -> Value {
-    Value::Int(i64::from(b))
+    Value::Bool(b)
 }
 
 fn binary(
@@ -1271,6 +1295,18 @@ fn bigint_out_of_range() -> EngineError {
     EngineError::new(1690, "22003", "BIGINT value is out of range")
 }
 
+/// The integer behind a boolean operand, or `None` for anything else.
+///
+/// Shaped like `Value::temporal_number` so the two untaggings compose in
+/// `arithmetic`: each hands back an owned replacement only where there is one,
+/// and the borrow is kept otherwise.
+fn bool_number(value: &Value) -> Option<Value> {
+    match value {
+        Value::Bool(b) => Some(Value::Int(i64::from(*b))),
+        _ => None,
+    }
+}
+
 /// The value an arithmetic operator produces.
 ///
 /// `pub(crate)` because `MOD` is the `%` operator spelled as a call and has to
@@ -1282,6 +1318,15 @@ pub(crate) fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> En
     if left.is_null() || right.is_null() {
         return Ok(Value::Null);
     }
+
+    // A boolean is 1 or 0 before any operator sees it. MySQL types `TRUE + 0`
+    // and `TRUE + TRUE` LONGLONG, and without this the pair missed the integer
+    // path below and came back as doubles — invisible in `SELECT`, where both
+    // render `1`, and not invisible in `JSON_ARRAY(TRUE + 0)`, which would
+    // have been `[1.0]` against MySQL's `[1]`.
+    let (plain_left, plain_right) = (bool_number(left), bool_number(right));
+    let left = plain_left.as_ref().unwrap_or(left);
+    let right = plain_right.as_ref().unwrap_or(right);
 
     // A temporal is its packed number before any operator sees it, which is
     // the whole of #0054: MySQL reads a DATE of 2024-01-05 as 20240105 where

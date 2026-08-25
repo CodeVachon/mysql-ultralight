@@ -498,6 +498,18 @@ fn write_value(w: &mut Writer, value: &Value) {
             w.str(member);
             w.u32(*ordinal);
         }
+        // No tag of its own, and so no format version: a boolean cannot be
+        // stored. Every value entering a row goes through
+        // `SqlType::coerce`, and every arm of it builds a fresh value of the
+        // column's own kind — a `BOOLEAN` column is a `TINYINT(1)` and holds
+        // the integer, which is MySQL's rule too: `JSON_ARRAY(b)` over such a
+        // column holding 1 is `[1]` there, not `[true]`. So this arm is what
+        // the row would already have held, written under the tag it would
+        // already have had.
+        Value::Bool(b) => {
+            w.u8(1);
+            w.i64(i64::from(*b));
+        }
     }
 }
 

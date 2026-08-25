@@ -392,11 +392,15 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
                 Err(_) => arg(0),
             }
         }
+        // A yes-or-no answer, and MySQL types it as one: `JSON_ARRAY(
+        // JSON_VALID('1'))` is `[true]` there. The same goes for the three
+        // predicates below.
         "json_valid" => match arg(0) {
             Value::Null => Value::Null,
-            other => Value::Int(i64::from(
-                serde_json::from_str::<serde_json::Value>(&other.as_text()).is_ok(),
-            )),
+            other => {
+                let valid = serde_json::from_str::<serde_json::Value>(&other.as_text()).is_ok();
+                crate::expr::bool_value(valid)
+            }
         },
         "json_quote" => {
             if arg(0).is_null() {
@@ -502,7 +506,7 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
                 }
                 None => document,
             };
-            Value::Int(i64::from(json_contains(&target, &candidate)))
+            crate::expr::bool_value(json_contains(&target, &candidate))
         }
         "json_set" | "json_array_append" => {
             if arg(0).is_null() {
@@ -606,7 +610,7 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
             };
 
             match name {
-                "regexp_like" => Value::Int(i64::from(re.is_match(hay))),
+                "regexp_like" => crate::expr::bool_value(re.is_match(hay)),
                 "regexp_replace" => {
                     let replaced = if occurrence == 0 {
                         re.replace_all(hay, text(2).as_str()).into_owned()
@@ -677,24 +681,30 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         // aggregate with, where `IF(1, e, 'z') + 0` is still the ordinal.
         "coalesce" => {
             let first = args.iter().find(|v| !v.is_null()).cloned();
-            untag_mixed_temporal(&args, first.map(Value::untag_enum)).unwrap_or(Value::Null)
+            untag_mixed_temporal(&args, first.map(Value::untag_enum).map(Value::untag_bool))
+                .unwrap_or(Value::Null)
         }
         "ifnull" | "nvl" => {
             let chosen = if arg(0).is_null() { arg(1) } else { arg(0) };
-            untag_mixed_temporal(&args, Some(chosen.untag_enum())).unwrap_or(Value::Null)
+            untag_mixed_temporal(&args, Some(chosen.untag_enum().untag_bool()))
+                .unwrap_or(Value::Null)
         }
+        // The boolean tag comes off here where the ENUM's ordinal does not,
+        // which is why the two are not one call. Measured on 8.3,
+        // `JSON_ARRAY(NULLIF(TRUE, 0))` and `JSON_ARRAY(IF(1, TRUE, FALSE))`
+        // are both `[1]`, while `IF(1, e, 'z') + 0` is still the ordinal.
         "nullif" => {
             if arg(0).compare(&arg(1)) == Some(std::cmp::Ordering::Equal) {
                 Value::Null
             } else {
-                arg(0)
+                arg(0).untag_bool()
             }
         }
         "if" => match arg(0).truthy() {
-            Some(true) => arg(1),
-            _ => arg(2),
+            Some(true) => arg(1).untag_bool(),
+            _ => arg(2).untag_bool(),
         },
-        "isnull" => Value::Int(i64::from(arg(0).is_null())),
+        "isnull" => crate::expr::bool_value(arg(0).is_null()),
 
         // -- strings -------------------------------------------------------
         "concat" => {
@@ -786,7 +796,14 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         // -- numbers -------------------------------------------------------
         // An integer keeps its exactness; everything else reads as the number
         // MySQL takes out of it, so `ABS('abc')` is 0 rather than NULL.
-        "abs" => match arg(0) {
+        // Untagged first, because a boolean is not a `Value::Int` and would
+        // have fallen to the float arm: `ABS(TRUE)` is a LONGLONG 1 on 8.3,
+        // and a double under that code renders `1` through the text protocol
+        // while the binary one writes eight bytes of f64 — the split
+        // `ResultSet::reconcile` exists to close, and it has no arm for this
+        // pair. `ROUND`, `FLOOR`, `CEIL` and `TRUNCATE` need no such call:
+        // they go through `whole`, which builds the integer from the number.
+        "abs" => match arg(0).untag_bool() {
             Value::Int(v) => Value::Int(v.abs()),
             other => Value::Float(other.as_number().abs()),
         },
@@ -837,6 +854,7 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
                 let want_greater = name == "greatest";
                 args.into_iter()
                     .map(Value::untag_enum)
+                    .map(Value::untag_bool)
                     .reduce(|a, b| {
                         let take_b = match a.compare(&b) {
                             Some(std::cmp::Ordering::Less) => want_greater,
@@ -1129,7 +1147,26 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
         // than relabelling: `JSON_OBJECT('c', CAST('[1,2]' AS JSON))` has to
         // give `{"c": [1, 2]}`, and text that is not JSON is an error here
         // exactly as it is on the way into a JSON column.
-        D::JSON => json::render(&json::parse(&value)?),
+        // A boolean converts to the JSON boolean rather than being read as
+        // the text `1`: `CAST(TRUE AS JSON)` is `true` on 8.3 and
+        // `JSON_TYPE` of it is BOOLEAN, where `CAST(1 AS JSON)` is the number.
+        // Every other value here is read as JSON *text*, which is why this is
+        // one arm and not a call to `json::from_value` — `CAST('[1,2]' AS
+        // JSON)` has to parse, not become a string.
+        //
+        // `CAST` is the only place the tag is honoured, and deliberately so:
+        // it is the only one MySQL gives an answer for. A JSON *column* and a
+        // JSON function argument both refuse a boolean there rather than
+        // converting it — `INSERT INTO t(j) VALUES (TRUE)` and `UPDATE t SET
+        // j = (1=1)` are 3140, `JSON_CONTAINS('[true]', TRUE)` is 3146 — and
+        // they refuse the integer 1 in the same words, so honouring the tag
+        // in `SqlType::coerce` or `json::parse` would invent an answer for a
+        // statement MySQL will not run. That the engine accepts them at all
+        // predates this and is the same gap for `Int`.
+        D::JSON => match &value {
+            Value::Bool(b) => json::render(&serde_json::Value::Bool(*b)),
+            _ => json::render(&json::parse(&value)?),
+        },
         D::Binary(_) | D::Varbinary(_) | D::Blob(_) => Value::Bytes(value.as_text().into_bytes()),
         other => return Err(unsupported(format!("CAST to `{other}`"))),
     })

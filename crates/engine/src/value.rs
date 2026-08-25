@@ -90,6 +90,32 @@ pub enum Value {
         member: String,
         ordinal: u32,
     },
+    /// A SQL boolean: `TRUE`, `FALSE`, or the answer of anything that asks a
+    /// yes-or-no question.
+    ///
+    /// The same argument the tags above make, over the one place MySQL can
+    /// still tell 1 from true: JSON. `CAST('true' AS JSON) = TRUE` is 1 there
+    /// and `= 1` is 0, because the keyword converts to the JSON *boolean* and
+    /// the literal to the JSON *number*. Read as `Int(1)`, both operands
+    /// became the number and the first row answered 0.
+    ///
+    /// Everywhere else it reads exactly as `Int(0|1)` does — `TRUE = 1` is 1,
+    /// `SELECT TRUE` sends `1`, `SUM(TRUE)` is 1 — so the tag changes the
+    /// *document* reading of a boolean and nothing else.
+    ///
+    /// It is not only the keyword. Measured on 8.3, `JSON_ARRAY(1 = 1)`,
+    /// `JSON_ARRAY(NOT 0)`, `JSON_ARRAY(1 AND 1)`, `JSON_ARRAY(1 IS TRUE)`
+    /// and `JSON_ARRAY(1 IN (1, 2))` are all `[true]`, so every comparison,
+    /// logical operator and postfix test carries it. That is why it is built
+    /// in [`crate::expr::bool_value`], the one funnel all of those already
+    /// went through, rather than at the literal alone.
+    ///
+    /// No column can hold one, which is measured rather than assumed: a
+    /// `BOOLEAN` column is a `TINYINT(1)`, and `JSON_ARRAY(b)` over one
+    /// holding 1 is `[1]` while `j = b` against a document of `true` is 0.
+    /// So [`crate::types::SqlType::coerce`] — the only way a value enters a
+    /// row — strips it, and the state image never has to know the tag exists.
+    Bool(bool),
 }
 
 impl Value {
@@ -120,6 +146,7 @@ impl Value {
             // Its ordinal, which is the whole point of the tag: a member
             // that is not itself a number read 0 out of its own characters.
             Value::Enum { ordinal, .. } => Some(i64::from(*ordinal)),
+            Value::Bool(b) => Some(i64::from(*b)),
             Value::Float(v) => Some(*v as i64),
             Value::Float32(v) => Some(*v as i64),
             Value::Text(v) | Value::Json(v) | Value::Decimal(v) => {
@@ -142,6 +169,7 @@ impl Value {
             // against a number is numeric, and reading the member's text gave
             // `None` here and sent the pair to the collation instead.
             Value::Enum { ordinal, .. } => Some(f64::from(*ordinal)),
+            Value::Bool(b) => Some(f64::from(u8::from(*b))),
             // Its packed number, which is what makes `d = 20240105` true: a
             // comparison against a number is numeric, and reading the text
             // gave `None` here and sent the pair to the collation instead.
@@ -165,6 +193,7 @@ impl Value {
             Value::Text(v) | Value::Json(v) | Value::Decimal(v) => numeric_prefix(v),
             Value::Bytes(v) => numeric_prefix(&String::from_utf8_lossy(v)),
             Value::Enum { ordinal, .. } => f64::from(*ordinal),
+            Value::Bool(b) => f64::from(u8::from(*b)),
             // Its packed digits, and its leading number only where the text is
             // not a temporal at all — a DATE column can hold text this engine
             // never validated, and that is no reason to answer differently
@@ -198,6 +227,10 @@ impl Value {
             // The document as it was serialised, which is what MySQL sends and
             // what a client reads back.
             Value::Json(v) | Value::Decimal(v) => v.clone(),
+            // `1` and `0`. MySQL has no boolean on the wire — `SELECT TRUE`
+            // and `SELECT 1 = 1` both send the character `1` — so the tag is
+            // invisible to a client and shows up only inside a document.
+            Value::Bool(b) => i64::from(*b).to_string(),
         }
     }
 
@@ -225,6 +258,7 @@ impl Value {
             // false only for the error value. Read as text, the first member
             // of `ENUM('a','b')` was false.
             Value::Enum { ordinal, .. } => Some(*ordinal != 0),
+            Value::Bool(b) => Some(*b),
         }
     }
 
@@ -248,12 +282,24 @@ impl Value {
         // how MySQL behaves and what Prisma's generated comparisons rely on.
         // A decimal is a number: `2.50` equals `2.5` and sorts below `10.00`,
         // where two *strings* of those characters do neither.
+        // A boolean is one of them: `TRUE = '1'` is 1 on 8.3 and `TRUE =
+        // 'abc'` is 0, which is the numeric reading and not the collation's.
+        // Left out, the pair fell through to `collate` and answered by the
+        // characters.
         let both_numeric = matches!(
             self,
-            Value::Int(_) | Value::Float(_) | Value::Decimal(_) | Value::Float32(_)
+            Value::Int(_)
+                | Value::Float(_)
+                | Value::Decimal(_)
+                | Value::Float32(_)
+                | Value::Bool(_)
         ) || matches!(
             other,
-            Value::Int(_) | Value::Float(_) | Value::Decimal(_) | Value::Float32(_)
+            Value::Int(_)
+                | Value::Float(_)
+                | Value::Decimal(_)
+                | Value::Float32(_)
+                | Value::Bool(_)
         );
 
         if both_numeric {
@@ -319,6 +365,29 @@ impl Value {
         }
     }
 
+    /// This value with any boolean tag removed, leaving 1 or 0.
+    ///
+    /// For the places MySQL stops reading a value as a boolean, which are not
+    /// the places it stops reading an ENUM as its ordinal — the two lists were
+    /// measured separately and overlap only by accident. `IF`, `CASE` and
+    /// `NULLIF` keep the ordinal and *drop* the boolean, so
+    /// `JSON_ARRAY(IF(1, TRUE, FALSE))` is `[1]` on 8.3; a scalar subquery
+    /// drops the ordinal and *keeps* the boolean, so `(SELECT TRUE) =
+    /// CAST('true' AS JSON)` is 1. `COALESCE`, `IFNULL`, `GREATEST`, `LEAST`,
+    /// `MIN`, `MAX` and a set operation drop both.
+    ///
+    /// The rule underneath all of it: a boolean survives only inside the
+    /// expression that asked the question. Anything that gives it a column to
+    /// live in — a derived table, a CTE, a user variable, a real column —
+    /// takes the tag off, so `SELECT JSON_ARRAY(x) FROM (SELECT TRUE AS x) t`
+    /// is `[1]` while the bare `JSON_ARRAY(TRUE)` is `[true]`.
+    pub fn untag_bool(self) -> Value {
+        match self {
+            Value::Bool(b) => Value::Int(i64::from(b)),
+            other => other,
+        }
+    }
+
     /// The exact number MySQL reads this temporal as, or `None` for anything
     /// that is not one.
     ///
@@ -352,10 +421,11 @@ impl Value {
     /// is false for every row: the literal is the string `{"a": 1}` and an
     /// object never equals a string.
     ///
-    /// One case is out of reach. MySQL reads the SQL keyword `TRUE` as JSON
-    /// `true` and the literal `1` as the number 1, and this engine evaluates
-    /// both to `Value::Int(1)` — there is no boolean here to tell them apart.
-    /// See #0061.
+    /// A boolean becomes the JSON *boolean*, which is the case this used to
+    /// say was out of reach: MySQL reads the keyword `TRUE` as JSON `true`
+    /// and the literal `1` as the number 1, so `CAST('true' AS JSON) = TRUE`
+    /// is 1 and `= 1` is 0. Both operands were `Value::Int(1)` until
+    /// `Value::Bool` existed to tell them apart. See #0061.
     fn as_json_operand(&self) -> serde_json::Value {
         crate::json::from_value(self)
     }
@@ -419,6 +489,11 @@ impl Value {
             // is what MySQL sends for it; the ordinal is a reading, not a
             // representation.
             Value::Enum { member, .. } => WireValue::Str(member.clone()),
+            // As the integer it announces itself to be. `SELECT TRUE` is a
+            // LONGLONG column on 8.3 carrying `1`, so a binary client reads
+            // eight bytes; sending the tag as a string would have desynced it
+            // against the type code beside it.
+            Value::Bool(b) => WireValue::I64(i64::from(*b)),
         }
     }
 

@@ -11284,3 +11284,470 @@ fn a_computed_column_is_described_by_its_expression() {
         vec![vec!["still here"]]
     );
 }
+
+#[test]
+fn a_sql_boolean_beside_a_document_is_a_boolean() {
+    // MySQL reads the keyword TRUE as the JSON value `true` and the literal 1
+    // as the JSON number 1, so the two compare against different documents.
+    // The engine had no boolean value, so both evaluated to 1 and the first
+    // row below answered 0. The whole of #0061. Measured on 8.3.
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        ("SELECT CAST('true' AS JSON) = TRUE", "1"),
+        ("SELECT CAST('true' AS JSON) = 1", "0"),
+        ("SELECT CAST('1' AS JSON) = TRUE", "0"),
+        ("SELECT CAST('1' AS JSON) = 1", "1"),
+        // FALSE and 0 split the same way, so the tag is not a special case
+        // for the true half.
+        ("SELECT CAST('false' AS JSON) = FALSE", "1"),
+        ("SELECT CAST('false' AS JSON) = 0", "0"),
+        ("SELECT CAST('0' AS JSON) = FALSE", "0"),
+        ("SELECT CAST('0' AS JSON) = 0", "1"),
+        // Either way round, and through the NULL-safe spelling and IN.
+        ("SELECT TRUE = CAST('true' AS JSON)", "1"),
+        ("SELECT 1 = CAST('true' AS JSON)", "0"),
+        ("SELECT CAST('true' AS JSON) <=> TRUE", "1"),
+        ("SELECT CAST('true' AS JSON) <> TRUE", "0"),
+        ("SELECT CAST('true' AS JSON) IN (TRUE)", "1"),
+        ("SELECT CAST('true' AS JSON) IN (1)", "0"),
+        // JSON's type order puts a boolean above a number, so an inequality
+        // against a document is not merely "not equal": it has a direction.
+        ("SELECT CAST('1' AS JSON) < TRUE", "1"),
+        ("SELECT CAST('true' AS JSON) < TRUE", "0"),
+        ("SELECT CAST('true' AS JSON) > TRUE", "0"),
+        // A conversion, not just a comparison: MySQL builds the JSON boolean
+        // where the literal 1 builds the number.
+        ("SELECT CAST(TRUE AS JSON)", "true"),
+        ("SELECT CAST(FALSE AS JSON)", "false"),
+        ("SELECT JSON_TYPE(CAST(TRUE AS JSON))", "BOOLEAN"),
+        ("SELECT JSON_TYPE(CAST(1 AS JSON))", "INTEGER"),
+        // Inside a document a boolean stays one, which is the same tag seen
+        // from the constructing side rather than the comparing side.
+        ("SELECT JSON_ARRAY(TRUE)", "[true]"),
+        ("SELECT JSON_ARRAY(FALSE)", "[false]"),
+        ("SELECT JSON_ARRAY(1)", "[1]"),
+        ("SELECT JSON_OBJECT('a', TRUE)", "{\"a\": true}"),
+        (
+            "SELECT JSON_ARRAY(TRUE, FALSE, 1, 0)",
+            "[true, false, 1, 0]",
+        ),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn every_yes_or_no_answer_is_a_boolean() {
+    // The keyword is the smaller half of the surface. Every comparison,
+    // logical operator, postfix test and predicate function is typed boolean
+    // by MySQL, so each of these is `[true]` on 8.3 and not `[1]` — which is
+    // why the tag is applied where all of them already met rather than at the
+    // literal alone.
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        ("SELECT JSON_ARRAY(1 = 1)", "[true]"),
+        ("SELECT JSON_ARRAY(1 < 2)", "[true]"),
+        ("SELECT JSON_ARRAY(1 <=> 1)", "[true]"),
+        ("SELECT JSON_ARRAY(1 <> 1)", "[false]"),
+        ("SELECT JSON_ARRAY(1 IN (1, 2))", "[true]"),
+        ("SELECT JSON_ARRAY(1 NOT IN (2))", "[true]"),
+        ("SELECT JSON_ARRAY(1 BETWEEN 0 AND 2)", "[true]"),
+        ("SELECT JSON_ARRAY('a' LIKE 'a')", "[true]"),
+        ("SELECT JSON_ARRAY('a' NOT LIKE 'b')", "[true]"),
+        ("SELECT JSON_ARRAY(1 IS NULL)", "[false]"),
+        ("SELECT JSON_ARRAY(1 IS NOT NULL)", "[true]"),
+        ("SELECT JSON_ARRAY(1 IS TRUE)", "[true]"),
+        ("SELECT JSON_ARRAY(TRUE IS NOT FALSE)", "[true]"),
+        ("SELECT JSON_ARRAY(NOT 0)", "[true]"),
+        ("SELECT JSON_ARRAY(1 AND 1)", "[true]"),
+        ("SELECT JSON_ARRAY(1 OR 0)", "[true]"),
+        ("SELECT JSON_ARRAY(TRUE AND FALSE)", "[false]"),
+        ("SELECT JSON_ARRAY(EXISTS(SELECT 1))", "[true]"),
+        ("SELECT JSON_ARRAY(ISNULL(1))", "[false]"),
+        ("SELECT JSON_ARRAY(JSON_CONTAINS('[1]', '1'))", "[true]"),
+        ("SELECT JSON_ARRAY(JSON_VALID('1'))", "[true]"),
+        ("SELECT JSON_ARRAY(REGEXP_LIKE('a', 'a'))", "[true]"),
+        // NULL is not false. A three-valued answer stays NULL rather than
+        // becoming the JSON boolean `false`.
+        ("SELECT JSON_ARRAY(NOT NULL)", "[null]"),
+        ("SELECT JSON_ARRAY(TRUE OR NULL)", "[true]"),
+        ("SELECT JSON_ARRAY(NULL AND 0)", "[false]"),
+        // The counterweight: a function that answers a *number* which happens
+        // to be 1 or 2 is not boolean, so the tag is not simply "anything
+        // small".
+        ("SELECT JSON_ARRAY(LOCATE('a', 'ba'))", "[2]"),
+        ("SELECT JSON_ARRAY(CHAR_LENGTH('a'))", "[1]"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+    // The comparison against a document is the same tag from the other side,
+    // so a bare comparison compares as `true` where the literal 1 does not.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('true' AS JSON) = (1 = 1), CAST('true' AS JSON) = (1 AND 1)"
+        ),
+        vec![vec!["1", "1"]]
+    );
+
+    // And each predicate is described the integer it answers. Asserted at the
+    // metadata's own level because every case above wraps the call in
+    // `JSON_ARRAY`, which exercises the value and hides the code — which is
+    // how `REGEXP_LIKE` stayed VAR_STRING while answering 0 or 1.
+    assert_eq!(
+        engine
+            .describe(
+                &session,
+                "SELECT REGEXP_LIKE('a', 'a'), ISNULL(1), JSON_VALID('1'), \
+                 JSON_CONTAINS('[1]', '1')",
+                0
+            )
+            .unwrap()
+            .iter()
+            .map(|c| format!("{:?}", c.ty))
+            .collect::<Vec<_>>(),
+        vec!["LongLong"; 4]
+    );
+    // And `REGEXP_LIKE` is NOT NULL when its arguments are — the other half of
+    // the same gap the type code above was. It follows its arguments rather
+    // than being unconditional, because `REGEXP_LIKE(NULL, 'a')` is NULL.
+    let nullable = |sql: &str| -> Vec<bool> {
+        engine
+            .describe(&session, sql, 0)
+            .unwrap()
+            .iter()
+            .map(|c| c.nullable)
+            .collect()
+    };
+    assert_eq!(nullable("SELECT REGEXP_LIKE('a', 'a')"), vec![false]);
+    assert_eq!(nullable("SELECT REGEXP_LIKE(NULL, 'a')"), vec![true]);
+}
+
+#[test]
+fn a_boolean_reads_as_one_or_zero_everywhere_but_a_document() {
+    // The tag changes the *document* reading and nothing else, which is what
+    // keeps it from being a second integer type. Every answer here is the one
+    // the untagged `Int(0|1)` already gave, and each was measured on 8.3
+    // rather than assumed — `TRUE + 0` is a LONGLONG there, not a double.
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        ("SELECT TRUE", "1"),
+        ("SELECT FALSE", "0"),
+        ("SELECT TRUE = 1", "1"),
+        ("SELECT TRUE + 0", "1"),
+        ("SELECT -TRUE", "-1"),
+        ("SELECT TRUE + TRUE", "2"),
+        ("SELECT CAST(TRUE AS CHAR)", "1"),
+        ("SELECT CAST(TRUE AS SIGNED)", "1"),
+        ("SELECT CONCAT(TRUE, '')", "1"),
+        ("SELECT SUM(TRUE)", "1"),
+        ("SELECT MIN(TRUE)", "1"),
+        ("SELECT TRUE IS TRUE", "1"),
+        ("SELECT 1 IS TRUE", "1"),
+        ("SELECT TRUE DIV 1", "1"),
+        ("SELECT TRUE MOD 2", "1"),
+        // A comparison against anything that is not a document is numeric,
+        // so `'abc'` is 0 rather than sorting beside the character `1`.
+        ("SELECT '1' = TRUE", "1"),
+        ("SELECT 1.0 = TRUE", "1"),
+        ("SELECT 'abc' = TRUE", "0"),
+        // The spellings that separate the numeric reading from the collated
+        // one: `'1.0'` and `'01'` are the number 1 and are not the characters
+        // `1`, so a boolean that compared by its text would answer 0 here.
+        ("SELECT '1.0' = TRUE", "1"),
+        ("SELECT '01' = TRUE", "1"),
+        ("SELECT '0.0' = FALSE", "1"),
+        ("SELECT TRUE LIKE '1'", "1"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+    // Arithmetic over a boolean stays exact. Invisible in `SELECT`, where a
+    // double renders `1` too, and not invisible in a document — the reason
+    // this is asserted through JSON_ARRAY as well as through the column type.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_ARRAY(TRUE + 0), JSON_ARRAY(-TRUE), JSON_ARRAY(TRUE + TRUE), \
+             JSON_ARRAY(TRUE & 1), JSON_ARRAY(TRUE << 1), JSON_ARRAY(SUM(TRUE)) \
+             FROM (SELECT 1) t"
+        ),
+        vec![vec!["[1]", "[-1]", "[2]", "[1]", "[2]", "[1]"]]
+    );
+    // The numeric functions too. `ABS` is the only one of these with an
+    // integer fast path of its own — the rest build their answer through
+    // `whole` — so it is the only one a boolean could fall out of, and it did.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_ARRAY(ABS(TRUE)), JSON_ARRAY(ROUND(TRUE)), JSON_ARRAY(FLOOR(TRUE)), \
+             JSON_ARRAY(CEIL(TRUE)), JSON_ARRAY(TRUNCATE(TRUE, 0)), JSON_ARRAY(MOD(TRUE, 2))"
+        ),
+        vec![vec!["[1]", "[1]", "[1]", "[1]", "[1]", "[1]"]]
+    );
+    // And it is announced as an integer, so a binary client decodes eight
+    // bytes rather than a string: the tag never crosses the wire. Asserted at
+    // the metadata's own level rather than through a row, because the two are
+    // decided in different code and a value that disagreed with its code is
+    // exactly the split this would otherwise miss.
+    let codes = |sql: &str| -> Vec<String> {
+        engine
+            .describe(&session, sql, 0)
+            .unwrap()
+            .iter()
+            .map(|c| format!("{:?}", c.ty))
+            .collect()
+    };
+    assert_eq!(
+        codes("SELECT TRUE, FALSE, 1 = 1, TRUE + 0, -TRUE, NOT 0, 1 <=> 1"),
+        vec!["LongLong"; 7]
+    );
+    // `<=>` was described VAR_STRING and nullable while answering an integer,
+    // which putting it in the corpus for #0061 found: it is the one
+    // comparison that answers whatever it is given, so it is NOT NULL over
+    // two NULLs.
+    assert!(
+        !engine
+            .describe(&session, "SELECT NULL <=> NULL", 0)
+            .unwrap()[0]
+            .nullable
+    );
+    // And the bytes themselves, because a wire value is where a tag that only
+    // *reads* as an integer would finally show: a `Str` under a LONGLONG code
+    // desynchronises a binary client.
+    assert_eq!(
+        Value::Bool(true).to_wire(),
+        mysql_ultralight_protocol::Value::I64(1)
+    );
+    assert_eq!(
+        Value::Bool(false).to_wire(),
+        mysql_ultralight_protocol::Value::I64(0)
+    );
+}
+
+#[test]
+fn a_boolean_does_not_survive_being_put_anywhere() {
+    // Measured on 8.3, and it is *not* the list an ENUM follows — the two were
+    // measured separately and disagree in both directions. `IF`, `CASE` and
+    // `NULLIF` keep an ENUM's ordinal and drop a boolean; a scalar subquery
+    // drops the ordinal and keeps the boolean.
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        ("SELECT JSON_ARRAY(IF(1, TRUE, FALSE))", "[1]"),
+        // Both branches, because the tag is taken off where the value is
+        // chosen and one arm handling it would read exactly like two.
+        ("SELECT JSON_ARRAY(IF(0, 1, TRUE))", "[1]"),
+        (
+            "SELECT JSON_ARRAY(CASE WHEN 1 THEN TRUE ELSE FALSE END)",
+            "[1]",
+        ),
+        ("SELECT JSON_ARRAY(CASE WHEN 0 THEN 1 ELSE TRUE END)", "[1]"),
+        ("SELECT JSON_ARRAY(NULLIF(TRUE, 0))", "[1]"),
+        // With one argument, so it is the function and not a mixture of types
+        // that takes the tag off.
+        ("SELECT JSON_ARRAY(COALESCE(TRUE))", "[1]"),
+        ("SELECT JSON_ARRAY(COALESCE(NULL, TRUE))", "[1]"),
+        ("SELECT JSON_ARRAY(IFNULL(TRUE, 0))", "[1]"),
+        ("SELECT JSON_ARRAY(IFNULL(NULL, TRUE))", "[1]"),
+        ("SELECT JSON_ARRAY(GREATEST(TRUE, FALSE))", "[1]"),
+        ("SELECT JSON_ARRAY(GREATEST(FALSE, TRUE))", "[1]"),
+        ("SELECT JSON_ARRAY(LEAST(TRUE, FALSE))", "[0]"),
+        ("SELECT JSON_ARRAY(LEAST(TRUE, TRUE))", "[1]"),
+        // Every aggregate, including the two that hand a value straight
+        // through.
+        // Through a one-row FROM, because an aggregate wrapped in a call
+        // needs one to be planned as an aggregate at all.
+        ("SELECT JSON_ARRAY(MIN(TRUE)) FROM (SELECT 1) t", "[1]"),
+        ("SELECT JSON_ARRAY(MAX(TRUE)) FROM (SELECT 1) t", "[1]"),
+        ("SELECT JSON_ARRAY(SUM(TRUE)) FROM (SELECT 1) t", "[1]"),
+        ("SELECT JSON_ARRAY(COUNT(TRUE)) FROM (SELECT 1) t", "[1]"),
+        // Anything that gives the value a column to live in.
+        ("SELECT JSON_ARRAY(x) FROM (SELECT TRUE AS x) t", "[1]"),
+        (
+            "WITH c AS (SELECT TRUE AS x) SELECT JSON_ARRAY(x) FROM c",
+            "[1]",
+        ),
+        (
+            "SELECT JSON_ARRAY(x) FROM (SELECT TRUE AS x UNION ALL SELECT TRUE) t LIMIT 1",
+            "[1]",
+        ),
+        // A set operation on its own, reached through a scalar subquery so
+        // the answer is visible at all. The subquery keeps the tag and the
+        // union takes it off, which is what makes this the case that separates
+        // the two — the derived table above would have hidden either one.
+        ("SELECT JSON_ARRAY((SELECT TRUE UNION SELECT TRUE))", "[1]"),
+        (
+            "SELECT JSON_ARRAY((SELECT TRUE UNION ALL SELECT TRUE LIMIT 1))",
+            "[1]",
+        ),
+        // And the counterweights, which are what stop the rule being read as
+        // "the tag never survives anything": a scalar subquery, a
+        // parenthesised expression and a unary plus all keep it.
+        ("SELECT JSON_ARRAY((SELECT TRUE))", "[true]"),
+        ("SELECT JSON_ARRAY((TRUE))", "[true]"),
+        ("SELECT JSON_ARRAY(+TRUE)", "[true]"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+    // A derived table is not a scalar subquery even when it is inside one, so
+    // the tag is gone by the time the outer query sees it.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT (SELECT TRUE) = CAST('true' AS JSON), \
+             (SELECT x FROM (SELECT TRUE AS x) t) = CAST('true' AS JSON), \
+             (SELECT TRUE UNION SELECT TRUE) = CAST('true' AS JSON), \
+             CAST('true' AS JSON) IN (SELECT TRUE), \
+             CAST('true' AS JSON) IN (SELECT TRUE UNION SELECT TRUE)"
+        ),
+        vec![vec!["1", "0", "0", "1", "0"]]
+    );
+    // A window function is one too, positional or aggregate. The positional
+    // ones read their subject straight out of a row where the aggregates go
+    // through the fold, so they were the one family that answered two ways —
+    // `FIRST_VALUE(TRUE)` matched a document of `true` where `MAX(TRUE)`
+    // beside it did not. Measured on 8.3: every column here is 0.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Win (id INT NOT NULL, PRIMARY KEY (id))",
+    );
+    run(&engine, &mut session, "INSERT INTO Win VALUES (1), (2)");
+    // Read back through a scalar subquery, which is the wrapper that *keeps*
+    // the tag — so anything still tagged here would answer 1, and every
+    // column is 0 on 8.3. `LAG`'s third argument is in because the default is
+    // taken from a literal rather than from a row and untags separately.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('true' AS JSON) = (SELECT FIRST_VALUE(TRUE) OVER () FROM Win LIMIT 1), \
+             CAST('true' AS JSON) = (SELECT LAST_VALUE(TRUE) OVER () FROM Win LIMIT 1), \
+             CAST('true' AS JSON) = (SELECT LEAD(TRUE) OVER (ORDER BY id) FROM Win LIMIT 1), \
+             CAST('true' AS JSON) = (SELECT LAG(1, 1, TRUE) OVER (ORDER BY id) FROM Win LIMIT 1), \
+             CAST('true' AS JSON) = (SELECT MAX(TRUE) OVER () FROM Win LIMIT 1)"
+        ),
+        vec![vec!["0", "0", "0", "0", "0"]]
+    );
+    // A table value constructor is table-shaped too, and it is the one whose
+    // *type* the tag reached: `wire_type` reads the first row, a boolean is
+    // not a `Value::Int`, and the column was described VAR_STRING while
+    // carrying 1. MySQL types `column_0` LONGLONG.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT column_0 = CAST('true' AS JSON) FROM (VALUES ROW(TRUE)) v"
+        ),
+        vec![vec!["0"]]
+    );
+
+    // A user variable is somewhere to put a value, so it holds 1 and not the
+    // keyword that was assigned to it.
+    run(&engine, &mut session, "SET @x = TRUE");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_ARRAY(@x), CAST('true' AS JSON) = @x"
+        ),
+        vec![vec!["[1]", "0"]]
+    );
+
+    // The constructor's *type* as well as its value, because that is the half
+    // the tag actually reached: the column is derived from the first row, so
+    // an untagged row is what keeps a boolean and the literal 1 describing the
+    // same column. MySQL says LONGLONG for both.
+    let codes = |sql: &str| -> Vec<String> {
+        engine
+            .describe(&session, sql, 0)
+            .unwrap()
+            .iter()
+            .map(|c| format!("{:?}", c.ty))
+            .collect()
+    };
+    assert_eq!(codes("VALUES ROW(TRUE)"), codes("VALUES ROW(1)"));
+    assert_eq!(codes("VALUES ROW(TRUE)"), vec!["LongLong"]);
+    // Its nullability came from nothing at all and was announced nullable
+    // whatever it held. From the expressions, and NOT NULL only when *every*
+    // row's is, since the rows share one column.
+    let nullable = |sql: &str| -> Vec<bool> {
+        engine
+            .describe(&session, sql, 0)
+            .unwrap()
+            .iter()
+            .map(|c| c.nullable)
+            .collect()
+    };
+    assert_eq!(nullable("VALUES ROW(TRUE), ROW(FALSE)"), vec![false]);
+    assert_eq!(nullable("VALUES ROW(1), ROW(0)"), vec![false]);
+    assert_eq!(nullable("VALUES ROW(TRUE), ROW(NULL)"), vec![true]);
+}
+
+#[test]
+fn a_column_never_holds_a_boolean() {
+    // The crux, and the reason the state image does not have to learn a tag:
+    // MySQL makes BOOLEAN a TINYINT(1), and a column holding 1 is the *number*
+    // 1 however it was written. `j = f` below is 0 on 8.3 for a row whose
+    // document is `true` and whose column holds 1, where `j = TRUE` is 1.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE B (id INT NOT NULL, f BOOLEAN, t TINYINT(1), n INT, \
+         v VARCHAR(10), g ENUM('2','1'), j JSON, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO B VALUES (1, TRUE, 1, 1, TRUE, TRUE, CAST('true' AS JSON)), \
+         (2, FALSE, 0, 0, FALSE, '1', CAST('false' AS JSON))",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, j = f, j = t, j = n, j = TRUE, j = 1 FROM B ORDER BY id"
+        ),
+        vec![
+            vec!["1", "0", "0", "0", "1", "0"],
+            vec!["2", "0", "0", "0", "0", "0"],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_ARRAY(f), JSON_ARRAY(t), JSON_ARRAY(n), JSON_ARRAY(v) \
+             FROM B WHERE id = 1"
+        ),
+        vec![vec!["[1]", "[1]", "[1]", "[\"1\"]"]]
+    );
+    // Assignment reads the keyword as the *number* it is, which is the one
+    // place a column can tell 1 from '1': `TRUE` into `ENUM('2','1')` is the
+    // first member, exactly as the literal 1 is, where the text `'1'` matches
+    // the member spelled `1`.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT g FROM B ORDER BY id"),
+        vec![vec!["2"], vec!["1"]]
+    );
+}
