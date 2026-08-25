@@ -96,42 +96,113 @@ pub fn intercept(sql: &str) -> Option<Intercepted> {
     }
 }
 
-/// A statement rewritten for the parser, and what the rewriting cost.
+/// A statement rewritten for the parser, and where every part of it stood in
+/// the text the client sent.
+///
+/// The two halves are not interchangeable. Spans come from the parser and so
+/// point into `sql`; a name, an error position or anything else a client sees
+/// has to be quoted from `written`, because that is the text it actually sent.
+/// `as_written` is the only bridge, and it exists because no pass here is
+/// length-preserving — `""` collapses to one byte and a backtick doubles into
+/// two, so equal lengths are a coincidence and not a licence to slice the
+/// original at the offsets the rewrite reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Normalised {
     /// The text to parse.
     pub sql: String,
-    /// Each `%` that was written as `MOD`: its byte offset in `sql`, and the
-    /// spelling it replaced.
+    /// The text the client sent.
+    written: String,
+    /// `sql` back to `written`.
+    map: Mapping,
+}
+
+impl Normalised {
+    /// A statement no pass has touched.
+    fn untouched(sql: &str) -> Self {
+        Self {
+            sql: sql.to_owned(),
+            written: sql.to_owned(),
+            map: Mapping::identity(sql.len()),
+        }
+    }
+
+    /// What the client wrote where the rewrite says `range`.
     ///
-    /// MySQL names an unaliased computed column after the text it was written
-    /// as, and the executor reads that name back out of `sql` — so these are
-    /// the places where `sql` no longer says what the client said. Carried
-    /// rather than recovered: a rewritten `%` cannot be told from one that was
-    /// typed, and `mod` is as valid a spelling as `MOD`.
-    pub mod_operators: Vec<(usize, String)>,
+    /// The smallest stretch of the original that covers the whole of `range`,
+    /// which for a rewrite is the only answer that cannot be wrong. A name is
+    /// a range rather than a point, so a region with no counterpart on one
+    /// side — a `""` that collapsed, a space IGNORE_SPACE removed — has to be
+    /// inside the answer whenever text on both sides of it is, or the answer
+    /// would join two stretches that were never adjacent. Trivia at the very
+    /// edges is left out for the same reason it would be wrong to keep it:
+    /// nothing in `range` came from it.
+    ///
+    /// `None` for a range outside the rewritten text.
+    pub fn as_written(&self, range: std::ops::Range<usize>) -> Option<&str> {
+        if range.start > range.end || range.end > self.sql.len() {
+            return None;
+        }
+        self.written.get(self.map.source(range))
+    }
+
+    /// The text the client wrote before `at` in the rewrite begins.
+    ///
+    /// Deliberately not `as_written(0..at)`, which ends where the range *before*
+    /// `at` ends — the far side of anything a pass removed there. This ends
+    /// where `at` itself begins, so what it reports is the character the client
+    /// actually put in front of that position.
+    ///
+    /// Which is a different character from the one the parser saw whenever a
+    /// pass closed a gap: under IGNORE_SPACE `SELECT (COUNT (*))` reaches the
+    /// parser as `SELECT(COUNT(*))`, where the `(` follows the `T` of `SELECT`
+    /// and never did in what was sent.
+    ///
+    /// `None` for a position outside the rewritten text.
+    pub fn written_before(&self, at: usize) -> Option<&str> {
+        if at > self.sql.len() {
+            return None;
+        }
+        self.written.get(..self.map.start_of(at))
+    }
+
+    /// Applies one pass, keeping the record of where the text came from.
+    fn rewrite(self, pass: impl FnOnce(&mut Rewriter<'_>)) -> Self {
+        let (sql, map) = {
+            let mut writer = Rewriter::new(&self);
+            pass(&mut writer);
+            writer.finish()
+        };
+        Self {
+            sql,
+            written: self.written,
+            map,
+        }
+    }
 }
 
 /// Rewrites text the parser would reject but that needs no special handling.
 pub fn normalise(sql: &str, mode: SqlMode) -> Normalised {
-    let mut out = sql.to_owned();
+    let mut out = Normalised::untouched(sql);
 
     // `SET @x := 1` is the same statement as `SET @x = 1`; only the spelling
     // is unsupported, so it is rewritten rather than intercepted.
-    if starts_with_keyword(&out, "SET") {
-        out = replace_outside_literals(&out, ":=", "=");
+    if starts_with_keyword(&out.sql, "SET") {
+        out = out.rewrite(|w| replace_outside_literals(w, ":=", "="));
     }
 
     // `DELETE a.*, b.* FROM ...` is the canonical multi-table spelling, and
     // the parser rejects the star. The `.*` carries no meaning MySQL does not
     // already take from the table name, so it is dropped.
-    if starts_with_keyword(&out, "DELETE") {
-        out = strip_delete_target_stars(&out);
+    if starts_with_keyword(&out.sql, "DELETE") {
+        out = out.rewrite(strip_delete_target_stars);
     }
 
     // MySQL accepts an IN list whose elements are scalar subqueries; the
     // parser reads the first as `IN (subquery)` and then fails on the comma.
-    out = expand_in_subquery_lists(&out);
+    out = out.rewrite(|w| {
+        let all = w.from.len();
+        expand_in_subquery_lists(w, 0, all);
+    });
 
     // Under ANSI_QUOTES a double-quoted word is an identifier. Rewriting it to
     // a backtick gives the parser the same meaning without a custom dialect,
@@ -139,7 +210,7 @@ pub fn normalise(sql: &str, mode: SqlMode) -> Normalised {
     // gated on the concrete dialect type, so a trait wrapper would silently
     // lose AUTO_INCREMENT and much else.
     if mode.ansi_quotes {
-        out = double_quotes_to_backticks(&out);
+        out = out.rewrite(double_quotes_to_backticks);
     }
 
     // Under IGNORE_SPACE a function name may be separated from its `(`. The
@@ -147,18 +218,228 @@ pub fn normalise(sql: &str, mode: SqlMode) -> Normalised {
     // closed up. Doing this only when the mode is set keeps the default
     // behaviour untouched.
     if mode.ignore_space {
-        out = close_call_spaces(&out);
+        out = out.rewrite(close_call_spaces);
     }
 
     // `n MOD 3` is the same operator as `n % 3`, and only the second spelling
     // parses. Last of the passes, so the tokenizer is shown the text the
     // parser will see and the offsets it reports are offsets into the answer.
-    let mut mod_operators = Vec::new();
-    out = mod_operator_to_percent(&out, &mut mod_operators);
+    mod_operator_to_percent(out)
+}
 
-    Normalised {
-        sql: out,
-        mod_operators,
+/// A stretch of rewritten text, and where it stood in the text the client sent.
+///
+/// The two lengths are independent — `src_len` is zero for text a pass
+/// inserted out of nothing — so neither side is a function of the other.
+/// `verbatim` says the stretch is the same bytes on both sides and an offset
+/// inside one is the same offset inside the other; without it a `"x"` rewritten
+/// to `` `x` `` would look interchangeable character for character, which is
+/// exactly the assumption this type exists to refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Piece {
+    out: usize,
+    len: usize,
+    src: usize,
+    src_len: usize,
+    verbatim: bool,
+}
+
+/// Where every part of a rewritten statement came from.
+///
+/// The pieces cover the rewritten text end to end and are ordered by `out`, so
+/// every position in it falls in exactly one. The *original* is not covered:
+/// text a pass removed is in no piece at all, which is why an answer is a hull
+/// and not a union — a range spanning a removal picks that text up because the
+/// hull is contiguous, and a range stopping at it does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Mapping {
+    pieces: Vec<Piece>,
+    src_len: usize,
+}
+
+impl Mapping {
+    fn identity(len: usize) -> Self {
+        Self {
+            pieces: vec![Piece {
+                out: 0,
+                len,
+                src: 0,
+                src_len: len,
+                verbatim: true,
+            }],
+            src_len: len,
+        }
+    }
+
+    /// The smallest range of the original covering `range` of the rewrite.
+    fn source(&self, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        let start = self.start_of(range.start);
+        // Never inverted: an empty range in the rewrite maps to an empty one
+        // here, wherever the two ends land.
+        let end = self.end_of(range.end).max(start);
+        start..end
+    }
+
+    /// Where a rewritten position starts in the original.
+    ///
+    /// The first piece the position is *inside*, so a piece that ends exactly
+    /// here is passed over — text removed just before the position was not
+    /// part of what follows it, and including it would widen the answer for
+    /// nothing.
+    fn start_of(&self, at: usize) -> usize {
+        self.pieces
+            .iter()
+            .find(|piece| piece.out + piece.len > at)
+            .map_or(self.src_len, |piece| {
+                if piece.verbatim {
+                    piece.src + (at - piece.out)
+                } else {
+                    // Inside a rewrite, so the whole of what it replaced is
+                    // what this position came from.
+                    piece.src
+                }
+            })
+    }
+
+    /// Where a rewritten position ends in the original, by the mirror rule.
+    fn end_of(&self, at: usize) -> usize {
+        self.pieces
+            .iter()
+            .rev()
+            .find(|piece| piece.out < at)
+            .map_or(0, |piece| {
+                if piece.verbatim {
+                    piece.src + (at - piece.out).min(piece.len)
+                } else {
+                    piece.src + piece.src_len
+                }
+            })
+    }
+}
+
+/// Builds one pass's output, and the record of where it came from.
+///
+/// A pass says what it copies and what it replaces, in order, and the mapping
+/// falls out. Composing is what makes that worth doing: a pass reports
+/// positions in *its own* input, which is the previous pass's output, and the
+/// answer has to be a position in the text the client sent however many passes
+/// stand between.
+struct Rewriter<'a> {
+    /// The text this pass reads.
+    from: &'a str,
+    /// Where `from` itself came from.
+    was: &'a Mapping,
+    out: String,
+    pieces: Vec<Piece>,
+    /// How far through `from` has been emitted.
+    copied: usize,
+    /// The first piece of `was` not yet carried over. Copying runs forwards,
+    /// so the search never has to start again from the beginning.
+    next: usize,
+}
+
+impl<'a> Rewriter<'a> {
+    fn new(text: &'a Normalised) -> Self {
+        Self {
+            from: &text.sql,
+            was: &text.map,
+            out: String::with_capacity(text.sql.len()),
+            pieces: Vec::new(),
+            copied: 0,
+            next: 0,
+        }
+    }
+
+    /// Copies `from` up to `to` unchanged.
+    fn copy_to(&mut self, to: usize) {
+        let to = to.clamp(self.copied, self.from.len());
+        if to == self.copied {
+            return;
+        }
+        let at = self.out.len();
+        while let Some(piece) = self.was.pieces.get(self.next).copied() {
+            if piece.out >= to {
+                break;
+            }
+            let lo = piece.out.max(self.copied);
+            let hi = (piece.out + piece.len).min(to);
+            if lo < hi {
+                self.pieces.push(if piece.verbatim {
+                    Piece {
+                        out: at + (lo - self.copied),
+                        len: hi - lo,
+                        src: piece.src + (lo - piece.out),
+                        src_len: hi - lo,
+                        verbatim: true,
+                    }
+                } else {
+                    // Only part of an earlier rewrite is being copied, and a
+                    // rewrite has no interior positions to divide, so the part
+                    // carries the whole of what it replaced.
+                    Piece {
+                        out: at + (lo - self.copied),
+                        len: hi - lo,
+                        ..piece
+                    }
+                });
+            }
+            if piece.out + piece.len > to {
+                break;
+            }
+            self.next += 1;
+        }
+        self.out.push_str(&self.from[self.copied..to]);
+        self.copied = to;
+    }
+
+    /// Emits `with` where `from[at..end]` stood.
+    ///
+    /// A removal records nothing, because there is nothing in the rewrite for
+    /// a piece to cover and the answer does not need one: a range is mapped to
+    /// the *hull* of what it covers, so text dropped between two stretches is
+    /// inside the answer whenever both of those stretches are, and text
+    /// dropped at either edge is outside it. A piece of zero length could
+    /// never be found by either end of the lookup.
+    fn substitute(&mut self, at: usize, end: usize, with: &str) {
+        // A pass has to report its edits in order, and one that does not would
+        // otherwise be absorbed rather than caught: `copy_to` clamps backwards
+        // and the cursor below takes the later end, so the overlapped input
+        // would be dropped and the pieces left out of order — a wrong column
+        // name with nothing to show for it. Every pass here walks segments or
+        // tokens ascending; this is for the next one that does not.
+        debug_assert!(
+            at >= self.copied,
+            "a rewriting pass reported an edit at {at} after emitting {}",
+            self.copied
+        );
+        self.copy_to(at);
+        if !with.is_empty() {
+            let source = self.was.source(at..end);
+            self.pieces.push(Piece {
+                out: self.out.len(),
+                len: with.len(),
+                src: source.start,
+                src_len: source.end - source.start,
+                verbatim: false,
+            });
+        }
+        self.out.push_str(with);
+        // A piece of `was` this substitution ate is left for the next copy to
+        // step over: it contributes nothing once `copied` is past it, and the
+        // cursor advances then rather than here.
+        self.copied = end.max(self.copied);
+    }
+
+    fn finish(mut self) -> (String, Mapping) {
+        let all = self.from.len();
+        self.copy_to(all);
+        (
+            self.out,
+            Mapping {
+                pieces: self.pieces,
+                src_len: self.was.src_len,
+            },
+        )
     }
 }
 
@@ -179,22 +460,23 @@ pub fn normalise(sql: &str, mode: SqlMode) -> Normalised {
 /// a `MOD` inside a string, a comment or a backquoted name is not a candidate
 /// at all.
 ///
-/// Each substitution is recorded in `sites` with the word it replaced, because
-/// a column named after the text it was written as has to be able to say
-/// `MOD` — or `mod`, which MySQL names just as faithfully.
-fn mod_operator_to_percent(sql: &str, sites: &mut Vec<(usize, String)>) -> String {
+/// The word each `%` was written as is not recorded anywhere: the mapping is
+/// what carries it, and a column named after the text it was written as reads
+/// `MOD` — or `mod`, which MySQL names just as faithfully — back out of the
+/// original through that.
+fn mod_operator_to_percent(text: Normalised) -> Normalised {
     // Nearly every statement is tokenized here for nothing, so the cheap test
     // comes first. As a *word*: `model`, `mode` and `modified_at` are ordinary
     // column names in the target schema, and a substring test would hand every
     // statement mentioning one a tokenizer pass it can never use.
-    if !contains_the_word_mod(sql) {
-        return sql.to_owned();
+    if !contains_the_word_mod(&text.sql) {
+        return text;
     }
 
-    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize_with_location() else {
+    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, &text.sql).tokenize_with_location() else {
         // Text the tokenizer refuses is text the parser will refuse, with a
         // better message than a half-applied rewrite could produce.
-        return sql.to_owned();
+        return text;
     };
 
     // Whitespace and comments are not operands, and MySQL allows any amount of
@@ -204,37 +486,38 @@ fn mod_operator_to_percent(sql: &str, sites: &mut Vec<(usize, String)>) -> Strin
         .filter(|t| !matches!(t.token, Token::Whitespace(_)))
         .collect();
 
-    let mut out = String::with_capacity(sql.len());
-    let mut copied = 0usize;
+    let mut substituted = false;
+    let (out, map) = {
+        let mut writer = Rewriter::new(&text);
+        let sql = writer.from;
 
-    for (index, token) in code.iter().enumerate() {
-        // A backquoted `mod` is `Keyword::NoKeyword`, so a column of that name
-        // never reaches the neighbour tests.
-        if !matches!(&token.token, Token::Word(word) if word.keyword == Keyword::MOD) {
-            continue;
+        for (index, token) in code.iter().enumerate() {
+            // A backquoted `mod` is `Keyword::NoKeyword`, so a column of that
+            // name never reaches the neighbour tests.
+            if !matches!(&token.token, Token::Word(word) if word.keyword == Keyword::MOD) {
+                continue;
+            }
+            let has_operands = index
+                .checked_sub(1)
+                .is_some_and(|before| ends_an_operand(&code[before].token))
+                && code
+                    .get(index + 1)
+                    .is_some_and(|after| begins_an_operand(&after.token));
+            if !has_operands {
+                continue;
+            }
+            let (Some(start), Some(end)) = (
+                byte_offset(sql, token.span.start),
+                byte_offset(sql, token.span.end),
+            ) else {
+                continue;
+            };
+            writer.substitute(start, end, "%");
+            substituted = true;
         }
-        let has_operands = index
-            .checked_sub(1)
-            .is_some_and(|before| ends_an_operand(&code[before].token))
-            && code
-                .get(index + 1)
-                .is_some_and(|after| begins_an_operand(&after.token));
-        if !has_operands {
-            continue;
-        }
-        let (Some(start), Some(end)) = (
-            byte_offset(sql, token.span.start),
-            byte_offset(sql, token.span.end),
-        ) else {
-            continue;
-        };
-        out.push_str(&sql[copied..start]);
-        sites.push((out.len(), sql[start..end].to_owned()));
-        out.push('%');
-        copied = end;
-    }
 
-    out.push_str(&sql[copied..]);
+        writer.finish()
+    };
 
     // Last, because no rule on the tokens either side can finish the job.
     // `ALTER TABLE t CHANGE colx mod GEOMETRY` renames a column to `mod` and
@@ -251,14 +534,17 @@ fn mod_operator_to_percent(sql: &str, sites: &mut Vec<(usize, String)>) -> Strin
     // costs two full parses where every other statement costs one. That is a
     // real cost for an engine whose reason to exist is start-up and query
     // latency, and it is paid only by statements that reach here at all —
-    // `contains_the_word_mod` rejects the rest on a byte scan, and `sites`
-    // being empty means nothing was substituted to check.
-    if !sites.is_empty() && Parser::parse_sql(&MySqlDialect {}, &out).is_err() {
-        sites.clear();
-        return sql.to_owned();
+    // `contains_the_word_mod` rejects the rest on a byte scan, and nothing
+    // substituted means nothing to check.
+    if !substituted || Parser::parse_sql(&MySqlDialect {}, &out).is_err() {
+        return text;
     }
 
-    out
+    Normalised {
+        sql: out,
+        written: text.written,
+        map,
+    }
 }
 
 /// Whether `mod` appears as a whole word, ignoring case.
@@ -460,38 +746,29 @@ pub fn split_statements(sql: &str) -> Vec<String> {
 ///
 /// Only the text before the first `FROM` is touched, so a `SELECT a.*` inside a
 /// subquery in the WHERE clause keeps its star.
-fn strip_delete_target_stars(sql: &str) -> String {
+fn strip_delete_target_stars(writer: &mut Rewriter<'_>) {
+    let sql = writer.from;
     let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len());
 
     for (kind, start, end) in segments(sql) {
         if kind != Segment::Code {
-            out.push_str(&sql[start..end]);
             continue;
         }
 
         let mut i = start;
         while i < end {
             if bytes[i] == b'.' && bytes.get(i + 1) == Some(&b'*') {
+                writer.substitute(i, i + 2, "");
                 i += 2;
                 continue;
             }
             // Everything from the target list's `FROM` onward is left alone.
             if word_at(bytes, i, b"FROM") {
-                out.push_str(&sql[i..]);
-                return out;
+                return;
             }
-            let next = sql[i..end]
-                .char_indices()
-                .nth(1)
-                .map(|(offset, _)| i + offset)
-                .unwrap_or(end);
-            out.push_str(&sql[i..next]);
-            i = next;
+            i += utf8_len(bytes[i]);
         }
     }
-
-    out
 }
 
 /// Whether `word` appears at `i` as a whole word, ignoring case.
@@ -609,16 +886,19 @@ fn unquote(word: &str) -> String {
 }
 
 /// Replaces every occurrence in code, leaving literals and comments alone.
-fn replace_outside_literals(sql: &str, from: &str, to: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
+fn replace_outside_literals(writer: &mut Rewriter<'_>, from: &str, to: &str) {
+    let sql = writer.from;
     for (kind, start, end) in segments(sql) {
-        let text = &sql[start..end];
-        match kind {
-            Segment::Code => out.push_str(&text.replace(from, to)),
-            _ => out.push_str(text),
+        if kind != Segment::Code {
+            continue;
+        }
+        let mut at = start;
+        while let Some(found) = sql[at..end].find(from) {
+            let found = at + found;
+            writer.substitute(found, found + from.len(), to);
+            at = found + from.len();
         }
     }
-    out
 }
 
 /// Rewrites `"identifier"` as `` `identifier` ``.
@@ -626,23 +906,24 @@ fn replace_outside_literals(sql: &str, from: &str, to: &str) -> String {
 /// Only quoted runs the scanner classified as such are converted, so a stray
 /// double quote inside a comment cannot open an identifier that swallows the
 /// rest of the statement.
-fn double_quotes_to_backticks(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
+///
+/// The rewrite is not length-preserving in either direction — `""` collapses
+/// to one byte and a backtick doubles into two — so each quoted run is one
+/// piece of the mapping rather than a stretch of it that happens to line up.
+fn double_quotes_to_backticks(writer: &mut Rewriter<'_>) {
+    let sql = writer.from;
     for (kind, start, end) in segments(sql) {
         let text = &sql[start..end];
-        if kind == Segment::Quoted && text.starts_with('"') {
-            let inner = text
-                .strip_prefix('"')
-                .and_then(|t| t.strip_suffix('"'))
-                .unwrap_or(&text[1..]);
-            out.push('`');
-            out.push_str(&inner.replace("\"\"", "\"").replace('`', "``"));
-            out.push('`');
-        } else {
-            out.push_str(text);
+        if kind != Segment::Quoted || !text.starts_with('"') {
+            continue;
         }
+        let inner = text
+            .strip_prefix('"')
+            .and_then(|t| t.strip_suffix('"'))
+            .unwrap_or(&text[1..]);
+        let quoted = format!("`{}`", inner.replace("\"\"", "\"").replace('`', "``"));
+        writer.substitute(start, end, &quoted);
     }
-    out
 }
 
 /// Rewrites `IN ((SELECT a), (SELECT b))` as `IN ((SELECT a) UNION ALL (SELECT b))`.
@@ -657,28 +938,30 @@ fn double_quotes_to_backticks(sql: &str) -> String {
 /// a UNION ALL it becomes ordinary set membership, so that error is not
 /// raised. Every occurrence in the target corpus carries `LIMIT 1`, so the
 /// case does not arise there.
-fn expand_in_subquery_lists(sql: &str) -> String {
+///
+/// Written over a range of the statement rather than over a string of its own
+/// so that a nested list recurses in place: a branch rewritten separately and
+/// spliced back would have to have its own mapping composed into this one, and
+/// the offsets it reported would be offsets into a string no caller has.
+fn expand_in_subquery_lists(writer: &mut Rewriter<'_>, from: usize, to: usize) {
+    let sql = writer.from;
     let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len());
-    let mut i = 0usize;
+    let mut i = from;
 
-    while i < bytes.len() {
-        // Literals and comments are copied verbatim; `IN` inside one is text.
+    while i < to {
+        // Literals and comments are code to nobody; `IN` inside one is text.
         if let Some((_, end)) = classify(bytes, i) {
-            out.push_str(&sql[i..end]);
-            i = end;
+            i = end.max(i + 1).min(to);
             continue;
         }
 
-        let is_in_keyword = bytes.len() - i >= 2
+        let is_in_keyword = to - i >= 2
             && bytes[i..i + 2].eq_ignore_ascii_case(b"IN")
             && i.checked_sub(1).is_none_or(|p| !is_ident_byte(bytes[p]))
             && bytes.get(i + 2).is_none_or(|b| !is_ident_byte(*b));
 
         if !is_in_keyword {
-            let len = utf8_len(bytes[i]);
-            out.push_str(&sql[i..(i + len).min(sql.len())]);
-            i += len;
+            i += utf8_len(bytes[i]);
             continue;
         }
 
@@ -687,36 +970,55 @@ fn expand_in_subquery_lists(sql: &str) -> String {
         let Some(close) = (bytes.get(open) == Some(&b'('))
             .then(|| matching_paren(bytes, open))
             .flatten()
+            // A list closing outside the range being walked is one belonging
+            // to an enclosing call, and rewriting it here would emit text out
+            // of order.
+            .filter(|close| *close < to)
         else {
-            out.push_str(&sql[i..i + 2]);
             i += 2;
             continue;
         };
 
-        let inner = &sql[open + 1..close];
-        let parts = split_top_level_commas(inner);
-        if parts.len() < 2 || !parts.iter().all(|p| is_parenthesised_select(p)) {
-            out.push_str(&sql[i..i + 2]);
+        let inner = open + 1;
+        let parts = split_top_level_commas(&sql[inner..close]);
+        if parts.len() < 2
+            || !parts
+                .iter()
+                .all(|p| is_parenthesised_select(&sql[inner + p.start..inner + p.end]))
+        {
             i += 2;
             continue;
         }
 
-        out.push_str(&sql[i..open]);
-        out.push('(');
-        let branches: Vec<String> = parts
-            .iter()
-            // Each branch keeps its parentheses: one may end in LIMIT, and
-            // `SELECT ... LIMIT 1 UNION ALL SELECT ...` binds the LIMIT to the
-            // whole union and stops parsing. Branches are expanded in turn so a
-            // nested list is not left behind.
-            .map(|p| expand_in_subquery_lists(p.trim()))
-            .collect();
-        out.push_str(&branches.join(" UNION ALL "));
-        out.push(')');
+        // Each branch keeps its parentheses: one may end in LIMIT, and
+        // `SELECT ... LIMIT 1 UNION ALL SELECT ...` binds the LIMIT to the
+        // whole union and stops parsing. Branches are expanded in turn so a
+        // nested list is not left behind.
+        let mut previous = None;
+        for part in &parts {
+            let branch = trimmed(sql, inner + part.start..inner + part.end);
+            match previous {
+                // The comma and the space either side of it together, because
+                // the three are one edit: what stands there afterwards came
+                // from all of them and from none of them in particular.
+                Some(end) => writer.substitute(end, branch.start, " UNION ALL "),
+                None => writer.substitute(inner, branch.start, ""),
+            }
+            expand_in_subquery_lists(writer, branch.start, branch.end);
+            previous = Some(branch.end);
+        }
+        if let Some(end) = previous {
+            writer.substitute(end, close, "");
+        }
         i = close + 1;
     }
+}
 
-    out
+/// `range` with the whitespace at either end left out.
+fn trimmed(sql: &str, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let text = &sql[range.clone()];
+    let start = range.start + (text.len() - text.trim_start().len());
+    start..(start + text.trim().len())
 }
 
 /// Whether an IN-list element is a single parenthesised SELECT.
@@ -794,7 +1096,9 @@ fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
 }
 
 /// Splits on commas that are not inside parentheses, literals or comments.
-fn split_top_level_commas(inner: &str) -> Vec<&str> {
+/// By range rather than by slice, because the caller needs to say where each
+/// part stood as well as what it says.
+fn split_top_level_commas(inner: &str) -> Vec<std::ops::Range<usize>> {
     let bytes = inner.as_bytes();
     let mut parts = Vec::new();
     let mut start = 0usize;
@@ -810,14 +1114,14 @@ fn split_top_level_commas(inner: &str) -> Vec<&str> {
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
             b',' if depth == 0 => {
-                parts.push(&inner[start..i]);
+                parts.push(start..i);
                 start = i + 1;
             }
             _ => {}
         }
         i += 1;
     }
-    parts.push(&inner[start..]);
+    parts.push(start..inner.len());
     parts
 }
 
@@ -829,16 +1133,15 @@ fn is_ident_byte(b: u8) -> bool {
 ///
 /// Doing this blind to comments deleted the newline that terminates a `--`
 /// comment, commenting out everything after it.
-fn close_call_spaces(sql: &str) -> String {
+fn close_call_spaces(writer: &mut Rewriter<'_>) {
+    let sql = writer.from;
     let parts = segments(sql);
-    let mut out = String::with_capacity(sql.len());
 
     for (index, (kind, start, end)) in parts.iter().enumerate() {
-        let text = &sql[*start..*end];
         if *kind != Segment::Code {
-            out.push_str(text);
             continue;
         }
+        let text = &sql[*start..*end];
 
         // A code segment that follows a comment begins with the newline that
         // ends it. Closing that up would pull the next line into the comment.
@@ -851,7 +1154,6 @@ fn close_call_spaces(sql: &str) -> String {
         let mut i = 0usize;
         while i < bytes.len() {
             if !bytes[i].is_ascii_whitespace() {
-                out.push_str(&text[i..i + utf8_len(bytes[i])]);
                 i += utf8_len(bytes[i]);
                 continue;
             }
@@ -866,22 +1168,21 @@ fn close_call_spaces(sql: &str) -> String {
             // this segment itself continues with `(`.
             let follows_paren = bytes.get(j) == Some(&b'(');
             let preceded = i > 0 || !after_comment;
+            // The character before the run, which is the last one that will
+            // have been emitted: a run is only ever removed with a `(` after
+            // it, so no removal can change what precedes the next one.
             let preceded = preceded
-                && out
+                && sql[..*start + i]
                     .chars()
                     .next_back()
                     .is_some_and(|p| p.is_alphanumeric() || p == '_');
 
             if preceded && follows_paren {
-                i = j;
-            } else {
-                out.push_str(&text[i..j]);
-                i = j;
+                writer.substitute(*start + i, *start + j, "");
             }
+            i = j;
         }
     }
-
-    out
 }
 
 fn utf8_len(first: u8) -> usize {
@@ -1408,5 +1709,227 @@ mod in_list_review_regressions {
             expand("WHERE b IN (/* x */ (SELECT 1), (SELECT 2))"),
             "WHERE b IN (/* x */ (SELECT 1) UNION ALL (SELECT 2))"
         );
+    }
+}
+
+#[cfg(test)]
+mod offset_mapping {
+    use super::*;
+
+    /// MySQL's `ANSI` as 8.3 expands it, so a fixture cannot describe one mode
+    /// while its name describes another.
+    const ANSI: SqlMode = SqlMode {
+        ansi_quotes: true,
+        pipes_as_concat: true,
+        ignore_space: true,
+        real_as_float: true,
+        strict: false,
+        only_full_group_by: true,
+        no_unsigned_subtraction: false,
+    };
+
+    fn quotes() -> SqlMode {
+        SqlMode {
+            ansi_quotes: true,
+            ..SqlMode::default()
+        }
+    }
+
+    fn space() -> SqlMode {
+        SqlMode {
+            ignore_space: true,
+            ..SqlMode::default()
+        }
+    }
+
+    /// What the client wrote where the rewrite says `needle`.
+    ///
+    /// By searching the *rewritten* text for the range, which is how the
+    /// executor reaches this: a span points into what the parser was given.
+    fn written(sql: &str, mode: SqlMode, needle: &str) -> String {
+        let normalised = normalise(sql, mode);
+        let at = normalised
+            .sql
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} is not in {:?}", normalised.sql));
+        normalised
+            .as_written(at..at + needle.len())
+            .unwrap_or_else(|| panic!("{needle:?} maps outside {sql:?}"))
+            .to_owned()
+    }
+
+    /// The whole point: an offset in the rewrite is not an offset in the
+    /// original, even where the two texts are the same length.
+    #[test]
+    fn a_rewritten_range_maps_back_to_the_text_it_came_from() {
+        // Same length, and positional — the case the obvious repair would
+        // have got right by luck.
+        assert_eq!(
+            written(r#"SELECT "x" + 1 FROM P"#, quotes(), "`x` + 1"),
+            r#""x" + 1"#
+        );
+        // One byte shorter: `""` collapses to one quote.
+        assert_eq!(
+            written(r#"SELECT "a""b" + 1 FROM P"#, quotes(), r#"`a"b` + 1"#),
+            r#""a""b" + 1"#
+        );
+        // One byte longer: a backtick doubles.
+        assert_eq!(
+            written("SELECT \"a`b\" + 1 FROM P", quotes(), "`a``b` + 1"),
+            "\"a`b\" + 1"
+        );
+        // Removed text, which has no counterpart at all: the space is inside
+        // the answer because text on both sides of it is.
+        assert_eq!(
+            written("SELECT COUNT (*) FROM P", space(), "COUNT(*)"),
+            "COUNT (*)"
+        );
+        // A range that is exactly one rewrite and nothing else, so both ends
+        // of it land inside the same piece.
+        assert_eq!(written(r#"SELECT "x" FROM P"#, quotes(), "`x`"), r#""x""#);
+        assert_eq!(
+            written("SELECT n MOD 3", SqlMode::default(), "n % 3"),
+            "n MOD 3"
+        );
+        assert_eq!(
+            written("SELECT n mod 3", SqlMode::default(), "n % 3"),
+            "n mod 3"
+        );
+    }
+
+    /// Every pass composed, in the order `normalise` runs them.
+    #[test]
+    fn the_passes_compose() {
+        assert_eq!(
+            written(
+                "SELECT LENGTH (\"a\"\"b\") MOD 2 FROM P",
+                ANSI,
+                "LENGTH(`a\"b`) % 2"
+            ),
+            "LENGTH (\"a\"\"b\") MOD 2"
+        );
+        // Two rewrites of different signs in one range: the identifier grows
+        // by a byte where the space before the call loses one.
+        assert_eq!(
+            written("SELECT ABS (\"a`b\") FROM P", ANSI, "ABS(`a``b`)"),
+            "ABS (\"a`b\")"
+        );
+    }
+
+    /// A range that begins at a rewrite an *earlier* pass made, which is the
+    /// case composing exists for: the `MOD` pass copies the identifier the
+    /// ANSI_QUOTES pass produced, and the answer is still the original.
+    #[test]
+    fn a_range_beginning_at_a_carried_rewrite_maps_back() {
+        assert_eq!(
+            written(r#"SELECT "x" MOD 3 FROM P"#, quotes(), "`x` % 3"),
+            r#""x" MOD 3"#
+        );
+    }
+
+    /// A range that stops in the middle of a rewrite covers the whole of it.
+    ///
+    /// A rewrite has no interior position that means anything in the original,
+    /// so half of one is still all of what it replaced. Asserted here and not
+    /// through a column name, because a name's span lands on token boundaries
+    /// and never inside one — this is the level the rule exists at.
+    #[test]
+    fn a_range_ending_inside_a_rewrite_covers_all_of_it() {
+        let sql = "SELECT \"a`b\" + 1";
+        let normalised = normalise(sql, quotes());
+        assert_eq!(normalised.sql, "SELECT `a``b` + 1");
+        // Two bytes into the rewritten identifier, which is one byte into the
+        // five the client wrote — a place the original does not have.
+        assert_eq!(normalised.as_written(0..9), Some("SELECT \"a`b\""));
+    }
+
+    /// A range that stops at a rewrite rather than covering it, which is where
+    /// a mapping can be too wide as easily as too narrow.
+    #[test]
+    fn trivia_at_the_edge_of_a_range_is_left_out() {
+        // The space IGNORE_SPACE removed sits at the end of this range, so it
+        // is outside what the range covers and outside the answer.
+        assert_eq!(
+            written("SELECT COUNT (*) FROM P", space(), "COUNT"),
+            "COUNT"
+        );
+        assert_eq!(written("SELECT COUNT (*) FROM P", space(), "(*)"), "(*)");
+    }
+
+    /// A pass that reports its edits out of order is a bug in that pass, and
+    /// the builder says so rather than absorbing it.
+    ///
+    /// Asserted here because there is no statement that reaches it: every pass
+    /// in this module walks segments or tokens ascending. `Rewriter` is the
+    /// facility the next pass will be written against, and absorbing a
+    /// mis-ordered edit would drop the overlapped input and leave the pieces
+    /// unordered — a wrong column name with nothing to show for it.
+    #[test]
+    #[should_panic(expected = "reported an edit at")]
+    fn an_edit_reported_out_of_order_is_refused() {
+        let _ = Normalised::untouched("SELECT a + b").rewrite(|writer| {
+            writer.substitute(9, 10, "-");
+            writer.substitute(7, 8, "z");
+        });
+    }
+
+    /// A statement no pass touched maps to itself, which is every statement
+    /// the default mode sees.
+    #[test]
+    fn an_untouched_statement_maps_to_itself() {
+        let sql = "SELECT a + 1, CONCAT('x', 'y') FROM t";
+        let normalised = normalise(sql, SqlMode::default());
+        assert_eq!(normalised.sql, sql);
+        assert_eq!(normalised.as_written(0..sql.len()), Some(sql));
+        assert_eq!(normalised.as_written(7..12), Some("a + 1"));
+        // Out of range rather than a panic or a wrong slice.
+        assert_eq!(normalised.as_written(0..sql.len() + 1), None);
+    }
+
+    /// The IN-list expansion inserts text with no counterpart in the original
+    /// and drops text with none in the rewrite, both in the same list.
+    #[test]
+    fn an_expanded_in_list_maps_back_to_the_list_as_written() {
+        let sql = "SELECT a FROM t WHERE b IN ( (SELECT 1) ,  (SELECT 2) )";
+        let normalised = normalise(sql, SqlMode::default());
+        assert_eq!(
+            normalised.sql,
+            "SELECT a FROM t WHERE b IN ((SELECT 1) UNION ALL (SELECT 2))"
+        );
+        let at = normalised.sql.find("((SELECT").unwrap();
+        let end = normalised.sql.len();
+        assert_eq!(
+            normalised.as_written(at..end),
+            Some("( (SELECT 1) ,  (SELECT 2) )")
+        );
+        // A branch on its own, with the inserted separator outside it.
+        let branch = normalised.sql.find("(SELECT 2)").unwrap();
+        assert_eq!(
+            normalised.as_written(branch..branch + "(SELECT 2)".len()),
+            Some("(SELECT 2)")
+        );
+    }
+
+    /// `SET @x := 1`, the one pass whose statement has no columns to name.
+    /// Mapped anyway, because a pass that reports nothing is a pass the next
+    /// reader has to remember is different.
+    #[test]
+    fn the_assignment_spelling_maps_back() {
+        assert_eq!(
+            written("SET @x := 1", SqlMode::default(), "@x = 1"),
+            "@x := 1"
+        );
+    }
+
+    /// And the DELETE star, for the same reason.
+    ///
+    /// Both edge rules in one statement: the star after `a` is inside the
+    /// range and comes back, the star after `b` is at the range's end and is
+    /// only reached by a range that covers the character past it.
+    #[test]
+    fn a_stripped_delete_star_maps_back() {
+        let sql = "DELETE a.*, b.* FROM a JOIN b ON a.id = b.id";
+        assert_eq!(written(sql, SqlMode::default(), "a, b"), "a.*, b");
+        assert_eq!(written(sql, SqlMode::default(), "a, b "), "a.*, b.* ");
     }
 }

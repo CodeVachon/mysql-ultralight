@@ -202,3 +202,8 @@
 {"at":"2026-08-25T16:39:34Z","id":106,"by":"Christopher Vachon","as":"user","type":"created","title":"Unary minus over a string is typed VAR_STRING","state":"Todo"}
 {"at":"2026-08-25T16:39:41Z","id":107,"by":"Christopher Vachon","as":"user","type":"created","title":"An identifier longer than MySQL allows is accepted","state":"Todo"}
 {"at":"2026-08-25T17:00:04Z","id":108,"by":"Christopher Vachon","as":"user","type":"created","title":"The image tests collide in the shared temp directory","state":"Todo"}
+{"at":"2026-08-25T19:32:16Z","id":59,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-25T19:32:31Z","id":109,"by":"Christopher Vachon","as":"user","type":"created","title":"A bound parameter column is named after its value","state":"Todo"}
+{"at":"2026-08-25T19:32:32Z","id":110,"by":"Christopher Vachon","as":"user","type":"created","title":"A view column is materialised wider than MySQL materialises it","state":"Todo"}
+{"at":"2026-08-25T20:18:10Z","id":60,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-08-25T20:18:10Z","id":60,"by":"Christopher Vachon","as":"user","type":"assigned","from":null,"to":"Christopher Vachon"}

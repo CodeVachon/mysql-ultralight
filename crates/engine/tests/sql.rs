@@ -8395,6 +8395,131 @@ fn a_view_keeps_the_name_its_definition_was_written_with() {
     assert_eq!(names, vec!["a", "b"]);
 }
 
+/// Under a mode that makes the rewriter change the statement, the name a
+/// client gets still has to be the text *it* wrote — which is the whole point
+/// of naming from the source, and exactly the modes the rewriter exists for.
+///
+/// Every expected name below was read off MySQL 8.3 under the same mode. They
+/// are not obvious: `SELECT "x" + 1` keeps its double quotes, `SELECT "a""b"`
+/// keeps the doubled one, and `COUNT (*)` keeps the space the parser was not
+/// allowed to see.
+///
+/// A bare quoted identifier is the exception on both servers, and for the same
+/// reason as a literal: it is named by what it denotes rather than by how it
+/// was spelled, so `SELECT "x"` is `x` and `SELECT "a""b"` is `a"b`.
+#[test]
+fn a_rewritten_statement_names_its_columns_after_what_the_client_wrote() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE P (id INT NOT NULL, x INT NULL, `a\"b` INT NULL, `a``b` INT NULL, \
+         PRIMARY KEY (id))",
+    );
+    run(&engine, &mut session, "INSERT INTO P VALUES (1, 5, 6, 7)");
+    let plain = session.config.sql_mode.clone();
+
+    for (flags, sql, expected) in [
+        // ANSI_QUOTES, where the rewrite is the same length as what it
+        // replaced and reading the original at the rewrite's offsets would
+        // have worked by luck.
+        (
+            "ANSI_QUOTES",
+            r#"SELECT "x" + 1 FROM P"#,
+            &[r#""x" + 1"#][..],
+        ),
+        (
+            "ANSI_QUOTES",
+            r#"SELECT 1 + "x" * 2 FROM P"#,
+            &[r#"1 + "x" * 2"#],
+        ),
+        // And where it is not. `""` collapses to one byte, so the rewrite is
+        // shorter than the original.
+        (
+            "ANSI_QUOTES",
+            r#"SELECT "a""b" + 1 FROM P"#,
+            &[r#""a""b" + 1"#],
+        ),
+        // A backtick doubles, so this one is longer.
+        ("ANSI_QUOTES", "SELECT \"a`b\" + 1 FROM P", &["\"a`b\" + 1"]),
+        // The identifier alone, named by what it denotes.
+        ("ANSI_QUOTES", r#"SELECT "x" FROM P"#, &["x"]),
+        ("ANSI_QUOTES", r#"SELECT "a""b" FROM P"#, &[r#"a"b"#]),
+        // IGNORE_SPACE, where the rewrite removes text that has no
+        // counterpart at all — and the name has to put it back.
+        ("IGNORE_SPACE", "SELECT COUNT (*) FROM P", &["COUNT (*)"]),
+        ("IGNORE_SPACE", "SELECT ABS (-1)", &["ABS (-1)"]),
+        (
+            "IGNORE_SPACE",
+            "SELECT CONCAT ('a' , 'b')",
+            &["CONCAT ('a' , 'b')"],
+        ),
+        // MySQL names the column with the newline in it, and with the comment.
+        ("IGNORE_SPACE", "SELECT ABS\n(-2)", &["ABS\n(-2)"]),
+        (
+            "IGNORE_SPACE",
+            "SELECT ABS /* c */ (-3)",
+            &["ABS /* c */ (-3)"],
+        ),
+        // A parenthesised item written *first*, where the gap this mode closes
+        // is the one after `SELECT` itself. The parser is handed
+        // `SELECT(COUNT(*))`, so the `(` the name starts at follows a letter
+        // in the rewrite and a space in what was written — and the backward
+        // walk has to take the second answer or the name falls back to the
+        // rendered tree. Anywhere but first, the character before the `(` is a
+        // comma or an operator and no gap is closed at all.
+        (
+            "IGNORE_SPACE",
+            "SELECT (COUNT (*)) FROM P",
+            &["(COUNT (*))"],
+        ),
+        ("IGNORE_SPACE", "SELECT ( 1 + 2 )", &["( 1 + 2 )"]),
+        (
+            "IGNORE_SPACE",
+            "SELECT (CONCAT ('a','b'))",
+            &["(CONCAT ('a','b'))"],
+        ),
+        // Already right before the walk was widened, because a binary
+        // operator's span starts at the `(` rather than inside it.
+        ("IGNORE_SPACE", "SELECT (1) + 2", &["(1) + 2"]),
+        // Both modes and the MOD rewrite in one statement, so every pass that
+        // changes text is composed in the answer.
+        (
+            "ANSI_QUOTES,IGNORE_SPACE",
+            "SELECT ABS (\"a`b\"), \"x\" MOD 3, LENGTH (\"a\"\"b\") FROM P",
+            &["ABS (\"a`b\")", "\"x\" MOD 3", "LENGTH (\"a\"\"b\")"],
+        ),
+        (
+            "ANSI_QUOTES,IGNORE_SPACE",
+            "SELECT UPPER (\"a\"\"b\"), \"a`b\" mod 2 FROM P",
+            &["UPPER (\"a\"\"b\")", "\"a`b\" mod 2"],
+        ),
+        // Every pass at once and the leading parenthesis too, so the closed
+        // gap, the rewritten identifier and the rewritten operator are all
+        // inside one name.
+        (
+            "ANSI_QUOTES,IGNORE_SPACE",
+            "SELECT (\"x\" MOD 3) FROM P",
+            &["(\"x\" MOD 3)"],
+        ),
+        (
+            "ANSI_QUOTES,IGNORE_SPACE",
+            "SELECT (LENGTH (\"a\"\"b\")) FROM P",
+            &["(LENGTH (\"a\"\"b\"))"],
+        ),
+    ] {
+        session.config.sql_mode = format!("{plain},{flags}");
+        let described = engine.describe(&session, sql, 0).unwrap().unwrap();
+        let names: Vec<&str> = described.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, expected, "describing {sql} under {flags}");
+        let Outcome::Rows(executed) = run(&engine, &mut session, sql) else {
+            panic!("expected rows from {sql}");
+        };
+        let names: Vec<&str> = executed.columns.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, expected, "running {sql} under {flags}");
+    }
+}
+
 /// Pins a divergence rather than claiming a fix.
 ///
 /// A parameter is spliced into the statement text before parsing, so by the
@@ -8406,10 +8531,14 @@ fn a_view_keeps_the_name_its_definition_was_written_with() {
 /// answers `NULL` where executing answers the value.
 ///
 /// Naming a spliced parameter `?` needs the binder to report where it wrote,
-/// through a normaliser that does not preserve offsets — the same missing
-/// offset mapping as #0060 — so it is not fixed here. This test exists so the
-/// behaviour cannot drift unnoticed while it waits. See also the `SELECT ?`
-/// assertion in `crates/engine/tests/describe.rs`.
+/// through a normaliser that did not preserve offsets. Half of that is now
+/// there: #0060 gave the rewriter an offset mapping, so a range of the parsed
+/// text can be carried back to the text it came from. What is still missing is
+/// the other half — `params::bind` reporting its own substitutions in the same
+/// terms, so the two compose — which is a change to the binder rather than to
+/// naming, and is not made here. This test exists so the behaviour cannot
+/// drift unnoticed while it waits. See also the `SELECT ?` assertion in
+/// `crates/engine/tests/describe.rs`.
 #[test]
 fn a_bound_parameter_column_is_named_after_its_value_where_mysql_says_question_mark() {
     let (engine, mut session) = engine();

@@ -1,11 +1,12 @@
 ---
 id: 60
 title: A rewritten statement names its columns after the rewrite
-state: Todo
+state: In Progress
 parent: 9
+assignee: Christopher Vachon
 labels: [compat]
 created: 2026-08-21T02:24:55Z
-updated: 2026-08-21T02:24:55Z
+updated: 2026-08-25T20:18:15Z
 ---
 
 ## Description

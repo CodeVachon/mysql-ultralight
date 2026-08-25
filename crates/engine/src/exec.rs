@@ -103,7 +103,7 @@ impl Engine {
             return Ok(None);
         }
 
-        let normalised = rewrite::normalise(&bound, session.sql_mode());
+        let normalised = std::rc::Rc::new(rewrite::normalise(&bound, session.sql_mode()));
         // Held for the whole call: a computed column is named after the text
         // it was written as, and that text is only available here.
         let _source = Source::set(&normalised, session.sql_mode());
@@ -435,7 +435,7 @@ impl Engine {
             return self.run_intercepted(session, intercepted, depth);
         }
 
-        let normalised = rewrite::normalise(&bound, mode);
+        let normalised = std::rc::Rc::new(rewrite::normalise(&bound, mode));
         let _source = Source::set(&normalised, mode);
         let statements = Parser::parse_sql(&MySqlDialect {}, &normalised.sql)
             .map_err(|e| EngineError::parse(format!("{e}")))?;
@@ -7593,9 +7593,10 @@ fn string_literal_name(contents: &str) -> String {
 /// of quote doubling in the first token and one byte of `'b'` in the joined
 /// value, so it balances and the interiors are what separate them.
 fn first_adjacent_literal(value: &sqlparser::ast::ValueWithSpan, joined: &str) -> Option<String> {
-    let sql = SOURCE.with(|s| s.borrow().as_ref().map(|c| c.sql.clone()))?;
-    let start = rewrite::byte_offset(&sql, value.span.start)?;
-    let end = rewrite::byte_offset(&sql, value.span.end)?;
+    let sql = SOURCE.with(|s| s.borrow().as_ref().map(|c| std::rc::Rc::clone(&c.source)))?;
+    let sql = &sql.sql;
+    let start = rewrite::byte_offset(sql, value.span.start)?;
+    let end = rewrite::byte_offset(sql, value.span.end)?;
     let first = sql.get(start..end)?;
     if first.len() == joined.len() + 2 && first.get(1..first.len() - 1) == Some(joined) {
         return None;
@@ -7628,15 +7629,19 @@ const SPAN_SLACK: usize = 64;
 ///
 /// `None` rather than a guess: the caller falls back to rendering the tree,
 /// which is wrong about spacing but never about *which* expression it names.
+///
+/// Two texts are in play and each answers a different question. The search
+/// runs over the *rewritten* statement, because that is what the spans point
+/// into and what can be parsed back to check a candidate — the original may
+/// not even parse without the mode that produced it, `SELECT "x" + 1` under
+/// ANSI_QUOTES being exactly that. The answer is then read out of the text the
+/// client sent, through the mapping, because that is the name MySQL gives.
 fn source_text(e: &Expr) -> Option<String> {
-    let (sql, mod_operators) = SOURCE.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map(|c| (c.sql.clone(), c.mod_operators.clone()))
-    })?;
+    let origin = SOURCE.with(|s| s.borrow().as_ref().map(|c| std::rc::Rc::clone(&c.source)))?;
+    let sql = &origin.sql;
     let span = e.span();
-    let reported = rewrite::byte_offset(&sql, span.start)?;
-    let from = rewrite::byte_offset(&sql, span.end)
+    let reported = rewrite::byte_offset(sql, span.start)?;
+    let from = rewrite::byte_offset(sql, span.end)
         .unwrap_or(reported)
         .max(reported);
     if let Some(known) = SOURCE.with(|s| {
@@ -7666,19 +7671,27 @@ fn source_text(e: &Expr) -> Option<String> {
             sql.get(*start..reported)
                 .is_some_and(|skipped| !skipped.contains([',', ';', '\'', '"', '`']))
         })
-        .filter(|start| *start == reported || starts_a_token(&sql, *start));
+        .filter(|start| *start == reported || starts_a_token(&origin, *start));
 
     let mut answer = None;
     for start in starts {
         if !sql.is_char_boundary(start) {
             continue;
         }
-        let found = ends(&sql, start, from, limit)
+        let found = ends(sql, start, from, limit)
             .into_iter()
-            .map(|end| sql[start..end].trim_end())
-            .find(|slice| !slice.is_empty() && parses_back_to(slice, &rendered));
-        if let Some(slice) = found {
-            answer = Some(respell_mod(slice, start, &mod_operators));
+            .map(|end| start + sql[start..end].trim_end().len())
+            .find(|end| *end > start && parses_back_to(&sql[start..*end], &rendered));
+        if let Some(end) = found {
+            // The name is the range as the client wrote it, which is the same
+            // text whenever no pass touched it and the point of the mapping
+            // when one did. Empty only if the whole of it was inserted by the
+            // rewriter, which no select item can be — and the caller's
+            // fallback is a better answer than a column with no name.
+            answer = origin
+                .as_written(start..end)
+                .filter(|written| !written.is_empty())
+                .map(str::to_owned);
             break;
         }
     }
@@ -7693,36 +7706,6 @@ fn source_text(e: &Expr) -> Option<String> {
         }
     });
     answer
-}
-
-/// Puts `MOD` back into a name the rewriter spelled `%`.
-///
-/// The parser is handed `%` because sqlparser has no infix `MOD`, but MySQL
-/// names an unaliased column after the text the *client* wrote — so without
-/// this, `SELECT n MOD 3` comes back as a column called `n % 3` and a caller
-/// reading the row by the name it asked for finds nothing.
-///
-/// `sites` are offsets into the whole statement and ascending, which is the
-/// order `normalise` records them in, each with the word that stood there.
-fn respell_mod(slice: &str, start: usize, sites: &[(usize, String)]) -> String {
-    let mut out = String::with_capacity(slice.len());
-    let mut copied = 0usize;
-    for (at, spelling) in sites
-        .iter()
-        .filter_map(|(site, spelling)| Some((site.checked_sub(start)?, spelling)))
-    {
-        if at < copied || at >= slice.len() {
-            continue;
-        }
-        out.push_str(&slice[copied..at]);
-        // The spelling the client used, not a canonical one: MySQL names
-        // `SELECT 7 mod 3` after the lowercase it was given.
-        out.push_str(spelling);
-        // Past the single byte the `%` occupies, whatever it replaced.
-        copied = at + 1;
-    }
-    out.push_str(&slice[copied..]);
-    out
 }
 
 /// Where an expression's text could end, nearest first.
@@ -7799,24 +7782,39 @@ fn parses_back_to(slice: &str, rendered: &str) -> bool {
 /// A name runs together with what precedes it or it is not the same name, so
 /// only a boundary is worth trying: `SUBSTRING(` is reached in one step from
 /// the space before it rather than nine.
-fn starts_a_token(sql: &str, at: usize) -> bool {
+///
+/// Asked of the text the client sent as well as of the rewrite, and a boundary
+/// in either is enough. A pass that closes a gap makes a junction that was
+/// never written: under IGNORE_SPACE the parser is handed `SELECT(COUNT(*))`,
+/// so the `(` the name has to start at follows the `T` of `SELECT` — and the
+/// walk refused to start there, leaving `SELECT (COUNT (*))` named by the
+/// rendered tree. It fired only on a parenthesised item written *first*,
+/// because anywhere else the character before the `(` is a comma or an
+/// operator and no gap is closed at all.
+///
+/// The other direction costs nothing. A pass that inserts text makes a
+/// boundary the original does not have, and the extra candidate is still held
+/// to parsing back to the same expression before it can be an answer.
+fn starts_a_token(source: &rewrite::Normalised, at: usize) -> bool {
+    let sql = &source.sql;
     if !sql.is_char_boundary(at) {
         return false;
     }
-    match sql[..at].chars().next_back() {
-        None => true,
-        Some(previous) => !previous.is_alphanumeric() && previous != '_',
-    }
+    let a_boundary = |text: &str| {
+        text.chars()
+            .next_back()
+            .is_none_or(|previous| !previous.is_alphanumeric() && previous != '_')
+    };
+    a_boundary(&sql[..at]) || source.written_before(at).is_some_and(a_boundary)
 }
 
 /// What the current parse tree came from, for the parts of it that the tree
 /// alone does not say.
 struct Origin {
-    /// The text, so a computed column can be named after what was written.
-    sql: std::rc::Rc<str>,
-    /// Where in `sql` an infix `MOD` was rewritten to `%`, and how it was
-    /// spelled before it was.
-    mod_operators: std::rc::Rc<[(usize, String)]>,
+    /// The text the parser was given, the text the client sent, and how the
+    /// two line up — so a computed column can be named after what was written
+    /// even where the rewriter changed it.
+    source: std::rc::Rc<rewrite::Normalised>,
     /// What each span has already been found to be called.
     ///
     /// A name is asked for at least twice per column — once to plan the
@@ -7904,10 +7902,9 @@ pub(crate) fn no_unsigned_subtraction() -> bool {
 struct Source(Option<Origin>);
 
 impl Source {
-    fn set(normalised: &rewrite::Normalised, mode: crate::dialect::SqlMode) -> Self {
+    fn set(normalised: &std::rc::Rc<rewrite::Normalised>, mode: crate::dialect::SqlMode) -> Self {
         let current = Origin {
-            sql: std::rc::Rc::from(normalised.sql.as_str()),
-            mod_operators: std::rc::Rc::from(normalised.mod_operators.as_slice()),
+            source: std::rc::Rc::clone(normalised),
             names: std::cell::RefCell::new(std::collections::HashMap::new()),
             pipes_as_concat: mode.pipes_as_concat,
             real_as_float: mode.real_as_float,

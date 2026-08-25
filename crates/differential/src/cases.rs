@@ -1560,6 +1560,93 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // The rewriter changes the statement under both of these modes, and a
+        // column named after the *rewrite* is named after text the client
+        // never sent. Every case here is a name, not a value: the rows agreed
+        // all along.
+        name: "sql_mode: ANSI_QUOTES",
+        setup: &[
+            "SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')",
+            "CREATE TABLE Aq (id INT NOT NULL, x INT NULL, `a\"b` INT NULL, \
+             `a``b` INT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Aq VALUES (1, 5, 6, 7)",
+        ],
+        cases: &[
+            // The rewrite to backticks is the same length here, which is the
+            // coincidence that makes a name from the wrong offsets look right.
+            same("SELECT \"x\" + 1 FROM Aq"),
+            same("SELECT 1 + \"x\" * 2 FROM Aq"),
+            // And here it is not: `\"\"` collapses to one byte, so the rewrite
+            // is shorter than what the client wrote.
+            same("SELECT \"a\"\"b\" + 1 FROM Aq"),
+            // A backtick doubles, so this one is longer.
+            same("SELECT \"a`b\" + 1 FROM Aq"),
+            same("SELECT \"a\"\"b\" + \"a`b\" FROM Aq"),
+            // A bare identifier is named by what it denotes rather than by
+            // how it was spelled, on both servers.
+            same("SELECT \"x\", \"a\"\"b\" FROM Aq"),
+        ],
+    },
+    Group {
+        name: "sql_mode: IGNORE_SPACE",
+        setup: &[
+            "SET SESSION sql_mode = CONCAT(@@sql_mode, ',IGNORE_SPACE')",
+            "CREATE TABLE Ig (id INT NOT NULL, n INT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Ig VALUES (1, 8)",
+        ],
+        cases: &[
+            // The gap the parser is not allowed to see, which MySQL keeps in
+            // the name character for character.
+            same("SELECT COUNT (*) FROM Ig"),
+            same("SELECT ABS (-1)"),
+            same("SELECT CONCAT ('a' , 'b')"),
+            same("SELECT LEFT ('abcdef', 3)"),
+            // A comment stands where the gap does and is kept just as
+            // faithfully.
+            same("SELECT ABS /* c */ (-3)"),
+            // The call spelling of MOD with a gap, beside the operator
+            // spelling: two rewrites of the same word in one statement.
+            same("SELECT MOD (n, 3), n MOD 3 FROM Ig"),
+            // Nested, and one gap inside the parentheses of another: the
+            // removals sit inside the name rather than at its edges.
+            same("SELECT ABS (ABS (-1)), 1 + ABS (-1), (COUNT (*)) FROM Ig"),
+            // A parenthesised item written *first*, which is the one position
+            // where the gap this mode closes is the one after `SELECT`. In the
+            // line above the same `(COUNT (*))` comes third, behind a comma —
+            // no gap is closed there, so that column cannot see the bug and
+            // the group read green while these were wrong.
+            same("SELECT (COUNT (*)) FROM Ig"),
+            same("SELECT (ABS (-1)) FROM Ig"),
+            same("SELECT (n MOD 3) FROM Ig"),
+            same("SELECT ( 1 + 2 )"),
+            same("SELECT (CONCAT ('a' , 'b'))"),
+            // Already right without the walk being widened, because a binary
+            // operator's span starts at the `(` rather than inside it. Kept so
+            // the two spellings are compared side by side.
+            same("SELECT (1) + 2"),
+        ],
+    },
+    Group {
+        // Both modes at once, so a name has to survive two passes that change
+        // the text by different amounts in different directions.
+        name: "sql_mode: ANSI_QUOTES and IGNORE_SPACE",
+        setup: &[
+            "SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES,IGNORE_SPACE')",
+            "CREATE TABLE Mixed (id INT NOT NULL, x INT NULL, `a\"b` INT NULL, \
+             `a``b` INT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Mixed VALUES (1, 5, 6, 7)",
+        ],
+        cases: &[
+            same("SELECT ABS (\"a`b\"), \"x\" MOD 3, LENGTH (\"a\"\"b\") FROM Mixed"),
+            same("SELECT UPPER (\"a\"\"b\"), \"a`b\" mod 2 FROM Mixed"),
+            same("SELECT MOD (\"x\", 3) FROM Mixed"),
+            // Every pass at once, behind a closed gap after `SELECT`.
+            same("SELECT (\"x\" MOD 3) FROM Mixed"),
+            same("SELECT (LENGTH (\"a\"\"b\")) FROM Mixed"),
+            same("SELECT COUNT (*) FROM Mixed"),
+        ],
+    },
+    Group {
         name: "extract",
         setup: &[
             "CREATE TABLE Ex (id INT NOT NULL, d DATE NULL, dt DATETIME NULL, \
