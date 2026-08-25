@@ -44,6 +44,18 @@ pub struct SqlMode {
     pub strict: bool,
     /// A grouped query may only select columns it grouped by, or aggregates.
     pub only_full_group_by: bool,
+    /// `-` between integers is signed even when an operand is UNSIGNED.
+    ///
+    /// Read at evaluation time, through the statement scope `crate::exec`
+    /// publishes, for the same reason `real_as_float` above is: the operands
+    /// of a subtraction are several recursions below the only place that holds
+    /// the session.
+    ///
+    /// It is the *operator* and not the operand kind that changes, which is
+    /// measured rather than taken from the name: under this mode `iu - 100` is
+    /// -93 and reported signed, while `iu + -100` and `iu * -1` still raise
+    /// 1690 and `iu + 1` is still UNSIGNED.
+    pub no_unsigned_subtraction: bool,
 }
 
 impl SqlMode {
@@ -58,6 +70,7 @@ impl SqlMode {
                 "REAL_AS_FLOAT" => out.real_as_float = true,
                 "STRICT_ALL_TABLES" | "STRICT_TRANS_TABLES" => out.strict = true,
                 "ONLY_FULL_GROUP_BY" => out.only_full_group_by = true,
+                "NO_UNSIGNED_SUBTRACTION" => out.no_unsigned_subtraction = true,
                 // ANSI is a compound mode. These five are what MySQL 8.3
                 // expands it to, read back from `SELECT @@sql_mode` after
                 // setting it rather than taken from the manual. The list was
@@ -135,6 +148,7 @@ mod tests {
                 // Not one of ANSI's five; `TRADITIONAL` is where MySQL puts
                 // the STRICT pair.
                 strict: false,
+                no_unsigned_subtraction: false,
             }
         );
     }

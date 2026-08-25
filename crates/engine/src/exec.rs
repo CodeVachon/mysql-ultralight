@@ -921,12 +921,31 @@ impl Engine {
 
         let columns = (0..width)
             .map(|i| {
-                let ty = rows
-                    .first()
-                    .and_then(|r| r.get(i))
-                    .map(wire_type)
-                    .unwrap_or(ColumnType::VarString);
+                // Folded over every row rather than read off the first, and
+                // through the same `widen` a set operation uses, because a
+                // constructor's rows share one column exactly as a union's
+                // branches do. `VALUES ROW(1), ROW(18446744073709551615)` is a
+                // NEWDECIMAL on 8.3 — there is no 64-bit integer holding both
+                // — and taking the first row's answer would have announced a
+                // signed LONGLONG over a value the engine sends unsigned.
+                let (ty, unsigned) = rows
+                    .iter()
+                    .filter_map(|r| r.get(i))
+                    // NULL says nothing about the others, exactly as it says
+                    // nothing in `combined`: `VALUES ROW(1), ROW(NULL)` is a
+                    // LONGLONG on 8.3, and folding NULL's VAR_STRING in would
+                    // have made it a string.
+                    .filter(|v| !v.is_null())
+                    .map(|v| (wire_type(v), matches!(v, Value::Unsigned(_))))
+                    .reduce(|(a, a_unsigned), (b, b_unsigned)| {
+                        (
+                            widen(a, a_unsigned, b, b_unsigned),
+                            a_unsigned && b_unsigned,
+                        )
+                    })
+                    .unwrap_or((ColumnType::VarString, false));
                 let mut column = OutColumn::new(format!("column_{i}"), ty);
+                column.unsigned = unsigned;
                 // From the expressions rather than from the values, which is
                 // where every other projection reads it: MySQL describes
                 // `VALUES ROW(1)` NOT NULL, and the column was announced
@@ -1124,11 +1143,24 @@ impl Engine {
                 // column to live in. Measured on 8.3, `SELECT JSON_ARRAY(x)
                 // FROM (SELECT TRUE AS x UNION SELECT FALSE) t` is `[0]` and
                 // `[1]`, never `[false]` and `[true]`.
+                //
+                // The UNSIGNED tag goes only where the merged column is
+                // signed, which is not the same rule and so is decided per
+                // column: measured on 8.3, `SELECT iu FROM t UNION SELECT iu
+                // FROM t` keeps the flag and `x - 100` over it still raises
+                // 1690, while the same union against a *signed* column drops
+                // it and answers -93. `column.unsigned` above has already
+                // taken the AND of the two branches, which is that rule.
                 for row in &mut left.rows {
-                    for value in row.iter_mut() {
-                        *value = std::mem::replace(value, Value::Null)
+                    for (value, column) in row.iter_mut().zip(&left.columns) {
+                        let merged = std::mem::replace(value, Value::Null)
                             .untag_enum()
                             .untag_bool();
+                        *value = if column.unsigned {
+                            merged
+                        } else {
+                            merged.untag_unsigned()
+                        };
                     }
                 }
                 Ok(left)
@@ -2161,13 +2193,24 @@ impl Engine {
                         // so without this the same query family answered two
                         // ways — `FIRST_VALUE(TRUE)` matched a document of
                         // `true` where `MAX(TRUE)` beside it did not.
-                        out[*index] = match usize::try_from(target)
-                            .ok()
-                            .and_then(|t| ordered.get(t))
-                        {
-                            Some((_, source)) => evaluate(subject, matching[*source])?.untag_bool(),
-                            None => fallback.clone(),
-                        };
+                        out[*index] =
+                            match usize::try_from(target).ok().and_then(|t| ordered.get(t)) {
+                                Some((_, source)) => {
+                                    let found = evaluate(subject, matching[*source])?.untag_bool();
+                                    // The default is a candidate for the answer,
+                                    // so it decides the sign alongside the subject
+                                    // — the same all-candidates rule a conditional
+                                    // follows. Measured on 8.3: `LAG(iu, 1, 0) -
+                                    // 100` is -93 and `LAG(iu) - 100` raises 1690.
+                                    if fallback.is_null() || matches!(fallback, Value::Unsigned(_))
+                                    {
+                                        found
+                                    } else {
+                                        found.untag_unsigned()
+                                    }
+                                }
+                                None => fallback.clone(),
+                            };
                     }
                 }
                 other if is_aggregate(other) => {
@@ -5220,7 +5263,7 @@ fn exact_total(values: &[&Value]) -> Option<(i128, usize)> {
     let scale = values
         .iter()
         .map(|v| match exact_operand(v)?.as_ref() {
-            Value::Int(_) => Some(0),
+            Value::Int(_) | Value::Unsigned(_) => Some(0),
             Value::Decimal(text) => Some(crate::decimal::scale_of(text)),
             _ => None,
         })
@@ -5232,6 +5275,7 @@ fn exact_total(values: &[&Value]) -> Option<(i128, usize)> {
             // Checked, because `scale` comes from a value's own text and
             // nothing bounds how many digits that has.
             Value::Int(n) => i128::from(*n).checked_mul(10i128.checked_pow(scale as u32)?)?,
+            Value::Unsigned(n) => i128::from(*n).checked_mul(10i128.checked_pow(scale as u32)?)?,
             Value::Decimal(text) => crate::decimal::units(text, scale)?,
             _ => return None,
         };
@@ -5281,7 +5325,13 @@ fn approximate_total(values: &[&Value]) -> f64 {
 /// units still cannot read one value two ways.
 fn exact_operand(value: &Value) -> Option<std::borrow::Cow<'_, Value>> {
     match value {
-        Value::Int(_) | Value::Decimal(_) => Some(std::borrow::Cow::Borrowed(value)),
+        // An unsigned value is exact too, and it has to be read here rather
+        // than left to `approximate_total`: `SUM(bu)` over a BIGINT UNSIGNED
+        // holding 18446744073709551615 is that number on 8.3, where the `f64`
+        // path renders 18446744073709552000.
+        Value::Int(_) | Value::Decimal(_) | Value::Unsigned(_) => {
+            Some(std::borrow::Cow::Borrowed(value))
+        }
         Value::Temporal(_) => value.temporal_number().map(std::borrow::Cow::Owned),
         _ => None,
     }
@@ -5427,34 +5477,40 @@ fn numeric_cast(data_type: &sqlparser::ast::DataType) -> bool {
     )
 }
 
-/// Whether an operand can be shown not to be negative.
+/// Whether an expression is the literal NULL, which no conditional counts
+/// against the sign of its answer.
 ///
-/// Unsigned answers itself, and so does a literal that is written without a
-/// sign. Anything else — a signed column, a subtraction, a call — is unknown
-/// and therefore assumed able to go below zero, which is the direction that
-/// keeps a wrong flag off the wire.
-fn never_negative(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]) -> bool {
+/// Measured on 8.3: `COALESCE(NULL, iu)`, `IFNULL(NULL, iu)` and `IF(1, iu,
+/// NULL)` all report UNSIGNED, as does a `CASE` with no `ELSE` at all. A
+/// *column* holding NULL is a different thing and is read for its declaration,
+/// which is why this looks at the literal and not at a value.
+fn is_null_literal(e: &Expr) -> bool {
     match e {
-        Expr::Nested(inner) => never_negative(inner, refs, input),
-        Expr::Value(v) => match &v.value {
-            sqlparser::ast::Value::Number(text, _) => !text.starts_with('-'),
-            _ => false,
-        },
-        other => unsigned_answer(other, refs, input),
+        Expr::Nested(inner) => is_null_literal(inner),
+        Expr::Value(v) => matches!(v.value, sqlparser::ast::Value::Null),
+        _ => false,
     }
 }
 
 /// Whether an expression's values are unsigned on the wire.
 ///
 /// Measured against MySQL 8.3, and the families do not agree with each other:
-/// arithmetic keeps the flag when *either* side has it, so `u + 1` is unsigned,
-/// where `COALESCE(u, 1)` is signed because a conditional needs *all* of its
-/// candidates to be. `-u` drops it, and so does anything that is no longer an
-/// integer — `u + 1.5` and `u / 2` are both signed.
+/// arithmetic keeps the flag when *either* side has it, so `u + 1` and `u - 1`
+/// are both unsigned, where `COALESCE(u, 1)` is signed because a conditional
+/// needs *all* of its candidates to be. `%` reads only its left operand. `-u`
+/// drops it, and so does anything that is no longer an integer — `u + 1.5` and
+/// `u / 2` are both signed.
 ///
-/// Defaults to signed, which is the safe direction: the engine holds an `i64`,
-/// so a value it can carry is one a signed reader can read, where an UNSIGNED
-/// flag on a negative number reads back as something enormous.
+/// This has to agree with what the *value* carries, or the two protocols
+/// disagree with each other: a column announced UNSIGNED over a negative
+/// number sends `-93` as text and the same bytes to a binary client reading
+/// 18446744073709551523. #0069 made every arithmetic answer that would go
+/// negative a refusal instead, which is what let subtraction back into the
+/// list here; the untagging in [`crate::value::Value::untag_unsigned`] is the
+/// other half of holding the two together.
+///
+/// Defaults to signed, which is still the safe direction: an expression whose
+/// sign nothing here recognises answers within the signed range or not at all.
 fn unsigned_answer(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]) -> bool {
     let recur = |inner: &Expr| unsigned_answer(inner, refs, input);
     let integral = |e: &Expr| is_integer(computed_column_type(e, refs, input));
@@ -5463,6 +5519,17 @@ fn unsigned_answer(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelCo
             direct_column(e, refs, input).is_some_and(|column| column.ty.unsigned)
         }
         Expr::Nested(inner) => recur(inner),
+        // A whole number too big for an `i64` is a BIGINT UNSIGNED in MySQL,
+        // which is the one literal that carries the flag: `SELECT
+        // 18446744073709551615 - 1` is UNSIGNED there and answers
+        // 18446744073709551614, where a signed column would have handed a
+        // binary client -2.
+        Expr::Value(v) => match &v.value {
+            sqlparser::ast::Value::Number(text, _) => {
+                text.parse::<i64>().is_err() && text.parse::<u64>().is_ok()
+            }
+            _ => false,
+        },
         // A cast names the signedness in the statement itself.
         Expr::Cast { data_type, .. } => {
             matches!(data_type, sqlparser::ast::DataType::Unsigned)
@@ -5493,21 +5560,31 @@ fn unsigned_answer(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelCo
             ) {
                 return true;
             }
-            // Only where the answer cannot come out negative. MySQL calls
-            // `u - 1` unsigned and *refuses* `u - 100` with 1690 rather than
-            // answering; this engine holds an i64 and answers -93, so a column
-            // flagged UNSIGNED would have the two protocols disagree with each
-            // other — the text one sending -93 and the binary one the same
-            // bytes for a client that reads 18446744073709551523. `u + -100`
-            // and `u * -1` do the same thing, so it is not enough to leave out
-            // subtraction: every operand has to be one that cannot be
-            // negative. See #0069.
-            matches!(op, B::Plus | B::Multiply | B::Modulo | B::MyIntegerDivide)
+            // `MOD` reads only its left operand, because that is the one its
+            // answer takes its sign from: measured on 8.3, `iu MOD -1` is
+            // UNSIGNED and `-1 MOD iu` is not. It keeps the flag whatever the
+            // result type is, where the three below need an integer one —
+            // `iu MOD 1e0` is a DOUBLE and still UNSIGNED, while `iu + 'x'` is
+            // a DOUBLE and signed.
+            if matches!(op, B::Modulo) {
+                return recur(left);
+            }
+            // Subtraction is back in the list. It was left out while the
+            // engine held an `i64` and answered `u - 100` with -93, which a
+            // UNSIGNED flag would have turned into 18446744073709551523 for a
+            // binary client; now that a subtraction leaving the range is
+            // refused with 1690, as MySQL refuses it, the flag is true again.
+            // See #0069.
+            //
+            // `NO_UNSIGNED_SUBTRACTION` takes it back out for the length of
+            // the statement, and takes nothing else out: under it `iu - 100`
+            // is signed and `iu + -100` still raises 1690.
+            if matches!(op, B::Minus) && no_unsigned_subtraction() {
+                return false;
+            }
+            matches!(op, B::Plus | B::Minus | B::Multiply | B::MyIntegerDivide)
                 && integral(e)
                 && (recur(left) || recur(right))
-                && [left, right]
-                    .iter()
-                    .all(|side| never_negative(side, refs, input))
         }
         // `~x` is a BIGINT UNSIGNED like the binary bitwise operators. A sign
         // is not — MySQL reports `-(7 ^ 3)` signed — which is what the
@@ -5518,14 +5595,30 @@ fn unsigned_answer(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelCo
         },
         // `CEIL` and `FLOOR` arrive as their own nodes rather than as calls.
         Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => recur(expr),
-        // Every result has to be unsigned; a signed `ELSE` gives it away.
+        // Every candidate has to be unsigned; a signed `ELSE` gives it away.
+        // A *missing* one does not, and neither does a NULL: measured on 8.3,
+        // `CASE WHEN 1 THEN iu END` and `IF(1, iu, NULL)` are both UNSIGNED,
+        // where reading the absent branch as a signed candidate made the first
+        // of them signed.
         Expr::Case {
             conditions,
             else_result,
             ..
         } => {
-            else_result.as_deref().is_some_and(&recur)
-                && conditions.iter().all(|w| recur(&w.result))
+            // Both halves read *every* candidate, the `ELSE` included. Reading
+            // only the `WHEN` results here described `CASE WHEN 0 THEN NULL
+            // ELSE bu END` signed while the value kept its unsigned tag — the
+            // text protocol writing every digit of 18446744073709551615 and a
+            // binary client reading the same eight bytes as -1. `COALESCE(NULL,
+            // bu)` and `IF(0, NULL, bu)` are UNSIGNED on 8.3 and this is the
+            // same expression written a third way.
+            let candidates = || {
+                conditions
+                    .iter()
+                    .map(|w| &w.result)
+                    .chain(else_result.as_deref())
+            };
+            candidates().any(&recur) && candidates().all(|r| is_null_literal(r) || recur(r))
         }
         Expr::Function(f) => {
             let name = f.name.to_string().to_ascii_lowercase();
@@ -5540,16 +5633,36 @@ fn unsigned_answer(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelCo
                 // These hand back one of their arguments unchanged, so the
                 // flag survives only if every candidate carries it: MySQL
                 // makes `COALESCE(u, 1)` signed on the strength of the `1`.
-                "coalesce" | "ifnull" | "nvl" | "greatest" | "least" => args.iter().all(&recur),
-                "if" => args.len() == 3 && args[1..].iter().all(&recur),
+                "coalesce" | "ifnull" | "nvl" | "greatest" | "least" => {
+                    args.iter().any(&recur) && args.iter().all(|a| is_null_literal(a) || recur(a))
+                }
+                "if" => {
+                    args.len() == 3
+                        && args[1..].iter().any(&recur)
+                        && args[1..].iter().all(|a| is_null_literal(a) || recur(a))
+                }
                 // MIN and MAX answer one of the rows they folded; SUM and AVG
                 // widen past the column and come back signed.
                 "min" | "max" => args.iter().all(&recur),
                 // A window reaching past the frame answers its default, which
-                // is why `LAG(u, 1, 0)` is signed — the `0` is.
-                "lag" | "lead" | "first_value" | "last_value" | "nth_value" => {
-                    args.iter().all(&recur)
+                // is why `LAG(u, 1, 0)` is signed — the `0` is. The *offset*
+                // is not a candidate and does not count, which is measured:
+                // `LAG(u, 1)` and `NTH_VALUE(u, 1)` are both UNSIGNED on 8.3
+                // though the 1 in each is not.
+                "lag" | "lead" => {
+                    args.first().is_some_and(&recur)
+                        && args.get(2).is_none_or(|d| is_null_literal(d) || recur(d))
                 }
+                // `NTH_VALUE` is described here and by `computed_column_type`
+                // and evaluated by neither: the window dispatch handles the
+                // other four and this one falls through to the aggregate arm,
+                // which does not know it. Described rather than removed
+                // because that is how it arrived; it needs implementing, not
+                // hiding.
+                "first_value" | "last_value" | "nth_value" => args.first().is_some_and(&recur),
+                // `MOD(a, b)` is `a % b` spelled as a call and takes its
+                // sign the same way, from its dividend alone.
+                "mod" => args.first().is_some_and(&recur),
                 _ => {
                     UNSIGNED_FOLLOWS_FIRST.contains(&name.as_str())
                         && args.first().is_some_and(&recur)
@@ -6009,19 +6122,49 @@ fn arithmetic_type(a: ColumnType, b: ColumnType) -> ColumnType {
 /// `CASE`, `COALESCE`, `IF`, `GREATEST`. Taking the first was the bug: a
 /// `CASE` returning a `TINYINT` in one branch and 1000 in another was declared
 /// one byte wide, and the binary protocol sent 232.
-fn combined(types: impl Iterator<Item = ColumnType>) -> ColumnType {
-    let mut answer: Option<ColumnType> = None;
-    for t in types {
+fn combined(types: impl Iterator<Item = (ColumnType, bool)>) -> ColumnType {
+    let mut answer: Option<(ColumnType, bool)> = None;
+    for (t, unsigned) in types {
         // NULL says nothing about the others.
         if t == ColumnType::Null {
             continue;
         }
         answer = Some(match answer {
-            None => t,
-            Some(so_far) => widen(so_far, false, t, false),
+            None => (t, unsigned),
+            // The signs are carried and handed to `widen`, which is the only
+            // thing that knows a `BIGINT UNSIGNED` beside a `BIGINT` has no
+            // integer left to widen into. Passing `false` for both — which
+            // this did — made `COALESCE(bu, b)` a signed LONGLONG where MySQL
+            // says NEWDECIMAL, and an unsigned value under that code reached a
+            // binary client as -1 while the text protocol wrote every digit.
+            //
+            // The widened code carries the *narrower* sign: an unsigned value
+            // widened to hold a negative one is no longer unsigned, and two
+            // unsigned operands stay unsigned.
+            Some((so_far, so_far_unsigned)) => (
+                widen(so_far, so_far_unsigned, t, unsigned),
+                so_far_unsigned && unsigned,
+            ),
         });
     }
-    answer.unwrap_or(ColumnType::Null)
+    answer.map(|(t, _)| t).unwrap_or(ColumnType::Null)
+}
+
+/// One candidate of a conditional, as the pair [`combined`] folds.
+///
+/// The sign is asked for only where the code is an integer one, because that
+/// is the only place `widen` reads it — and because `unsigned_answer` calls
+/// back into `computed_column_type`, so an unconditional call here would make
+/// the two walk each other over every subexpression rather than over the
+/// integer ones.
+fn candidate_type(
+    e: &Expr,
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+) -> (ColumnType, bool) {
+    let ty = computed_column_type(e, refs, input);
+    let unsigned = is_integer(ty) && unsigned_answer(e, refs, input);
+    (ty, unsigned)
 }
 
 /// The input column an expression names outright, if it names one.
@@ -6141,11 +6284,7 @@ fn computed_column_type(
                     // returned when the first is NULL. `COALESCE(i, 'x')` is a
                     // string in MySQL, and calling it a LONGLONG had the binary
                     // protocol send 0 for the `'x'`.
-                    combined(
-                        candidates
-                            .iter()
-                            .map(|a| computed_column_type(a, refs, input)),
-                    )
+                    combined(candidates.iter().map(|a| candidate_type(a, refs, input)))
                 }
                 // These hand back one of their arguments unchanged, so they
                 // keep its width: `GREATEST(tinyint, smallint)` really is a
@@ -6155,7 +6294,7 @@ fn computed_column_type(
                 "greatest" | "least" => combined(
                     function_arguments(f)
                         .iter()
-                        .map(|a| computed_column_type(a, refs, input)),
+                        .map(|a| candidate_type(a, refs, input)),
                 ),
                 // These keep the *kind* of what they were given but not its
                 // width — MySQL answers LONGLONG for every integer argument,
@@ -6195,7 +6334,7 @@ fn computed_column_type(
                     combined(
                         function_arguments(f)
                             .iter()
-                            .map(|a| computed_column_type(a, refs, input)),
+                            .map(|a| candidate_type(a, refs, input)),
                     ),
                     true,
                 ),
@@ -6372,7 +6511,7 @@ fn computed_column_type(
                 .iter()
                 .map(|w| &w.result)
                 .chain(else_result.as_deref())
-                .map(|r| computed_column_type(r, refs, input)),
+                .map(|r| candidate_type(r, refs, input)),
         ),
         Expr::Nested(inner) => computed_column_type(inner, refs, input),
         _ => ColumnType::VarString,
@@ -7144,6 +7283,9 @@ struct Origin {
     /// only that the word was written; which type it declares is the mode's
     /// answer, not the parser's.
     real_as_float: bool,
+    /// Whether `-` stays signed over an UNSIGNED operand. The tree records the
+    /// operator; which domain it works in is the mode's answer.
+    no_unsigned_subtraction: bool,
 }
 
 thread_local! {
@@ -7188,6 +7330,24 @@ pub(crate) fn real_as_float() -> bool {
     })
 }
 
+/// Whether `-` is signed over an UNSIGNED operand in the statement being run.
+///
+/// Read here rather than passed to `expr::arithmetic` for the same reason as
+/// above: a subtraction is evaluated several recursions below the only place
+/// that holds the session, and a `mode` argument would have to be threaded
+/// through every operator that does not care.
+///
+/// `false` without a statement in scope, which is MySQL's default: an unsigned
+/// operand makes a subtraction unsigned unless `NO_UNSIGNED_SUBTRACTION` says
+/// otherwise.
+pub(crate) fn no_unsigned_subtraction() -> bool {
+    SOURCE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .is_some_and(|current| current.no_unsigned_subtraction)
+    })
+}
+
 /// Publishes the statement text for the duration of a scope.
 ///
 /// Restored through a guard rather than a trailing assignment: a stale text
@@ -7203,6 +7363,7 @@ impl Source {
             names: std::cell::RefCell::new(std::collections::HashMap::new()),
             pipes_as_concat: mode.pipes_as_concat,
             real_as_float: mode.real_as_float,
+            no_unsigned_subtraction: mode.no_unsigned_subtraction,
         };
         Self(SOURCE.with(|s| s.replace(Some(current))))
     }
@@ -7218,6 +7379,12 @@ impl Drop for Source {
 fn wire_type(value: &Value) -> ColumnType {
     match value {
         Value::Int(_) => ColumnType::LongLong,
+        // An integer like the arm above it, and *not* the VAR_STRING the
+        // catch-all gave it: `to_wire` sends a `WireValue::U64`, so a column
+        // announced VAR_STRING put eight raw bytes where a binary client was
+        // reading a length-encoded string and desynchronised the row. MySQL
+        // types `VALUES ROW(18446744073709551615)` LONGLONG UNSIGNED.
+        Value::Unsigned(_) => ColumnType::LongLong,
         Value::Float(_) => ColumnType::Double,
         Value::Bytes(_) => ColumnType::Blob,
         // A document is declared as a string, like every other computed

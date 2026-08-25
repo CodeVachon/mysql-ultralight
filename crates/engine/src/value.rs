@@ -116,6 +116,33 @@ pub enum Value {
     /// So [`crate::types::SqlType::coerce`] — the only way a value enters a
     /// row — strips it, and the state image never has to know the tag exists.
     Bool(bool),
+    /// An integer MySQL is treating as UNSIGNED.
+    ///
+    /// Two things at once, and both are needed. It is a *magnitude* an `i64`
+    /// cannot hold — `BIGINT UNSIGNED` reaches 18446744073709551615 and every
+    /// bitwise operator answers in that range, so `SELECT ~0` had no
+    /// representation and was refused — and it is the *tag* that decides how
+    /// an operator behaves: measured on 8.3, `iu - 100` over an `INT UNSIGNED`
+    /// holding 7 raises 1690 rather than answering -93, and it does so because
+    /// the subtraction is unsigned, not because 7 is small.
+    ///
+    /// The range check is per operator, which is measured and is the opposite
+    /// of what #0052 concluded for the bitwise chain: `iu - 100 + 200` raises
+    /// 1690 naming `(iu - 100)` even though 107 would fit. So the answer is
+    /// not "check what the chain hands out" — it is "compute exactly, and
+    /// check against the domain this operator works in". See
+    /// [`crate::expr::arithmetic`].
+    ///
+    /// The sign is a property of the *column*, so it is applied in
+    /// [`crate::types::SqlType::coerce`] where the declaration is still in
+    /// hand — the same argument `Enum` above makes about its ordinal. A
+    /// literal above `i64::MAX` carries it too, because MySQL types one
+    /// `BIGINT UNSIGNED`: `SELECT 18446744073709551615 - 1` answers there.
+    ///
+    /// It comes back off wherever MySQL's own result type is signed — unary
+    /// minus, a conditional with a signed candidate, a set operation whose
+    /// branches disagree — see [`Value::untag_unsigned`].
+    Unsigned(u64),
 }
 
 impl Value {
@@ -147,6 +174,10 @@ impl Value {
             // that is not itself a number read 0 out of its own characters.
             Value::Enum { ordinal, .. } => Some(i64::from(*ordinal)),
             Value::Bool(b) => Some(i64::from(*b)),
+            // Wrapped rather than refused, which is MySQL's own answer:
+            // `CAST(bu AS SIGNED)` over a BIGINT UNSIGNED holding
+            // 18446744073709551615 is -1 on 8.3, not an error.
+            Value::Unsigned(v) => Some(*v as i64),
             Value::Float(v) => Some(*v as i64),
             Value::Float32(v) => Some(*v as i64),
             Value::Text(v) | Value::Json(v) | Value::Decimal(v) => {
@@ -156,6 +187,31 @@ impl Value {
                     .or_else(|| t.parse::<f64>().ok().map(|f| f as i64))
             }
             _ => None,
+        }
+    }
+
+    /// The value as an exact integer, wide enough for either sign's range.
+    ///
+    /// `as_int` above cannot answer this question: it returns an `i64`, so
+    /// every value above `i64::MAX` comes back saturated or wrapped, and a
+    /// `BIGINT UNSIGNED` column checking its own range against that would
+    /// refuse the top half of what it can hold. `i128` covers both ranges
+    /// exactly and nothing else about the reading changes.
+    pub fn as_exact_int(&self) -> Option<i128> {
+        match self {
+            Value::Unsigned(v) => Some(i128::from(*v)),
+            // Parsed at the full width before falling back to a float, so
+            // `'18446744073709551615'` into a `BIGINT UNSIGNED` is the number
+            // it spells and not the nearest double to it.
+            Value::Text(v) | Value::Json(v) | Value::Decimal(v) => {
+                let t = v.trim();
+                t.parse::<i128>()
+                    .ok()
+                    .or_else(|| t.parse::<f64>().ok().map(|f| f as i128))
+            }
+            Value::Float(v) => Some(*v as i128),
+            Value::Float32(v) => Some(*v as i128),
+            other => other.as_int().map(i128::from),
         }
     }
 
@@ -170,6 +226,7 @@ impl Value {
             // `None` here and sent the pair to the collation instead.
             Value::Enum { ordinal, .. } => Some(f64::from(*ordinal)),
             Value::Bool(b) => Some(f64::from(u8::from(*b))),
+            Value::Unsigned(v) => Some(*v as f64),
             // Its packed number, which is what makes `d = 20240105` true: a
             // comparison against a number is numeric, and reading the text
             // gave `None` here and sent the pair to the collation instead.
@@ -194,6 +251,7 @@ impl Value {
             Value::Bytes(v) => numeric_prefix(&String::from_utf8_lossy(v)),
             Value::Enum { ordinal, .. } => f64::from(*ordinal),
             Value::Bool(b) => f64::from(u8::from(*b)),
+            Value::Unsigned(v) => *v as f64,
             // Its packed digits, and its leading number only where the text is
             // not a temporal at all — a DATE column can hold text this engine
             // never validated, and that is no reason to answer differently
@@ -231,6 +289,9 @@ impl Value {
             // and `SELECT 1 = 1` both send the character `1` — so the tag is
             // invisible to a client and shows up only inside a document.
             Value::Bool(b) => i64::from(*b).to_string(),
+            // Without the sign the `i64` reading would put on it: the whole
+            // point of the tag is that 18446744073709551615 is not -1.
+            Value::Unsigned(v) => v.to_string(),
         }
     }
 
@@ -259,6 +320,7 @@ impl Value {
             // of `ENUM('a','b')` was false.
             Value::Enum { ordinal, .. } => Some(*ordinal != 0),
             Value::Bool(b) => Some(*b),
+            Value::Unsigned(v) => Some(*v != 0),
         }
     }
 
@@ -278,6 +340,19 @@ impl Value {
             return crate::json::compare(&self.as_json_operand(), &other.as_json_operand());
         }
 
+        // Two integers compare as integers, ahead of the `f64` path below,
+        // because that path cannot tell 18446744073709551615 from
+        // 18446744073709551614 — both round to 2^64 as doubles, so
+        // `bu = 18446744073709551615` answered 1 for either. Widened to
+        // `i128`, where every `i64` and every `u64` is exact, so `bu > -1` is
+        // decided by the numbers rather than by the sign. An `Int` pair was
+        // already handled below the `f64` path and now reaches this one
+        // instead, which is the same answer for every value a double can hold
+        // and a better one above 2^53.
+        if let (Some(a), Some(b)) = (self.exact_integer(), other.exact_integer()) {
+            return Some(a.cmp(&b));
+        }
+
         // Numbers compare numerically even against numeric strings, which is
         // how MySQL behaves and what Prisma's generated comparisons rely on.
         // A decimal is a number: `2.50` equals `2.5` and sorts below `10.00`,
@@ -293,6 +368,7 @@ impl Value {
                 | Value::Decimal(_)
                 | Value::Float32(_)
                 | Value::Bool(_)
+                | Value::Unsigned(_)
         ) || matches!(
             other,
             Value::Int(_)
@@ -300,16 +376,13 @@ impl Value {
                 | Value::Decimal(_)
                 | Value::Float32(_)
                 | Value::Bool(_)
+                | Value::Unsigned(_)
         );
 
         if both_numeric {
             if let (Some(a), Some(b)) = (self.as_float(), other.as_float()) {
                 return a.partial_cmp(&b);
             }
-        }
-
-        if let (Value::Int(a), Value::Int(b)) = (self, other) {
-            return Some(a.cmp(b));
         }
 
         match (self, other) {
@@ -385,6 +458,52 @@ impl Value {
         match self {
             Value::Bool(b) => Value::Int(i64::from(b)),
             other => other,
+        }
+    }
+
+    /// This value with any UNSIGNED tag removed, leaving the signed reading.
+    ///
+    /// For the places MySQL's own result type is signed although an unsigned
+    /// operand reached them, and the list is its own — measured on 8.3, and
+    /// not the list `untag_bool` or `untag_enum` above carry. Unary minus
+    /// drops it, so `-iu - 100` is -107 and not a refusal. A conditional needs
+    /// *every* candidate to be unsigned, so `COALESCE(iu, 1) - 100` is -93
+    /// where `COALESCE(iu, iu) - 100` raises 1690 — the same all-candidates
+    /// rule the UNSIGNED flag on the wire follows. A set operation keeps it
+    /// only where both branches have it, which is where a scalar subquery, a
+    /// derived table and `NULLIF` differ: all three keep it.
+    ///
+    /// Widened rather than wrapped, because none of those places is a signed
+    /// *integer*: MySQL has nothing 64-bit that holds both a `u64` and a
+    /// negative, so it answers a DECIMAL and keeps every digit —
+    /// `COALESCE(bu, b)` over 18446744073709551615 is that number, NEWDECIMAL,
+    /// on 8.3, and `SELECT ~0 UNION SELECT 1` is that number beside 1. Wrapped
+    /// to an `i64` both of those read -1.
+    ///
+    /// A cast is the one place that really does wrap — `CAST(bu AS SIGNED)` is
+    /// -1 there — and it says so in the statement rather than coming through
+    /// here.
+    pub fn untag_unsigned(self) -> Value {
+        match self {
+            Value::Unsigned(v) => match i64::try_from(v) {
+                Ok(n) => Value::Int(n),
+                Err(_) => Value::Decimal(v.to_string()),
+            },
+            other => other,
+        }
+    }
+
+    /// The exact integer this value *is*, for the two tags that hold one.
+    ///
+    /// `i128` because the two ranges do not fit in either 64-bit type: an
+    /// `Int` reaches below zero and an `Unsigned` above `i64::MAX`. `None` for
+    /// everything else, including a numeric string — those still compare
+    /// through `f64`, which is what they did before there was an unsigned tag.
+    fn exact_integer(&self) -> Option<i128> {
+        match self {
+            Value::Int(v) => Some(i128::from(*v)),
+            Value::Unsigned(v) => Some(i128::from(*v)),
+            _ => None,
         }
     }
 
@@ -494,6 +613,10 @@ impl Value {
             // eight bytes; sending the tag as a string would have desynced it
             // against the type code beside it.
             Value::Bool(b) => WireValue::I64(i64::from(*b)),
+            // As a `u64`, which the wire encoding already has a case for. Sent
+            // as an `i64` it would reach a binary client as -1 under a column
+            // the engine has just announced UNSIGNED.
+            Value::Unsigned(v) => WireValue::U64(*v),
         }
     }
 
@@ -502,7 +625,18 @@ impl Value {
         match value {
             WireValue::Null => Value::Null,
             WireValue::I64(v) => Value::Int(*v),
-            WireValue::U64(v) => Value::Int(*v as i64),
+            // Only where it will not fit signed, which keeps every parameter
+            // that already worked exactly as it was: a client sends most
+            // integers as `U64` whatever their size, and tagging all of them
+            // would make `? - 100` refuse for a bound 7. Above `i64::MAX`
+            // there is no such choice — `Int(*v as i64)` made
+            // 18446744073709551615 into -1, so a `BIGINT UNSIGNED` column that
+            // takes the value through the text protocol refused it through the
+            // binary one.
+            WireValue::U64(v) => match i64::try_from(*v) {
+                Ok(n) => Value::Int(n),
+                Err(_) => Value::Unsigned(*v),
+            },
             WireValue::F32(v) => Value::Float(*v as f64),
             WireValue::F64(v) => Value::Float(*v),
             WireValue::Str(v) => Value::Text(v.clone()),

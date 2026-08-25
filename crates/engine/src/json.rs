@@ -495,6 +495,11 @@ pub fn from_value(value: &Value) -> Json {
     match value {
         Value::Null => Json::Null,
         Value::Int(n) => Json::from(*n),
+        // As a JSON number at its own width, which serde_json's `u64` case
+        // renders exactly. Through the `i64` reading it would have been -1:
+        // `JSON_ARRAY(bu)` over 18446744073709551615 is `[18446744073709551615]`
+        // on 8.3.
+        Value::Unsigned(n) => Json::from(*n),
         Value::Float(f) => serde_json::Number::from_f64(*f).map_or(Json::Null, Json::Number),
         // Widened, not through the six digits a FLOAT column displays:
         // MySQL's JSON number is a double, and `JSON_OBJECT('a', f)` over a

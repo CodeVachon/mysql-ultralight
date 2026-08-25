@@ -4691,12 +4691,878 @@ fn cast_to_an_integer_reads_the_leading_number() {
         vec![vec!["12", "0", "-5"]]
     );
 
-    // An unsigned cast of a negative value cannot be represented, so it is
-    // refused rather than reported as a negative number.
-    let err = engine
-        .execute(&mut session, "SELECT CAST(-1 AS UNSIGNED)", &[])
-        .unwrap_err();
-    assert_eq!(err.code, 1235);
+    // An unsigned cast of a negative value is a reinterpretation, which the
+    // engine could not represent until #0069 gave `Value` an unsigned tag —
+    // it answered 1235 before that. All four measured on 8.3.
+    //
+    // The string is here because the reading has to be exact to reach these
+    // numbers at all: read through an `i64` it saturated at
+    // 9223372036854775807.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(-1 AS UNSIGNED), CAST(-2 AS UNSIGNED), \
+                    CAST('18446744073709551615' AS UNSIGNED), CAST('abc' AS UNSIGNED)"
+        ),
+        vec![vec![
+            "18446744073709551615",
+            "18446744073709551614",
+            "18446744073709551615",
+            "0"
+        ]]
+    );
+}
+
+/// A table of every unsigned width beside its signed counterparts.
+fn unsigned_widths(engine: &Engine, session: &mut Session) {
+    run(
+        engine,
+        session,
+        "CREATE TABLE U (id INT NOT NULL, tu TINYINT UNSIGNED NULL, su SMALLINT UNSIGNED NULL, \
+         mu MEDIUMINT UNSIGNED NULL, iu INT UNSIGNED NULL, bu BIGINT UNSIGNED NULL, \
+         i INT NULL, b BIGINT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        engine,
+        session,
+        "INSERT INTO U VALUES (1, 7, 7, 7, 7, 7, 7, 7)",
+    );
+}
+
+#[test]
+fn unsigned_arithmetic_that_leaves_the_range_is_refused() {
+    // The engine held an `i64` and answered `iu - 100` with -93, where MySQL
+    // raises 1690 — which is why #0064 had to leave the UNSIGNED flag off a
+    // subtraction. All measured on 8.3.
+    let (engine, mut session) = engine();
+    unsigned_widths(&engine, &mut session);
+
+    for sql in [
+        // Every width, so it is the column's sign deciding and not its size.
+        "SELECT tu - 100 FROM U",
+        "SELECT su - 100 FROM U",
+        "SELECT mu - 100 FROM U",
+        "SELECT iu - 100 FROM U",
+        "SELECT bu - 100 FROM U",
+        // Wider than subtraction, which is the whole of the issue's note: a
+        // negative operand does it to `+`, `*` and `DIV` as well.
+        "SELECT iu + -100 FROM U",
+        "SELECT iu * -1 FROM U",
+        "SELECT iu DIV -1 FROM U",
+        // The unsigned operand on the right instead.
+        "SELECT -100 + iu FROM U",
+        "SELECT -1 * iu FROM U",
+        "SELECT 0 - iu FROM U",
+        "SELECT 6 - iu FROM U",
+        "SELECT -8 DIV iu FROM U",
+        // The chain, which is the case that settles where the check goes:
+        // MySQL refuses this though 107 would fit, so the check is per
+        // operator and not at the boundary #0052 moved the bitwise one to.
+        "SELECT iu - 100 + 200 FROM U",
+        "SELECT iu + 100 - 200 FROM U",
+    ] {
+        let error = engine.execute(&mut session, sql, &[]).expect_err(sql);
+        assert_eq!(error.code, 1690, "{sql}");
+        assert_eq!(error.sql_state, "22003", "{sql}");
+        assert_eq!(
+            error.message, "BIGINT UNSIGNED value is out of range",
+            "{sql}"
+        );
+    }
+
+    // A string operand takes the whole thing out of the integer domain, so it
+    // answers where the same number written as a cast refuses. Both measured
+    // on 8.3, and the pair is why the operand test reads the tag rather than
+    // asking whether the value happens to be a number.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT iu - '100' FROM U"),
+        vec![vec!["-93"]]
+    );
+    let error = engine
+        .execute(
+            &mut session,
+            "SELECT iu - CAST('100' AS SIGNED) FROM U",
+            &[],
+        )
+        .expect_err("a cast is an integer operand");
+    assert_eq!(error.code, 1690, "{}", error.message);
+
+    // And everything whose true value stays inside the range still answers,
+    // negative operands included: it is the answer that is checked and not the
+    // spelling of the operands.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT iu - 7, iu - -1, 100 - iu, 7 - iu, iu + -7, iu * 0 FROM U"
+        ),
+        vec![vec!["0", "8", "93", "0", "0", "0"]]
+    );
+}
+
+#[test]
+fn modulo_takes_its_sign_from_its_left_operand_alone() {
+    // The one arithmetic operator that does not read both sides. Measured on
+    // 8.3: `iu MOD -1` is UNSIGNED and answers 0, `-1 MOD iu` is signed and
+    // answers -1. Reading either side would have made the second one unsigned
+    // and refused it, since -1 is not in the range.
+    let (engine, mut session) = engine();
+    unsigned_widths(&engine, &mut session);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT iu MOD -1, iu MOD -3, -1 MOD iu, -1 DIV iu FROM U"
+        ),
+        vec![vec!["0", "1", "-1", "0"]]
+    );
+
+    let signs: Vec<bool> = engine
+        .describe(&session, "SELECT iu MOD -1, -1 MOD iu FROM U", 0)
+        .unwrap()
+        .iter()
+        .map(|c| c.unsigned)
+        .collect();
+    assert_eq!(signs, vec![true, false]);
+}
+
+#[test]
+fn signed_arithmetic_that_leaves_the_range_is_refused_too() {
+    // The engine wrapped these deliberately, on the strength of a comment
+    // saying MySQL lets a sum wrap. It does not: measured on 8.3, all four
+    // raise 1690 with the *signed* spelling of the message, which is how a
+    // client tells which domain overflowed.
+    let (engine, mut session) = engine();
+    unsigned_widths(&engine, &mut session);
+
+    for sql in [
+        "SELECT b + 9223372036854775807 FROM U",
+        "SELECT b * 9223372036854775807 FROM U",
+        "SELECT 9223372036854775807 + 1",
+        "SELECT -9223372036854775808 - 1",
+    ] {
+        let error = engine.execute(&mut session, sql, &[]).expect_err(sql);
+        assert_eq!(error.code, 1690, "{sql}");
+        assert_eq!(error.message, "BIGINT value is out of range", "{sql}");
+    }
+}
+
+#[test]
+fn a_bigint_unsigned_column_holds_its_whole_range() {
+    // The engine capped the column at `i64::MAX` and refused the top half of
+    // what it can hold, which was the other half of holding only an `i64`.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE W (id INT NOT NULL, bu BIGINT UNSIGNED NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO W VALUES (1, 18446744073709551615)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT bu, bu - 1, bu + -1, bu * 1, bu - bu, bu DIV 10 FROM W"
+        ),
+        vec![vec![
+            "18446744073709551615",
+            "18446744073709551614",
+            "18446744073709551614",
+            "18446744073709551615",
+            "0",
+            "1844674407370955161"
+        ]]
+    );
+
+    // Comparison at the top of the range, which the `f64` reading could not
+    // do: every `u64` above 2^53 rounds, so these two literals were one
+    // number and the first comparison answered 1 for both.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT bu = 18446744073709551615, bu = 18446744073709551614, \
+                    bu > 9223372036854775807, bu > -1 FROM W"
+        ),
+        vec![vec!["1", "0", "1", "1"]]
+    );
+
+    // A rounding at a non-negative scale hands the number back rather than
+    // finding out through an `f64` that it was already whole: the double
+    // rounds 18446744073709551615 up to 2^64, which is not a value the column
+    // can hold at all.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROUND(bu), TRUNCATE(bu, 0), FLOOR(bu), CEIL(bu) FROM W"
+        ),
+        vec![vec![
+            "18446744073709551615",
+            "18446744073709551615",
+            "18446744073709551615",
+            "18446744073709551615"
+        ]]
+    );
+
+    // The same value as a *bound parameter*, which is the binary protocol's
+    // way in. Read as an `i64` it arrived as -1 and the column refused it, so
+    // a statement the text protocol accepted failed when a client prepared it.
+    let top = Value::from_wire(&mysql_ultralight_protocol::Value::U64(u64::MAX));
+    engine
+        .execute(&mut session, "INSERT INTO W VALUES (2, ?)", &[top])
+        .expect("a bound BIGINT UNSIGNED at the top of its range");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT bu FROM W WHERE id = 2"),
+        vec![vec!["18446744073709551615"]]
+    );
+    // A parameter that fits signed is unchanged, which is the half that keeps
+    // every statement that already worked working: a client sends most
+    // integers unsigned whatever their size, and `? - 100` over a bound 7 is
+    // -93 rather than a refusal.
+    let small = Value::from_wire(&mysql_ultralight_protocol::Value::U64(7));
+    let Outcome::Rows(bound) = engine
+        .execute(&mut session, "SELECT ? - 100", &[small])
+        .expect("a bound 7 is a signed 7")
+    else {
+        panic!("expected rows")
+    };
+    assert_eq!(bound.rows[0][0].as_text(), "-93");
+
+    // A signed cast wraps rather than refusing, which is MySQL's answer for
+    // the one value that has to choose.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(bu AS SIGNED), CAST(bu AS CHAR) FROM W WHERE id = 1"
+        ),
+        vec![vec!["-1", "18446744073709551615"]]
+    );
+
+    // Above the range still refuses, at the column and at the operator.
+    let error = engine
+        .execute(
+            &mut session,
+            "INSERT INTO W VALUES (2, 18446744073709551616)",
+            &[],
+        )
+        .expect_err("2^64 is not a BIGINT UNSIGNED");
+    assert_eq!(error.code, 1264, "{}", error.message);
+    let error = engine
+        .execute(&mut session, "SELECT bu + 1 FROM W", &[])
+        .expect_err("2^64 is not a BIGINT UNSIGNED");
+    assert_eq!(error.code, 1690, "{}", error.message);
+
+    // The protocol's own rendering, which is a second one: `rows` above reads
+    // the engine's `as_text`, and a client reads this. Sent as an `i64` the
+    // column would announce UNSIGNED and carry the digits of -1.
+    let Outcome::Rows(result) = run(&engine, &mut session, "SELECT bu FROM W") else {
+        panic!("expected rows")
+    };
+    let mut text = mysql_ultralight_protocol::BufWriter::new();
+    result.rows[0][0].to_wire().encode_text(&mut text);
+    assert_eq!(
+        String::from_utf8_lossy(&text.into_inner()[1..]),
+        "18446744073709551615"
+    );
+
+    // A sign drops the flag rather than keeping it, so this refuses in the
+    // *signed* domain — MySQL's answer, and the message says which.
+    let error = engine
+        .execute(&mut session, "SELECT -bu FROM W", &[])
+        .expect_err("-(2^64-1) is not a BIGINT");
+    assert_eq!(error.message, "BIGINT value is out of range");
+    // While a sign over a value that does fit answers, and goes on answering
+    // once it is negative.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT -(bu DIV 10), -(bu DIV 10) - 100 FROM W WHERE id = 1"
+        ),
+        vec![vec!["-1844674407370955161", "-1844674407370955261"]]
+    );
+}
+
+#[test]
+fn an_else_is_a_candidate_for_the_sign_like_every_other_branch() {
+    // The `ELSE` as the *only* unsigned candidate is the shape that reads it
+    // and nothing else does — with an unsigned `THEN` the flag is decided
+    // before the `ELSE` is looked at. Described signed while the value kept
+    // its tag, the text protocol wrote every digit of 18446744073709551615 and
+    // a binary client read the same eight bytes as -1.
+    //
+    // The three spellings are one expression, and MySQL calls all three
+    // UNSIGNED on 8.3 — the siblings are here because they were already right,
+    // so a fix that broke them would say so.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE W (id INT NOT NULL, bu BIGINT UNSIGNED NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO W VALUES (1, 18446744073709551615)",
+    );
+
+    let sql = "SELECT CASE WHEN 0 THEN NULL ELSE bu END, COALESCE(NULL, bu), \
+               IF(0, NULL, bu) FROM W";
+    assert_eq!(
+        rows(&engine, &mut session, sql),
+        vec![vec!["18446744073709551615"; 3]]
+    );
+    let signs: Vec<bool> = engine
+        .describe(&session, sql, 0)
+        .unwrap()
+        .iter()
+        .map(|c| c.unsigned)
+        .collect();
+    assert_eq!(signs, vec![true, true, true]);
+
+    // And a signed `ELSE` still gives it away, so the fix widened what is read
+    // rather than what is accepted.
+    let mixed: Vec<bool> = engine
+        .describe(
+            &session,
+            "SELECT CASE WHEN 0 THEN NULL ELSE 1 END, CASE WHEN 1 THEN bu ELSE 1 END FROM W",
+            0,
+        )
+        .unwrap()
+        .iter()
+        .map(|c| c.unsigned)
+        .collect();
+    assert_eq!(mixed, vec![false, false]);
+}
+
+#[test]
+fn a_table_value_constructor_describes_an_unsigned_value_as_an_integer() {
+    // `to_wire` sends a `WireValue::U64`, so a column announced VAR_STRING —
+    // which is where the catch-all put it — wrote eight raw bytes where a
+    // binary client was reading a length-encoded string, and desynchronised
+    // the row it was in the middle of. MySQL types `VALUES ROW(...)` over an
+    // unsigned value LONGLONG UNSIGNED. The same defect the diff fixed for a
+    // boolean by untagging before the columns are derived; an unsigned value
+    // cannot be untagged, because MySQL really does describe it unsigned.
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        ("VALUES ROW(18446744073709551615)", "LongLong true"),
+        ("VALUES ROW(~0)", "LongLong true"),
+        ("VALUES ROW(1 << 63)", "LongLong true"),
+        ("VALUES ROW(1)", "LongLong false"),
+        // A NULL row says nothing about the column.
+        (
+            "VALUES ROW(18446744073709551615), ROW(NULL)",
+            "LongLong true",
+        ),
+        // Two rows sharing one column with no integer holding both, which is
+        // where a mixed-sign union ends up too.
+        (
+            "VALUES ROW(1), ROW(18446744073709551615)",
+            "NewDecimal false",
+        ),
+    ] {
+        let described = engine.describe(&session, sql, 0).unwrap();
+        assert_eq!(
+            format!("{:?} {}", described[0].ty, described[0].unsigned),
+            expected,
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        rows(&engine, &mut session, "VALUES ROW(~0)"),
+        vec![vec!["18446744073709551615"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "VALUES ROW(1), ROW(18446744073709551615)"
+        ),
+        vec![vec!["1"], vec!["18446744073709551615"]]
+    );
+}
+
+#[test]
+fn a_number_is_an_enum_index_whatever_its_sign() {
+    // MySQL reads a number as a position and a string as a member, and the
+    // signedness of the number is not part of that rule. Read as text, `1 & 1`
+    // matched the *member* `1` while the literal 1 beside it stored the first
+    // member `2` — the same number stored two different ways, decided by a tag
+    // the statement never mentions. The declaration is out of alphabetical and
+    // out of numeric order so an index and a member cannot pass for each other.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Idx (id INT NOT NULL, g ENUM('2','1') NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Idx VALUES (1, 1 & 1), (2, 1), (3, 2 & 2), (4, 2), \
+         (5, 18446744073709551615 - 18446744073709551614)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT g, g + 0 FROM Idx ORDER BY id"
+        ),
+        vec![
+            vec!["2", "1"],
+            vec!["2", "1"],
+            vec!["1", "2"],
+            vec!["1", "2"],
+            vec!["2", "1"],
+        ]
+    );
+    // A position no column declares is refused rather than wrapped, which is
+    // what an index above `i64::MAX` becomes.
+    let error = engine
+        .execute(
+            &mut session,
+            "INSERT INTO Idx VALUES (6, 18446744073709551615)",
+            &[],
+        )
+        .expect_err("2^64-1 is not a position in a two-member ENUM");
+    assert_eq!(error.code, 1265, "{}", error.message);
+}
+
+#[test]
+fn a_conditional_over_both_signs_widens_rather_than_wrapping() {
+    // A `BIGINT UNSIGNED` beside a signed one has no 64-bit integer that holds
+    // them both, so MySQL answers a NEWDECIMAL and keeps every digit of each.
+    // Wrapping the tag off — which is what a signed `i64` reading does — made
+    // all of these -1. Measured on 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE M (id INT NOT NULL, bu BIGINT UNSIGNED NOT NULL, b BIGINT NOT NULL, \
+         iu INT UNSIGNED NOT NULL, i INT NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO M VALUES (1, 18446744073709551615, 7, 7, 7)",
+    );
+
+    let sql = "SELECT COALESCE(bu, b), IFNULL(bu, b), GREATEST(bu, b), IF(1, bu, b), \
+               CASE WHEN 1 THEN bu ELSE b END FROM M";
+    assert_eq!(
+        rows(&engine, &mut session, sql),
+        vec![vec!["18446744073709551615"; 5]]
+    );
+    // And the code says so, or the binary protocol would read eight bytes of
+    // something the text protocol spelled out in full.
+    let codes: Vec<String> = engine
+        .describe(&session, sql, 0)
+        .unwrap()
+        .iter()
+        .map(|c| format!("{:?} {}", c.ty, c.unsigned))
+        .collect();
+    assert_eq!(codes, vec!["NewDecimal false"; 5]);
+
+    // A narrower pair still has an integer to widen into, so those stay
+    // LONGLONG — the sign is what runs out, not the type system.
+    let narrow: Vec<String> = engine
+        .describe(
+            &session,
+            "SELECT COALESCE(iu, i), COALESCE(iu, b), COALESCE(iu, iu) FROM M",
+            0,
+        )
+        .unwrap()
+        .iter()
+        .map(|c| format!("{:?} {}", c.ty, c.unsigned))
+        .collect();
+    assert_eq!(
+        narrow,
+        vec!["LongLong false", "LongLong false", "Long true"]
+    );
+
+    // Three candidates, which is the only shape that reads the sign the fold
+    // carries: with two, `widen` sees both declarations directly. A signed
+    // `INT` and an `INT UNSIGNED` already need a `BIGINT` between them, and a
+    // `BIGINT UNSIGNED` after that leaves nothing — MySQL says NEWDECIMAL, and
+    // a fold that let either side's sign win would have called it a LONGLONG.
+    let three: Vec<String> = engine
+        .describe(
+            &session,
+            "SELECT COALESCE(i, iu, bu), COALESCE(i, iu) FROM M",
+            0,
+        )
+        .unwrap()
+        .iter()
+        .map(|c| format!("{:?} {}", c.ty, c.unsigned))
+        .collect();
+    assert_eq!(three, vec!["NewDecimal false", "LongLong false"]);
+}
+
+#[test]
+fn a_rounding_at_a_negative_scale_stays_exact_over_an_unsigned_value() {
+    // These compute in an `f64`, which has no digit left below 2^53 — so at
+    // the top of a BIGINT UNSIGNED the answer was a number that had never been
+    // in the column. Measured on 8.3: `TRUNCATE(bu, -1)` is
+    // 18446744073709551610, and `ROUND(bu, -1)` *refuses*, because carrying up
+    // leaves the range the answer has to fit in.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE W (id INT NOT NULL, bu BIGINT UNSIGNED NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO W VALUES (1, 18446744073709551615), (2, 18446744073709551605), \
+         (3, 18446744073709551604)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TRUNCATE(bu, -1), TRUNCATE(bu, -2), TRUNCATE(bu, -30) FROM W WHERE id = 1"
+        ),
+        vec![vec!["18446744073709551610", "18446744073709551600", "0"]]
+    );
+    // A scale so deep that the power of ten it cuts at does not fit either:
+    // the answer is zero rather than an overflow, which is MySQL's too.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TRUNCATE(bu, -39), ROUND(bu, -39), TRUNCATE(bu, -100) FROM W WHERE id = 1"
+        ),
+        vec![vec!["0", "0", "0"]]
+    );
+    // Half goes up, which is measured rather than assumed.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROUND(bu, -1) FROM W WHERE id > 1 ORDER BY id"
+        ),
+        vec![vec!["18446744073709551610"], vec!["18446744073709551600"]]
+    );
+    let error = engine
+        .execute(
+            &mut session,
+            "SELECT ROUND(bu, -1) FROM W WHERE id = 1",
+            &[],
+        )
+        .expect_err("rounding up leaves the range");
+    assert_eq!(error.code, 1690, "{}", error.message);
+}
+
+#[test]
+fn a_conditional_keeps_the_unsigned_reading_only_where_every_candidate_has_one() {
+    // The same all-candidates rule the UNSIGNED flag on the wire follows, and
+    // it has to hold for the *value* as well or the two disagree row by row:
+    // measured on 8.3, `COALESCE(iu, iu) - 100` raises 1690 and
+    // `COALESCE(iu, 1) - 100` answers -93.
+    let (engine, mut session) = engine();
+    unsigned_widths(&engine, &mut session);
+
+    for sql in [
+        "SELECT COALESCE(iu, iu) - 100 FROM U",
+        "SELECT IF(1, iu, iu) - 100 FROM U",
+        "SELECT IFNULL(iu, iu) - 100 FROM U",
+        "SELECT GREATEST(iu, iu) - 100 FROM U",
+        "SELECT LEAST(iu, iu) - 100 FROM U",
+        "SELECT (CASE WHEN 1 THEN iu ELSE iu END) - 100 FROM U",
+        // A NULL candidate does not count against it, and a missing `ELSE` is
+        // a NULL candidate.
+        "SELECT COALESCE(NULL, iu) - 100 FROM U",
+        "SELECT IF(1, iu, NULL) - 100 FROM U",
+        "SELECT (CASE WHEN 1 THEN iu END) - 100 FROM U",
+        // `NULLIF` answers its first argument and takes its sign from that
+        // alone, which is why it is not in the list below.
+        "SELECT NULLIF(iu, 1) - 100 FROM U",
+        // A NULL branch beside the taken one does not count against it
+        // either, where a `1` in the same position does — the pair below.
+        "SELECT (CASE WHEN 0 THEN NULL WHEN 1 THEN iu END) - 100 FROM U",
+    ] {
+        let error = engine.execute(&mut session, sql, &[]).expect_err(sql);
+        assert_eq!(error.code, 1690, "{sql}");
+    }
+
+    for sql in [
+        "SELECT COALESCE(iu, 1) - 100 FROM U",
+        "SELECT IF(1, iu, 1) - 100 FROM U",
+        "SELECT IFNULL(iu, 1) - 100 FROM U",
+        "SELECT GREATEST(iu, 1) - 100 FROM U",
+        "SELECT (CASE WHEN 1 THEN iu ELSE 1 END) - 100 FROM U",
+        "SELECT (CASE WHEN 0 THEN 1 ELSE iu END) - 100 FROM U",
+        "SELECT (CASE WHEN 0 THEN 1 WHEN 1 THEN iu END) - 100 FROM U",
+    ] {
+        assert_eq!(rows(&engine, &mut session, sql), vec![vec!["-93"]], "{sql}");
+    }
+    // A branch MySQL never reaches cannot be what makes it refuse. `CASE` is
+    // the one conditional whose candidates are not already evaluated, so the
+    // engine evaluates the untaken ones to ask what they are — and this is the
+    // case that says what to do when that fails: on 8.3 the whole expression
+    // is UNSIGNED and raises 1690, because `bu + 1` is unsigned *as a type*
+    // however the arithmetic in it would have gone.
+    run(
+        &engine,
+        &mut session,
+        "UPDATE U SET bu = 18446744073709551615 WHERE id = 1",
+    );
+    let error = engine
+        .execute(
+            &mut session,
+            "SELECT (CASE WHEN 1 THEN iu ELSE bu + 1 END) - 100 FROM U",
+            &[],
+        )
+        .expect_err("the untaken branch does not decide this");
+    assert_eq!(error.code, 1690, "{}", error.message);
+
+    // `LEAST(iu, 1)` picks the 1, so its answer differs from the six above
+    // while the rule that produced it is the same one.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LEAST(iu, 1) - 100 FROM U"),
+        vec![vec!["-99"]]
+    );
+}
+
+#[test]
+fn the_unsigned_reading_survives_exactly_what_mysql_lets_it_survive() {
+    // Measured on 8.3, and the list is its own: #0068's ENUM and #0061's
+    // boolean each keep a different subset, and neither transfers. A scalar
+    // subquery drops the ordinal and keeps this; a set operation drops all
+    // three unless both branches agree, where a derived table keeps this and
+    // the ordinal and drops the boolean.
+    let (engine, mut session) = engine();
+    unsigned_widths(&engine, &mut session);
+
+    for sql in [
+        "SELECT (SELECT iu FROM U) - 100",
+        "SELECT x - 100 FROM (SELECT iu AS x FROM U) t",
+        "SELECT x - 100 FROM (SELECT iu AS x FROM U UNION ALL SELECT iu FROM U) t",
+        // `ABS`, `MIN` and `MAX` hand a row's own value back.
+        "SELECT ABS(iu) - 100 FROM U",
+        "SELECT MIN(iu) - 100 FROM U",
+        "SELECT MAX(iu) - 100 FROM U",
+    ] {
+        let error = engine.execute(&mut session, sql, &[]).expect_err(sql);
+        assert_eq!(error.code, 1690, "{sql}");
+    }
+
+    // A window function answers a row of its frame, or the default it was
+    // given where it reaches past one — and the default is a candidate, so it
+    // decides the sign along with the subject. Reached through a derived
+    // table because a window function inside an expression is a separate gap:
+    // `LAG(iu) OVER (...) - 100` is unsupported here whatever the sign.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Win (id INT NOT NULL, w INT UNSIGNED NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Win VALUES (1, 7), (2, 8)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT x - 100 FROM (SELECT id, LAG(w, 1, 0) OVER (ORDER BY id) AS x FROM Win) t \
+             ORDER BY x"
+        ),
+        vec![vec!["-100"], vec!["-93"]]
+    );
+    for sql in [
+        "SELECT x - 100 FROM (SELECT id, LAG(w) OVER (ORDER BY id) AS x FROM Win) t ORDER BY x",
+        "SELECT x - 100 FROM (SELECT id, FIRST_VALUE(w) OVER (ORDER BY id) AS x FROM Win) t \
+         ORDER BY x",
+    ] {
+        let error = engine.execute(&mut session, sql, &[]).expect_err(sql);
+        assert_eq!(error.code, 1690, "{sql}");
+    }
+
+    // A rounding hands back the number it was given rather than building a
+    // new one, so all four keep the sign — the negative scale included, which
+    // is the one that cannot answer by handing the argument straight back.
+    for sql in [
+        "SELECT ROUND(iu) - 100 FROM U",
+        "SELECT CEIL(iu) - 100 FROM U",
+        "SELECT FLOOR(iu) - 100 FROM U",
+        "SELECT TRUNCATE(iu, 0) - 100 FROM U",
+        "SELECT ROUND(iu, -1) - 100 FROM U",
+        "SELECT TRUNCATE(iu, -1) - 100 FROM U",
+    ] {
+        let error = engine.execute(&mut session, sql, &[]).expect_err(sql);
+        assert_eq!(error.code, 1690, "{sql}");
+    }
+
+    // A set operation with a signed branch drops it, which is the pair that
+    // proves the union is not simply passing values through.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT x - 100 FROM (SELECT iu AS x FROM U UNION ALL SELECT i FROM U) t"
+        ),
+        vec![vec!["-93"], vec!["-93"]]
+    );
+    // `SUM`, `AVG` and `COUNT` build a new number and come back signed.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT SUM(iu) - 100, AVG(iu) - 100, COUNT(iu) - 100 FROM U"
+        ),
+        vec![vec!["-93", "-93.0000", "-99"]]
+    );
+}
+
+#[test]
+fn a_sum_over_an_unsigned_column_stays_exact_at_the_top_of_its_range() {
+    // `SUM` and `AVG` build an exact total, and an unsigned operand had no
+    // case there — so it fell through to the `f64` path and 18446744073709551615
+    // came back as 18446744073709552000.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE W (id INT NOT NULL, bu BIGINT UNSIGNED NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO W VALUES (1, 18446744073709551615)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT SUM(bu), AVG(bu), MIN(bu), MAX(bu) FROM W"
+        ),
+        vec![vec![
+            "18446744073709551615",
+            "18446744073709551615.0000",
+            "18446744073709551615",
+            "18446744073709551615"
+        ]]
+    );
+}
+
+#[test]
+fn no_unsigned_subtraction_moves_the_domain_of_one_operator() {
+    // The flag takes `-` out of the unsigned domain and takes nothing else out
+    // of it, which is measured rather than read off its name.
+    let (engine, mut session) = engine();
+    unsigned_widths(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_UNSIGNED_SUBTRACTION')",
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT iu - 100, iu - 8, 6 - iu FROM U"
+        ),
+        vec![vec!["-93", "-1", "-1"]]
+    );
+    // And the flag on the wire moves with the value, or the text protocol
+    // would say -93 while the binary one handed the same bytes to a client
+    // reading 18446744073709551523.
+    let signs: Vec<bool> = engine
+        .describe(&session, "SELECT iu - 100, iu + 1 FROM U", 0)
+        .unwrap()
+        .iter()
+        .map(|c| c.unsigned)
+        .collect();
+    assert_eq!(signs, vec![false, true]);
+
+    // What it does not touch.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT iu + 1, iu * 2, iu DIV 2 FROM U"
+        ),
+        vec![vec!["8", "14", "3"]]
+    );
+    for sql in [
+        "SELECT iu + -100 FROM U",
+        "SELECT iu * -1 FROM U",
+        "SELECT iu DIV -1 FROM U",
+    ] {
+        let error = engine.execute(&mut session, sql, &[]).expect_err(sql);
+        assert_eq!(error.code, 1690, "{sql}");
+        assert_eq!(
+            error.message, "BIGINT UNSIGNED value is out of range",
+            "{sql}"
+        );
+    }
+
+    // Turning it off again puts the subtraction back, so the mode is read per
+    // statement rather than baked in when the column was.
+    run(
+        &engine,
+        &mut session,
+        "SET SESSION sql_mode = 'STRICT_TRANS_TABLES'",
+    );
+    let error = engine
+        .execute(&mut session, "SELECT iu - 100 FROM U", &[])
+        .expect_err("the mode is off again");
+    assert_eq!(error.code, 1690);
+}
+
+#[test]
+fn a_literal_above_the_signed_range_is_unsigned() {
+    // MySQL types one BIGINT UNSIGNED, so it subtracts in the unsigned domain
+    // and reports the flag. Read as a double the operand was rounded before
+    // anything was taken off it.
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 18446744073709551615 - 1"),
+        vec![vec!["18446744073709551614"]]
+    );
+    let signs: Vec<bool> = engine
+        .describe(
+            &session,
+            "SELECT 18446744073709551615 - 1, 9223372036854775807 - 1",
+            0,
+        )
+        .unwrap()
+        .iter()
+        .map(|c| c.unsigned)
+        .collect();
+    assert_eq!(signs, vec![true, false]);
+
+    for sql in [
+        "SELECT 18446744073709551615 + 1",
+        "SELECT 0 - 18446744073709551615",
+    ] {
+        let error = engine.execute(&mut session, sql, &[]).expect_err(sql);
+        assert_eq!(error.code, 1690, "{sql}");
+    }
+
+    // A bitwise operator reads an unsigned operand as the bit pattern it
+    // already is. Through the `f64` fall-through the cast saturated and this
+    // answered 9223372036854775807.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 0 | 18446744073709551615, ~0 & 18446744073709551615"
+        ),
+        vec![vec!["18446744073709551615", "18446744073709551615"]]
+    );
 }
 
 #[test]
@@ -6564,17 +7430,18 @@ fn a_computed_column_keeps_the_unsigned_flag() {
         // Arithmetic keeps the flag when *either* side has it — and loses it
         // as soon as the answer stops being an integer, or is negated.
         (
-            // Subtraction is left off on purpose: MySQL refuses `u - 100` with
-            // 1690 where this engine answers -93, and flagging the column
-            // UNSIGNED would have the two protocols disagree with each other.
-            // #0069.
-            // Every operand has to be one that cannot be negative, not just
-            // the operator: `u + -100` and `u * -1` go negative exactly as
-            // `u - 100` does, and MySQL refuses all three with 1690. #0069.
+            // Subtraction is in the list, and so is a negative operand beside
+            // an unsigned one. Both were left off while the engine answered
+            // `u - 100` with -93 and MySQL refused it with 1690; now that the
+            // engine refuses it too, the flag says what MySQL says. #0069.
+            //
+            // `%` reads only its left operand — `u % -1` is UNSIGNED there and
+            // `-1 % u` is not — which is measured and is why it is the one
+            // arithmetic operator not written as "either side".
             "SELECT u, u+1, u*2, u+u, u DIV 2, u%2, u-1, u+(-100), u*(-1), \
-                    u+id, -u, u/2, u+1.5 FROM G",
+                    u+id, -u, u/2, u+1.5, (-1)%u FROM G",
             vec![
-                true, true, true, true, true, true, false, false, false, false, false, false,
+                true, true, true, true, true, true, true, true, true, true, false, false, false,
                 false,
             ],
         ),
@@ -6600,11 +7467,35 @@ fn a_computed_column_keeps_the_unsigned_flag() {
             "SELECT CASE WHEN 1 THEN u ELSE u END, CASE WHEN 1 THEN u ELSE 1 END, u=1 FROM G",
             vec![true, false, false],
         ),
-        // A window reaching past its frame answers the default it was given,
-        // and that `0` is signed.
+        // A NULL candidate does not count against it, and a missing `ELSE` is
+        // a NULL candidate. Measured on 8.3, where reading the absent branch
+        // as a signed one made the first of these signed.
         (
-            "SELECT LAG(u,1,0) OVER (ORDER BY id), FIRST_VALUE(u) OVER (ORDER BY id) FROM G",
-            vec![false, true],
+            "SELECT CASE WHEN 1 THEN u END, CASE WHEN 0 THEN NULL WHEN 1 THEN u END, \
+                    COALESCE(NULL, u), IF(1, u, NULL), IFNULL(NULL, u) FROM G",
+            vec![true, true, true, true, true],
+        ),
+        // A literal above the signed range is the one literal MySQL calls
+        // UNSIGNED, and it is what makes `18446744073709551615 - 1` answer
+        // rather than hand a binary client -2.
+        (
+            "SELECT 18446744073709551615, 18446744073709551615 - 1, 9223372036854775807 FROM G",
+            vec![true, true, false],
+        ),
+        // A window reaching past its frame answers the default it was given,
+        // and that `0` is signed. The *offset* is not a candidate and does not
+        // count, which is measured: `LAG(u, 1)` and `NTH_VALUE(u, 1)` are both
+        // UNSIGNED on 8.3 though the 1 in each is not.
+        (
+            "SELECT LAG(u,1,0) OVER (ORDER BY id), FIRST_VALUE(u) OVER (ORDER BY id), \
+                    LAG(u,1) OVER (ORDER BY id), NTH_VALUE(u,1) OVER (ORDER BY id) FROM G",
+            vec![false, true, true, true],
+        ),
+        // `MOD(a, b)` is `a % b` spelled as a call and takes its sign the same
+        // way, from its dividend alone.
+        (
+            "SELECT MOD(u, -1), MOD(-1, u), ROUND(u, -1), TRUNCATE(u, -1) FROM G",
+            vec![true, false, true, true],
         ),
     ] {
         assert_eq!(signs(&session, sql), expected, "{sql}");
@@ -7440,46 +8331,54 @@ fn the_bitwise_operators_answer_over_unsigned_bits() {
 }
 
 #[test]
-fn a_bitwise_answer_too_wide_for_an_i64_is_refused() {
-    // MySQL answers a BIGINT UNSIGNED and the engine holds an i64, so an
-    // answer above `i64::MAX` has no value to be. Carrying the bits and
+fn a_bitwise_answer_too_wide_for_an_i64_is_answered() {
+    // These were refused with 1235 until #0069 gave `Value` an unsigned tag,
+    // which is what #0077 was waiting for. Refusing was the right answer while
+    // the alternative was a wrong one: carrying the bits in an `i64` and
     // letting the column's UNSIGNED flag reinterpret them prints the right
-    // digits for `SELECT ~0` and is wrong everywhere else — `~0 > 5` answered
-    // 0 for MySQL's 1, `CONCAT(~0)` answered -1, `~0 MOD 10` answered
-    // 18446744073709551615 for 5 — because nothing on the value tells the next
-    // reader it is unsigned. Wrong answers are not a trade this engine makes,
-    // so the shapes it cannot represent refuse.
+    // digits for `SELECT ~0` and nothing else — `~0 > 5` answered 0 for
+    // MySQL's 1, `CONCAT(~0)` answered -1, `~0 MOD 10` answered
+    // 18446744073709551615 for 5 — because nothing on the value told the next
+    // reader it was unsigned. Now something does.
+    //
+    // The mixed contexts are here for exactly that reason: the digits alone
+    // would pass `SELECT ~0` while every one of the readings below stayed
+    // wrong. All measured on 8.3.
     let (engine, mut session) = engine();
-    for sql in [
-        "SELECT ~0",
-        "SELECT 1 << 63",
-        "SELECT -5 & -3",
-        "SELECT ~0 > 5",
-        "SELECT ~0 DIV 2",
-        "SELECT ~0 - 1",
-        "SELECT CONCAT(~0)",
+    for (sql, expected) in [
+        ("SELECT ~0", "18446744073709551615"),
+        ("SELECT 1 << 63", "9223372036854775808"),
+        ("SELECT -5 & -3", "18446744073709551609"),
+        ("SELECT ~0 > 5", "1"),
+        ("SELECT ~0 DIV 2", "9223372036854775807"),
+        ("SELECT ~0 - 1", "18446744073709551614"),
+        ("SELECT ~0 MOD 10", "5"),
+        ("SELECT CONCAT(~0)", "18446744073709551615"),
     ] {
-        let error = engine
-            .execute(&mut session, sql, &[])
-            .expect_err("an answer above i64::MAX is not representable");
-        assert_eq!(error.code, 1235, "{sql}");
-        assert!(
-            error
-                .message
-                .contains("above the largest signed 64-bit integer"),
-            "{sql} refused with {}",
-            error.message
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
         );
     }
+
+    // And the one direction that still refuses, because it has to: a bitwise
+    // answer is a BIGINT UNSIGNED, so adding one to the largest of them leaves
+    // the range and MySQL raises 1690 rather than wrapping to zero.
+    let error = engine
+        .execute(&mut session, "SELECT ~0 + 1", &[])
+        .expect_err("2^64 is not a BIGINT UNSIGNED");
+    assert_eq!(error.code, 1690, "{}", error.message);
 }
 
 #[test]
 fn a_bitwise_chain_composes_over_bits_it_cannot_hand_out() {
-    // The refusal is at the chain's boundary and not at every operator, which
-    // is the difference between a gap and a rout: `1 + 3 & ~5` is 0 in MySQL
-    // and reaches it through 18446744073709551610 — a number the engine cannot
-    // hold but can carry the bits of. Checking each operator refused 1354 of
-    // 6000 random expressions that it can answer exactly.
+    // A chain is computed as a chain: `1 + 3 & ~5` is 0 in MySQL and reaches
+    // it through 18446744073709551610. This was written when that intermediate
+    // had no `Value` to be — checking each operator against `i64` refused 1354
+    // of 6000 random expressions it can answer exactly — and it still holds
+    // now that one does, because the composition is what makes the answers
+    // right rather than merely representable.
     let (engine, mut session) = engine();
     for (sql, expected) in [
         ("SELECT 1 + 3 & ~5", "0"),
@@ -8822,17 +9721,13 @@ fn a_bitwise_temporal_operand_is_its_packed_digits() {
         );
     }
 
-    // `~d` still refuses, and now for the only reason left: MySQL answers
-    // 18446744073689291513, which is above `i64::MAX` and has no `Value` to
-    // be. That is #0077 and not this — the operand converted fine.
-    let error = engine
-        .execute(&mut session, "SELECT ~d FROM T", &[])
-        .expect_err("the complement of a date is above the signed range");
-    assert_eq!(error.code, 1235);
-    assert!(
-        error.message.contains("18446744073689291513"),
-        "refused with {}",
-        error.message
+    // `~d` answers since #0069 gave `Value` an unsigned tag. It refused before
+    // that with 1235, because 18446744073689291513 is above `i64::MAX` and had
+    // nothing to be — which was #0077 and never this: the operand had been
+    // converting correctly the whole time, and this is the proof of it.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT ~d FROM T"),
+        vec![vec!["18446744073689291513"]]
     );
 }
 

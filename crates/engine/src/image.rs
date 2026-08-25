@@ -27,6 +27,12 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// not fail cleanly, it would silently produce a catalog with the wrong shape,
 /// and every test running against it would be wrong in a way nothing reports.
 ///
+/// v8 adds another: an UNSIGNED integer. A v7 image cannot hold one at all —
+/// its widest tag is an `i64`, so a `BIGINT UNSIGNED` column was capped at
+/// `i64::MAX` and 18446744073709551615 could not be stored — and a v7 image
+/// that *could* be read as v8 would reload every unsigned column signed, which
+/// decides whether `iu - 100` is 1690 or -93. See #0069.
+///
 /// v7 adds another: an ENUM member and the ordinal it was declared at, which a
 /// v6 image would reload as text — and a member read as text is 0 in
 /// arithmetic where MySQL says its position. The ordinal cannot be recovered
@@ -51,7 +57,7 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// answering it, which is the wrong answer the version check exists to
 /// prevent. An image is a file a user keeps and boots from with `--state`, so
 /// the stale one has to fail rather than mislead.
-pub const FORMAT_VERSION: u32 = 7;
+pub const FORMAT_VERSION: u32 = 8;
 
 /// Writes the whole catalog.
 pub fn encode(catalog: &Catalog) -> Vec<u8> {
@@ -498,6 +504,14 @@ fn write_value(w: &mut Writer, value: &Value) {
             w.str(member);
             w.u32(*ordinal);
         }
+        // Tag 10, appended like every tag before it, and written as the `u64`
+        // it is rather than through an `i64` — the top half of the range is
+        // the reason the tag exists, so a signed field here would lose exactly
+        // the values it was added to carry.
+        Value::Unsigned(n) => {
+            w.u8(10);
+            w.u64(*n);
+        }
         // No tag of its own, and so no format version: a boolean cannot be
         // stored. Every value entering a row goes through
         // `SqlType::coerce`, and every arm of it builds a fresh value of the
@@ -552,6 +566,7 @@ fn read_value(r: &mut Reader<'_>) -> EngineResult<Value> {
             let ordinal = r.u32()?;
             Value::Enum { member, ordinal }
         }
+        10 => Value::Unsigned(r.u64()?),
         other => return Err(malformed(format!("unknown value tag {other}"))),
     })
 }

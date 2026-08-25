@@ -422,10 +422,22 @@ pub const GROUPS: &[Group] = &[
             same("SELECT 7 ^ 3, 7 & 3, 7 | 3, 1 << 3, 16 >> 2, ~-1"),
             // MySQL computes these over 64 *unsigned* bits, so a negative
             // operand is its two's complement and a shift does not sign-extend.
-            // Only answers up to `i64::MAX` are here: the engine holds an i64
-            // and refuses what it cannot represent, which is its own gap and
-            // not something this file can ask about.
             same("SELECT -1 & 1, -1 >> 1, ~-6, ~-1 & 255, 1 + 3 & ~-6"),
+            // And the half that used to be refused with 1235, because the
+            // answer was above `i64::MAX` and had no `Value` to be. #0069's
+            // unsigned tag is what closed #0077.
+            same("SELECT ~0, 1 << 63, -5 & -3, ~1, 0 | 18446744073709551615"),
+            // The mixed contexts, which are the reason a tag was needed rather
+            // than a wider integer: the digits alone would have printed right
+            // in the first column and been wrong in every one after it.
+            same("SELECT ~0 > 5, ~0 = 18446744073709551615, ~0 MOD 10, ~0 DIV 2, ~0 - 1"),
+            same("SELECT CONCAT(~0), JSON_ARRAY(~0), CAST(~0 AS SIGNED), CAST(~0 AS CHAR)"),
+            // A bitwise answer is a BIGINT UNSIGNED, so arithmetic over one
+            // leaves the range the same way a column's does.
+            same("SELECT ~0 + 1"),
+            same("SELECT ~u FROM B ORDER BY id"),
+            same("SELECT ~n FROM B ORDER BY id"),
+            same("SELECT ~0 UNION SELECT 1"),
             // A shift count is unsigned and is not reduced: 64 shifts
             // everything out, and -1 arrives as a count of 2^64-1.
             same("SELECT 1 << 64, 1 << 100, 1 << -1, (-1 >> 1) >> 62"),
@@ -1041,6 +1053,281 @@ pub const GROUPS: &[Group] = &[
             // one place a column can tell 1 from '1'.
             same("INSERT INTO BE VALUES (TRUE)"),
             same("SELECT v FROM BE ORDER BY v"),
+        ],
+    },
+    Group {
+        // MySQL refuses rather than answering when arithmetic over an UNSIGNED
+        // operand leaves its range, and this engine held an `i64` and
+        // answered: `iu - 100` over an `INT UNSIGNED` holding 7 was -93 where
+        // MySQL raises 1690. #0064 had to leave the UNSIGNED flag off a
+        // subtraction because of it.
+        //
+        // The check is per operator and against the *true* value, which is
+        // measured and is the opposite of what #0052 concluded for a bitwise
+        // chain: `iu - 100 + 200` is refused though 107 would fit, while
+        // `iu - -1` and `100 - iu` are answered. So the cases below vary the
+        // operand signs rather than only the operators.
+        name: "unsigned arithmetic out of range",
+        setup: &[
+            "CREATE TABLE U (id INT NOT NULL, tu TINYINT UNSIGNED NULL, \
+             su SMALLINT UNSIGNED NULL, mu MEDIUMINT UNSIGNED NULL, iu INT UNSIGNED NULL, \
+             bu BIGINT UNSIGNED NULL, i INT NULL, b BIGINT NULL, PRIMARY KEY (id))",
+            "INSERT INTO U VALUES (1, 7, 7, 7, 7, 7, 7, 7)",
+            // The top of the range, which is the half an engine holding an
+            // `i64` could not store at all.
+            "CREATE TABLE Wide (id INT NOT NULL, bu BIGINT UNSIGNED NOT NULL, \
+             iu INT UNSIGNED NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Wide VALUES (1, 18446744073709551615, 4294967295)",
+            // Two rows, so a window function has a frame to reach past.
+            "CREATE TABLE Win (id INT NOT NULL, iu INT UNSIGNED NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Win VALUES (1, 7), (2, 8)",
+            // Declared out of order, so an index and a member name are
+            // different answers: position 1 is the member `2`.
+            "CREATE TABLE Idx (id INT NOT NULL, g ENUM('2','1') NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Idx VALUES (1, 1 & 1), (2, 1), (3, 2 & 2), (4, 2)",
+        ],
+        cases: &[
+            // Every width refuses, so this is the column's sign and not its
+            // size deciding.
+            same("SELECT tu - 100 FROM U"),
+            same("SELECT su - 100 FROM U"),
+            same("SELECT mu - 100 FROM U"),
+            same("SELECT iu - 100 FROM U"),
+            same("SELECT bu - 100 FROM U"),
+            // Wider than subtraction: a negative operand does it to `+` and
+            // `*` as well, which is why the rule is about the answer and not
+            // about the operator.
+            same("SELECT iu + -100 FROM U"),
+            same("SELECT iu * -1 FROM U"),
+            same("SELECT iu DIV -1 FROM U"),
+            // The literal on the left, where the operand that carries the sign
+            // is the right one.
+            same("SELECT -100 + iu FROM U"),
+            same("SELECT -1 * iu FROM U"),
+            same("SELECT 0 - iu FROM U"),
+            same("SELECT 6 - iu FROM U"),
+            same("SELECT -1 - iu FROM U"),
+            same("SELECT -8 DIV iu FROM U"),
+            // The chain, which is the case that settles where the check goes:
+            // MySQL refuses this and names the inner subtraction.
+            same("SELECT iu - 100 + 200 FROM U"),
+            same("SELECT iu + 100 - 200 FROM U"),
+            // And everything that stays inside the range still answers,
+            // negative operands included.
+            same("SELECT iu - 7, iu - -1, 100 - iu, 7 - iu, iu + -7 FROM U"),
+            same("SELECT iu + 1, iu * 2, iu DIV 2, iu * 0 FROM U"),
+            // `%` reads only its left operand for the sign, so these two are
+            // the same numbers under different flags.
+            same("SELECT iu MOD -1, iu MOD -3, -1 MOD iu, -1 DIV iu FROM U"),
+            // A sign drops the flag, so the answer goes negative rather than
+            // refusing — and `-bu` refuses for the *signed* reason instead.
+            same("SELECT -iu, -iu - 100 FROM U"),
+            same("SELECT -bu FROM Wide"),
+            // The top of the range: storing it, reading it back, and the
+            // arithmetic on either side of the edge.
+            same("SELECT bu, bu - 1, bu + -1, bu * 1, bu - bu FROM Wide"),
+            same("SELECT bu + 1 FROM Wide"),
+            same("SELECT bu * 2 FROM Wide"),
+            same("SELECT bu - -1 FROM Wide"),
+            same("SELECT bu + bu FROM Wide"),
+            same("SELECT iu * iu, iu + iu FROM Wide"),
+            // Signed overflow is the same code with a different message, and
+            // this engine used to wrap through all of them.
+            same("SELECT b + 9223372036854775807 FROM U"),
+            same("SELECT b * 9223372036854775807 FROM U"),
+            same("SELECT 9223372036854775807 + 1"),
+            same("SELECT 9223372036854775807 * 2"),
+            same("SELECT -9223372036854775808 - 1"),
+            // A literal above `i64::MAX` is a BIGINT UNSIGNED in MySQL, so it
+            // subtracts in the unsigned domain like a column would.
+            same("SELECT 18446744073709551615 - 1"),
+            same("SELECT 18446744073709551615 + 1"),
+            same("SELECT 0 - 18446744073709551615"),
+            // A cast names the sign in the statement itself.
+            same("SELECT CAST(i AS UNSIGNED) - 100 FROM U"),
+            same("SELECT CAST(7 AS UNSIGNED) - 100"),
+            same("SELECT CAST(bu AS SIGNED), CAST(bu AS CHAR) FROM Wide"),
+            // A conditional needs *every* candidate to be unsigned, and the
+            // pairs below differ only in whether one of them is — which is the
+            // same rule the UNSIGNED flag on the wire follows.
+            same("SELECT COALESCE(iu, 1) - 100 FROM U"),
+            same("SELECT COALESCE(iu, iu) - 100 FROM U"),
+            same("SELECT IF(1, iu, 1) - 100 FROM U"),
+            same("SELECT IF(1, iu, iu) - 100 FROM U"),
+            same("SELECT IFNULL(iu, 1) - 100 FROM U"),
+            same("SELECT IFNULL(iu, iu) - 100 FROM U"),
+            same("SELECT GREATEST(iu, 1) - 100 FROM U"),
+            same("SELECT GREATEST(iu, iu) - 100 FROM U"),
+            same("SELECT LEAST(iu, 1) - 100 FROM U"),
+            same("SELECT LEAST(iu, iu) - 100 FROM U"),
+            same("SELECT (CASE WHEN 1 THEN iu ELSE 1 END) - 100 FROM U"),
+            same("SELECT (CASE WHEN 1 THEN iu ELSE iu END) - 100 FROM U"),
+            // A NULL candidate does not count against it, and a missing
+            // `ELSE` is a NULL candidate.
+            same("SELECT COALESCE(NULL, iu) - 100 FROM U"),
+            same("SELECT IF(1, iu, NULL) - 100 FROM U"),
+            same("SELECT (CASE WHEN 1 THEN iu END) - 100 FROM U"),
+            same("SELECT (CASE WHEN 0 THEN 1 ELSE iu END) - 100 FROM U"),
+            // `NULLIF` answers its first argument and takes its sign from
+            // that alone, which is why it is not in the list above.
+            same("SELECT NULLIF(iu, 1) - 100 FROM U"),
+            // The `ELSE` as the *only* unsigned candidate, which is the shape
+            // that reads it and nothing else does: the three below are one
+            // expression written three ways and MySQL calls all three
+            // UNSIGNED. The value has to agree with the flag or the text
+            // protocol writes every digit while a binary client reads -1.
+            same("SELECT CASE WHEN 0 THEN NULL ELSE bu END FROM Wide"),
+            same("SELECT COALESCE(NULL, bu) FROM Wide"),
+            same("SELECT IF(0, NULL, bu) FROM Wide"),
+            same("SELECT CASE WHEN 0 THEN NULL ELSE iu END - 100 FROM U"),
+            // A scalar subquery and a derived table both keep it, where a
+            // boolean survives only one of the two and an ENUM only the other.
+            same("SELECT (SELECT iu FROM U) - 100"),
+            same("SELECT x - 100 FROM (SELECT iu AS x FROM U) t"),
+            same("SELECT x - 100 FROM (SELECT bu AS x FROM Wide) t"),
+            // A set operation keeps it only where both branches have it, so
+            // these two differ by which column the second branch reads.
+            same("SELECT x - 100 FROM (SELECT iu AS x FROM U UNION ALL SELECT iu FROM U) t"),
+            same("SELECT x - 100 FROM (SELECT iu AS x FROM U UNION ALL SELECT i FROM U) t"),
+            same("SELECT iu AS x FROM U UNION SELECT iu FROM U"),
+            same("SELECT iu AS x FROM U UNION SELECT i FROM U"),
+            // `ABS`, `MIN` and `MAX` hand a row's own value back; `SUM`, `AVG`
+            // and `COUNT` build a new number and come back signed.
+            same("SELECT ABS(iu) - 100 FROM U"),
+            same("SELECT MIN(iu) - 100 FROM U"),
+            same("SELECT MAX(iu) - 100 FROM U"),
+            same("SELECT SUM(iu) - 100, AVG(iu) - 100, COUNT(iu) - 100 FROM U"),
+            same("SELECT SUM(bu), AVG(bu), MIN(bu), MAX(bu) FROM Wide"),
+            // A non-integer operand takes the whole thing out of the integer
+            // domain, so this answers rather than refusing.
+            //
+            // Only `100.5` here, and not the `100.0` or the `iu / -1` that
+            // were measured beside it: MySQL types both of those NEWDECIMAL
+            // and renders `-93.0` and `-7.0000`, where this engine reads a
+            // decimal literal as a double and divides into one. That gap
+            // predates #0069 and belongs to whichever issue takes decimal
+            // literals; putting it here would cost the empty baseline for a
+            // reason that has nothing to do with the sign.
+            same("SELECT iu - 100.5 FROM U"),
+            same("SELECT iu - '100' FROM U"),
+            same("SELECT iu - CAST('100' AS SIGNED) FROM U"),
+            // Comparison at the top of the range, which the `f64` reading
+            // could not tell apart: every `u64` above 2^53 rounds.
+            same("SELECT bu = 18446744073709551615, bu = 18446744073709551614 FROM Wide"),
+            same("SELECT bu > 0, bu > -1, bu > 9223372036854775807 FROM Wide"),
+            same("SELECT bu + 0, CONCAT(bu), JSON_ARRAY(bu) FROM Wide"),
+            // A table value constructor gives the value a column of its own,
+            // and that column has to be described as the integer it sends: a
+            // VAR_STRING code over eight raw bytes desynchronises the row it
+            // is in the middle of.
+            same("VALUES ROW(18446744073709551615)"),
+            same("VALUES ROW(~0)"),
+            same("VALUES ROW(1 << 63)"),
+            same("VALUES ROW(1)"),
+            // Two rows sharing one column, where there is no integer holding
+            // both — the same place a mixed-sign union ends up.
+            same("VALUES ROW(1), ROW(18446744073709551615)"),
+            same("VALUES ROW(18446744073709551615), ROW(18446744073709551614)"),
+            // A NULL row says nothing about the column's type, which is the
+            // half a fold has to be told.
+            same("VALUES ROW(18446744073709551615), ROW(NULL)"),
+            // A number is an index into an ENUM whatever its signedness. Read
+            // as text, `1 & 1` matched the *member* `1` while the literal 1
+            // beside it stored the first member — the same number stored two
+            // ways.
+            same("SELECT g FROM Idx ORDER BY id"),
+            same("SELECT g + 0 FROM Idx ORDER BY id"),
+            // These round the number they were given rather than building a
+            // new one, so the sign survives — and the negative scale is here
+            // because it is the one that cannot short-circuit.
+            same("SELECT ROUND(iu) - 100 FROM U"),
+            same("SELECT CEIL(iu) - 100 FROM U"),
+            same("SELECT FLOOR(iu) - 100 FROM U"),
+            same("SELECT TRUNCATE(iu, 0) - 100 FROM U"),
+            same("SELECT ROUND(iu, -1) - 100 FROM U"),
+            same("SELECT TRUNCATE(iu, -1) - 100 FROM U"),
+            same("SELECT ROUND(bu), CEIL(bu), FLOOR(bu), TRUNCATE(bu, 0) FROM Wide"),
+            // A negative scale at the top of the range, where the two part
+            // company: cutting can only go down, rounding can carry out of it.
+            same("SELECT TRUNCATE(bu, -1), TRUNCATE(bu, -2), TRUNCATE(bu, -30) FROM Wide"),
+            same("SELECT ROUND(bu, -1) FROM Wide"),
+            same("SELECT ROUND(bu - 10, -1), ROUND(bu - 6, -1) FROM Wide"),
+            same("SELECT TRUNCATE(bu, -39), ROUND(bu, -39), TRUNCATE(bu, -100) FROM Wide"),
+            // A conditional whose candidates are a `BIGINT UNSIGNED` and a
+            // signed one has no integer left to widen into, so MySQL answers
+            // a decimal and keeps every digit of both.
+            same(
+                "SELECT COALESCE(Wide.bu, U.b), IFNULL(Wide.bu, U.b), \
+                 GREATEST(Wide.bu, U.b) FROM Wide, U",
+            ),
+            same(
+                "SELECT IF(1, Wide.bu, U.b), CASE WHEN 1 THEN Wide.bu ELSE U.b END \
+                 FROM Wide, U",
+            ),
+            same(
+                "SELECT COALESCE(Wide.iu, U.i), COALESCE(U.tu, U.i), \
+                 COALESCE(Wide.iu, U.b) FROM Wide, U",
+            ),
+            // Three candidates, which is the only shape that reads the sign
+            // carried between them rather than two declarations at once.
+            same("SELECT COALESCE(U.i, U.iu, Wide.bu), COALESCE(U.i, U.iu) FROM Wide, U"),
+            // `MOD` spelled as a call reads its dividend, exactly as `%` does.
+            same("SELECT MOD(iu, -1), MOD(-1, iu) FROM U"),
+            // A window function answers a row of its frame, or the default it
+            // was given when it reaches past one — and the default decides the
+            // sign along with the subject, where the *offset* does not.
+            same("SELECT id, LAG(iu) OVER (ORDER BY id) FROM Win ORDER BY id"),
+            same("SELECT id, LAG(iu, 1) OVER (ORDER BY id) FROM Win ORDER BY id"),
+            same("SELECT id, LAG(iu, 1, 0) OVER (ORDER BY id) FROM Win ORDER BY id"),
+            same("SELECT id, FIRST_VALUE(iu) OVER (ORDER BY id) FROM Win ORDER BY id"),
+            // Reached through a derived table, because a window function
+            // inside an expression is a separate gap in this engine — it is
+            // unsupported there whatever the sign, so asking about it here
+            // would report that gap rather than this one.
+            //
+            // `FIRST_VALUE` rather than the `LAG(iu)` measured beside it, and
+            // for a reason that is not about the sign: MySQL refuses per row,
+            // so `LAG(iu)` sends the first row — whose value is NULL — and
+            // *then* raises 1690, where this engine buffers the result and
+            // refuses before sending anything. Every row of `FIRST_VALUE`
+            // overflows, so the two servers refuse in the same place.
+            same(
+                "SELECT x - 100 FROM (SELECT id, LAG(iu, 1, 0) OVER (ORDER BY id) AS x \
+                 FROM Win) t ORDER BY x",
+            ),
+            same(
+                "SELECT x - 100 FROM (SELECT id, FIRST_VALUE(iu) OVER (ORDER BY id) AS x \
+                 FROM Win) t ORDER BY x",
+            ),
+        ],
+    },
+    Group {
+        // `NO_UNSIGNED_SUBTRACTION` takes `-` out of the unsigned domain and
+        // takes nothing else out of it, which is measured rather than read off
+        // the flag's name: `iu + -100` and `iu * -1` still refuse under it,
+        // and `iu + 1` is still UNSIGNED.
+        name: "sql_mode: NO_UNSIGNED_SUBTRACTION",
+        setup: &[
+            "SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_UNSIGNED_SUBTRACTION')",
+            "CREATE TABLE N (id INT NOT NULL, iu INT UNSIGNED NULL, PRIMARY KEY (id))",
+            "INSERT INTO N VALUES (1, 7)",
+            "CREATE TABLE NWide (id INT NOT NULL, bu BIGINT UNSIGNED NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO NWide VALUES (1, 18446744073709551615)",
+        ],
+        cases: &[
+            // The whole of the flag: the same subtraction, answered rather
+            // than refused, and reported signed rather than UNSIGNED.
+            same("SELECT iu - 100, iu - 8, 6 - iu FROM N"),
+            // And what it does not touch.
+            same("SELECT iu + 1, iu * 2, iu DIV 2 FROM N"),
+            same("SELECT iu + -100 FROM N"),
+            same("SELECT iu * -1 FROM N"),
+            same("SELECT iu DIV -1 FROM N"),
+            // A subtraction that leaves the *signed* range now, which is the
+            // other half of the flag: it moves the domain rather than removing
+            // the check.
+            same("SELECT bu - 1 FROM NWide"),
+            same("SELECT bu + 1 FROM NWide"),
         ],
     },
     Group {

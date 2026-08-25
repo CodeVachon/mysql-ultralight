@@ -151,10 +151,28 @@ impl Answer {
         for row in result {
             match row {
                 Ok(row) => rows.push(render(&row)),
+                // A server error before any row is a refusal, not a
+                // truncation. MySQL raises some of them *per row* rather than
+                // while planning — `SELECT iu - 100` over an INT UNSIGNED
+                // describes its column, then sends 1690 — so the refusal
+                // arrives after `columns()` has already been read, where this
+                // engine refuses before answering at all. A client sees an
+                // error with the same code either way, which is the fact this
+                // harness is comparing.
+                //
+                // Only before any row, and deliberately: a statement that
+                // sent rows and *then* refused is a partial answer, and
+                // calling that a refusal would hide a real difference in what
+                // reached the client.
+                Err(mysql::Error::MySqlError(e)) if rows.is_empty() => {
+                    return Answer::Failed {
+                        code: e.code,
+                        state: e.state,
+                    }
+                }
                 // Reported rather than swallowed: stopping here and returning
                 // the short list would be read as the server having sent fewer
-                // rows, and the actual reason — which is this tool's problem,
-                // not the server's — would be gone.
+                // rows, and the actual reason would be gone.
                 Err(e) => {
                     return Answer::Truncated {
                         after: rows.len(),

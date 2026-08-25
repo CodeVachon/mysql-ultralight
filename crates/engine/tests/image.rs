@@ -898,7 +898,7 @@ fn a_boolean_never_reaches_the_image_and_is_written_as_its_integer_if_it_does() 
     // Put one there anyway and encode it, because "cannot happen" is a claim
     // about today's `coerce` and the writer has to have an answer either way.
     // It writes the integer under the tag the column would already have used,
-    // so nothing is lost and no reader has to learn a tenth tag.
+    // so nothing is lost and no reader has to learn a tag for it.
     catalog
         .database_mut("testdb")
         .unwrap()
@@ -911,7 +911,53 @@ fn a_boolean_never_reaches_the_image_and_is_written_as_its_integer_if_it_does() 
         Value::Int(1)
     );
 
-    // And the format is the one the previous build wrote, so a `--state` image
-    // taken before #0061 still loads.
-    assert_eq!(image::FORMAT_VERSION, 7);
+    // And the boolean did not move the version: 7 was #0068's ENUM tag and 8
+    // is #0069's unsigned one, neither of them this. Pinned rather than
+    // derived, so the day something *does* give a boolean a tag of its own it
+    // has to come back here and say so.
+    assert_eq!(image::FORMAT_VERSION, 8);
+}
+
+#[test]
+fn an_unsigned_column_survives_at_its_full_width_and_stays_unsigned() {
+    // Both halves of the tag have to make it into the image. The *magnitude*,
+    // because a `BIGINT UNSIGNED` reaches 18446744073709551615 and a v7 image
+    // had no field that could hold it; and the *sign*, because an unsigned
+    // column reloaded signed answers `u - 100` with -93 where MySQL raises
+    // 1690 — the whole of #0069, reintroduced by a restart.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (id INTEGER NOT NULL, u BIGINT UNSIGNED NOT NULL,          i INTEGER UNSIGNED NOT NULL, s BIGINT NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO T VALUES (1, 18446744073709551615, 7, 7)",
+    );
+
+    // The subtraction is in here beside the value because the two read
+    // different halves of the tag: an image that kept the digits and lost the
+    // sign would still print 18446744073709551615 and would stop refusing.
+    let sql = "SELECT u, u - 1, s - 100 FROM T";
+    let before = rows(&engine, &mut session, sql);
+    // Stated rather than only compared, so a reload that lost the tag on both
+    // sides could not pass by agreeing with itself.
+    assert_eq!(
+        before,
+        vec![vec!["18446744073709551615", "18446744073709551614", "-93"]]
+    );
+
+    let encoded = image::encode(&engine.catalog_snapshot().unwrap());
+    let decoded = image::decode(&encoded).unwrap();
+    let restored = Engine::from_catalog(decoded, ServerConfig::default()).unwrap();
+    let mut session = Session::new(ServerConfig::default(), 1);
+    session.current_database = Some("testdb".to_owned());
+    assert_eq!(rows(&restored, &mut session, sql), before);
+
+    let err = restored
+        .execute(&mut session, "SELECT i - 100 FROM T", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1690, "{}", err.message);
 }

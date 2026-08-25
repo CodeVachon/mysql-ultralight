@@ -369,15 +369,21 @@ impl SqlType {
     /// outside it, which is not a formality here: the binary protocol encodes
     /// by the declared type, so a `TINYINT` that had been allowed to hold 999
     /// would reach a client as 231.
-    fn integer_range(&self) -> (i64, i64) {
+    fn integer_range(&self) -> (i128, i128) {
         let (signed_low, signed_high, unsigned_high) = match self.base_name().as_str() {
             "tinyint" => (-128, 127, 255),
             "smallint" => (-32_768, 32_767, 65_535),
             "mediumint" => (-8_388_608, 8_388_607, 16_777_215),
             "int" | "integer" => (-2_147_483_648, 2_147_483_647, 4_294_967_295),
-            // The engine holds an `i64`, so an UNSIGNED BIGINT above
-            // `i64::MAX` is out of reach whatever this says.
-            _ => (i64::MIN, i64::MAX, i64::MAX),
+            // `i128` throughout so this row can say what it means: a
+            // `BIGINT UNSIGNED` holds 18446744073709551615 in MySQL, and while
+            // the engine held only an `i64` this had to claim `i64::MAX` and
+            // refuse the top half of the column's own range.
+            _ => (
+                i128::from(i64::MIN),
+                i128::from(i64::MAX),
+                i128::from(u64::MAX),
+            ),
         };
         if self.unsigned {
             (0, unsigned_high)
@@ -413,12 +419,22 @@ impl SqlType {
 
         Ok(match self.kind {
             TypeKind::Bool | TypeKind::Int => {
-                let n = value.as_int().ok_or_else(mismatch)?;
+                let n = value.as_exact_int().ok_or_else(mismatch)?;
                 let (low, high) = self.integer_range();
                 if n < low || n > high {
                     return Err(out_of_range());
                 }
-                Value::Int(n)
+                // Tagged here because this is the last place the column's own
+                // signedness and the value are both in hand — the same
+                // argument the ENUM ordinal below makes. An operand being
+                // subtracted from something has no column left to ask, and
+                // whether `iu - 100` is 1690 or -93 is entirely the column's
+                // answer. See #0069.
+                if self.unsigned {
+                    Value::Unsigned(n as u64)
+                } else {
+                    Value::Int(n as i64)
+                }
             }
             // A YEAR is two bytes on the wire, and MySQL's range for it is
             // 1901 to 2155 with zero for "none". Left unchecked it was the one
@@ -505,6 +521,16 @@ impl SqlType {
                     // text `1` would have matched the member `1` instead.
                     Value::Int(n) => Some(*n),
                     Value::Bool(b) => Some(i64::from(*b)),
+                    // An unsigned integer is a number here too, and for the
+                    // same reason: MySQL reads a number as an index whatever
+                    // its signedness. Left out, `1 & 1` into `ENUM('2','1')`
+                    // was read as the *text* `1` and matched the member `1`,
+                    // where the plain literal 1 beside it stored the first
+                    // member `2` — the same number stored two ways, decided by
+                    // a tag the statement never mentioned. An index above
+                    // `i64::MAX` wraps negative and is refused, which is the
+                    // right answer for a position no column declares.
+                    Value::Unsigned(n) => Some(*n as i64),
                     Value::Float(_) | Value::Float32(_) | Value::Decimal(_) => {
                         Some(value.as_number().trunc() as i64)
                     }

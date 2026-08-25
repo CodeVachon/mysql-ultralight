@@ -1192,6 +1192,7 @@ mod review_regressions {
         real_as_float: true,
         strict: false,
         only_full_group_by: true,
+        no_unsigned_subtraction: false,
     };
 
     /// A lone double quote in a comment used to open an identifier run that

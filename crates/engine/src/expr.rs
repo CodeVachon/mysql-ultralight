@@ -279,11 +279,20 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
                 // double -1.0 the fallback would build. MySQL types it
                 // LONGLONG, and the difference is visible: `JSON_ARRAY(-TRUE)`
                 // is `[-1]` there and would have been `[-1.0]`.
-                UnaryOperator::Minus => Ok(match value.untag_bool() {
-                    Value::Null => Value::Null,
-                    Value::Int(v) => Value::Int(-v),
-                    other => Value::Float(-other.as_number()),
-                }),
+                // Checked at `i128` rather than negated in place, because
+                // both integer tags have a value whose negation they cannot
+                // hold — `-b` over a BIGINT holding `i64::MIN` and `-bu` over
+                // a BIGINT UNSIGNED holding `u64::MAX` both raise 1690 on 8.3,
+                // and in Rust the first of the two panicked. `false` because a
+                // sign is never unsigned whatever it was given: MySQL reports
+                // `-iu` LONGLONG without the flag and answers -7.
+                UnaryOperator::Minus => match value.untag_bool() {
+                    Value::Null => Ok(Value::Null),
+                    ref exact @ (Value::Int(_) | Value::Unsigned(_)) => {
+                        fitted(integer_operand(exact).map(|v| -v), false)
+                    }
+                    other => Ok(Value::Float(-other.as_number())),
+                },
                 UnaryOperator::Plus => Ok(value),
                 other => Err(unsupported(format!("unary operator `{other}`"))),
             }
@@ -381,6 +390,7 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
                 Some(op) => Some(eval(op, ctx)?),
                 None => None,
             };
+            let mut taken = None;
             for CaseWhen { condition, result } in conditions {
                 let hit = match &subject {
                     // `CASE x WHEN y` compares; `CASE WHEN c` tests truthiness.
@@ -388,18 +398,26 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
                     None => eval(condition, ctx)?.truthy() == Some(true),
                 };
                 if hit {
-                    // Untagged, because `CASE` builds a result type out of
-                    // its branches and a boolean is not one of the types it
-                    // can build: `JSON_ARRAY(CASE WHEN 1 THEN TRUE ELSE FALSE
-                    // END)` is `[1]` on 8.3. An ENUM survives the same
-                    // construct, so the two tags part company here.
-                    return Ok(eval(result, ctx)?.untag_bool());
+                    taken = Some(result);
+                    break;
                 }
             }
-            match else_result {
-                Some(e) => Ok(eval(e, ctx)?.untag_bool()),
-                None => Ok(Value::Null),
-            }
+            let Some(taken) = taken.or(else_result.as_deref()) else {
+                return Ok(Value::Null);
+            };
+            // Untagged, because `CASE` builds a result type out of its
+            // branches and a boolean is not one of the types it can build:
+            // `JSON_ARRAY(CASE WHEN 1 THEN TRUE ELSE FALSE END)` is `[1]` on
+            // 8.3. An ENUM survives the same construct, so the two tags part
+            // company here.
+            let value = eval(taken, ctx)?.untag_bool();
+            Ok(unsigned_case(
+                value,
+                taken,
+                conditions,
+                else_result.as_deref(),
+                ctx,
+            ))
         }
 
         Expr::Cast {
@@ -740,9 +758,16 @@ fn function_args(f: &sqlparser::ast::Function, ctx: &Context<'_>) -> EngineResul
 /// Converts a literal from the AST.
 pub fn literal(value: &AstValue) -> EngineResult<Value> {
     Ok(match value {
+        // A whole number too big for an `i64` is UNSIGNED, not approximate:
+        // MySQL types `18446744073709551615` BIGINT UNSIGNED and answers
+        // `18446744073709551615 - 1`, where reading it as a double would have
+        // rounded the operand before subtracting anything from it.
         AstValue::Number(n, _) => match n.parse::<i64>() {
             Ok(v) => Value::Int(v),
-            Err(_) => Value::Float(n.parse::<f64>().unwrap_or(0.0)),
+            Err(_) => match n.parse::<u64>() {
+                Ok(v) => Value::Unsigned(v),
+                Err(_) => Value::Float(n.parse::<f64>().unwrap_or(0.0)),
+            },
         },
         AstValue::SingleQuotedString(s)
         | AstValue::DoubleQuotedString(s)
@@ -1295,6 +1320,90 @@ fn bigint_out_of_range() -> EngineError {
     EngineError::new(1690, "22003", "BIGINT value is out of range")
 }
 
+/// The same refusal, for an operator whose result type is UNSIGNED.
+///
+/// MySQL says which of the two it was, and the difference is the whole of
+/// #0069: measured on 8.3, `iu - 100` over an `INT UNSIGNED` holding 7 raises
+/// the unsigned one because the true answer -93 is below zero, while
+/// `9223372036854775807 + 1` raises the signed one because the true answer is
+/// above `i64::MAX`. Same code, same SQLSTATE, different domain.
+fn bigint_unsigned_out_of_range() -> EngineError {
+    EngineError::new(1690, "22003", "BIGINT UNSIGNED value is out of range")
+}
+
+/// The exact integer an operand contributes, or `None` if it is not one.
+///
+/// Only the two tags that *are* integers. A string and a float stay out on
+/// purpose: MySQL reads `'7' - 100` as a double and answers -93 whatever the
+/// column beside it was declared, so widening this would pull them onto the
+/// exact path and change answers this issue is not about.
+fn integer_operand(value: &Value) -> Option<i128> {
+    match value {
+        Value::Int(v) => Some(i128::from(*v)),
+        Value::Unsigned(v) => Some(i128::from(*v)),
+        _ => None,
+    }
+}
+
+/// Whether this operator over these operands produces an UNSIGNED result.
+///
+/// Measured on 8.3, and the operators do not agree with each other:
+///
+/// | expression   | result                          |
+/// |--------------|---------------------------------|
+/// | `iu + 1`     | UNSIGNED — either side carries it |
+/// | `100 - iu`   | UNSIGNED, and answers 93          |
+/// | `iu DIV 2`   | UNSIGNED, and so is `-1 DIV iu`   |
+/// | `iu MOD -1`  | UNSIGNED — but `-1 MOD iu` is not |
+/// | `iu / 2`     | signed; a quotient is not an integer |
+///
+/// `MOD` reads only its left operand because that is the one its answer takes
+/// its sign from, so an unsigned dividend can never produce a negative
+/// remainder and a signed one always may.
+///
+/// `NO_UNSIGNED_SUBTRACTION` takes `-` out of the list and nothing else out of
+/// it, which is measured rather than taken from the flag's name: under it
+/// `iu - 100` is -93 and signed, while `iu + -100` and `iu * -1` still raise
+/// 1690 and `iu + 1` is still UNSIGNED.
+fn unsigned_result(op: &BinaryOperator, left: &Value, right: &Value) -> bool {
+    use BinaryOperator as B;
+    let unsigned = |v: &Value| matches!(v, Value::Unsigned(_));
+    match op {
+        B::Minus if crate::exec::no_unsigned_subtraction() => false,
+        B::Plus | B::Minus | B::Multiply | B::MyIntegerDivide => unsigned(left) || unsigned(right),
+        B::Modulo => unsigned(left),
+        _ => false,
+    }
+}
+
+/// An exactly-computed integer result, checked against the domain it belongs to.
+///
+/// The check is per operator and against the *true* value, which is what MySQL
+/// does and is not what #0052 concluded for the bitwise chain: `iu - 100 + 200`
+/// raises 1690 naming `(iu - 100)` on 8.3, even though 107 fits. Checking only
+/// what the chain hands out would have answered 107.
+///
+/// `None` is out of range rather than an error of its own: the only way to get
+/// one here is an `i128` multiplication overflowing, which needs both operands
+/// near 2^64 and puts the answer far outside either domain.
+fn fitted(result: Option<i128>, unsigned: bool) -> EngineResult<Value> {
+    if unsigned {
+        match result {
+            Some(v) => u64::try_from(v)
+                .map(Value::Unsigned)
+                .map_err(|_| bigint_unsigned_out_of_range()),
+            None => Err(bigint_unsigned_out_of_range()),
+        }
+    } else {
+        match result {
+            Some(v) => i64::try_from(v)
+                .map(Value::Int)
+                .map_err(|_| bigint_out_of_range()),
+            None => Err(bigint_out_of_range()),
+        }
+    }
+}
+
 /// The integer behind a boolean operand, or `None` for anything else.
 ///
 /// Shaped like `Value::temporal_number` so the two untaggings compose in
@@ -1305,6 +1414,53 @@ fn bool_number(value: &Value) -> Option<Value> {
         Value::Bool(b) => Some(Value::Int(i64::from(*b))),
         _ => None,
     }
+}
+
+/// A `CASE`'s answer, with the UNSIGNED tag kept only where every branch has one.
+///
+/// The same all-candidates rule the eager conditionals in [`crate::functions`]
+/// follow — `CASE WHEN 1 THEN iu ELSE iu END - 100` raises 1690 on 8.3 and
+/// `... ELSE 1 END - 100` answers -93 — but `CASE` is the one construct that
+/// does not evaluate its candidates, so the untaken branches are evaluated
+/// here to be asked what they are.
+///
+/// Only when the answer is unsigned in the first place, which is what bounds
+/// the cost: a `CASE` with nothing to lose is as lazy as it was. Where there
+/// is something to lose, laziness is given up — the untaken branches are
+/// evaluated once per row, and a subquery in one of them is run. That is a
+/// real price and it is paid deliberately: MySQL decides this from the
+/// branches' declared *types*, which are out of reach here, and evaluating
+/// them is the only way to ask.
+///
+/// A branch that *fails* to evaluate is skipped rather than counted against
+/// the tag: a branch MySQL never reaches cannot be what makes it refuse the
+/// statement, and `CASE WHEN 1 THEN iu ELSE bu + 1 END` is unsigned there
+/// whatever the arithmetic in the arm nobody took would have done.
+fn unsigned_case(
+    value: Value,
+    taken: &Expr,
+    conditions: &[CaseWhen],
+    else_result: Option<&Expr>,
+    ctx: &Context<'_>,
+) -> Value {
+    if !matches!(value, Value::Unsigned(_)) {
+        return value;
+    }
+    let others = conditions
+        .iter()
+        .map(|w| &w.result)
+        .chain(else_result)
+        .filter(|other| !std::ptr::eq(*other, taken));
+    for other in others {
+        // A NULL branch does not count against it, which is measured: `CASE
+        // WHEN 1 THEN iu END` is UNSIGNED on 8.3 with no `ELSE` at all.
+        match eval(other, ctx) {
+            Ok(v) if v.is_null() || matches!(v, Value::Unsigned(_)) => {}
+            Ok(_) => return value.untag_unsigned(),
+            Err(_) => {}
+        }
+    }
+    value
 }
 
 /// The value an arithmetic operator produces.
@@ -1338,41 +1494,31 @@ pub(crate) fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> En
 
     // Integer arithmetic stays integral; anything else goes through f64, which
     // is what MySQL does for non-DECIMAL operands.
-    if let (Value::Int(a), Value::Int(b)) = (left, right) {
-        return Ok(match op {
-            B::Plus => Value::Int(a.wrapping_add(*b)),
-            B::Minus => Value::Int(a.wrapping_sub(*b)),
-            B::Multiply => Value::Int(a.wrapping_mul(*b)),
+    //
+    // Computed at `i128` and then checked, rather than at the width of the
+    // answer. Neither 64-bit type can hold every operand — an `Int` reaches
+    // below zero and an `Unsigned` above `i64::MAX` — and the question being
+    // asked is about the *true* value: `iu - -1` is 8 and `iu - 1` is 6, both
+    // answered, while `iu - 8` is refused, and all three are the same
+    // subtraction over the same domain.
+    if let (Some(a), Some(b)) = (integer_operand(left), integer_operand(right)) {
+        let unsigned = unsigned_result(op, left, right);
+        return match op {
+            B::Plus => fitted(a.checked_add(b), unsigned),
+            B::Minus => fitted(a.checked_sub(b), unsigned),
+            B::Multiply => fitted(a.checked_mul(b), unsigned),
             // Division by zero yields NULL in MySQL, not an error.
-            B::Divide => {
-                if *b == 0 {
-                    Value::Null
-                } else {
-                    Value::Float(*a as f64 / *b as f64)
-                }
-            }
-            B::Modulo => {
-                if *b == 0 {
-                    Value::Null
-                } else {
-                    Value::Int(a.wrapping_rem(*b))
-                }
-            }
+            B::Divide if b == 0 => Ok(Value::Null),
+            B::Divide => Ok(Value::Float(a as f64 / b as f64)),
+            B::Modulo if b == 0 => Ok(Value::Null),
+            B::Modulo => fitted(Some(a % b), unsigned),
             // `DIV` truncates toward zero rather than flooring: MySQL answers
             // -3 for `-7 DIV 2`, where a floor would say -4. Rust's integer
             // division truncates the same way.
-            B::MyIntegerDivide => {
-                if *b == 0 {
-                    Value::Null
-                } else {
-                    // The one quotient that does not fit, and MySQL refuses it
-                    // rather than wrapping — unlike the additions above, which
-                    // it lets wrap.
-                    Value::Int(a.checked_div(*b).ok_or_else(bigint_out_of_range)?)
-                }
-            }
+            B::MyIntegerDivide if b == 0 => Ok(Value::Null),
+            B::MyIntegerDivide => fitted(Some(a / b), unsigned),
             _ => unreachable!("caller restricts the operator set"),
-        });
+        };
     }
 
     // Exact where both sides are exact, which a fractional temporal makes
@@ -1434,7 +1580,11 @@ fn exact_arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> Option<
         return None;
     }
     let scale = |v: &Value| match v {
-        Value::Int(_) => Some(0usize),
+        // An unsigned operand is exact too, and it is not range-checked here:
+        // a decimal result is not an integer one, so MySQL answers
+        // `iu - 100.5` -93.5 rather than refusing it, and `bu + 1.5` is
+        // 18446744073709551616.5 — past `u64::MAX` and still an answer.
+        Value::Int(_) | Value::Unsigned(_) => Some(0usize),
         Value::Decimal(text) => Some(crate::decimal::scale_of(text)),
         _ => None,
     };
@@ -1443,6 +1593,9 @@ fn exact_arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> Option<
         // Checked, because the scale comes from a value's own text and nothing
         // bounds how many digits that has.
         Value::Int(n) => i128::from(*n).checked_mul(10i128.checked_pow(u32::try_from(at).ok()?)?),
+        Value::Unsigned(n) => {
+            i128::from(*n).checked_mul(10i128.checked_pow(u32::try_from(at).ok()?)?)
+        }
         Value::Decimal(text) => crate::decimal::units(text, at),
         _ => None,
     };
@@ -1465,35 +1618,36 @@ fn exact_arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> Option<
     Some(Value::Decimal(crate::decimal::render(total, scale)))
 }
 
-/// A bitwise chain's answer as a `Value`, or a refusal.
+/// A bitwise chain's answer as a `Value`.
 ///
-/// MySQL answers every bitwise operator as a `BIGINT UNSIGNED` and this engine
-/// holds an `i64`, so an answer above `i64::MAX` has no value to be. Keeping
-/// the bits and letting the column's UNSIGNED flag reinterpret them looks like
-/// it works — `SELECT ~0` prints 18446744073709551615 that way — but only for
-/// a value that leaves as a column of its own and is never read again. *Every*
-/// other reader sees the raw `i64`, and nothing on the value tells them not
-/// to: measured against 8.3, `~0 / 2` answered -0.5 for 9223372036854775807.5,
-/// `~0 MOD 10` answered 18446744073709551615 for 5, `CONCAT(~0)` answered -1,
-/// `~0 > 5` answered 0 for 1, and a `UNION` dropped the flag and printed -1.
-/// Those are wrong answers rather than gaps, which this engine does not trade
-/// for coverage.
+/// MySQL answers every bitwise operator as a `BIGINT UNSIGNED`, and while this
+/// engine held only an `i64` an answer above `i64::MAX` had nothing to be, so
+/// `SELECT ~0` and `SELECT 1 << 63` were refused with 1235. That was #0077,
+/// and it closed when #0069 gave `Value` an unsigned tag for its own reasons.
 ///
-/// So the answer is refused where it cannot be represented, and only there:
-/// the check is at the chain's boundary, so everything the chain can compute
-/// exactly it still computes. What refuses is a bitwise expression whose own
-/// value is above `i64::MAX` — `SELECT ~0` and `SELECT 1 << 63` — and nothing
-/// else. `SELECT ~0 & 255` is 255 and `SELECT 1 + 3 & ~5` is 0.
+/// Keeping the bits in an `i64` and letting the column's UNSIGNED flag
+/// reinterpret them was the alternative, and it is why the refusal stood as
+/// long as it did: it looks like it works for a value that leaves as a column
+/// of its own and is never read again, and *every* other reader sees the raw
+/// `i64` with nothing on the value to tell it otherwise. Measured against 8.3,
+/// that answered `~0 MOD 10` 18446744073709551615 for 5, `CONCAT(~0)` -1,
+/// `~0 > 5` 0 for 1, and a `UNION` dropped the flag and printed -1. The tag is
+/// what tells them.
 ///
-/// Representing the rest means giving `Value` an unsigned variant, which
-/// reaches the state image, every comparison, and every function's `match` —
-/// its own issue rather than a corner of this one.
+/// One reader it does *not* fix, and it is named here rather than left to be
+/// discovered: `/`. MySQL answers `~0 / 2` 9223372036854775807.5000 and this
+/// engine answers 9223372036854776000, because a quotient goes through an
+/// `f64` whatever its operands were tagged. That is not the unsigned tag
+/// missing — `9223372036854775807 / 2` is 4611686018427388000 here for the
+/// same reason, and has been since long before the tag existed. It is #0085,
+/// and `exact_arithmetic` above says why `/` is left out of the exact path:
+/// MySQL widens a quotient by `div_precision_increment` and this engine does
+/// not, so answering half of that rule exactly would make the gap depend on
+/// what was divided. So this is a wrong answer rather than a refusal, in one
+/// operator, knowingly, and it is the same wrong answer a signed operand of
+/// that size already got.
 fn bit_pattern(bits: u64) -> EngineResult<Value> {
-    i64::try_from(bits).map(Value::Int).map_err(|_| {
-        unsupported(format!(
-            "the bitwise result {bits}, which is above the largest signed 64-bit integer"
-        ))
-    })
+    Ok(Value::Unsigned(bits))
 }
 
 /// The bit pattern MySQL reads out of one operand.
@@ -1524,6 +1678,10 @@ fn bit_pattern(bits: u64) -> EngineResult<Value> {
 fn bit_operand(v: &Value) -> EngineResult<u64> {
     Ok(match v {
         Value::Int(n) => *n as u64,
+        // Already the bit pattern, and it has to be read as one: through the
+        // `f64` fall-through below, `0 | 18446744073709551615` came back
+        // 9223372036854775807 because the cast saturates.
+        Value::Unsigned(n) => *n,
         // Through the same packed number arithmetic uses, so `d | 0` and
         // `d + 0` cannot disagree about what a DATE is worth. A fractional
         // temporal packs to a decimal and is rounded like any other decimal
@@ -1647,9 +1805,10 @@ fn bitwise_value(e: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
 /// The 64 bits a bitwise chain computes, or `None` where it is NULL.
 ///
 /// Recurses through the chain rather than going back out through `eval`, so
-/// that an intermediate wider than `i64` never has to become a `Value`. Every
-/// operator here is exact on the bits whatever their sign, which is why the
-/// chain composes and the boundary is the only place a range matters.
+/// that a chain is computed as a chain. Every operator here is exact on the
+/// bits whatever their sign, so nothing is lost between them — which mattered
+/// more when the boundary was the only place a `Value` could be built, and is
+/// still what makes `1 + 3 & ~5` reach 0 through 18446744073709551610.
 fn bitwise_bits(e: &Expr, ctx: &Context<'_>) -> EngineResult<Option<u64>> {
     use BinaryOperator as B;
     match e {

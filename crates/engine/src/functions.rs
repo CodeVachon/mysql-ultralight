@@ -681,12 +681,17 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         // aggregate with, where `IF(1, e, 'z') + 0` is still the ordinal.
         "coalesce" => {
             let first = args.iter().find(|v| !v.is_null()).cloned();
-            untag_mixed_temporal(&args, first.map(Value::untag_enum).map(Value::untag_bool))
+            let chosen =
+                untag_mixed_temporal(&args, first.map(Value::untag_enum).map(Value::untag_bool));
+            chosen
+                .map(|v| untag_mixed_unsigned(&args, v))
                 .unwrap_or(Value::Null)
         }
         "ifnull" | "nvl" => {
             let chosen = if arg(0).is_null() { arg(1) } else { arg(0) };
-            untag_mixed_temporal(&args, Some(chosen.untag_enum().untag_bool()))
+            let chosen = untag_mixed_temporal(&args, Some(chosen.untag_enum().untag_bool()));
+            chosen
+                .map(|v| untag_mixed_unsigned(&args, v))
                 .unwrap_or(Value::Null)
         }
         // The boolean tag comes off here where the ENUM's ordinal does not,
@@ -700,10 +705,15 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
                 arg(0).untag_bool()
             }
         }
-        "if" => match arg(0).truthy() {
-            Some(true) => arg(1).untag_bool(),
-            _ => arg(2).untag_bool(),
-        },
+        // The condition is not a candidate, so only the two branches decide
+        // the sign: `IF(iu, 1, 2)` is signed on 8.3 though its test is not.
+        "if" => {
+            let chosen = match arg(0).truthy() {
+                Some(true) => arg(1).untag_bool(),
+                _ => arg(2).untag_bool(),
+            };
+            untag_mixed_unsigned(args.get(1..).unwrap_or_default(), chosen)
+        }
         "isnull" => crate::expr::bool_value(arg(0).is_null()),
 
         // -- strings -------------------------------------------------------
@@ -803,12 +813,37 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         // `ResultSet::reconcile` exists to close, and it has no arm for this
         // pair. `ROUND`, `FLOOR`, `CEIL` and `TRUNCATE` need no such call:
         // they go through `whole`, which builds the integer from the number.
+        //
+        // The UNSIGNED reading survives, which is measured: `ABS(iu) - 100`
+        // raises 1690 on 8.3 where `SUM(iu) - 100` answers -93, so `ABS` hands
+        // the column's own reading back rather than building a new number.
+        //
+        // Checked rather than `i64::abs`, for the one value that has no
+        // positive counterpart: MySQL raises 1690 for
+        // `ABS(-9223372036854775808)` and Rust panicked on it.
         "abs" => match arg(0).untag_bool() {
-            Value::Int(v) => Value::Int(v.abs()),
+            Value::Unsigned(v) => Value::Unsigned(v),
+            Value::Int(v) => match v.checked_abs() {
+                Some(v) => Value::Int(v),
+                None => {
+                    return Err(EngineError::new(
+                        1690,
+                        "22003",
+                        "BIGINT value is out of range",
+                    ))
+                }
+            },
             other => Value::Float(other.as_number().abs()),
         },
         "round" => {
             let places = args.get(1).and_then(Value::as_int).unwrap_or(0);
+            // An unsigned operand is rounded exactly, because an `f64` drops
+            // every digit past 2^53 — which is most of a BIGINT UNSIGNED, and
+            // is the difference between MySQL's answer and a number ending in
+            // zeros that was never in the column.
+            if let Value::Unsigned(v) = arg(0) {
+                return unsigned_scaled(v, places, true);
+            }
             let factor = 10f64.powi(places as i32);
             let rounded = (arg(0).as_number() * factor).round() / factor;
             if places <= 0 {
@@ -821,8 +856,16 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         // parse: `FLOOR('abc')` is 0 and `CEIL('3.2')` is 4, where answering
         // NULL for anything unparseable made both of those NULL. A real NULL
         // has already been answered above.
-        "floor" => whole(arg(0).as_number().floor()),
-        "ceil" | "ceiling" => whole(arg(0).as_number().ceil()),
+        // An unsigned integer is already whole, and is answered without going
+        // near the `f64` these otherwise round in.
+        "floor" => match arg(0) {
+            already @ Value::Unsigned(_) => already,
+            other => whole(other.as_number().floor()),
+        },
+        "ceil" | "ceiling" => match arg(0) {
+            already @ Value::Unsigned(_) => already,
+            other => whole(other.as_number().ceil()),
+        },
         // Through the operator it is spelled as, so the two cannot drift:
         // reading both sides as integers answered 1 for `MOD(1.500, 2)` under
         // a column described NEWDECIMAL, which promises the fraction it had
@@ -836,6 +879,9 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         // 1.5 where `ROUND` would say 1.6.
         "truncate" => {
             let places = args.get(1).and_then(Value::as_int).unwrap_or(0);
+            if let Value::Unsigned(v) = arg(0) {
+                return unsigned_scaled(v, places, false);
+            }
             let factor = 10f64.powi(places as i32);
             let cut = (arg(0).as_number() * factor).trunc() / factor;
             if places <= 0 {
@@ -852,7 +898,9 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
                 Value::Null
             } else {
                 let want_greater = name == "greatest";
-                args.into_iter()
+                let candidates = args.clone();
+                let winner = args
+                    .into_iter()
                     .map(Value::untag_enum)
                     .map(Value::untag_bool)
                     .reduce(|a, b| {
@@ -867,7 +915,8 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
                             a
                         }
                     })
-                    .unwrap_or(Value::Null)
+                    .unwrap_or(Value::Null);
+                untag_mixed_unsigned(&candidates, winner)
             }
         }
 
@@ -947,6 +996,72 @@ fn untag_mixed_temporal(args: &[Value], chosen: Option<Value>) -> Option<Value> 
     } else {
         chosen
     })
+}
+
+/// `ROUND` or `TRUNCATE` of an unsigned integer, computed exactly.
+///
+/// A non-negative scale hands the number straight back: an integer is already
+/// rounded there, and finding that out through an `f64` would lose the digits
+/// the tag exists to carry.
+///
+/// A negative one cuts or rounds at a power of ten, in `u128` so that carrying
+/// past the top of the range is visible rather than saturating. MySQL refuses
+/// that carry rather than answering: `ROUND(bu, -1)` over 18446744073709551615
+/// raises 1690 on 8.3, where `TRUNCATE(bu, -1)` answers 18446744073709551610
+/// because cutting can only go down. `ROUND` goes half *up*, which is measured
+/// — 12350 rounds to 12400 and 12345 to 12300.
+///
+/// A scale below -20 leaves nothing of a `u64`, so the answer is zero rather
+/// than an overflowing power.
+fn unsigned_scaled(v: u64, places: i64, round: bool) -> EngineResult<Value> {
+    if places >= 0 {
+        return Ok(Value::Unsigned(v));
+    }
+    let Some(step) = places
+        .checked_neg()
+        .and_then(|p| u32::try_from(p).ok())
+        .and_then(|p| 10u128.checked_pow(p))
+    else {
+        return Ok(Value::Unsigned(0));
+    };
+    let value = u128::from(v);
+    let cut = value - value % step;
+    let scaled = if round && value - cut >= step.div_ceil(2) {
+        cut + step
+    } else {
+        cut
+    };
+    u64::try_from(scaled)
+        .map(Value::Unsigned)
+        .map_err(|_| EngineError::new(1690, "22003", "BIGINT UNSIGNED value is out of range"))
+}
+
+/// Drops the UNSIGNED tag unless every candidate beside it carries one.
+///
+/// Shaped like `untag_mixed_temporal` above and measured separately from it,
+/// because the two families are not the same list. This one is the same rule
+/// the UNSIGNED flag on the wire follows, which is why they agree row for row:
+/// `COALESCE(iu, iu) - 100` raises 1690 on 8.3 and reports UNSIGNED, while
+/// `COALESCE(iu, 1) - 100` answers -93 and reports signed.
+///
+/// A NULL candidate does not count against it, which is measured — `IF(1, iu,
+/// NULL)`, `COALESCE(NULL, iu)` and a `CASE` with no `ELSE` are all UNSIGNED
+/// on 8.3 — and is the same blind spot `untag_mixed_temporal` documents: a
+/// *column* holding NULL is signed by declaration and carries no tag to say
+/// so.
+///
+/// The candidates are the arguments that could *be* the answer, which is not
+/// always all of them: `IF`'s condition is not one, and `NULLIF` has only its
+/// first, which is why that one does not call this at all.
+fn untag_mixed_unsigned(candidates: &[Value], chosen: Value) -> Value {
+    if candidates
+        .iter()
+        .all(|v| v.is_null() || matches!(v, Value::Unsigned(_)))
+    {
+        chosen
+    } else {
+        chosen.untag_unsigned()
+    }
 }
 
 fn pad_to(s: &str, width: usize, pad: &str, left: bool) -> String {
@@ -1050,15 +1165,28 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
         // common one written by hand.
         | D::Signed
         | D::SignedInteger => Value::Int(int_prefix(&value)),
-        // UNSIGNED reinterprets a negative value as a 64-bit unsigned one,
-        // which does not fit the engine's integer. Refusing beats reporting a
-        // negative number for a cast whose entire point is that it is not.
+        // UNSIGNED reinterprets rather than refusing, which it could not do
+        // while the engine held an `i64`: `CAST(-1 AS UNSIGNED)` is
+        // 18446744073709551615 on 8.3 and `CAST(-2 AS UNSIGNED)` is
+        // 18446744073709551614. This used to answer 1235.
+        //
+        // Read exactly rather than through `int_prefix`, which returns an
+        // `i64` and so saturates on the values this cast exists to produce:
+        // `CAST('18446744073709551615' AS UNSIGNED)` came back `i64::MAX`.
+        //
+        // A fractional argument truncates toward zero here where MySQL rounds
+        // half away from zero — `CAST(-1.5 AS UNSIGNED)` is
+        // 18446744073709551614 there and 18446744073709551615 here. That is
+        // the signed cast's rounding rule above, which this one inherits by
+        // sharing the reading, and it belongs to whichever issue takes it:
+        // fixing it for one target and not the other would leave
+        // `CAST(1.5 AS SIGNED)` and `CAST(1.5 AS UNSIGNED)` disagreeing about
+        // the same number.
         D::Unsigned | D::UnsignedInteger => {
-            let n = int_prefix(&value);
-            if n < 0 {
-                return Err(unsupported("CAST of a negative value AS UNSIGNED"));
-            }
-            Value::Int(n)
+            let exact = value
+                .as_exact_int()
+                .unwrap_or_else(|| i128::from(int_prefix(&value)));
+            Value::Unsigned(exact as u64)
         }
         // By the number MySQL reads out of the value: `CAST('abc' AS DOUBLE)`
         // is 0 there, not NULL. Answering NULL made the cast contradict the
