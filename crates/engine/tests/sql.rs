@@ -6612,6 +6612,465 @@ fn a_float_column_holds_and_prints_four_bytes() {
 }
 
 #[test]
+fn a_float_with_a_scale_is_stored_and_shown_at_that_scale() {
+    // `FLOAT(M,D)` and `DOUBLE(M,D)` are not the one-argument form with a
+    // display rule bolted on. MySQL *rounds the stored value* to D places on
+    // the way in and then shows exactly D of them, always — so 1.234567890123
+    // into a `FLOAT(10,4)` reads back `1.2346` and 0.1 reads back `0.1000`.
+    // Every value here measured on 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE S (f FLOAT(10,4), d DOUBLE(10,4))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO S VALUES (1.234567890123, 1.234567890123),(0.1,0.1),(1.5,1.5),\
+                              (-3.14159265,-3.14159265),(0,0)",
+    );
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT f, d FROM S"),
+        vec![
+            vec!["1.2346", "1.2346"],
+            vec!["0.1000", "0.1000"],
+            vec!["1.5000", "1.5000"],
+            vec!["-3.1416", "-3.1416"],
+            vec!["0.0000", "0.0000"],
+        ]
+    );
+
+    // The rounding is of the *value*, not of its rendering, which is only
+    // visible away from the column list: `JSON_ARRAY` reads the number a
+    // document holds and ignores the places entirely. `1.2345999479293823` is
+    // the four bytes of 1.2346; `1.2345678806304932` would be the four bytes
+    // of the value nobody rounded.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_ARRAY(f), JSON_ARRAY(d) FROM S LIMIT 1"
+        ),
+        vec![vec!["[1.2345999479293823]", "[1.2346]"]]
+    );
+
+    // Rounded before the narrowing to four bytes rather than after. 2.00005 is
+    // the value that tells the two apart: its `f64` falls just below the half
+    // and its `f32` just above, and MySQL stores 2.0000.
+    run(&engine, &mut session, "DELETE FROM S");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO S VALUES (2.00005, 2.00005)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT f, d FROM S"),
+        vec![vec!["2.0000", "2.0000"]]
+    );
+}
+
+#[test]
+fn a_declared_precision_and_scale_are_held_to_mysqls_limits() {
+    // Not cosmetic. `M` and `D` arrive as `u64` — the parser takes any number
+    // the grammar allows — and a scale is a count of characters written per
+    // value: `DECIMAL(10,1000000)` stored 1.5 as a million-character number
+    // here, and a fixed-scale float renders the same way, so
+    // `DOUBLE(10,4294967295)` is a four-billion-character allocation from one
+    // statement. MySQL refuses every one of these at CREATE TABLE.
+    //
+    // The order is what the codes prove, and it is measured: the scale is
+    // checked before the precision, so `FLOAT(300,31)` is 1425 and not 1439
+    // and `DECIMAL(66,31)` is 1425 and not 1426. A DECIMAL counts 65 digits
+    // and says so with its own code; the approximate pair are measured in
+    // display width and stop at 255.
+    let (engine, mut session) = engine();
+    let scale = "Too big scale 31 specified for column 'x'. Maximum is 30.";
+    let m_lt_d = "For float(M,D), double(M,D) or decimal(M,D), M must be >= D (column 'x').";
+    let width = "Display width out of range for column 'x' (max = 255)";
+    let refused = [
+        ("CREATE TABLE B1 (x FLOAT(10,31))", 1425, scale),
+        ("CREATE TABLE B2 (x DOUBLE(10,31))", 1425, scale),
+        ("CREATE TABLE B3 (x DECIMAL(10,31))", 1425, scale),
+        (
+            "CREATE TABLE B4 (x DECIMAL(10,1000000))",
+            1425,
+            "Too big scale 1000000 specified for column 'x'. Maximum is 30.",
+        ),
+        ("CREATE TABLE B5 (x FLOAT(300,31))", 1425, scale),
+        ("CREATE TABLE B6 (x DECIMAL(66,31))", 1425, scale),
+        ("CREATE TABLE B7 (x FLOAT(300,2))", 1439, width),
+        ("CREATE TABLE B8 (x DOUBLE(256,2))", 1439, width),
+        (
+            "CREATE TABLE B9 (x DECIMAL(66,2))",
+            1426,
+            "Too-big precision 66 specified for 'x'. Maximum is 65.",
+        ),
+        ("CREATE TABLE Ba (x FLOAT(2,5))", 1427, m_lt_d),
+        ("CREATE TABLE Bb (x DECIMAL(2,5))", 1427, m_lt_d),
+    ];
+    for (sql, code, message) in refused {
+        let error = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(error.code, code, "{sql} -> {}", error.message);
+        // The words too, not only the code: they carry the limit, and a client
+        // that prints the error is what a migration author reads.
+        assert_eq!(error.message, message, "{sql}");
+    }
+
+    // Every path that builds a column, not just `CREATE TABLE`: an ALTER
+    // that adds or redefines one declares a type in exactly the same words.
+    run(&engine, &mut session, "CREATE TABLE Bz (x INT)");
+    for sql in [
+        "ALTER TABLE Bz ADD COLUMN y DECIMAL(10,31)",
+        "ALTER TABLE Bz MODIFY COLUMN x DOUBLE(10,31)",
+        "ALTER TABLE Bz CHANGE COLUMN x w FLOAT(10,31)",
+    ] {
+        let error = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(error.code, 1425, "{sql} -> {}", error.message);
+    }
+
+    // The widest each type really allows still goes through, and so does a
+    // lone precision — `DECIMAL(8)` is `DECIMAL(8,0)`, not an error.
+    for sql in [
+        "CREATE TABLE Bc (x FLOAT(255,30))",
+        "CREATE TABLE Bd (x DOUBLE(255,30))",
+        "CREATE TABLE Be (x DECIMAL(65,30))",
+        "CREATE TABLE Bf (x DECIMAL(8))",
+        "CREATE TABLE Bg (x FLOAT(25))",
+    ] {
+        run(&engine, &mut session, sql);
+    }
+}
+
+#[test]
+fn a_wide_scale_shows_the_shortest_digits_that_read_back() {
+    // The places are padded onto the *shortest* string that round-trips, not
+    // onto the double's binary expansion, and past about seventeen significant
+    // digits those are different numbers. Both rows measured on 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE P (a DOUBLE(20,17), b DOUBLE(255,30), c FLOAT(40,2))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO P VALUES (0.1, 1.5, 1e30)",
+    );
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a, b, c FROM P"),
+        vec![vec![
+            // The expansion is 0.10000000000000001.
+            "0.10000000000000000",
+            // The expansion is 1.500000000000000222044604925031.
+            "1.500000000000000000000000000000",
+            // Four bytes cannot hold 1e30, and the digits that read those four
+            // bytes back stop well before the point.
+            "1000000015047466200000000000000.00",
+        ]]
+    );
+
+    // And the value behind them is the one four or eight bytes hold: the wide
+    // scale must not have moved it. Dividing back by a power of ten would
+    // have, because neither power is exact — 1.5 came back
+    // 1.5000000000000002.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT JSON_ARRAY(b) FROM P"),
+        vec![vec!["[1.5]"]]
+    );
+}
+
+#[test]
+fn a_value_that_rounds_to_zero_loses_its_sign() {
+    // -0.001 into a `FLOAT(10,2)` rounds to a negative zero, and MySQL stores
+    // the positive one: 8.3 answers `0.00`, `[0.0]` and a plain zero on the
+    // wire. The sign survives only where the rounding does not reach zero,
+    // which is why -0.006 is here beside it.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Zs (id INT, f FLOAT(10,2), d DOUBLE(10,2))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Zs VALUES (1,-0.001,-0.001),(2,-0.004,-0.004),(3,-0.006,-0.006)",
+    );
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT f, d FROM Zs ORDER BY id"),
+        vec![
+            vec!["0.00", "0.00"],
+            vec!["0.00", "0.00"],
+            vec!["-0.01", "-0.01"],
+        ]
+    );
+    // Not a rendering rule: the sign is gone from the stored number too, so a
+    // document and a binary client see it gone as well.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_ARRAY(f, d) FROM Zs WHERE id = 1"
+        ),
+        vec![vec!["[0.0, 0.0]"]]
+    );
+}
+
+#[test]
+fn a_cast_to_a_decimal_is_held_to_mysqls_own_limits() {
+    // The same one-statement blow-up the column check closes, reachable by
+    // anyone who can send a SELECT: `CAST(1.5 AS DECIMAL(10,1000000))`
+    // answered a million-digit number here.
+    //
+    // A cast's rule is not the column's, and neither is its order — measured
+    // on 8.3, it checks the precision, then M >= D, and only then the scale.
+    // `DECIMAL(70,40)` is 1426 where the column form is 1425, and
+    // `DECIMAL(10,31)` is 1427 where the column form is 1425.
+    let (engine, mut session) = engine();
+    let m_lt_d = "For float(M,D), double(M,D) or decimal(M,D), M must be >= D (column '').";
+    let refused = [
+        ("SELECT CAST(1.5 AS DECIMAL(10,31))", 1427, m_lt_d),
+        ("SELECT CAST(1.5 AS DECIMAL(2,5))", 1427, m_lt_d),
+        ("SELECT CAST(1.5 AS DECIMAL(10,1000000))", 1427, m_lt_d),
+        (
+            "SELECT CAST(1.5 AS DECIMAL(66,2))",
+            1426,
+            "Too-big precision 66 specified for '1.5'. Maximum is 65.",
+        ),
+        (
+            "SELECT CAST(1.5 AS DECIMAL(70,40))",
+            1426,
+            "Too-big precision 70 specified for '1.5'. Maximum is 65.",
+        ),
+        (
+            "SELECT CAST(1.5 AS DECIMAL(65,31))",
+            1425,
+            "Too big scale 31 specified for column '1.5'. Maximum is 30.",
+        ),
+    ];
+    for (sql, code, message) in refused {
+        let error = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(error.code, code, "{sql} -> {}", error.message);
+        assert_eq!(error.message, message, "{sql}");
+    }
+
+    // The widest a cast really allows still converts.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT CAST(1.5 AS DECIMAL(65,30))"),
+        vec![vec!["1.500000000000000000000000000000"]]
+    );
+}
+
+#[test]
+fn a_set_operation_carries_the_wider_scale_and_rounds_into_it() {
+    // A set operation materialises its result, and MySQL's temporary table has
+    // one field per column: both branches are written into it and read back at
+    // *its* scale, which is the wider of the two. Measured on 8.3, including
+    // the width — `FLOAT(12,2) UNION ALL FLOAT(10,4)` is `float(14,4)` read in
+    // either order.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Su (f FLOAT(10,4), d DOUBLE(10,4), a FLOAT(12,2), h DOUBLE(12,6), pd DOUBLE)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Su VALUES (0.1, 0.1, 0.1, 0.1, 0.1)",
+    );
+
+    let cases = [
+        // The widening is where the scale used to be dropped: these three
+        // change the type code, and only a change of code cleared it.
+        ("SELECT f FROM Su UNION ALL SELECT d FROM Su", "0.1000"),
+        ("SELECT f FROM Su UNION ALL SELECT h FROM Su", "0.100000"),
+        // And the same code with different scales, which takes the other
+        // branch: the wider *declaration* is not the wider scale, and reading
+        // the pair in this order used to answer two places.
+        ("SELECT f FROM Su UNION ALL SELECT a FROM Su", "0.1000"),
+        ("SELECT a FROM Su UNION ALL SELECT f FROM Su", "0.1000"),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected], vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // A plain DOUBLE has no scale to merge, so the column has none either and
+    // every digit of the widened four-byte value shows, exactly as MySQL does.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT f FROM Su UNION ALL SELECT pd FROM Su"
+        ),
+        vec![vec!["0.10000000149011612"], vec!["0.1"]]
+    );
+
+    // One row, as MySQL answers: both branches are written into the same
+    // field and read back as the same number.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT f FROM Su UNION SELECT d FROM Su"
+        ),
+        vec![vec!["0.1000"]]
+    );
+
+    // The rounding is of the *value*, not of the printing, and the difference
+    // only shows once the result feeds another query — a rendering at the
+    // merged scale would print `0.1000` over whatever number was behind it.
+    // Read through a document, which takes the number and ignores the places:
+    // the four-byte 0.1 widens to 0.10000000149011612 and has to become the
+    // eight-byte 0.1 that the other branch already holds.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_ARRAY(x) FROM \
+             (SELECT f AS x FROM Su UNION ALL SELECT d FROM Su) t ORDER BY 1"
+        ),
+        vec![vec!["[0.1]"], vec!["[0.1]"]]
+    );
+    // And they really are one number afterwards, which is the same claim from
+    // the other side.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(DISTINCT x) FROM \
+             (SELECT f AS x FROM Su UNION ALL SELECT d FROM Su) t"
+        ),
+        vec![vec!["1"]]
+    );
+}
+
+#[test]
+fn a_view_hands_its_rows_on_without_shaping_them_for_its_own_columns() {
+    // A view runs a whole query, and its result is not on its way out — it is
+    // about to feed another one. Reconciling it there shaped every value for
+    // the *inner* column's code, and the outer query then read it under a code
+    // of its own: a `double(10,4)` came back rendered at its four places, was
+    // converted back to a plain double by the DOUBLE arm on the second pass,
+    // and lost them, while the `float(10,4)` beside it kept them. One rule,
+    // two answers, decided by which arm the second pass happened to have.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Vt (f FLOAT(10,4), d DOUBLE(10,4))",
+    );
+    run(&engine, &mut session, "INSERT INTO Vt VALUES (0.1, 0.1)");
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Vv AS SELECT f, d FROM Vt",
+    );
+
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT f, d FROM Vv"),
+        vec![vec!["0.1000", "0.1000"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT * FROM Vv"),
+        vec![vec!["0.1000", "0.1000"]]
+    );
+}
+
+#[test]
+fn a_float_with_a_scale_rounds_a_tie_to_the_even_digit() {
+    // `rint`'s rule and not `round`'s. These three are exact halves after the
+    // multiply, so nothing but the tie rule decides them; 0.135 and 0.145
+    // beside them are not halves at all — their doubles fall just above and
+    // just below — and they answer 0.14 either way, which is why they are no
+    // evidence and these are.
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE T (f FLOAT(10,2))");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO T VALUES (0.125),(0.015),(0.025),(-0.125)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT f FROM T"),
+        vec![vec!["0.12"], vec!["0.02"], vec!["0.02"], vec!["-0.12"],]
+    );
+
+    // Both renderings, for the reason the test above reads both: a client
+    // reads the protocol's and a test reads the engine's, and a fix applied to
+    // one of them only is invisible to the other.
+    let Outcome::Rows(result) = run(&engine, &mut session, "SELECT f FROM T LIMIT 1") else {
+        panic!("expected rows")
+    };
+    let mut text = mysql_ultralight_protocol::BufWriter::new();
+    result.rows[0][0].to_wire().encode_text(&mut text);
+    assert_eq!(
+        String::from_utf8_lossy(&text.into_inner()[1..]),
+        "0.12",
+        "the protocol shows the declared places too"
+    );
+
+    // And the binary protocol still sends the column's four bytes, which is
+    // what the type code promises: the places are a rendering, not a change of
+    // type. MySQL announces MYSQL_TYPE_FLOAT for a `FLOAT(M,D)` and sends four
+    // bytes of the rounded value.
+    let described = engine
+        .describe(&session, "SELECT f FROM T", 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(format!("{:?}", described[0].ty), "Float");
+    let mut binary = mysql_ultralight_protocol::BufWriter::new();
+    result.rows[0][0]
+        .to_wire()
+        .encode_binary(&mut binary, described[0].ty);
+    assert_eq!(binary.into_inner(), 0.12f32.to_le_bytes());
+}
+
+#[test]
+fn a_float_wider_than_its_declared_digits_is_refused() {
+    // `FLOAT(M,D)` holds M digits with D after the point, so a `FLOAT(6,2)`
+    // stops below 10000. MySQL raises 1264 rather than truncating, and it does
+    // so *after* rounding: 9999.994 goes in and 9999.995 does not, because the
+    // second rounds to 10000.00. Both measured on 8.3, and a `DOUBLE(6,2)`
+    // beside it answers the same way.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE W (f FLOAT(6,2), d DOUBLE(6,2))",
+    );
+
+    for sql in [
+        "INSERT INTO W (f) VALUES (12345.678)",
+        "INSERT INTO W (f) VALUES (9999.995)",
+        "INSERT INTO W (d) VALUES (12345.678)",
+        "INSERT INTO W (d) VALUES (-9999.995)",
+    ] {
+        let error = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(error.code, 1264, "{sql}");
+    }
+
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO W VALUES (9999.994, 9999.994)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT f, d FROM W"),
+        vec![vec!["9999.99", "9999.99"]]
+    );
+}
+
+#[test]
 fn a_float_expression_is_typed_the_way_its_value_is_tagged() {
     // Whether a FLOAT survives an expression is decided per function, and
     // MySQL is not uniform about it: `-f`, `ABS(f)` and `ROUND(f, 2)` widen to
@@ -6671,6 +7130,38 @@ fn a_float_expression_is_typed_the_way_its_value_is_tagged() {
             "{expression} encodes to the wrong width"
         );
     }
+}
+
+#[test]
+fn a_float_converts_to_a_decimal_by_its_value_and_not_by_its_display() {
+    // The six significant digits are a *rendering*, and converting out of them
+    // makes the answer depend on how wide the column happened to print:
+    // `CAST(f AS DECIMAL(20,10))` over a FLOAT holding 1.234567890123 is
+    // 1.2345678806 on 8.3 and was 1.2345700000 here, read back out of
+    // `1.23457`. #0071 already made this argument for `CAST(f AS JSON)`, which
+    // is the same value asked for through a different conversion — and the two
+    // disagreeing about one number is worse than either being wrong.
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE C (f FLOAT, d DOUBLE)");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO C VALUES (1.234567890123, 1.234567890123),(16777217, 16777217)",
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(f AS DECIMAL(20,10)), CAST(d AS DECIMAL(20,10)) FROM C"
+        ),
+        vec![
+            vec!["1.2345678806", "1.2345678901"],
+            // Four bytes cannot hold 16777217, and the conversion says so
+            // where the display's `16777200` did not.
+            vec!["16777216.0000000000", "16777217.0000000000"],
+        ]
+    );
 }
 
 #[test]

@@ -1037,7 +1037,7 @@ impl Engine {
                 use sqlparser::ast::{SetOperator, SetQuantifier};
 
                 let mut left = self.set_expr(session, left, outer)?;
-                let right = self.set_expr(session, right, outer)?;
+                let mut right = self.set_expr(session, right, outer)?;
 
                 if left.columns.len() != right.columns.len() {
                     return Err(EngineError::new(
@@ -1107,8 +1107,27 @@ impl Engine {
                         let width = |c: &Option<crate::types::SqlType>| {
                             c.as_ref().and_then(|d| d.length).unwrap_or(0)
                         };
+                        // Read before the width swap below overwrites it, for
+                        // the reason the signedness above is read before the
+                        // flags are merged: the merge needs both sides, and
+                        // the swap has already thrown one of them away.
+                        // Without this, `FLOAT(10,4) UNION ALL FLOAT(12,2)`
+                        // merged the wider declaration with itself and showed
+                        // two places, while the same pair the other way round
+                        // showed four.
+                        let merged =
+                            merged_approximate(column.ty, &column.declared, &right.declared);
                         if width(&right.declared) > width(&column.declared) {
                             column.declared = right.declared.clone();
+                        }
+                        // Except for an approximate scale, which is the *max*
+                        // and not the wider declaration's: measured on 8.3,
+                        // `FLOAT(12,2) UNION ALL FLOAT(10,4)` is `float(14,4)`
+                        // read in either order, where taking the wider side
+                        // whole answers two places one way round and four the
+                        // other.
+                        if merged.is_some() {
+                            column.declared = merged;
                         }
                         continue;
                     }
@@ -1127,7 +1146,50 @@ impl Engine {
                     // for -5. Only on this path: the branch above returns when
                     // the two already agree.
                     column.unsigned &= right.unsigned;
-                    column.declared = None;
+                    // Cleared, except where both branches are approximate and
+                    // declare a scale: that scale is the whole difference
+                    // between `0.1000` and `0.10000000149011612`, and the
+                    // widening is exactly where it used to be dropped —
+                    // `FLOAT(10,4) UNION ALL DOUBLE(10,4)` kept it while
+                    // `FLOAT(10,4) UNION ALL DOUBLE(12,6)` did not, because
+                    // only the second one changes the code.
+                    column.declared =
+                        merged_approximate(column.ty, &column.declared, &right.declared);
+                }
+
+                // A set operation materialises its result, and MySQL's
+                // temporary table has one field per column: values from both
+                // branches are written into it and read back at *its* scale.
+                // That is visible before anything is printed —
+                // `SELECT f FROM t UNION SELECT d FROM t` over a `FLOAT(10,4)`
+                // and a `DOUBLE(10,4)` both holding 0.1 is one row on 8.3, and
+                // two without this, because the widened four-byte value and
+                // the eight-byte one differ until they are rounded together.
+                // So it happens here, ahead of the de-duplication below.
+                let scaled: Vec<Option<(String, crate::types::SqlType)>> = left
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        let declared = c.declared.clone().filter(|d| {
+                            d.kind == crate::types::TypeKind::Float && d.scale.is_some()
+                        })?;
+                        Some((c.name.clone(), declared))
+                    })
+                    .collect();
+                for (i, merged) in scaled.iter().enumerate() {
+                    let Some((name, declared)) = merged else {
+                        continue;
+                    };
+                    for row in left.rows.iter_mut().chain(right.rows.iter_mut()) {
+                        let Some(value) = row.get_mut(i) else {
+                            continue;
+                        };
+                        // Cannot fail: the merged width keeps the widest
+                        // integer part of either branch, so every value that
+                        // fit the column it came from fits this one.
+                        let taken = std::mem::replace(value, Value::Null);
+                        *value = declared.coerce(taken, name)?;
+                    }
                 }
 
                 let all = matches!(
@@ -4348,7 +4410,15 @@ impl Engine {
             ));
         }
 
-        let outcome = self.execute(&mut scoped, &view.definition, &[])?;
+        // Not through `execute`, which reconciles on the way out: this result
+        // is not on its way out, it is about to feed another query. Reconciling
+        // it shapes every value for the *inner* column's code, and the outer
+        // query then reads it under a code of its own — a `double(10,4)` in a
+        // view came back rendered at its four places, was converted to a plain
+        // double by the DOUBLE arm on the second pass, and lost them, while
+        // the `float(10,4)` beside it kept them. Same rule, two answers,
+        // decided by which arm the second pass happened to have.
+        let outcome = self.execute_at_depth(&mut scoped, &view.definition, &[], 0)?;
         let Outcome::Rows(rows) = outcome else {
             return Err(EngineError::new(
                 1064,
@@ -6336,6 +6406,56 @@ fn candidate_type(
     let ty = computed_column_type(e, refs, input);
     let unsigned = is_integer(ty) && unsigned_answer(e, refs, input);
     (ty, unsigned)
+}
+
+/// The declaration a set operation's column takes when both branches are
+/// approximate and both declare a scale.
+///
+/// `None` where either side is a plain `FLOAT`/`DOUBLE`, a computed
+/// expression, or anything that is not approximate — MySQL drops to a
+/// not-fixed column there, which is what an absent declaration already means.
+/// A `DECIMAL` beside an approximate is also left out: 8.3 answers
+/// `double(13,4)` for `FLOAT(10,4) UNION ALL DECIMAL(10,3)` and the 13 does
+/// not follow from the rule the three approximate pairs below give, so it is
+/// not guessed at here.
+///
+/// The scale is the wider of the two and the width keeps the wider integer
+/// part, both measured: `FLOAT(12,2) UNION ALL FLOAT(10,4)` is `float(14,4)`,
+/// `FLOAT(12,2) UNION ALL DOUBLE(10,4)` is `double(14,4)`, and
+/// `FLOAT(10,4) UNION ALL FLOAT(10,4)` is `float(10,4)` — so ten integer
+/// digits beside six give ten, and four places beside two give four.
+fn merged_approximate(
+    ty: ColumnType,
+    left: &Option<crate::types::SqlType>,
+    right: &Option<crate::types::SqlType>,
+) -> Option<crate::types::SqlType> {
+    let name = match ty {
+        ColumnType::Float => "float",
+        ColumnType::Double => "double",
+        _ => return None,
+    };
+    let parts = |declared: &Option<crate::types::SqlType>| {
+        let declared = declared.as_ref()?;
+        if declared.kind != crate::types::TypeKind::Float {
+            return None;
+        }
+        Some((declared.length?, declared.scale?))
+    };
+    let (left_length, left_scale) = parts(left)?;
+    let (right_length, right_scale) = parts(right)?;
+    let scale = left_scale.max(right_scale);
+    let integral = left_length
+        .saturating_sub(left_scale)
+        .max(right_length.saturating_sub(right_scale));
+    let length = integral.saturating_add(scale);
+    Some(crate::types::SqlType {
+        kind: crate::types::TypeKind::Float,
+        declared: format!("{name}({length},{scale})"),
+        length: Some(length),
+        scale: Some(scale),
+        unsigned: false,
+        variants: Vec::new(),
+    })
 }
 
 /// The input column an expression names outright, if it names one.

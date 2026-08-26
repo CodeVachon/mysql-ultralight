@@ -109,7 +109,9 @@ fn build_column_with_checks(
     position: usize,
     inline_checks: &mut Vec<crate::catalog::Check>,
 ) -> EngineResult<Column> {
-    let mut column = Column::new(def.name.value.clone(), SqlType::from_ast(&def.data_type)?);
+    let declared = SqlType::from_ast(&def.data_type)?;
+    declared.check_declaration_limits(&def.name.value)?;
+    let mut column = Column::new(def.name.value.clone(), declared);
     column.position = position;
     // MySQL columns are nullable unless declared otherwise, except that a
     // PRIMARY KEY column is implicitly NOT NULL.

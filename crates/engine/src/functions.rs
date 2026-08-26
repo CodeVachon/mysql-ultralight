@@ -1331,7 +1331,23 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
             // Through `SqlType`, so the cast and a column declared the same
             // way fill an omitted scale in one place: a bare `DECIMAL` is
             // `DECIMAL(10,0)` to both.
-            let scale = crate::types::SqlType::from_ast(ty)?.scale.unwrap_or(0) as usize;
+            let target = crate::types::SqlType::from_ast(ty)?;
+            // The same one-statement blow-up `check_declaration_limits` closes
+            // for a column, reachable here by anyone who can send a SELECT:
+            // the scale arrives as a `u64` straight from the parser, and
+            // `decimal_digits` writes that many characters, so
+            // `CAST(1.5 AS DECIMAL(10,1000000))` answered a million-digit
+            // number and `DECIMAL(10,4294967295)` would ask for four
+            // gigabytes.
+            //
+            // Its own rule, not the column's, and measured: a cast checks the
+            // precision first, then M >= D, and only then the scale — so
+            // `CAST(1.5 AS DECIMAL(70,40))` is 1426 where the column form is
+            // 1425, and `CAST(1.5 AS DECIMAL(10,31))` is 1427 where the column
+            // form is 1425. The operand stands in for the column's name, and
+            // 1427 names no column at all.
+            check_cast_precision(&target, source)?;
+            let scale = target.scale.unwrap_or(0) as usize;
             // A temporal converts through its packed number, not its text:
             // `CAST(d AS DECIMAL(20,2))` is 20240105.00 in MySQL where reading
             // `2024-01-05` as a number gives 2024.00. An ENUM converts through
@@ -1339,6 +1355,15 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
             // 1.00 for the first member where reading `a` gives 0.00.
             let source = match &value {
                 Value::Enum { ordinal, .. } => ordinal.to_string(),
+                // The widened double rather than the six digits a float
+                // *displays*, which is the argument #0071 already made for
+                // `CAST(f AS JSON)` one arm below — the display is a
+                // rendering, and converting from it makes the answer depend on
+                // how wide the column happened to print. `CAST(f AS
+                // DECIMAL(20,10))` over a FLOAT holding 1.234567890123 is
+                // 1.2345678806 on 8.3 and was 1.2345700000 here, read back out
+                // of `1.23457`.
+                Value::Float32(v) => crate::decimal::plain(f64::from(*v)),
                 _ => value
                     .temporal_number()
                     .map_or_else(|| value.as_text(), |number| number.as_text()),
@@ -1413,6 +1438,42 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
         D::Binary(_) | D::Varbinary(_) | D::Blob(_) => Value::Bytes(value.as_text().into_bytes()),
         other => return Err(unsupported(format!("CAST to `{other}`"))),
     })
+}
+
+/// The limits MySQL puts on the `(M,D)` of a cast target.
+///
+/// Not the column's limits and not in the column's order — both measured on
+/// 8.3, and both differ. Bounding all three is what keeps the scale below 30
+/// and so keeps `decimal_digits` from being handed a length nothing checked.
+fn check_cast_precision(target: &crate::types::SqlType, source: &str) -> EngineResult<()> {
+    let (Some(precision), scale) = (target.length, target.scale.unwrap_or(0)) else {
+        return Ok(());
+    };
+    if precision > 65 {
+        return Err(EngineError::new(
+            1426,
+            "42000",
+            format!("Too-big precision {precision} specified for '{source}'. Maximum is 65."),
+        ));
+    }
+    // Before the scale limit, which is the half that is not the column's
+    // order: `CAST(1.5 AS DECIMAL(10,31))` is 1427 and `DECIMAL(65,31)` is
+    // 1425, so it is `M < D` that decides when both are wrong.
+    if precision < scale {
+        return Err(EngineError::new(
+            1427,
+            "42000",
+            "For float(M,D), double(M,D) or decimal(M,D), M must be >= D (column '').",
+        ));
+    }
+    if scale > 30 {
+        return Err(EngineError::new(
+            1425,
+            "42000",
+            format!("Too big scale {scale} specified for column '{source}'. Maximum is 30."),
+        ));
+    }
+    Ok(())
 }
 
 /// MySQL LIKE matching: `%` is any run, `_` is one character.

@@ -344,6 +344,82 @@ impl SqlType {
         self.declared[..end].to_owned()
     }
 
+    /// The limits MySQL puts on a declared `(M,D)`, in the order it checks
+    /// them.
+    ///
+    /// Not cosmetic. `M` and `D` reach here as `u64` — the parser takes any
+    /// number the grammar allows — and both the fixed-scale rendering and a
+    /// DECIMAL's own storage build a string with `D` digits after the point,
+    /// so `DECIMAL(10,1000000)` writes a million-character value and
+    /// `DOUBLE(10,4294967295)` asks for four billion. One statement, and no
+    /// value in the row large enough to hint at it. MySQL refuses all of them
+    /// at `CREATE TABLE`.
+    ///
+    /// The order is measured: `FLOAT(300,31)` is 1425 and not 1439, and
+    /// `DECIMAL(66,31)` is 1425 and not 1426, so the scale is checked first.
+    /// `FLOAT(2,5)` is 1427, which only a declaration that passed both limits
+    /// can reach.
+    ///
+    /// Columns only. A cast declares a type too and MySQL polices it by
+    /// different rules — `CAST(1.5 AS DECIMAL(10,31))` is 1427 there where the
+    /// column is 1425 — so this is called where a column is built rather than
+    /// where a type is parsed.
+    pub fn check_declaration_limits(&self, column: &str) -> EngineResult<()> {
+        const MAX_SCALE: u64 = 30;
+        if !matches!(self.kind, TypeKind::Float | TypeKind::Decimal) {
+            return Ok(());
+        }
+        if let Some(scale) = self.scale.filter(|scale| *scale > MAX_SCALE) {
+            return Err(EngineError::new(
+                1425,
+                "42000",
+                format!(
+                    "Too big scale {scale} specified for column '{column}'. Maximum is {MAX_SCALE}."
+                ),
+            ));
+        }
+        // A DECIMAL counts 65 digits and reports going past them with its own
+        // code; the two approximate types are measured in display width
+        // instead and stop at 255.
+        let decimal = self.kind == TypeKind::Decimal;
+        let max_precision = if decimal { 65 } else { 255 };
+        if let Some(length) = self.length.filter(|length| *length > max_precision) {
+            return Err(if decimal {
+                EngineError::new(
+                    1426,
+                    "42000",
+                    format!(
+                        "Too-big precision {length} specified for '{column}'. \
+                         Maximum is {max_precision}."
+                    ),
+                )
+            } else {
+                EngineError::new(
+                    1439,
+                    "42000",
+                    format!(
+                        "Display width out of range for column '{column}' (max = {max_precision})"
+                    ),
+                )
+            });
+        }
+        // Only where both were written: a lone `(M)` has no scale to outgrow,
+        // and `DECIMAL(8)` is `DECIMAL(8,0)` rather than an error.
+        if let (Some(length), Some(scale)) = (self.length, self.scale) {
+            if length < scale {
+                return Err(EngineError::new(
+                    1427,
+                    "42000",
+                    format!(
+                        "For float(M,D), double(M,D) or decimal(M,D), \
+                         M must be >= D (column '{column}')."
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Converts a value to this column's type, or explains why it cannot.
     ///
     /// Rejecting rather than silently storing the wrong shape is the point:
@@ -499,6 +575,32 @@ impl SqlType {
                 if self.unsigned && n < 0.0 {
                     return Err(out_of_range());
                 }
+                // The two-argument form is not a display rule. MySQL *stores*
+                // a `FLOAT(M,D)` or `DOUBLE(M,D)` rounded to D places, which
+                // is visible far from any column list: `JSON_ARRAY(f)` over a
+                // `FLOAT(10,4)` given 1.234567890123 is
+                // `[1.2345999479293823]` on 8.3 — the four bytes of 1.2346 —
+                // where the unrounded value would be `[1.2345678806304932]`,
+                // and the binary protocol sends those same bytes.
+                //
+                // Rounded before the narrowing, not after, which is measured:
+                // 2.00005 into a `FLOAT(10,4)` is 2.0000 there. Its `f64` is
+                // just below the half and its `f32` just above, so narrowing
+                // first would round the other way.
+                let n = match self.scale {
+                    Some(scale) => {
+                        let rounded = rounded_to_scale(n, scale);
+                        // The range is what the digits allow rather than what
+                        // the type can hold: 9999.995 into a `FLOAT(6,2)` is
+                        // 1264 because it *rounds* to 10000.00, while 9999.994
+                        // is taken. So the check follows the rounding.
+                        if !fits_digits(rounded, self.length, scale) {
+                            return Err(out_of_range());
+                        }
+                        rounded
+                    }
+                    None => n,
+                };
                 // A `FLOAT` is four bytes in MySQL and holds what four bytes
                 // hold: 1.234567890123 comes back 1.23457. Keeping the double
                 // made the column a `DOUBLE` that happened to be declared
@@ -847,6 +949,100 @@ fn float_type(name: &str, info: &sqlparser::ast::ExactNumberInfo, unsigned: bool
         unsigned,
         variants: Vec::new(),
     }
+}
+
+/// A double rounded to `scale` decimal places, the way MySQL rounds one into a
+/// `FLOAT(M,D)` or `DOUBLE(M,D)` column.
+///
+/// Ties go to the even digit, which is `rint`'s rule and not `round`'s, and is
+/// measured rather than assumed: into a `FLOAT(10,2)`, 0.125 stores 0.12 where
+/// half-away-from-zero would give 0.13, 0.015 stores 0.02 and 0.025 stores
+/// 0.02. All three are exact halves *after* the multiply, so nothing but the
+/// tie rule separates them. The neighbouring 0.135 and 0.145 are not halves at
+/// all — their doubles fall just above and just below — and they store 0.14
+/// either way, which is why they are useless as evidence and the three above
+/// are not.
+///
+/// The multiply is the same one MySQL does, so a scale that overflows to an
+/// infinity leaves the value alone rather than turning it into one.
+fn rounded_to_scale(value: f64, scale: u64) -> f64 {
+    if !value.is_finite() {
+        return value;
+    }
+    let factor = power_of_ten(scale);
+    let scaled = value * factor;
+    if !scaled.is_finite() {
+        return value;
+    }
+    let rounded = scaled.round_ties_even();
+    // Nothing to round, so nothing to divide. The division is not free: it is
+    // a second rounding, and at a wide scale it moves a value that was already
+    // exact. 1.5 into a `DOUBLE(255,30)` multiplies to 1.5e30, which is
+    // integral and comes back unchanged — and then `1.5e30 / 1e30` is
+    // 1.5000000000000002, because neither power of ten is exact. MySQL sends
+    // 1.5 for that row, and so does this.
+    let result = if rounded == scaled {
+        value
+    } else {
+        rounded / factor
+    };
+    // MySQL stores the positive zero. -0.001 into a `FLOAT(10,2)` rounds to a
+    // *negative* zero, which reads back `-0.00`, embeds in a document as
+    // `-0.0` and reaches a binary client with its sign bit set; 8.3 answers
+    // `0.00`, `0.0` and a plain zero for all three. Normalised here rather
+    // than in the rendering because all three readings are wrong, not just the
+    // printed one — and only the rounding can produce it, which is why the
+    // sign survives on -0.006 rounding to -0.01 beside it.
+    if result == 0.0 {
+        return 0.0;
+    }
+    result
+}
+
+/// Ten to the power of `exponent`, written out the way MySQL's own `log_10[]`
+/// table is.
+///
+/// `10f64.powi(n)` agrees with every entry here on this host, so this fixes no
+/// measured bug and no test tells the two apart. It is written out because
+/// `powi` is a binary exponentiation and nothing promises it is correctly
+/// rounded: above 22 an f64 no longer holds a power of ten exactly, and a
+/// value that is an exact half against the true power is not one against a
+/// neighbour an ulp away — which is the one thing the tie rule above cannot
+/// survive. A literal is the same constant on every host.
+///
+/// Thirty-one entries because that is every scale a column may declare;
+/// `check_declaration_limits` refuses the rest.
+fn power_of_ten(exponent: u64) -> f64 {
+    const POWERS: [f64; 31] = [
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+        1e17, 1e18, 1e19, 1e20, 1e21, 1e22, 1e23, 1e24, 1e25, 1e26, 1e27, 1e28, 1e29, 1e30,
+    ];
+    match POWERS.get(exponent as usize) {
+        Some(power) => *power,
+        // Only the digit check below reaches past thirty, and it compares
+        // rather than rounds: an exponent that overflows to an infinity fails
+        // every comparison a finite value can make, which is the right answer
+        // for a width nothing can outgrow.
+        None => 10f64.powi(exponent.min(i32::MAX as u64) as i32),
+    }
+}
+
+/// Whether a rounded value fits the `M` digits a `FLOAT(M,D)` declares.
+///
+/// `M` counts every digit and `D` of them are after the point, so the value
+/// has to stay below 10 to the power of the difference. MySQL raises 1264
+/// rather than truncating, and it does so on the *rounded* value.
+fn fits_digits(value: f64, precision: Option<u64>, scale: u64) -> bool {
+    let Some(precision) = precision else {
+        return true;
+    };
+    // Unreachable from a column, since `check_declaration_limits` answers
+    // 1427 for `M < D` before a value can be stored in one. Kept so this stays
+    // total rather than relying on that from a distance.
+    let Some(integral) = precision.checked_sub(scale) else {
+        return false;
+    };
+    value.abs() < power_of_ten(integral)
 }
 
 /// ENUM and SET members as MySQL reports them: quoted, with any quote inside

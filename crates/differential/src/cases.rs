@@ -294,6 +294,137 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // `FLOAT(M,D)` and `DOUBLE(M,D)` are not the one-argument forms with a
+        // display rule attached. MySQL rounds the stored value to D places on
+        // the way in, checks it against the M digits *after* that rounding,
+        // and then shows exactly D places wherever the column itself is read.
+        // #0075.
+        //
+        // Wherever the *column* is read, and no further: MySQL carries that D
+        // forward as an expression's `decimals`, so `f + 0` and `SUM(f)` still
+        // show four places there and `AVG(f)` shows eight, and this engine has
+        // no per-expression `decimals` to carry. There is deliberately no case
+        // for those below — they would be divergences, and the baseline is
+        // empty. `REAL(M,D)` has none either: MySQL reads it as
+        // `double(10,4)` and `sqlparser` will not parse the spelling at all,
+        // so the engine answers 1064.
+        name: "a float declared with a scale",
+        setup: &[
+            "CREATE TABLE Fx (id INT NOT NULL, f FLOAT(10,4) NULL, d DOUBLE(10,4) NULL, \
+             n FLOAT(6,2) NULL, pf FLOAT NULL, PRIMARY KEY (id))",
+            // 2.00005 tells the rounding order apart: its `f64` falls just
+            // below the half and its `f32` just above, so a value narrowed
+            // before it was rounded comes out 2.0001 instead of 2.0000.
+            // 0.125 is an exact half and pins the tie rule, which is `rint`'s
+            // and rounds to the even digit.
+            "INSERT INTO Fx VALUES (1, 1.234567890123, 1.234567890123, 2.00005, 1.234567890123), \
+             (2, 0.1, 0.1, 0.125, 0.1), (3, 1.5, 1.5, 9999.994, 16777217), \
+             (4, -3.14159265, -3.14159265, NULL, NULL)",
+            "CREATE VIEW Fv AS SELECT f, d FROM Fx",
+            // A scale wide enough to run past what a double distinguishes,
+            // where padding the binary expansion and padding the shortest
+            // round-trip stop being the same string. The `Ba` case below only
+            // declared these widths and never stored a value in them.
+            "CREATE TABLE Fw (id INT NOT NULL, p DOUBLE(20,17) NULL, q DOUBLE(255,30) NULL, \
+             r FLOAT(40,2) NULL, z FLOAT(10,2) NULL, PRIMARY KEY (id))",
+            "INSERT INTO Fw VALUES (1, 0.1, 1.5, 1e30, -0.001), (2, 0.1, 0.5, 1e30, -0.006)",
+            // Two scales on the same code, and two codes: the merged column
+            // takes the wider scale either way round and rounds both branches
+            // into it.
+            "CREATE TABLE Fu (f FLOAT(10,4) NULL, d DOUBLE(10,4) NULL, a FLOAT(12,2) NULL, \
+             h DOUBLE(12,6) NULL, pd DOUBLE NULL)",
+            "INSERT INTO Fu VALUES (0.1, 0.1, 0.1, 0.1, 0.1)",
+        ],
+        cases: &[
+            same("SELECT f, d, n FROM Fx ORDER BY id"),
+            // The places are a rendering; the rounding is of the value. Only
+            // somewhere that reads the number rather than the column can tell
+            // the two apart, and a document is that place.
+            same("SELECT JSON_OBJECT('f', f, 'd', d) FROM Fx ORDER BY id"),
+            same("SELECT CAST(f AS DECIMAL(20,10)), CAST(d AS DECIMAL(20,10)) FROM Fx ORDER BY id"),
+            // The same conversion over a *plain* FLOAT, which was reading the
+            // six digits the column displays rather than the double behind
+            // them and answered 1.2345700000 for 1.2345678806304932.
+            same("SELECT CAST(pf AS DECIMAL(20,10)) FROM Fx ORDER BY id"),
+            // A derived table and a set operation both carry the declared
+            // scale forward, so the places survive being materialised.
+            same("SELECT f FROM (SELECT f FROM Fx) s ORDER BY f"),
+            same("SELECT f FROM Fx UNION ALL SELECT f FROM Fx ORDER BY 1"),
+            // A view is the one of those that runs a whole query of its own,
+            // and its result used to be shaped for its own column codes before
+            // the outer query read it: the `double(10,4)` came back without
+            // its places and the `float(10,4)` beside it kept them.
+            same("SELECT f, d FROM Fv ORDER BY f"),
+            same("SELECT COUNT(*), f FROM Fx GROUP BY f ORDER BY f"),
+            // M digits with D after the point stops a `FLOAT(6,2)` below
+            // 10000, and the check is against the rounded value: 9999.994 is
+            // in the row above and 9999.995 is 1264.
+            same("INSERT INTO Fx (id, n) VALUES (9, 9999.995)"),
+            same("INSERT INTO Fx (id, n) VALUES (9, 12345.678)"),
+            same("INSERT INTO Fx (id, d) VALUES (9, -123456789.5)"),
+            same("UPDATE Fx SET n = 10000.00 WHERE id = 1"),
+            same("SELECT n FROM Fx WHERE n > 1 ORDER BY n"),
+            // M and D are limits, not decoration: a scale is a count of
+            // characters written per value, so an unchecked one is a
+            // million-character number from one statement. The codes prove the
+            // order — the scale is checked before the precision, so
+            // `FLOAT(300,31)` is 1425 and not 1439.
+            same("CREATE TABLE B1 (x FLOAT(10,31))"),
+            same("CREATE TABLE B2 (x DOUBLE(10,31))"),
+            same("CREATE TABLE B3 (x DECIMAL(10,1000000))"),
+            same("CREATE TABLE B4 (x FLOAT(300,31))"),
+            same("CREATE TABLE B5 (x DECIMAL(66,31))"),
+            same("CREATE TABLE B6 (x FLOAT(300,2))"),
+            same("CREATE TABLE B7 (x DOUBLE(256,2))"),
+            same("CREATE TABLE B8 (x DECIMAL(66,2))"),
+            same("CREATE TABLE B9 (x FLOAT(2,5))"),
+            same("SELECT p, q, r FROM Fw ORDER BY id"),
+            // A negative value that rounds to zero loses its sign, and not
+            // only in the printing: 8.3 stores the positive zero, so the
+            // document and the wire lose it too. The second row keeps its sign
+            // because its rounding does not reach zero.
+            same("SELECT z, JSON_ARRAY(z) FROM Fw ORDER BY id"),
+            // A set operation is materialised through a field of the merged
+            // type, so both branches come back at the wider scale — and the
+            // rounding happens before the de-duplication, which is what makes
+            // the UNION below one row rather than two.
+            same("SELECT f FROM Fu UNION ALL SELECT d FROM Fu ORDER BY 1"),
+            same("SELECT f FROM Fu UNION ALL SELECT h FROM Fu ORDER BY 1"),
+            same("SELECT f FROM Fu UNION ALL SELECT a FROM Fu ORDER BY 1"),
+            same("SELECT a FROM Fu UNION ALL SELECT f FROM Fu ORDER BY 1"),
+            same("SELECT f FROM Fu UNION SELECT d FROM Fu ORDER BY 1"),
+            // A plain DOUBLE has no scale to merge, so neither has the column.
+            same("SELECT f FROM Fu UNION ALL SELECT pd FROM Fu ORDER BY 1"),
+            // The rounding is of the value and not of the printing, which only
+            // shows once the merged result feeds another query: a document
+            // takes the number and ignores the places.
+            same(
+                "SELECT JSON_ARRAY(x) FROM \
+                 (SELECT f AS x FROM Fu UNION ALL SELECT d FROM Fu) t ORDER BY 1",
+            ),
+            same(
+                "SELECT COUNT(DISTINCT x) FROM \
+                 (SELECT f AS x FROM Fu UNION ALL SELECT d FROM Fu) t",
+            ),
+            // A cast declares a precision and a scale too, and unchecked they
+            // were a million-digit answer from one SELECT. Its rule is not the
+            // column's and neither is its order: the precision first, then
+            // M >= D, and only then the scale.
+            same("SELECT CAST(1.5 AS DECIMAL(10,31))"),
+            same("SELECT CAST(1.5 AS DECIMAL(2,5))"),
+            same("SELECT CAST(1.5 AS DECIMAL(10,1000000))"),
+            same("SELECT CAST(1.5 AS DECIMAL(66,2))"),
+            same("SELECT CAST(1.5 AS DECIMAL(70,40))"),
+            same("SELECT CAST(1.5 AS DECIMAL(65,31))"),
+            same("SELECT CAST(1.5 AS DECIMAL(65,30))"),
+            // Every path that declares a column, not just CREATE TABLE.
+            same("ALTER TABLE Fx ADD COLUMN z DECIMAL(10,31)"),
+            same("ALTER TABLE Fx MODIFY COLUMN n FLOAT(300,2)"),
+            // And the widest each type really allows still goes through.
+            same("CREATE TABLE Ba (x FLOAT(255,30), y DOUBLE(255,30), z DECIMAL(65,30))"),
+        ],
+    },
+    Group {
         name: "types and description",
         setup: &[
             "CREATE TABLE T (

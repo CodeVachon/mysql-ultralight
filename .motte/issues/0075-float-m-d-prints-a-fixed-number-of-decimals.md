@@ -1,11 +1,11 @@
 ---
 id: 75
 title: FLOAT(M,D) prints a fixed number of decimals
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-08-21T19:37:25Z
-updated: 2026-08-21T19:37:25Z
+updated: 2026-08-26T11:18:10Z
 ---
 
 ## Description

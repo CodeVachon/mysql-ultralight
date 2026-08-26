@@ -148,10 +148,45 @@ impl ResultSet {
     /// find, not one to paper over.
     pub fn reconcile(&mut self) {
         for (index, column) in self.columns.iter().enumerate() {
+            // A `FLOAT(M,D)` or `DOUBLE(M,D)` shows exactly D places, always,
+            // the way a DECIMAL does: 0.1 in a `FLOAT(10,4)` reads back
+            // `0.1000` and not `0.1`.
+            //
+            // Rendered here rather than tagged on the value because the scale
+            // belongs to the *column*: MySQL keeps it on the field and carries
+            // it forward as an expression's `decimals`, which this engine does
+            // not model — see the note on `fixed_scale`.
+            let scale = fixed_scale(column);
+
             for row in &mut self.rows {
                 let Some(value) = row.get_mut(index) else {
                     continue;
                 };
+                if let (Some(scale), Value::Float(_) | Value::Float32(_)) = (scale, &*value) {
+                    // From the *shortest* digits that read back as this
+                    // double, not from its binary expansion, which is what
+                    // `format!("{:.*}")` writes. The two part company as soon
+                    // as the scale runs past what a double distinguishes:
+                    // 0.1 in a `DOUBLE(20,17)` is `0.10000000000000000` on 8.3
+                    // and the expansion is `0.10000000000000001`, and 1.5 in a
+                    // `DOUBLE(255,30)` is thirty zeros there against
+                    // `1.500000000000000222044604925031`. MySQL's `my_fcvt`
+                    // goes through dtoa, which stops at the shortest string
+                    // that round-trips and pads the rest — so this pads too.
+                    //
+                    // Rounds as well as pads, and has to: `ALTER TABLE` can
+                    // give a column a scale its existing rows never passed
+                    // `coerce` for, and 8.3 renders those stale rows rounded.
+                    //
+                    // The binary protocol is unaffected: `encode_binary` takes
+                    // its width from the *type code*, which is still FLOAT or
+                    // DOUBLE, and reads the number back out of these digits.
+                    // Tagged a decimal rather than left as text because it is
+                    // a number.
+                    let shortest = crate::decimal::plain(value.as_number());
+                    *value = Value::Decimal(crate::types::decimal_digits(&shortest, scale));
+                    continue;
+                }
                 match (column.ty, &value) {
                     (ColumnType::Float, Value::Float(v)) => *value = Value::Float32(*v as f32),
                     (ColumnType::Double, Value::Float32(v)) => *value = Value::Float(f64::from(*v)),
@@ -213,6 +248,30 @@ impl ResultSet {
             rows: vec![vec![value]],
         }
     }
+}
+
+/// The number of decimal places a column shows every value at, where it has
+/// one.
+///
+/// Only a declared `FLOAT(M,D)` or `DOUBLE(M,D)` does. `REAL(M,D)` is the same
+/// type to MySQL — it reports `double(10,4)` for it — but `sqlparser` has no
+/// precision on its `REAL`, so the engine answers 1064 for the spelling rather
+/// than getting as far as this. A clear error, and its own gap.
+///
+/// MySQL keeps that D on the field as its `decimals` and propagates it through
+/// an expression — `f + 0` and `SUM(f)` over a `FLOAT(10,4)` both still show
+/// four places on 8.3, `AVG(f)` shows eight, and a division adds four — so the
+/// rule is really about expressions and not about columns. This engine has no
+/// per-expression `decimals`, so anything computed falls back to the plain
+/// float rendering. That is what MySQL itself does for everything outside that
+/// list — `ROUND(f, 2)`, `CAST(f AS FLOAT)` and `JSON_ARRAY(f)` all drop the
+/// places there — and a divergence for the handful inside it.
+fn fixed_scale(column: &OutColumn) -> Option<usize> {
+    let declared = column.declared.as_ref()?;
+    if declared.kind != crate::types::TypeKind::Float {
+        return None;
+    }
+    declared.scale.map(|scale| scale as usize)
 }
 
 /// The outcome of one statement.
