@@ -151,8 +151,8 @@ const KNOWN: &[&str] = &[
     "year",
 ];
 
-/// MySQL's SOUNDEX, which is the classic algorithm with three of its own
-/// answers to the places the variants disagree.
+/// MySQL's SOUNDEX over a character string, which is the classic algorithm
+/// with three of its own answers to the places the variants disagree.
 ///
 /// Measured against 8.3 rather than taken from a description of Soundex:
 ///
@@ -167,6 +167,82 @@ const KNOWN: &[&str] = &[
 /// A string with no letter in it gives the empty string, not NULL — NULL is
 /// only for a NULL argument, which is answered before this is reached.
 fn soundex(text: &str) -> String {
+    // MySQL's letter test for a multi-byte charset is a range over the
+    // *codepoint* and not a Unicode property: ASCII, or U+00C0 and above.
+    // `µ` and `ª` are alphabetic to Rust and not to MySQL, and `×` is the
+    // reverse. Verified over every codepoint outside ASCII — 63,400 in the
+    // BMP and all 1,048,576 above it — against 8.3 on a utf8mb4 connection:
+    // the character is emitted whole, byte for byte as it arrived, with no
+    // case folding, and it codes as zero.
+    //
+    // #0074 recorded this as only an approximation, on the strength of
+    // `SOUNDEX('€abc')` measuring as the single byte 0xE2 followed by `120`.
+    // That measurement was taken through a *latin1* connection, which hands
+    // MySQL each UTF-8 byte as its own latin1 character — and the lead byte of
+    // a multi-byte sequence is 0xC0 or above, so it passes this very test
+    // while the continuation bytes fail it. The bytes come back looking
+    // truncated because they are a different string, not because SOUNDEX
+    // decoded one badly.
+    soundex_of(
+        text.chars()
+            .filter(|c| c.is_ascii_alphabetic() || (*c as u32) >= 0xC0),
+    )
+}
+
+/// MySQL's SOUNDEX over a binary string, which is a different letter test.
+///
+/// A single-byte charset uses its own ctype table rather than the codepoint
+/// range [`soundex`] applies, and the binary charset classifies only ASCII:
+/// measured on 8.3, of all 256 byte values exactly `A`-`Z` and `a`-`z` are
+/// letters, so `SOUNDEX(CAST('éabc' AS BINARY))` is `A120` where the same
+/// characters as text are `é120`. Every byte above 0x7F is skipped as though
+/// it were punctuation, which is why an all-high-byte binary string gives the
+/// empty string where the text reading gives a four-character answer.
+///
+/// So the result is always ASCII, whatever the input held, and stays a
+/// `Value::Text` — the first letter is emitted verbatim and only a letter can
+/// be first.
+///
+/// This is the *only* reading a binary string gets here, which is worth saying
+/// because a bitwise operator refuses one for the opposite reason: `X'0F' & 1`
+/// and `_binary'ab' & 1` want different answers out of the same `Value`. For
+/// SOUNDEX they do not — a hex literal, a `CAST(x AS BINARY)`, a `BINARY 'x'`
+/// and a VARBINARY column all measure as `A120` over those bytes. So does a
+/// `_binary` literal on MySQL, which this engine cannot evaluate at all: an
+/// introducer parses to a prefixed expression and is refused.
+///
+/// What this does *not* reach is a binary string that has been through another
+/// string function first. MySQL keeps the binary charset across `CONCAT`,
+/// `SUBSTRING`, `TRIM` and `UPPER`, and this engine does not: over a VARBINARY
+/// column holding `éabc`, all four are `A120` on 8.3, while here the first
+/// three are `é120` and `UPPER` is `É120` — case-folding the accent as well,
+/// because the bytes have become text by then. The charset is a property of
+/// the *expression* in MySQL and only of the `Value` here, and every one of
+/// those functions builds a `Value::Text`. That is a gap in charset
+/// propagation rather than in this function, and it is the reason this
+/// dispatch is on the value rather than on a type read off the expression.
+///
+/// A bound parameter is not a binary string, which is measured rather than
+/// assumed: a `Buffer` bound through mysql2 answers `é120` on 8.3, because the
+/// placeholder is in a text context and MySQL converts the bytes to the
+/// statement's charset. The engine agrees, by decoding a parameter whose bytes
+/// are valid UTF-8 as text.
+fn soundex_binary(bytes: &[u8]) -> String {
+    soundex_of(
+        bytes
+            .iter()
+            .copied()
+            .filter(u8::is_ascii_alphabetic)
+            .map(char::from),
+    )
+}
+
+/// The algorithm both readings share, over the letters each of them found.
+///
+/// Split from the letter test rather than parameterised by it because the test
+/// is the whole of the difference between them: everything below counts and
+/// codes letters identically, and only what *counts* as one changes.
+fn soundex_of(mut letters: impl Iterator<Item = char>) -> String {
     // Zero for a vowel and for the letters that behave like one, and for any
     // letter outside ASCII: `CAFÉ` is `C100`, the accent contributing nothing
     // while still being a letter.
@@ -180,18 +256,6 @@ fn soundex(text: &str) -> String {
         _ => b'0',
     };
 
-    // MySQL's letter test is a range and not a Unicode property: ASCII, or a
-    // codepoint at or above U+00C0. `µ` and `ª` are alphabetic to Rust and not
-    // to MySQL, and `×` is the reverse.
-    //
-    // Only an approximation past ASCII, because MySQL runs this over *bytes*:
-    // it reads the lead byte of a multi-byte character, finds it above 0xC0,
-    // and emits that byte alone as the first character of the answer —
-    // `SOUNDEX('€abc')` is 0xE2 followed by `120`, which is not a string at
-    // all. This reads whole characters, so `é` stays `é`. See #0074.
-    let mut letters = text
-        .chars()
-        .filter(|c| c.is_ascii_alphabetic() || (*c as u32) >= 0xC0);
     let Some(first) = letters.next() else {
         return String::new();
     };
@@ -902,7 +966,15 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         "mod" => {
             crate::expr::arithmetic(&sqlparser::ast::BinaryOperator::Modulo, &arg(0), &arg(1))?
         }
-        "soundex" => Value::text(soundex(&text(0))),
+        // Dispatched on the argument rather than reading it as text: MySQL's
+        // letter test comes from the argument's charset, and the binary one
+        // admits only ASCII where a utf8mb4 one admits every codepoint from
+        // U+00C0 up. Read as text, `SOUNDEX(CAST('éabc' AS BINARY))` answered
+        // `é120` where MySQL answers `A120`.
+        "soundex" => Value::text(match arg(0) {
+            Value::Bytes(bytes) => soundex_binary(&bytes),
+            other => soundex(&other.as_text()),
+        }),
         // Toward zero at the given number of places, which may be negative:
         // `TRUNCATE(15.6, -1)` is 10. Not rounding — `TRUNCATE(1.567, 1)` is
         // 1.5 where `ROUND` would say 1.6.

@@ -571,6 +571,11 @@ pub const GROUPS: &[Group] = &[
         setup: &[
             "CREATE TABLE S (id INT NOT NULL, t VARCHAR(30) NULL, n INT NULL, PRIMARY KEY (id))",
             "INSERT INTO S VALUES (1,'Hello',5),(2,NULL,NULL),(3,'  pad  ',-2)",
+            // A binary column of its own rather than a column added to `S`:
+            // SOUNDEX reads a binary string by a different rule from a text
+            // one, and every case above selects from `S` by name.
+            "CREATE TABLE SB (id INT NOT NULL, b VARBINARY(32) NULL, PRIMARY KEY (id))",
+            "INSERT INTO SB VALUES (1,'Robert'),(2,'éabc')",
         ],
         cases: &[
             same("SELECT CONCAT(t, '!'), UPPER(t), LOWER(t), LENGTH(t) FROM S ORDER BY id"),
@@ -580,6 +585,25 @@ pub const GROUPS: &[Group] = &[
             // and the answer is not truncated to four.
             same("SELECT SOUNDEX('Tymczak'), SOUNDEX('Pfister'), SOUNDEX('Ashcraft')"),
             same("SELECT SOUNDEX('Robert'), SOUNDEX('Bhbb'), SOUNDEX(''), SOUNDEX(123)"),
+            // The letter test past ASCII, which is a range over the codepoint
+            // and not a Unicode property: `µ` and `ª` are alphabetic to Rust
+            // and below MySQL's U+00C0 threshold, and `×` is the reverse. The
+            // character that passes is emitted whole, unfolded, and codes
+            // zero. #0074 recorded this as unreachable on a reading taken
+            // through a latin1 connection, where each UTF-8 byte arrives as
+            // its own character and a lead byte passes the same test.
+            same("SELECT SOUNDEX('éabc'), SOUNDEX('€abc'), SOUNDEX('µabc'), SOUNDEX('×abc')"),
+            // Only the leading character can differ: everywhere else a
+            // non-ASCII letter codes zero, like a vowel, and writes nothing.
+            same("SELECT SOUNDEX('abc€'), SOUNDEX('aé'), SOUNDEX('b€b'), SOUNDEX('café')"),
+            // A binary string is the other letter test. The binary charset's
+            // ctype table classifies only ASCII, so a high byte is skipped as
+            // punctuation where the same character as text is a letter coding
+            // zero — which is why the second of these is empty here and
+            // `é000` as text.
+            same("SELECT SOUNDEX(CAST('éabc' AS BINARY)), SOUNDEX(CAST('éé' AS BINARY))"),
+            same("SELECT SOUNDEX(BINARY 'éabc'), SOUNDEX(CAST('Ashcraft' AS BINARY))"),
+            same("SELECT id, SOUNDEX(b) FROM SB ORDER BY id"),
             same("SELECT COALESCE(t, 'none'), IFNULL(n, 0), NULLIF(n, 5) FROM S ORDER BY id"),
             same("SELECT ROUND(n / 3, 2), ABS(n), n DIV 2, n % 3 FROM S ORDER BY id"),
             // `MOD` is `%` spelled as a keyword, and the parser is given the

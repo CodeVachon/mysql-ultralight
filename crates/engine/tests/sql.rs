@@ -6837,21 +6837,66 @@ fn soundex_answers_what_mysql_answers() {
         );
     }
 
-    // These two are *not* MySQL's answers. They pin a deliberate
-    // approximation, which is why they are kept apart from the measurements
-    // above. MySQL's letter test is a range rather than a Unicode property —
-    // ASCII, or a byte at or above 0xC0 — and it applies it to *bytes*, so
-    // `SOUNDEX('µabc')` there is the lead byte 0xC2 followed by `120`, which
-    // is not a string a client can read. This applies the same threshold to
-    // whole characters, so `µ` is not a letter and the `A` becomes the first.
-    // #0074 has the measurements.
-    for (sql, approximated) in [
+    // The letter test past ASCII, all measured on 8.3 through a utf8mb4
+    // connection. It is a range over the codepoint rather than a Unicode
+    // property — ASCII, or U+00C0 and above — so `µ` and `ª` are alphabetic to
+    // Rust and not to MySQL, and `×` is the reverse. The character that passes
+    // is emitted whole and unfolded, and codes as zero.
+    //
+    // #0074 recorded these as unreachable, on the strength of `SOUNDEX('€abc')`
+    // measuring as the single byte 0xE2 followed by `120`. That reading came
+    // through a *latin1* connection, which gives MySQL each UTF-8 byte as its
+    // own latin1 character — and a lead byte is 0xC0 or above, so it passes
+    // this same test while the continuation bytes fail it.
+    for (sql, expected) in [
+        ("SELECT SOUNDEX('éabc')", "é120"),
+        ("SELECT SOUNDEX('€abc')", "€120"),
+        ("SELECT SOUNDEX('🙂abc')", "🙂120"),
+        // Below U+00C0, so not a letter: the `a` becomes the first character.
         ("SELECT SOUNDEX('µabc')", "A120"),
         ("SELECT SOUNDEX('ªabc')", "A120"),
+        // Above it, so a letter, though Rust would not call it one.
+        ("SELECT SOUNDEX('×abc')", "×120"),
+        // Position matters only for what lands first. Everywhere else a
+        // non-ASCII letter codes zero, like a vowel.
+        ("SELECT SOUNDEX('abc€')", "A120"),
+        ("SELECT SOUNDEX('aé')", "A000"),
+        ("SELECT SOUNDEX('b€b')", "B000"),
+        // A combining mark is a character like any other, and this one is
+        // below U+00C0, so `e` stands alone as the first letter.
+        ("SELECT SOUNDEX('e\u{301}abc')", "E120"),
     ] {
         assert_eq!(
             rows(&engine, &mut session, sql),
-            vec![vec![approximated]],
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // A *binary* string is a different letter test, and the same measurements
+    // through the same connection. A single-byte charset uses its own ctype
+    // table instead of the codepoint range above, and the binary charset
+    // classifies only ASCII — of all 256 byte values exactly `A`-`Z` and
+    // `a`-`z` are letters on 8.3 — so every byte above 0x7F is skipped as
+    // though it were punctuation.
+    for (sql, expected) in [
+        ("SELECT SOUNDEX(CAST('éabc' AS BINARY))", "A120"),
+        ("SELECT SOUNDEX(BINARY 'éabc')", "A120"),
+        ("SELECT SOUNDEX(X'C3A9616263')", "A120"),
+        // Nothing but high bytes leaves no letter at all, where the same
+        // characters as text answer `é000`.
+        ("SELECT SOUNDEX(CAST('éé' AS BINARY))", ""),
+        // ASCII reads identically through both, which is what makes the
+        // divergence a leading-character one and never a digit one: a high
+        // byte codes zero on one path and is absent on the other, and neither
+        // writes a digit.
+        ("SELECT SOUNDEX(CAST('Robert' AS BINARY))", "R163"),
+        ("SELECT SOUNDEX(CAST('Ashcraft' AS BINARY))", "A2613"),
+        ("SELECT SOUNDEX(CAST('café' AS BINARY))", "C100"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
             "{sql}"
         );
     }
@@ -11059,6 +11104,46 @@ fn a_column_filled_from_its_implicit_default_holds_an_enum() {
     assert_eq!(
         rows(&engine, &mut session, "SELECT e, e + 0 FROM D"),
         vec![vec!["a", "1"]]
+    );
+}
+
+#[test]
+fn a_column_filled_from_its_implicit_default_holds_bytes() {
+    // The value a backfill writes into a NOT NULL binary column. It goes into
+    // the row without passing `coerce`, so it has to carry the variant on its
+    // own — and everything that reads a binary column reads the variant, not
+    // the column's declaration, so a row that held text was a binary column
+    // answering two ways.
+    //
+    // A bitwise operator is what shows it, because it is the one consumer that
+    // *refuses* a binary operand rather than converting it: with the default
+    // left as text, `b & 1` answered 0 for the backfilled row and raised 1235
+    // for a row inserted normally, from the same column.
+    let (engine, mut session) = engine();
+    for sql in [
+        "CREATE TABLE D (id INT NOT NULL, PRIMARY KEY (id))",
+        "INSERT INTO D (id) VALUES (1)",
+        "ALTER TABLE D ADD COLUMN b VARBINARY(8) NOT NULL",
+        "INSERT INTO D (id, b) VALUES (2, 'x')",
+    ] {
+        run(&engine, &mut session, sql);
+    }
+
+    for id in [1, 2] {
+        let sql = format!("SELECT b & 1 FROM D WHERE id = {id}");
+        let err = engine.execute(&mut session, &sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1235, "{sql}");
+    }
+
+    // And it is still the empty string everywhere that reads one, so the
+    // variant is the only thing that changed.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT b, SOUNDEX(b) FROM D ORDER BY id"
+        ),
+        vec![vec!["", ""], vec!["x", "X000"]]
     );
 }
 

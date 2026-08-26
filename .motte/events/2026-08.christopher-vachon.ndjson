@@ -233,3 +233,5 @@
 {"at":"2026-08-26T08:49:10Z","id":125,"by":"Christopher Vachon","as":"user","type":"created","title":"CREATE TABLE AS SELECT makes a zero-column table and desynchronises the connection","state":"Todo"}
 {"at":"2026-08-26T08:49:10Z","id":126,"by":"Christopher Vachon","as":"user","type":"created","title":"A column's declared length is never sent","state":"Todo"}
 {"at":"2026-08-26T08:49:10Z","id":127,"by":"Christopher Vachon","as":"user","type":"created","title":"A union of a string and a number does not follow MySQL's aggregate string rule","state":"Todo"}
+{"at":"2026-08-26T09:44:53Z","id":73,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-08-26T09:45:01Z","id":74,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}

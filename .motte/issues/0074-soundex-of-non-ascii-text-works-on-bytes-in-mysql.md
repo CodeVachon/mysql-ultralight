@@ -1,11 +1,11 @@
 ---
 id: 74
 title: SOUNDEX of non-ASCII text works on bytes in MySQL
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-08-21T18:55:46Z
-updated: 2026-08-21T18:55:46Z
+updated: 2026-08-26T09:45:01Z
 ---
 
 ## Description

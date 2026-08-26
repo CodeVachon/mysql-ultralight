@@ -397,7 +397,16 @@ impl SqlType {
                     ordinal: 0,
                 },
             },
-            TypeKind::Text | TypeKind::Blob | TypeKind::Set => Value::text(""),
+            // Empty *bytes*, not empty text: everything that reads a binary
+            // column dispatches on the variant, so a default-filled row must
+            // carry the same one an inserted row does. It did not, and the
+            // same column answered two ways — after `ALTER TABLE ... ADD
+            // COLUMN b VARBINARY(8) NOT NULL` backfilled an existing row,
+            // `b & 1` gave 0 for that row and 1235 for a normally inserted
+            // one, because the bitwise operators refuse a binary operand and
+            // this default was not one.
+            TypeKind::Blob => Value::Bytes(Vec::new()),
+            TypeKind::Text | TypeKind::Set => Value::text(""),
         }
     }
 
