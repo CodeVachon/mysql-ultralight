@@ -803,7 +803,37 @@ impl Engine {
     // ---------------------------------------------------------------- SELECT
 
     fn query(&self, session: &Session, query: &Query) -> EngineResult<ResultSet> {
-        self.query_with_outer(session, query, None)
+        let mut result = self.query_with_outer(session, query, None)?;
+        // A set operation's answer goes through a temporary table, and a
+        // temporary table has no field for `MYSQL_TYPE_NULL`, so a column that
+        // was NULL on every branch comes out `binary(0)` — measured on 8.3,
+        // and confirmed by `CREATE TABLE t AS SELECT NULL UNION SELECT NULL`,
+        // whose column is declared exactly that.
+        //
+        // Here rather than inside the merge, because MySQL materialises a
+        // chain of set operations *once*, over all its terms at the same time.
+        // `SELECT NULL UNION SELECT NULL UNION SELECT 1` is a LONGLONG there —
+        // and so is the same statement with the first two bracketed, so it is
+        // not associativity that decides it. Converting inside the merge made
+        // the left pair a `binary(0)` that then widened against the 1 to a
+        // string, and a binary client read "1" for the integer 1.
+        //
+        // `query` is the boundary a whole query answers at, and a set
+        // operation nested in another one does not come through it: a
+        // bracketed arm is a `SetExpr::Query` handled by `query_with_outer`.
+        // The other way a set operation is materialised — as a derived table,
+        // a CTE or a view — is `SqlType::from_column_type`, which every one of
+        // those reads its columns back through.
+        if is_set_operation(query.body.as_ref()) {
+            for column in &mut result.columns {
+                if column.ty == ColumnType::Null {
+                    let materialised = crate::types::SqlType::materialised_null();
+                    column.ty = materialised.column_type();
+                    column.declared = Some(materialised);
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Runs each CTE of a query and puts its rows in scope under its name.
@@ -953,7 +983,20 @@ impl Engine {
                             a_unsigned && b_unsigned,
                         )
                     })
-                    .unwrap_or((ColumnType::VarString, false));
+                    // Nothing left to fold means every row was NULL in this
+                    // column, and NULL is the absence of a type rather than a
+                    // string: measured on 8.3, `VALUES ROW(NULL)` is
+                    // `MYSQL_TYPE_NULL`, exactly as `SELECT NULL` is. The
+                    // VAR_STRING that was here made it a `varchar(512)` the
+                    // moment anything read it back as a relation.
+                    //
+                    // Left typeless rather than materialised here, because a
+                    // bare constructor is not materialised — MySQL gives
+                    // `SELECT * FROM (VALUES ROW(NULL)) v` `binary(0)` and the
+                    // constructor on its own `MYSQL_TYPE_NULL`. Saying `Null`
+                    // is what lets the two materialising paths give it the
+                    // other answer where they apply.
+                    .unwrap_or((ColumnType::Null, false));
                 let mut column = OutColumn::new(format!("column_{i}"), ty);
                 column.unsigned = unsigned;
                 // From the expressions rather than from the values, which is
@@ -6737,6 +6780,25 @@ impl Drop for Shaping {
 fn shaping<T>(f: impl FnOnce() -> T) -> T {
     let _restore = Shaping(SHAPING.with(|s| s.replace(true)));
     f()
+}
+
+/// Whether a query's body is a set operation, seen through any brackets the
+/// statement was written with.
+///
+/// `(SELECT NULL UNION SELECT NULL)` parses as a `SetExpr::Query` wrapping the
+/// operation, and matching only the bare variant left it typed
+/// `MYSQL_TYPE_NULL` where the same statement without the brackets was
+/// `binary(0)`. MySQL makes no such distinction: measured on 8.3, brackets at
+/// any depth, and an ORDER BY or LIMIT inside or outside them, all give the
+/// materialised type. A bracketed *arm* of a larger set operation is a
+/// different thing and does not reach here — `set_expr` answers it through
+/// `query_with_outer`.
+fn is_set_operation(body: &SetExpr) -> bool {
+    match body {
+        SetExpr::SetOperation { .. } => true,
+        SetExpr::Query(inner) => is_set_operation(&inner.body),
+        _ => false,
+    }
 }
 
 /// The column positions a GROUP BY determines, which is more than the columns

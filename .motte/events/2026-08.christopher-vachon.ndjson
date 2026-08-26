@@ -227,3 +227,9 @@
 {"at":"2026-08-26T03:49:12Z","id":122,"by":"Christopher Vachon","as":"user","type":"created","title":"A decimal embedded in a document keeps its internal scale, not its displayed one","state":"Todo"}
 {"at":"2026-08-26T03:49:12Z","id":123,"by":"Christopher Vachon","as":"user","type":"created","title":"UNION does not unify a decimal's scale across branches","state":"Todo"}
 {"at":"2026-08-26T03:49:17Z","id":72,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-08-26T07:20:19Z","id":72,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-08-26T07:20:32Z","id":124,"by":"Christopher Vachon","as":"user","type":"created","title":"A shortest-form tie rounds half up where MySQL rounds half to even","state":"Todo"}
+{"at":"2026-08-26T07:20:39Z","id":73,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-08-26T08:49:10Z","id":125,"by":"Christopher Vachon","as":"user","type":"created","title":"CREATE TABLE AS SELECT makes a zero-column table and desynchronises the connection","state":"Todo"}
+{"at":"2026-08-26T08:49:10Z","id":126,"by":"Christopher Vachon","as":"user","type":"created","title":"A column's declared length is never sent","state":"Todo"}
+{"at":"2026-08-26T08:49:10Z","id":127,"by":"Christopher Vachon","as":"user","type":"created","title":"A union of a string and a number does not follow MySQL's aggregate string rule","state":"Todo"}

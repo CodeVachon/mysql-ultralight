@@ -7370,6 +7370,164 @@ fn a_number_too_big_for_a_double_is_not_valid_json_text() {
     assert_eq!(err.code, 3141, "expected invalid JSON text for: {sql}");
 }
 
+/// What a column of nothing but NULLs is typed as once it has been through a
+/// temporary table.
+///
+/// `MYSQL_TYPE_NULL` is the absence of a type and no temporary-table field
+/// holds one, so MySQL substitutes `binary(0)` — `MYSQL_TYPE_STRING` with the
+/// binary charset. Measured against 8.3 through a real prepared statement,
+/// every statement below.
+///
+/// The one thing this engine deliberately does not reproduce: MySQL's
+/// `COM_STMT_PREPARE` answers `MYSQL_TYPE_NULL` for the *outermost* set
+/// operation of a statement, because that one's temporary table is not built
+/// until the statement runs — while both of its protocols' result sets, and
+/// its prepare metadata for every nested case below, say `binary(0)`. #0073
+/// records the measurement. One answer is given on both paths here, and it is
+/// the one that carries the rows.
+#[test]
+fn an_all_null_column_takes_the_type_its_materialisation_gives_it() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE VIEW VN AS SELECT NULL AS c");
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW VU AS SELECT NULL AS c UNION SELECT NULL",
+    );
+
+    // Both of the engine's type paths, because they are separate functions and
+    // the wire encodes from whichever one answered: `describe` fills in
+    // `COM_STMT_PREPARE`, execution fills in the result set. Asserting only one
+    // of them would leave the other free to drift.
+    let shapes = |session: &mut Session, sql: &str| -> (String, String) {
+        let described = engine
+            .describe(session, sql, 0)
+            .unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
+            .unwrap_or_else(|| panic!("described nothing: {sql}"));
+        let Outcome::Rows(executed) = run(&engine, session, sql) else {
+            panic!("expected rows from: {sql}");
+        };
+        (
+            format!("{:?}", described[0].ty),
+            format!("{:?}", executed.columns[0].ty),
+        )
+    };
+
+    let mut mismatches = Vec::new();
+    for (sql, expected) in [
+        // Nothing has materialised, so the column is still typeless.
+        ("SELECT NULL", "Null"),
+        // Neither has anything here: measured on 8.3, sorting, grouping,
+        // de-duplicating, limiting and folding all leave `MYSQL_TYPE_NULL`
+        // alone. It is the temporary table and not the extra clause that
+        // changes the type, so the set operation is not just "the one with
+        // more machinery in it".
+        ("SELECT NULL ORDER BY 1", "Null"),
+        ("SELECT NULL GROUP BY 1", "Null"),
+        ("SELECT DISTINCT NULL", "Null"),
+        ("SELECT NULL LIMIT 1", "Null"),
+        ("SELECT COALESCE(NULL, NULL)", "Null"),
+        // A set operation materialises, so it does.
+        ("SELECT NULL UNION SELECT NULL", "String"),
+        ("SELECT NULL UNION ALL SELECT NULL", "String"),
+        ("SELECT NULL UNION SELECT NULL UNION SELECT NULL", "String"),
+        ("SELECT NULL INTERSECT SELECT NULL", "String"),
+        ("SELECT NULL EXCEPT SELECT NULL", "String"),
+        ("(SELECT NULL) UNION (SELECT NULL)", "String"),
+        ("SELECT NULL UNION SELECT NULL ORDER BY 1", "String"),
+        ("SELECT NULL UNION SELECT NULL LIMIT 1", "String"),
+        // Brackets round the whole statement change nothing on 8.3, at any
+        // depth and with the ORDER BY on either side of them. They do change
+        // the parse — a bracketed body is a `SetExpr::Query` — and matching
+        // only the bare variant left these typeless where the same statement
+        // written without brackets was `binary(0)`.
+        ("(SELECT NULL UNION SELECT NULL)", "String"),
+        ("((SELECT NULL UNION SELECT NULL))", "String"),
+        ("(SELECT NULL UNION SELECT NULL) ORDER BY 1", "String"),
+        ("(SELECT NULL UNION SELECT NULL LIMIT 1)", "String"),
+        // And brackets do not make a plain SELECT materialise either.
+        ("(SELECT NULL)", "Null"),
+        ("((SELECT NULL))", "Null"),
+        ("(SELECT NULL) ORDER BY 1", "Null"),
+        // A chain of them materialises *once*, over all its terms together.
+        // Doing it per merge made the first pair a `binary(0)` that then
+        // widened against the 1 into a string, and a binary client read "1"
+        // where MySQL sends the integer 1. Bracketing the pair does not
+        // change the answer on 8.3 either, so it is not associativity.
+        ("SELECT NULL UNION SELECT NULL UNION SELECT 1", "LongLong"),
+        ("(SELECT NULL UNION SELECT NULL) UNION SELECT 1", "LongLong"),
+        ("SELECT 1 UNION (SELECT NULL UNION SELECT NULL)", "LongLong"),
+        (
+            "(SELECT NULL UNION SELECT NULL LIMIT 1) UNION SELECT 1",
+            "LongLong",
+        ),
+        // A derived table, a CTE and a view are the other way a result is
+        // materialised, and MySQL types them the same way — with or without a
+        // set operation inside, which is what says the rule is the temporary
+        // table rather than the UNION.
+        ("SELECT * FROM (SELECT NULL) d", "String"),
+        ("SELECT * FROM (SELECT NULL UNION SELECT NULL) d", "String"),
+        ("WITH c AS (SELECT NULL) SELECT * FROM c", "String"),
+        (
+            "WITH c AS (SELECT NULL UNION SELECT NULL) SELECT * FROM c",
+            "String",
+        ),
+        ("SELECT * FROM VN", "String"),
+        ("SELECT * FROM VU", "String"),
+        // A table value constructor is the fourth relation-shaped thing, and
+        // it answers both halves of the rule at once: on its own it is
+        // typeless, and materialised it is `binary(0)`. It reaches neither
+        // conversion by the type it folds to — the fold sees only non-NULL
+        // values, so an all-NULL column is whatever the empty fold says, and
+        // saying VAR_STRING there put a `varchar(512)` in front of both.
+        ("VALUES ROW(NULL)", "Null"),
+        ("VALUES ROW(NULL), ROW(NULL)", "Null"),
+        ("SELECT * FROM (VALUES ROW(NULL)) v", "String"),
+        ("SELECT * FROM (VALUES ROW(NULL), ROW(NULL)) v", "String"),
+        ("VALUES ROW(NULL) UNION VALUES ROW(NULL)", "String"),
+        // One typed row still settles it, in a constructor as in a union.
+        ("VALUES ROW(NULL), ROW(1)", "LongLong"),
+        ("SELECT * FROM (VALUES ROW(NULL), ROW(1)) v", "LongLong"),
+        // A materialised branch beside an unmaterialised one keeps the
+        // materialised type, because the NULL branch still contributes none.
+        (
+            "SELECT * FROM (SELECT NULL UNION SELECT NULL) d UNION SELECT NULL",
+            "String",
+        ),
+    ] {
+        // Collected rather than asserted per statement, so a change that
+        // breaks one shape reports that shape and not merely the first one in
+        // the list. Proving a mutation bites means knowing *which* claim it
+        // broke, and stopping at the first mismatch hides every later one.
+        let (described, executed) = shapes(&mut session, sql);
+        if (described.as_str(), executed.as_str()) != (expected, expected) {
+            mismatches.push(format!(
+                "{sql}\n    expected {expected}, described {described}, executed {executed}"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "\n{}", mismatches.join("\n"));
+
+    // `binary(0)` and not merely "some string": the type code alone is shared
+    // with `CHAR`, and the charset is the difference between the two. MySQL
+    // reports exactly this for a view over either statement, which is the same
+    // answer `CREATE TABLE t AS SELECT NULL` writes into the table it creates.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME, DATA_TYPE, COLUMN_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE \
+             FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME IN ('VN', 'VU') \
+             ORDER BY TABLE_NAME"
+        ),
+        vec![
+            vec!["VN", "binary", "binary(0)", "0", "YES"],
+            vec!["VU", "binary", "binary(0)", "0", "YES"],
+        ]
+    );
+}
+
 #[test]
 fn a_null_branch_of_a_union_contributes_no_type() {
     // NULL is the absence of a type, not a competing one. Widening against it
@@ -7431,10 +7589,12 @@ fn a_null_branch_of_a_union_contributes_no_type() {
             "SELECT NULL UNION SELECT u FROM N",
             ("Long".to_owned(), false, true),
         ),
-        // Nothing on either side leaves nothing.
+        // Nothing on either side leaves nothing to widen — and then the
+        // materialising gives the column a type of its own, which is
+        // `an_all_null_column_takes_the_type_its_materialisation_gives_it`.
         (
             "SELECT NULL UNION SELECT NULL",
-            ("Null".to_owned(), false, false),
+            ("String".to_owned(), false, false),
         ),
         // Two real branches still widen, and two NOT NULL ones stay NOT NULL.
         (

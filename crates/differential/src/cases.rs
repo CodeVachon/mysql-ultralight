@@ -374,12 +374,13 @@ pub const GROUPS: &[Group] = &[
             // type at all, so whatever the other branch is has to survive it.
             same("SELECT nn FROM N UNION SELECT NULL ORDER BY 1"),
             same("SELECT dn FROM N UNION SELECT NULL ORDER BY 1"),
-            // `SELECT NULL UNION SELECT NULL` is deliberately absent. MySQL
-            // answers it two ways — `NULL` when the statement is prepared and
-            // `STRING` when it is run, because a materialised column cannot be
-            // the null type — so it cannot tell an engine bug from a MySQL
-            // inconsistency. The engine's answer is pinned by a unit test
-            // instead. #0073.
+            // `SELECT NULL UNION SELECT NULL` and its family live in the
+            // "a materialised null column" group below, which is where the
+            // measurement that made them askable is written down. This note
+            // used to say they were unaskable because MySQL answers the
+            // statement two ways; it answers the *result set* one way in both
+            // protocols, and the harness reads no other kind of metadata.
+            // #0073.
             // NULL on the left, which is the branch that has to *adopt* the
             // other side's type rather than keep its own.
             same("SELECT NULL UNION SELECT id FROM N ORDER BY 1"),
@@ -403,6 +404,96 @@ pub const GROUPS: &[Group] = &[
             same("SELECT id FROM A EXCEPT SELECT id FROM B ORDER BY id"),
             same("SELECT d.id FROM (SELECT id FROM A) d ORDER BY d.id"),
             same("WITH c AS (SELECT id FROM A) SELECT id FROM c ORDER BY id"),
+        ],
+    },
+    Group {
+        // A column that never holds anything but NULL has no type, and no
+        // temporary-table field can carry one — so materialising it gives it
+        // `binary(0)`. Which statements materialise is the whole question, and
+        // it is not the one the extra machinery suggests: sorting, grouping,
+        // de-duplicating and limiting all leave `MYSQL_TYPE_NULL` alone.
+        //
+        // What this group cannot ask, and #0073 records: MySQL's
+        // `COM_STMT_PREPARE` answers `MYSQL_TYPE_NULL` for the *outermost* set
+        // operation of a statement, because that temporary table is not built
+        // until it runs. The harness reads result-set metadata, which MySQL
+        // answers `binary(0)` in both protocols, so a case here compares the
+        // answer the two servers agree the question has — asking the other one
+        // would need the harness to read prepare metadata, which it does not.
+        name: "a materialised null column",
+        setup: &[
+            "CREATE VIEW VNull AS SELECT NULL AS c",
+            "CREATE VIEW VNullUnion AS SELECT NULL AS c UNION SELECT NULL",
+        ],
+        cases: &[
+            // Unmaterialised, and the reference point for everything below.
+            same("SELECT NULL"),
+            // Materialised by a set operation, whichever one and however many
+            // branches.
+            same("SELECT NULL UNION SELECT NULL"),
+            same("SELECT NULL UNION ALL SELECT NULL ORDER BY 1"),
+            same("SELECT NULL UNION SELECT NULL UNION SELECT NULL"),
+            same("SELECT NULL INTERSECT SELECT NULL"),
+            same("SELECT NULL EXCEPT SELECT NULL"),
+            same("(SELECT NULL) UNION (SELECT NULL)"),
+            same("SELECT NULL UNION SELECT NULL ORDER BY 1"),
+            same("SELECT NULL UNION SELECT NULL LIMIT 1"),
+            // Brackets round the whole statement change the parse and not the
+            // answer, at any depth and with the ORDER BY on either side.
+            same("(SELECT NULL UNION SELECT NULL)"),
+            same("((SELECT NULL UNION SELECT NULL))"),
+            same("(SELECT NULL UNION SELECT NULL) ORDER BY 1"),
+            same("(SELECT NULL UNION SELECT NULL LIMIT 1)"),
+            same("(SELECT NULL)"),
+            same("((SELECT NULL))"),
+            same("(SELECT NULL) ORDER BY 1"),
+            // One typed branch settles it, and a chain is materialised once
+            // over all its terms — so the NULL pair does not become a
+            // `binary(0)` that then widens against the integer. Bracketing
+            // the pair does not change it either, which is what says the rule
+            // is not associativity.
+            same("SELECT NULL UNION SELECT NULL UNION SELECT 1 ORDER BY 1"),
+            same("(SELECT NULL UNION SELECT NULL) UNION SELECT 1 ORDER BY 1"),
+            same("SELECT 1 UNION (SELECT NULL UNION SELECT NULL) ORDER BY 1"),
+            same("SELECT NULL UNION SELECT 1 UNION SELECT NULL ORDER BY 1"),
+            // Not materialised: the clause is not what does it.
+            same("SELECT NULL ORDER BY 1"),
+            same("SELECT NULL GROUP BY 1"),
+            same("SELECT DISTINCT NULL"),
+            same("SELECT NULL LIMIT 1"),
+            // The other way a result is materialised, with and without a set
+            // operation inside it.
+            same("SELECT * FROM (SELECT NULL) d"),
+            same("SELECT * FROM (SELECT NULL UNION SELECT NULL) d"),
+            same("WITH c AS (SELECT NULL) SELECT * FROM c"),
+            same("WITH c AS (SELECT NULL UNION SELECT NULL) SELECT * FROM c"),
+            same("SELECT * FROM VNull"),
+            same("SELECT * FROM VNullUnion"),
+            // A table value constructor answers both halves at once: typeless
+            // on its own, `binary(0)` once something materialises it.
+            same("VALUES ROW(NULL)"),
+            same("VALUES ROW(NULL), ROW(NULL)"),
+            same("SELECT * FROM (VALUES ROW(NULL)) v"),
+            same("SELECT * FROM (VALUES ROW(NULL), ROW(NULL)) v"),
+            same("VALUES ROW(NULL) UNION VALUES ROW(NULL)"),
+            same("VALUES ROW(NULL), ROW(1)"),
+            same("SELECT * FROM (VALUES ROW(NULL), ROW(1)) v"),
+            // A materialised branch beside an unmaterialised one keeps the
+            // materialised type, since the NULL branch still contributes none.
+            same("SELECT * FROM (SELECT NULL UNION SELECT NULL) d UNION SELECT NULL"),
+            // `binary(0)` and not merely "a string": the type code is shared
+            // with CHAR and the charset is the difference, so the spelling is
+            // asked for where a client can read it.
+            //
+            // `DATABASE()` rather than the name spelled out, because a group's
+            // database is named by the harness: a literal that stopped
+            // matching would select no rows on *both* servers, compare equal,
+            // and report a case that asked nothing as a case that agreed.
+            same(
+                "SELECT TABLE_NAME, DATA_TYPE, COLUMN_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE \
+                 FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() \
+                 AND TABLE_NAME IN ('VNull', 'VNullUnion') ORDER BY TABLE_NAME",
+            ),
         ],
     },
     Group {

@@ -183,6 +183,37 @@ impl SqlType {
         Ok(out)
     }
 
+    /// The type a column of pure NULLs takes on once it is materialised.
+    ///
+    /// `MYSQL_TYPE_NULL` is the absence of a type, and a temporary table has
+    /// no field that can hold one, so MySQL substitutes the narrowest thing
+    /// that can: `binary(0)`. That is not a guess — it is what
+    /// `CREATE TABLE t AS SELECT NULL` writes into the table it creates, and
+    /// `MYSQL_TYPE_STRING` with the binary charset and length 0 is the same
+    /// column on the wire.
+    ///
+    /// Reached from the two places this engine materialises a result: a set
+    /// operation answered at the `query` boundary, and a derived table, CTE,
+    /// view or table value constructor fed back in as a relation, which all
+    /// read their columns through `from_column_type`.
+    ///
+    /// Not every typeless column comes through one of those. A scalar subquery
+    /// is typed by `computed_column_type`, which has no arm for one and falls
+    /// to its string catch-all, so `SELECT (SELECT NULL UNION SELECT NULL)` is
+    /// VAR_STRING here against `binary(0)` on 8.3 — and `SELECT (SELECT NULL)`
+    /// VAR_STRING against `MYSQL_TYPE_NULL`. That is #0104, whose cause is the
+    /// missing arm rather than the materialising, and it is untouched here.
+    pub fn materialised_null() -> Self {
+        Self {
+            kind: TypeKind::Blob,
+            declared: "binary(0)".to_owned(),
+            length: Some(0),
+            scale: None,
+            unsigned: false,
+            variants: Vec::new(),
+        }
+    }
+
     /// Recovers a type from a wire type code.
     ///
     /// Used where a result set is fed back in as a relation, such as a view or
@@ -213,6 +244,13 @@ impl SqlType {
                 ..simple(TypeKind::Year, "year")
             },
             ColumnType::Json => simple(TypeKind::Json, "json"),
+            // Reached whenever a relation is built from a result set that had
+            // nothing but NULLs in a column — a derived table, a CTE, or a
+            // view. Without this arm it fell to the `varchar(512)` catch-all,
+            // and `SELECT * FROM (SELECT NULL) d` came back VAR_STRING where
+            // MySQL, having put the column in a temporary table, says
+            // `binary(0)`.
+            ColumnType::Null => Self::materialised_null(),
             ColumnType::Blob
             | ColumnType::LongBlob
             | ColumnType::MediumBlob

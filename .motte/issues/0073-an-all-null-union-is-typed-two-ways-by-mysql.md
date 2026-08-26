@@ -1,11 +1,11 @@
 ---
 id: 73
 title: An all-NULL union is typed two ways by MySQL
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-08-21T18:26:27Z
-updated: 2026-08-21T18:26:27Z
+updated: 2026-08-26T07:20:39Z
 ---
 
 ## Description

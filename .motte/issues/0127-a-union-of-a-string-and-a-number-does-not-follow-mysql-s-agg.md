@@ -1,0 +1,23 @@
+---
+id: 127
+title: A union of a string and a number does not follow MySQL's aggregate string rule
+state: Todo
+parent: 9
+labels: [compat]
+created: 2026-08-26T08:49:10Z
+updated: 2026-08-26T08:49:10Z
+---
+
+## Description
+
+Found while measuring for #0073, pre-existing and not caused by it.
+
+    SELECT * FROM (SELECT NULL UNION SELECT NULL) d UNION SELECT 1
+    mysql   MYSQL_TYPE_STRING, char(8), cs 45
+    engine  MYSQL_TYPE_VAR_STRING
+
+crates/engine's widen falls to VAR_STRING wherever a union mixes a string with something else, where MySQL keeps CHAR and computes a length from the widest branch -- here 8, the display width of a BIGINT.
+
+Related to #0065, which taught a union to keep a column's type when a branch is NULL, and to #0123, which is the same aggregation applied to a decimal's scale. This is the string half of the same rule.
+
+Not in the corpus. Note the length half cannot be proven by the harness until it compares column_length at all -- see the length issue filed alongside this one.
