@@ -387,7 +387,7 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
             }
             // Already-unquoted text is returned as it is, which is what makes
             // JSON_UNQUOTE(JSON_EXTRACT(...)) work whatever the extract found.
-            match serde_json::from_str::<serde_json::Value>(&text(0)) {
+            match json::document_of(&arg(0)) {
                 Ok(parsed) => json::unquote(&parsed),
                 Err(_) => arg(0),
             }
@@ -398,7 +398,10 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         "json_valid" => match arg(0) {
             Value::Null => Value::Null,
             other => {
-                let valid = serde_json::from_str::<serde_json::Value>(&other.as_text()).is_ok();
+                // Through the same parse a cast uses, so the answers agree:
+                // `1e2000` is 0 here and 3141 there, and both because a
+                // number a double cannot hold is not valid JSON text on 8.3.
+                let valid = json::document_of(&other).is_ok();
                 crate::expr::bool_value(valid)
             }
         },
@@ -465,6 +468,26 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
             if arg(0).is_null() {
                 return Ok(Value::Null);
             }
+            // DECIMAL is missing from this list, and cannot be added while a
+            // document is a rendering. MySQL has a third number type in the
+            // binary form it stores JSON in, and #0071 gave the engine the
+            // digits a decimal was written with — but the digits are not what
+            // separates the types. Measured on 8.3, its *own* rendering is
+            // byte-identical across the pairs it types differently:
+            //
+            //     DECIMAL(10,1) 2.5   ->  `2.5`  DECIMAL
+            //     CAST('2.5' AS JSON) ->  `2.5`  DOUBLE
+            //     DECIMAL(10,0) 2     ->  `2`    DECIMAL
+            //     CAST('2' AS JSON)   ->  `2`    INTEGER
+            //
+            // So `Number::as_str` carries the spelling and the spelling is
+            // not a function of the type. Answering DECIMAL for the decimals
+            // that *are* separable — the ones with a trailing zero past the
+            // shortest form, which no double spells — would make the answer
+            // depend on the column's scale rather than on its type, and 8.3
+            // says DECIMAL for both scales. Getting this right needs the type
+            // carried beside the text, which is a change to what a
+            // `Value::Json` is and to the image format that stores one.
             Value::text(match json::parse(&arg(0))? {
                 serde_json::Value::Null => "NULL",
                 serde_json::Value::Bool(_) => "BOOLEAN",
@@ -1299,6 +1322,20 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
         // predates this and is the same gap for `Int`.
         D::JSON => match &value {
             Value::Bool(b) => json::render(&serde_json::Value::Bool(*b)),
+            // An approximate number converts to the JSON number it *is*,
+            // rather than being read back from the text it displays as. Both
+            // halves of that were wrong. A decimal's text loses the scale —
+            // `CAST(d AS JSON)` over a DECIMAL(10,2) holding 2.50 is `2.50`
+            // on 8.3, and reading those digits back makes it the double they
+            // spell, MySQL's parser having no decimal in it. A FLOAT's text
+            // is the six significant digits the column *displays*, so a float
+            // holding 1.234567890123 came back `1.23457` where 8.3 answers
+            // `1.2345678806304932` — the widened double, and the same answer
+            // `JSON_ARRAY(f)` gives here. Two paths disagreeing about one
+            // value is worse than either being wrong. See #0071.
+            Value::Decimal(_) | Value::Float(_) | Value::Float32(_) => {
+                json::render(&json::from_value(&value))
+            }
             _ => json::render(&json::parse(&value)?),
         },
         D::Binary(_) | D::Varbinary(_) | D::Blob(_) => Value::Bytes(value.as_text().into_bytes()),
@@ -1366,6 +1403,12 @@ fn like_at(t: &[char], mut ti: usize, p: &[char], mut pi: usize, escape: Option<
 ///
 /// An object contains another when it has every one of its members; an array
 /// contains a value when some element does. Anything else is equality.
+///
+/// Equality as *JSON* rather than as two trees, which is not the same
+/// question for a number: `JSON_CONTAINS('[2.0]', '2')` is 1 on 8.3, and
+/// `2.50` from a DECIMAL column is contained by an array holding `2.5`.
+/// Comparing the parsed values instead made each spelling its own value —
+/// visibly so once a number began keeping the digits it was written with.
 fn json_contains(target: &serde_json::Value, candidate: &serde_json::Value) -> bool {
     use serde_json::Value as Json;
     match (target, candidate) {
@@ -1376,7 +1419,7 @@ fn json_contains(target: &serde_json::Value, candidate: &serde_json::Value) -> b
             .iter()
             .all(|v| a.iter().any(|found| json_contains(found, v))),
         (Json::Array(a), other) => a.iter().any(|found| json_contains(found, other)),
-        (a, b) => a == b,
+        (a, b) => json::compare(a, b) == Some(std::cmp::Ordering::Equal),
     }
 }
 

@@ -6913,6 +6913,338 @@ fn a_json_double_is_written_the_way_mysql_writes_one() {
 }
 
 #[test]
+fn a_decimal_in_a_document_keeps_its_scale() {
+    // The scale is the answer: a client reading a money column out of a
+    // document cares that 2.50 came back and not 2.5. Every row measured on
+    // 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE M (id INT NOT NULL, a DECIMAL(10,2) NULL, b DECIMAL(10,4) NULL, \
+                         c DECIMAL(10,0) NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO M VALUES (1, '2.50', '2.5000', '2'), (2, '-3.10', '-3.1000', '-3'), \
+                              (3, '0.00', '0.0000', '0')",
+    );
+
+    for (sql, expected) in [
+        // Every constructor, because each one builds the document its own way
+        // and only the first was ever looked at.
+        (
+            "SELECT JSON_OBJECT('a', a, 'b', b, 'c', c) FROM M WHERE id = 1",
+            r#"{"a": 2.50, "b": 2.5000, "c": 2}"#,
+        ),
+        (
+            "SELECT JSON_ARRAY(a, b, c) FROM M WHERE id = 2",
+            "[-3.10, -3.1000, -3]",
+        ),
+        // Zero is written to its scale like anything else — `0.00`, not `0`.
+        (
+            "SELECT JSON_ARRAY(a, b, c) FROM M WHERE id = 3",
+            "[0.00, 0.0000, 0]",
+        ),
+        // A cast converts to the JSON decimal rather than reading the text
+        // back, which is the difference between 2.50 and the double 2.5.
+        ("SELECT CAST(a AS JSON) FROM M WHERE id = 1", "2.50"),
+        (
+            "SELECT JSON_SET('{\"x\": 1}', '$.x', a) FROM M WHERE id = 1",
+            r#"{"x": 2.50}"#,
+        ),
+        (
+            "SELECT JSON_MERGE_PATCH(JSON_OBJECT('a', a), '{\"b\": 2}') FROM M WHERE id = 1",
+            r#"{"a": 2.50, "b": 2}"#,
+        ),
+        ("SELECT JSON_ARRAYAGG(a) FROM M", "[2.50, -3.10, 0.00]"),
+        // An aggregate's own decimal, not only a column's.
+        ("SELECT JSON_ARRAY(SUM(a)) FROM M", "[-0.60]"),
+        // Extraction gives back what was put in, both ways.
+        (
+            "SELECT JSON_EXTRACT(JSON_OBJECT('a', a), '$.a') FROM M WHERE id = 1",
+            "2.50",
+        ),
+        (
+            "SELECT JSON_UNQUOTE(JSON_EXTRACT(JSON_OBJECT('a', a), '$.a')) FROM M WHERE id = 1",
+            "2.50",
+        ),
+        // Source text is the other side of the boundary and has no decimal in
+        // it: MySQL's parser reads `2.50` as the double 2.5, `-0` as the
+        // integer 0, and `1E2` as `100.0`.
+        ("SELECT CAST('[2.50, -0, 1E2]' AS JSON)", "[2.5, 0, 100.0]"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // Through storage and back. A JSON column holds the document a
+    // constructor built, so the scale survives being written and read; the
+    // same digits written as *text* are the source-text parse and do not.
+    run(&engine, &mut session, "CREATE TABLE MJ (id INT, doc JSON)");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO MJ SELECT id, JSON_OBJECT('a', a) FROM M WHERE id = 1",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO MJ VALUES (9, '{\"a\": 2.50}')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT doc, doc->'$.a', doc->>'$.a' FROM MJ ORDER BY id"
+        ),
+        vec![
+            vec![r#"{"a": 2.50}"#, "2.50", "2.50"],
+            vec![r#"{"a": 2.5}"#, "2.5", "2.5"],
+        ]
+    );
+}
+
+#[test]
+fn a_document_s_numbers_compare_by_value_and_exactly() {
+    // Two questions in one, because the answers have to agree: `2.50`, `2.5`
+    // and `2` are one number, and two decimals a double cannot tell apart are
+    // two. Measured on 8.3 — it answers 1 for the first pair and 0 for the
+    // second, and counts two groups either way.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C (id INT NOT NULL, a DECIMAL(10,2) NULL, w DECIMAL(30,2) NULL, \
+                         PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO C VALUES (1, '2.50', '123456789012345678901.00'), \
+                              (2, '2.00', '123456789012345678902.00')",
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_ARRAY(a) = CAST('[2.5]' AS JSON), \
+                    JSON_ARRAY(a) = CAST('[2.50]' AS JSON) FROM C WHERE id = 1"
+        ),
+        vec![vec!["1", "1"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_ARRAY(a) = CAST('[2]' AS JSON) FROM C WHERE id = 2"
+        ),
+        vec![vec!["1"]]
+    );
+    // Past what a double can separate. Through one, these two documents were
+    // equal and DISTINCT kept one row.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT (SELECT JSON_ARRAY(w) FROM C WHERE id = 1) \
+                  = (SELECT JSON_ARRAY(w) FROM C WHERE id = 2)"
+        ),
+        vec![vec!["0"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(DISTINCT JSON_ARRAY(w)) FROM C"
+        ),
+        vec![vec!["2"]]
+    );
+    // And the key agrees with the comparison: one group for the spellings the
+    // comparison calls equal.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(DISTINCT CAST(v AS JSON)) FROM \
+             (SELECT '2.50' v UNION ALL SELECT '2.5' UNION ALL SELECT '2.500') x"
+        ),
+        vec![vec!["1"]]
+    );
+    // JSON_CONTAINS asks the same question and has to give the same answer:
+    // `[2.0]` contains `2` on 8.3.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_CONTAINS(JSON_OBJECT('a', a), '2.5', '$.a'), \
+                    JSON_CONTAINS('[2.0]', '2'), JSON_CONTAINS('[2]', '2.0') \
+             FROM C WHERE id = 1"
+        ),
+        vec![vec!["1", "1", "1"]]
+    );
+}
+
+#[test]
+fn the_number_sentinel_key_is_an_ordinary_key() {
+    // `$serde_json::private::Number` is how serde_json passes a number it is
+    // holding as text through a visitor, and its own reader turns any object
+    // with that key back into a number. MySQL has never heard of it: measured
+    // on 8.3, every one of these is an object, `JSON_VALID` is 1 for all
+    // three spellings, and the key comes back out of an extract.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE S (id INT NOT NULL, doc JSON NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO S VALUES \
+         (1, '{\"$serde_json::private::Number\": \"1\"}'), \
+         (2, '{\"$serde_json::private::Number\": 1}'), \
+         (3, '{\"$serde_json::private::Number\": \"abc\"}'), \
+         (5, '{\"$serde_json::private::Number\": \"1\", \"b\": 2}'), \
+         (6, '{\"b\": 2, \"$serde_json::private::Number\": \"1\"}'), \
+         (7, '[2.50, {\"$serde_json::private::Number\": \"1\"}]')",
+    );
+    // Built by this engine's own constructor, not only written as text. This
+    // is the one that used to fail 3140 against the engine's own rendering.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO S VALUES (4, JSON_OBJECT('$serde_json::private::Number', 1))",
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, doc, JSON_TYPE(doc), JSON_LENGTH(doc) FROM S ORDER BY id"
+        ),
+        vec![
+            vec![
+                "1",
+                r#"{"$serde_json::private::Number": "1"}"#,
+                "OBJECT",
+                "1"
+            ],
+            vec!["2", r#"{"$serde_json::private::Number": 1}"#, "OBJECT", "1"],
+            vec![
+                "3",
+                r#"{"$serde_json::private::Number": "abc"}"#,
+                "OBJECT",
+                "1"
+            ],
+            vec!["4", r#"{"$serde_json::private::Number": 1}"#, "OBJECT", "1"],
+            vec![
+                "5",
+                r#"{"b": 2, "$serde_json::private::Number": "1"}"#,
+                "OBJECT",
+                "2"
+            ],
+            vec![
+                "6",
+                r#"{"b": 2, "$serde_json::private::Number": "1"}"#,
+                "OBJECT",
+                "2"
+            ],
+            // The array is the pair that matters most: one document holding
+            // both a real number and that key, which have to come out as two
+            // different things.
+            vec![
+                "7",
+                r#"[2.5, {"$serde_json::private::Number": "1"}]"#,
+                "ARRAY",
+                "2"
+            ],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_VALID('{\"$serde_json::private::Number\": \"1\"}'), \
+                    JSON_VALID('{\"$serde_json::private::Number\": 1}'), \
+                    JSON_VALID('{\"$serde_json::private::Number\": \"abc\"}')"
+        ),
+        vec![vec!["1", "1", "1"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_EXTRACT(doc, '$.\"$serde_json::private::Number\"') FROM S WHERE id = 1"
+        ),
+        vec![vec![r#""1""#]]
+    );
+}
+
+#[test]
+fn a_cast_to_json_converts_an_approximate_number_rather_than_reading_its_text() {
+    // A FLOAT displays six significant digits, so reading a cast back from
+    // the column's own text gave `1.23457` where 8.3 answers the widened
+    // double. Both routes into a document have to agree, and only one of
+    // them was MySQL's. Measured on 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE F (f FLOAT NULL, d DOUBLE NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO F VALUES (1.234567890123, 1.234567890123), (16777217, 16777217)",
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(f AS JSON), JSON_ARRAY(f), CAST(d AS JSON), JSON_ARRAY(d) \
+             FROM F ORDER BY f"
+        ),
+        vec![
+            vec![
+                "1.2345678806304932",
+                "[1.2345678806304932]",
+                "1.234567890123",
+                "[1.234567890123]"
+            ],
+            vec!["16777216.0", "[16777216.0]", "16777217.0", "[16777217.0]"],
+        ]
+    );
+}
+
+#[test]
+fn a_number_too_big_for_a_double_is_not_valid_json_text() {
+    // serde used to refuse this on its own, reading the literal into an f64
+    // and failing on the infinity. Holding a number as its digits means
+    // nothing objects any more, so the parse has to — and 8.3 does: `1e2000`
+    // is 3141 there and JSON_VALID answers 0.
+    let (engine, mut session) = engine();
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_VALID('1e2000'), JSON_VALID('[1e2000]'), JSON_VALID('1e308')"
+        ),
+        vec![vec!["0", "0", "1"]]
+    );
+    let sql = "SELECT CAST('1e2000' AS JSON)";
+    let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+    assert_eq!(err.code, 3141, "expected invalid JSON text for: {sql}");
+}
+
+#[test]
 fn a_null_branch_of_a_union_contributes_no_type() {
     // NULL is the absence of a type, not a competing one. Widening against it
     // fell through to the string fallback, so `SELECT id FROM N UNION SELECT

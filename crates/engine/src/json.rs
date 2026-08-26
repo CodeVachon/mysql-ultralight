@@ -10,10 +10,14 @@
 //! rather than a silent miss, because a path that quietly matches nothing looks
 //! exactly like a column that is legitimately absent.
 
-use serde_json::Value as Json;
+use serde_json::{Number, Value as Json};
 
 use crate::error::{EngineError, EngineResult};
 use crate::value::Value;
+
+/// MySQL's own words for a number a double cannot hold, which is the one
+/// parse failure serde no longer raises for us — see [`normalise`].
+const TOO_BIG: &str = "Number too big to be stored in double.";
 
 /// One step of a JSON path.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,14 +172,333 @@ pub fn parse(value: &Value) -> EngineResult<Json> {
     if value.is_null() {
         return Ok(Json::Null);
     }
-    let text = value.as_text();
-    serde_json::from_str(&text).map_err(|e| {
+    document_of(value).map_err(|e| {
         EngineError::new(
             3141,
             "22032",
             format!("Invalid JSON text: \"{e}\" in argument to a JSON function"),
         )
     })
+}
+
+/// The document a value holds, from whichever side of the boundary it came.
+///
+/// The two sides are not the same parse, and the difference is the whole of
+/// #0071. MySQL's JSON parser has no decimal in it: source text `2.50` is the
+/// double 2.5 and `JSON_TYPE` calls it DOUBLE. The same digits arriving from a
+/// `DECIMAL` column are a decimal, keep their scale, and are written back as
+/// `2.50`. So text is normalised on the way in and a document already tagged
+/// as one is taken exactly as written — which is what carries the scale across
+/// the text this engine stores a document as.
+///
+/// `Err` carries the parser's own message, for the caller to place in whatever
+/// wording its error code wants.
+pub fn document_of(value: &Value) -> Result<Json, String> {
+    match value {
+        Value::Json(text) => parse_document(text),
+        other => parse_source(&other.as_text()),
+    }
+}
+
+/// Parses source text into a document, reading each number as MySQL reads one.
+///
+/// Not public: every caller outside this module is on one side of the
+/// boundary or the other and wants [`document_of`] to pick for it.
+fn parse_source(text: &str) -> Result<Json, String> {
+    let mut parsed = read(text)?;
+    normalise(&mut parsed)?;
+    Ok(parsed)
+}
+
+/// Parses this engine's own rendering of a document back into one.
+///
+/// Verbatim, because every number in it was already spelled the way MySQL
+/// spells one before it was written out.
+pub fn parse_document(text: &str) -> Result<Json, String> {
+    read(text)
+}
+
+/// The one place JSON text becomes a tree.
+///
+/// Through [`Document`] rather than `serde_json::Value`, because with
+/// `arbitrary_precision` on, serde_json's own reader treats one object key as
+/// a private protocol — see there.
+fn read(text: &str) -> Result<Json, String> {
+    serde_json::from_str::<Document>(text)
+        .map(|Document(json)| json)
+        .map_err(|e| e.to_string())
+}
+
+/// The key serde_json reserves for a number it is holding as text.
+///
+/// Not a key to MySQL, which stores it like any other — measured on 8.3, all
+/// four of `{"$serde_json::private::Number": "1"}`, `: 1`, `: "abc"` and
+/// `JSON_OBJECT('$serde_json::private::Number', 1)` are objects of length one.
+const NUMBER_TOKEN: &str = "$serde_json::private::Number";
+
+/// A document read without serde_json's number sentinel getting in the way.
+///
+/// With `arbitrary_precision` on, serde_json passes a number it is holding as
+/// text through the visitor as a one-member map keyed by [`NUMBER_TOKEN`], and
+/// its own `Value` reader turns any map with that key back into a number. So
+/// a document that legitimately *has* that key stopped being itself: the text
+/// `{"$serde_json::private::Number": "1"}` became the number 1, `: 1` and
+/// `: "abc"` became parse errors, and a row holding one — which this engine's
+/// own `JSON_OBJECT` can build — failed the whole state image on reload.
+///
+/// The two are distinguishable, and by something firmer than a guess about
+/// the text. serde_json hands a real JSON string to the visitor *borrowed from
+/// the input*, or from its unescaping scratch buffer; it hands a number's
+/// digits over as an owned `String`, because they come from the `String` it
+/// parked them in. So `visit_string` means "serde's own number" and
+/// `visit_str` means "a member whose value is a string" — see [`Sentinel`],
+/// and the test that pins both directions so a change in either fails loudly
+/// rather than quietly.
+struct Document(Json);
+
+/// What followed [`NUMBER_TOKEN`]: serde's parked digits, or a real member's
+/// value.
+enum Sentinel {
+    /// Owned, so serde_json parked it — this map is a number.
+    Digits(String),
+    /// Anything else, so the key is a key and this is its value.
+    Member(Json),
+}
+
+struct DocumentVisitor;
+
+impl<'de> serde::de::Visitor<'de> for DocumentVisitor {
+    type Value = Document;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<Document, E> {
+        Ok(Document(Json::Bool(v)))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Document, E> {
+        Ok(Document(Json::from(v)))
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Document, E> {
+        Ok(Document(Json::from(v)))
+    }
+
+    // Both spellings of a string reach here — serde's default `visit_borrowed_str`
+    // forwards to this one — and `visit_string` below has to say the same
+    // thing, because a *string* is a string however it was delivered. Only
+    // [`Sentinel`] reads anything into the difference.
+    fn visit_str<E>(self, v: &str) -> Result<Document, E> {
+        Ok(Document(Json::String(v.to_owned())))
+    }
+
+    fn visit_string<E>(self, v: String) -> Result<Document, E> {
+        Ok(Document(Json::String(v)))
+    }
+
+    fn visit_unit<E>(self) -> Result<Document, E> {
+        Ok(Document(Json::Null))
+    }
+
+    fn visit_seq<A>(self, mut items: A) -> Result<Document, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut array = Vec::new();
+        while let Some(Document(item)) = items.next_element()? {
+            array.push(item);
+        }
+        Ok(Document(Json::Array(array)))
+    }
+
+    fn visit_map<A>(self, mut members: A) -> Result<Document, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let Some(key) = members.next_key::<String>()? else {
+            return Ok(Document(Json::Object(serde_json::Map::new())));
+        };
+        // Only the *first* key can be serde's, because that is the only shape
+        // it produces; a token further along is a key like any other and the
+        // loop below takes it.
+        let first = if key == NUMBER_TOKEN {
+            match members.next_value::<Sentinel>()? {
+                Sentinel::Digits(digits) => {
+                    let number = digits.parse::<Number>().map_err(serde::de::Error::custom)?;
+                    return Ok(Document(Json::Number(number)));
+                }
+                Sentinel::Member(value) => value,
+            }
+        } else {
+            members.next_value::<Document>()?.0
+        };
+
+        let mut object = serde_json::Map::new();
+        object.insert(key, first);
+        // A repeated key keeps the last value, which is serde_json's own rule
+        // and 8.3's: `CAST('{"a":1,"a":2}' AS JSON)` is `{"a": 2}` there.
+        while let Some((key, Document(value))) = members.next_entry::<String, Document>()? {
+            object.insert(key, value);
+        }
+        Ok(Document(Json::Object(object)))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Document {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(DocumentVisitor)
+    }
+}
+
+struct SentinelVisitor;
+
+impl<'de> serde::de::Visitor<'de> for SentinelVisitor {
+    type Value = Sentinel;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    /// Borrowed from the input or unescaped into serde's scratch buffer:
+    /// either way it is a string that was written in the document.
+    fn visit_str<E>(self, v: &str) -> Result<Sentinel, E> {
+        Ok(Sentinel::Member(Json::String(v.to_owned())))
+    }
+
+    /// Owned, which the JSON reader never produces for a string it read —
+    /// this is serde_json handing back the digits it parked.
+    fn visit_string<E>(self, v: String) -> Result<Sentinel, E> {
+        Ok(Sentinel::Digits(v))
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<Sentinel, E> {
+        Ok(Sentinel::Member(Json::Bool(v)))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Sentinel, E> {
+        Ok(Sentinel::Member(Json::from(v)))
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Sentinel, E> {
+        Ok(Sentinel::Member(Json::from(v)))
+    }
+
+    fn visit_unit<E>(self) -> Result<Sentinel, E> {
+        Ok(Sentinel::Member(Json::Null))
+    }
+
+    fn visit_seq<A>(self, items: A) -> Result<Sentinel, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        DocumentVisitor
+            .visit_seq(items)
+            .map(|Document(json)| Sentinel::Member(json))
+    }
+
+    fn visit_map<A>(self, members: A) -> Result<Sentinel, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        DocumentVisitor
+            .visit_map(members)
+            .map(|Document(json)| Sentinel::Member(json))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Sentinel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(SentinelVisitor)
+    }
+}
+
+/// Rewrites every number of a freshly parsed document the way MySQL's parser
+/// reads one.
+///
+/// With `arbitrary_precision` a `Number` holds the text it was written as, so
+/// without this a parsed `2.50` would print itself straight back and be
+/// indistinguishable from the decimal `2.50` that has to. Measured on 8.3:
+/// `CAST('2.50' AS JSON)` is `2.5` and DOUBLE, `CAST('-0' AS JSON)` is the
+/// integer `0`, and `CAST('18446744073709551616' AS JSON)` — past what an
+/// integer holds — is the double `1.8446744073709552e19`.
+///
+/// It is also where a number too big for a double is refused. Without the
+/// feature serde did that itself, reading the literal into an f64 and failing
+/// on the infinity; with it the digits are kept and nothing objects, so
+/// `1e2000` would have become a valid document here and is 3141 on 8.3.
+fn normalise(json: &mut Json) -> Result<(), String> {
+    match json {
+        Json::Number(n) => *n = as_parsed(n)?,
+        Json::Array(items) => {
+            for item in items {
+                normalise(item)?;
+            }
+        }
+        Json::Object(members) => {
+            for member in members.values_mut() {
+                normalise(member)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn as_parsed(n: &Number) -> Result<Number, String> {
+    // An integer literal that fits an integer stays one, as written — and
+    // `-0` reaches `0` through the i64, which is the answer 8.3 gives.
+    if !n.as_str().contains(['.', 'e', 'E']) {
+        if let Some(i) = n.as_i64() {
+            return Ok(i.into());
+        }
+        if let Some(u) = n.as_u64() {
+            return Ok(u.into());
+        }
+    }
+    // Everything else is a double, spelled by [`double`] rather than kept as
+    // it was typed: `1E2` is `100.0` on 8.3 and not `1E2`.
+    //
+    // Through serde's own reading of the digits and *not* `Number::as_f64`,
+    // which is Rust's. The two do not always land on the same double, and the
+    // one that matches MySQL is serde's: both it and the rapidjson MySQL
+    // parses JSON with take the fast, approximate path by default, so
+    // `1000000000000000.5` is the double below on both and the one above in
+    // Rust. Measured on 8.3 — it answers 1000000000000000.4, and reading that
+    // literal exactly would answer .5. Where the two parsers *do* differ is
+    // #0072, which this leaves exactly where it was.
+    //
+    // Reading it that way is also the refusal: serde answers "number out of
+    // range" rather than an infinity, which is the check `normalise` promises
+    // and 8.3's own answer to `1e2000`.
+    let value: f64 = serde_json::from_str(n.as_str()).map_err(|_| TOO_BIG.to_owned())?;
+    double_number(value).ok_or_else(|| TOO_BIG.to_owned())
+}
+
+/// A double as a JSON number, spelled the way MySQL spells one.
+///
+/// `None` for a value JSON has no number for, which is what [`double`] writes
+/// as `null` and no `Number` parses.
+fn double_number(value: f64) -> Option<Number> {
+    double(value).parse().ok()
+}
+
+/// A number as it is written out, which is how it is held but for one thing.
+///
+/// serde canonicalises an exponent's sign on the way in — `1e15` and `1E2` are
+/// held as `1e+15` and `1e+2`, whichever way they were typed — and MySQL
+/// writes no sign there. Everything else about the text survives, the mantissa
+/// and a decimal's trailing zeros included, so this is the whole of the
+/// difference between what is held and what goes out.
+fn written(n: &Number) -> String {
+    let text = n.as_str();
+    // Only the exponent marker can carry a `+` in a JSON number, so the first
+    // one is the one.
+    match text.split_once("e+") {
+        Some((mantissa, exponent)) => format!("{mantissa}e{exponent}"),
+        None => text.to_owned(),
+    }
 }
 
 /// Renders JSON back into the engine's representation, tagged as a document.
@@ -203,10 +526,12 @@ pub fn render(json: &Json) -> Value {
 /// Strings are delegated to serde_json, whose escaping matches MySQL's —
 /// checked against it, including `/`, `"` and `\`.
 ///
-/// A double is *not* delegated — serde writes an exponent as `1e+30` where
-/// MySQL writes `1e30`, and switches to exponent form earlier — so it goes
-/// through [`double`] below, which follows MySQL's own rule. An integer is
-/// delegated, because there is nothing to choose.
+/// A number is written exactly as the document holds it. Every number in one
+/// is spelled before it gets here — a parsed one by [`normalise`], a built one
+/// by [`from_value`] — so that a decimal's trailing zeros survive to be
+/// written and a double is already in MySQL's spelling rather than serde's,
+/// which writes an exponent as `1e+30` where MySQL writes `1e30` and switches
+/// to exponent form earlier.
 pub fn render_text(json: &Json) -> String {
     let mut out = String::new();
     write_json(&mut out, json);
@@ -238,11 +563,9 @@ fn write_json(out: &mut String, json: &Json) {
             }
             out.push('}');
         }
-        // A double is written by MySQL's rule rather than serde's, which
-        // differ on both the threshold and the sign.
-        Json::Number(n) if n.as_f64().is_some() && n.as_i64().is_none() && n.as_u64().is_none() => {
-            out.push_str(&double(n.as_f64().unwrap_or(f64::NAN)));
-        }
+        // As held. Re-spelling it here would undo the two things the holding
+        // is for: a decimal's scale, and a double already put in MySQL's form.
+        Json::Number(n) => out.push_str(&written(n)),
         scalar => out.push_str(&scalar.to_string()),
     }
 }
@@ -348,17 +671,19 @@ pub fn compare(left: &Json, right: &Json) -> Option<std::cmp::Ordering> {
     Some(match (left, right) {
         (Json::Null, Json::Null) => Ordering::Equal,
         (Json::Bool(a), Json::Bool(b)) => a.cmp(b),
-        // Numerically, so `1` equals `1.0`. Exactly where both sides are
-        // integers, because f64 cannot tell 9007199254740992 from the number
-        // after it — sending both through it made two distinct documents
-        // compare equal, which loses a DISTINCT row and rejects a legitimate
-        // insert into a unique column.
+        // Numerically, so `1` equals `1.0` and the decimal `2.50` equals the
+        // double `2.5` — and exactly, over the digits, because f64 cannot tell
+        // 9007199254740992 from the number after it, nor two `DECIMAL(30,2)`s
+        // apart at their twentieth digit. Sending those through one made two
+        // distinct documents compare equal, which loses a DISTINCT row and
+        // rejects a legitimate insert into a unique column. Measured: 8.3
+        // answers 0 for both pairs, and 0 for `1e30` against
+        // 1000000000000000000000000000001.
         (Json::Number(a), Json::Number(b)) => {
-            if let (Some(x), Some(y)) = (a.as_i64(), b.as_i64()) {
-                return Some(x.cmp(&y));
-            }
-            if let (Some(x), Some(y)) = (a.as_u64(), b.as_u64()) {
-                return Some(x.cmp(&y));
+            if let (Some(x), Some(y)) = (exact(a), exact(b)) {
+                if let Some(order) = crate::decimal::compare(&x, &y) {
+                    return Some(order);
+                }
             }
             return a.as_f64()?.partial_cmp(&b.as_f64()?);
         }
@@ -417,27 +742,38 @@ pub fn comparison_key(json: &Json) -> String {
     out
 }
 
+/// A number's digits with any exponent written out, which is the form both the
+/// exact comparison and the key work in.
+///
+/// A double is read through the shortest digits that spell it rather than
+/// through the value it actually holds — measured, 8.3 calls the JSON `0.1`
+/// equal to the decimal `0.1` and *not* to 0.100000000000000005551115123126,
+/// which is what the double really is.
+///
+/// `None` for a number no decimal can hold, which is a magnitude no double
+/// reaches and so nothing a document can contain.
+fn exact(n: &Number) -> Option<String> {
+    let text = n.as_str();
+    if text.contains(['e', 'E']) {
+        crate::decimal::expanded(text)
+    } else {
+        Some(text.to_owned())
+    }
+}
+
 /// A number written so that exactly the numbers [`compare`] calls equal share
 /// a spelling.
 ///
-/// Whole numbers key as integers however they were written, so `1` and `1.0`
-/// meet and `-0.0` meets `0` — and a big integer keys as itself rather than as
-/// the f64 it does not fit in.
-fn number_key(n: &serde_json::Number) -> String {
-    if let Some(i) = n.as_i64() {
-        return i.to_string();
+/// By value, over the digits: `2.50`, `2.5` and `2.500` are one number and one
+/// key, `1.0` meets `1`, `-0.0` meets `0`, and a big integer keys as itself
+/// rather than as the f64 it does not fit in. The same [`crate::decimal`]
+/// shortening a DECIMAL column keys under, so a document's number and a
+/// column's group the same way.
+fn number_key(n: &Number) -> String {
+    if let Some(key) = exact(n).and_then(|text| crate::decimal::shortest(&text)) {
+        return key;
     }
-    if let Some(u) = n.as_u64() {
-        return u.to_string();
-    }
-    let f = n.as_f64().unwrap_or(f64::NAN);
-    // A whole double keys as the integer it is, which is what makes `1.0` meet
-    // `1` — and folds `-0.0` into `0`, where printing the double would have
-    // split a value the comparison calls equal.
-    if f.fract() == 0.0 && f.abs() < i64::MAX as f64 {
-        return (f as i64).to_string();
-    }
-    format!("{f:?}")
+    format!("{:?}", n.as_f64().unwrap_or(f64::NAN))
 }
 
 fn write_comparison_key(out: &mut String, json: &Json) {
@@ -500,13 +836,14 @@ pub fn from_value(value: &Value) -> Json {
         // `JSON_ARRAY(bu)` over 18446744073709551615 is `[18446744073709551615]`
         // on 8.3.
         Value::Unsigned(n) => Json::from(*n),
-        Value::Float(f) => serde_json::Number::from_f64(*f).map_or(Json::Null, Json::Number),
+        // Spelled here rather than at the end, because a document holds every
+        // number as the text it will be written as. `Number::from_f64` would
+        // have stored serde's spelling, which is not MySQL's.
+        Value::Float(f) => double_number(*f).map_or(Json::Null, Json::Number),
         // Widened, not through the six digits a FLOAT column displays:
         // MySQL's JSON number is a double, and `JSON_OBJECT('a', f)` over a
         // float holding 1.234567890123 gives `{"a": 1.2345678806304932}`.
-        Value::Float32(f) => {
-            serde_json::Number::from_f64(f64::from(*f)).map_or(Json::Null, Json::Number)
-        }
+        Value::Float32(f) => double_number(f64::from(*f)).map_or(Json::Null, Json::Number),
         Value::Text(s) => Json::String(s.clone()),
         // A string, like the text it renders as: MySQL gives
         // `JSON_OBJECT('a', d)` the value `"2024-01-05"` and not the packed
@@ -524,20 +861,22 @@ pub fn from_value(value: &Value) -> Json {
         // `[true]` there, not `[1]`.
         Value::Bool(b) => Json::Bool(*b),
         Value::Bytes(b) => Json::String(String::from_utf8_lossy(b).into_owned()),
-        // A number rather than a string: `JSON_OBJECT('a', decimal_column)`
-        // gives `{"a": 2.5}` and not `{"a": "2.50"}`. The scale is lost on the
-        // way through, because `serde_json` is built without
-        // `arbitrary_precision` and reads every number into an f64 — MySQL
-        // keeps it and answers `{"a": 2.50}`. See #0071.
+        // A number rather than a string — `JSON_OBJECT('a', decimal_column)`
+        // gives `{"a": 2.50}` and not `{"a": "2.50"}` — and the *same* digits,
+        // scale included. This is the one place the `arbitrary_precision`
+        // feature is paying for itself: parsed into a `Number` there, the text
+        // is what the number is, so the trailing zero the column's scale
+        // exists to carry survives being embedded, stored, reloaded and
+        // written back out.
         Value::Decimal(s) => s
-            .parse::<serde_json::Number>()
+            .parse::<Number>()
             .map_or_else(|_| Json::String(s.clone()), Json::Number),
         // Every route to a tagged value validates it first — a constructor
         // serialised it from a `Json`, a column coerced it, an image checked
         // it on load — so this parses what one of those wrote. The fallback is
         // unreachable rather than lenient; a JSON null beats re-encoding the
         // source text as a string, which is the double-encoding this removes.
-        Value::Json(s) => serde_json::from_str(s).unwrap_or(Json::Null),
+        Value::Json(s) => parse_document(s).unwrap_or(Json::Null),
     }
 }
 
@@ -649,5 +988,96 @@ pub fn merge_patch(target: &Json, patch: &Json) -> Json {
             Json::Object(merged)
         }
         other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The signal [`Document`] reads the sentinel key by, pinned from both
+    /// sides.
+    ///
+    /// It is a property of serde rather than of this code: the JSON reader
+    /// hands a string to a visitor borrowed from the input, or from its
+    /// unescaping scratch buffer, and hands a number it is holding as text
+    /// over *owned*, because that comes out of the `String` the parser parked
+    /// it in. Both directions are asserted, so a serde that stopped borrowing
+    /// — or one that started handing numbers over borrowed — fails here
+    /// rather than quietly turning one legal document into another.
+    #[test]
+    fn serde_still_tells_a_parked_number_from_a_member() {
+        use serde::de::{Deserialize, IntoDeserializer};
+
+        // The owned side, which is how a parked number arrives.
+        let parked: serde::de::value::StringDeserializer<serde::de::value::Error> =
+            String::from("2.50").into_deserializer();
+        let owned = Sentinel::deserialize(parked).expect("a parked number deserialises");
+        assert!(
+            matches!(&owned, Sentinel::Digits(digits) if digits == "2.50"),
+            "an owned string is serde_json's parked number"
+        );
+
+        // And the borrowed side, through the JSON reader itself, which is
+        // what actually decides: the same digits written as a member's value
+        // stay a member, and the number spelled the same way stays a number.
+        assert_eq!(
+            render_text(&read(r#"{"$serde_json::private::Number": "2.50"}"#).unwrap()),
+            r#"{"$serde_json::private::Number": "2.50"}"#
+        );
+        assert_eq!(render_text(&read("2.50").unwrap()), "2.50");
+    }
+
+    /// Every shape of the sentinel key. Measured on 8.3, which stores it like
+    /// any other key: all of these are objects, and the two-member ones have
+    /// length two.
+    #[test]
+    fn the_sentinel_key_is_a_key() {
+        for (text, expected) in [
+            (
+                r#"{"$serde_json::private::Number": "1"}"#,
+                r#"{"$serde_json::private::Number": "1"}"#,
+            ),
+            (
+                r#"{"$serde_json::private::Number": 1}"#,
+                r#"{"$serde_json::private::Number": 1}"#,
+            ),
+            (
+                r#"{"$serde_json::private::Number": "abc"}"#,
+                r#"{"$serde_json::private::Number": "abc"}"#,
+            ),
+            // The value written with an escape, so it reaches the visitor
+            // through serde's scratch buffer rather than borrowed. That is a
+            // third delivery and it must land on the same side as borrowed.
+            (
+                r#"{"$serde_json::private::Number": "\u0031"}"#,
+                r#"{"$serde_json::private::Number": "1"}"#,
+            ),
+            // And the *key* written with an escape, which decodes to the same
+            // key and so cannot be caught by looking at the source text.
+            (
+                r#"{"\u0024serde_json::private::Number": "1"}"#,
+                r#"{"$serde_json::private::Number": "1"}"#,
+            ),
+            // Beside another member, in both orders: only a first key can
+            // ever be serde's, so the second order takes the other path.
+            (
+                r#"{"$serde_json::private::Number": "1", "b": 2}"#,
+                r#"{"b": 2, "$serde_json::private::Number": "1"}"#,
+            ),
+            (
+                r#"{"b": 2, "$serde_json::private::Number": "1"}"#,
+                r#"{"b": 2, "$serde_json::private::Number": "1"}"#,
+            ),
+            // Nested beside a real number, which is the pair that has to come
+            // out of one document as two different things.
+            (
+                r#"[2.50, {"$serde_json::private::Number": "1"}]"#,
+                r#"[2.5, {"$serde_json::private::Number": "1"}]"#,
+            ),
+        ] {
+            let parsed = parse_source(text).unwrap_or_else(|e| panic!("{text}\n  -> {e}"));
+            assert_eq!(render_text(&parsed), expected, "{text}");
+        }
     }
 }

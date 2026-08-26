@@ -1,11 +1,11 @@
 ---
 id: 71
 title: A decimal embedded in JSON loses its scale
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-08-21T16:09:17Z
-updated: 2026-08-21T16:09:17Z
+updated: 2026-08-26T00:53:01Z
 ---
 
 ## Description

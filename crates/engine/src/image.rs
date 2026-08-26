@@ -544,7 +544,7 @@ fn read_value(r: &mut Reader<'_>) -> EngineResult<Value> {
             // and comparison, which is a wrong answer where the rest of the
             // engine raises 3140 or 3141.
             let text = r.str()?;
-            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
+            let Ok(parsed) = crate::json::parse_document(&text) else {
                 return Err(malformed(format!(
                     "value is tagged JSON but is not: {text:?}"
                 )));

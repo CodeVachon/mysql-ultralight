@@ -970,3 +970,88 @@ fn an_unsigned_column_survives_at_its_full_width_and_stays_unsigned() {
         .unwrap_err();
     assert_eq!(err.code, 1690, "{}", err.message);
 }
+
+#[test]
+fn a_reloaded_document_keeps_a_decimal_s_scale() {
+    // A document is stored as its text and re-read on load, so the reload is
+    // one more place the scale can be dropped — and it is not the same parse
+    // as reading a *string* into a JSON column: this text is already a
+    // document, and its `2.50` is the decimal it was built from rather than
+    // the double the same digits would spell arriving from outside.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE D (id INT NOT NULL, amount DECIMAL(10,2) NOT NULL, doc JSON NOT NULL, \
+                         PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO D (id, amount, doc) VALUES (1, '2.50', '{}')",
+    );
+    run(
+        &engine,
+        &mut session,
+        "UPDATE D SET doc = JSON_OBJECT('a', amount) WHERE id = 1",
+    );
+
+    let sql = "SELECT doc, doc->'$.a' FROM D";
+    let before = rows(&engine, &mut session, sql);
+    // Stated rather than only compared, so a reload that dropped the scale on
+    // both sides could not pass by agreeing with itself.
+    assert_eq!(before, vec![vec![r#"{"a": 2.50}"#, "2.50"]]);
+
+    let encoded = image::encode(&engine.catalog_snapshot().unwrap());
+    let decoded = image::decode(&encoded).unwrap();
+    let restored = Engine::from_catalog(decoded, ServerConfig::default()).unwrap();
+    let mut session = Session::new(ServerConfig::default(), 1);
+    session.current_database = Some("testdb".to_owned());
+    assert_eq!(rows(&restored, &mut session, sql), before);
+}
+
+#[test]
+fn a_document_holding_serde_s_number_key_still_reloads() {
+    // The worst shape this can take. A `Value::Json` is re-read on load, and
+    // a row that fails to parse there is not one bad row — `decode` refuses
+    // the whole image, so a single legal document would cost the entire
+    // saved state. `$serde_json::private::Number` is a key like any other on
+    // 8.3, and this engine's own JSON_OBJECT can build one.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE K (id INT NOT NULL, doc JSON NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO K VALUES (1, '{\"$serde_json::private::Number\": \"1\"}'), \
+                              (2, '{\"$serde_json::private::Number\": 1}'), \
+                              (3, '[2.50, {\"$serde_json::private::Number\": \"1\"}]')",
+    );
+
+    let sql = "SELECT id, doc, JSON_TYPE(doc) FROM K ORDER BY id";
+    let before = rows(&engine, &mut session, sql);
+    // Stated rather than only compared, so a reload that mangled both sides
+    // could not pass by agreeing with itself.
+    assert_eq!(
+        before,
+        vec![
+            vec!["1", r#"{"$serde_json::private::Number": "1"}"#, "OBJECT"],
+            vec!["2", r#"{"$serde_json::private::Number": 1}"#, "OBJECT"],
+            vec![
+                "3",
+                r#"[2.5, {"$serde_json::private::Number": "1"}]"#,
+                "ARRAY"
+            ],
+        ]
+    );
+
+    let encoded = image::encode(&engine.catalog_snapshot().unwrap());
+    let decoded = image::decode(&encoded).expect("the image loads");
+    let restored = Engine::from_catalog(decoded, ServerConfig::default()).unwrap();
+    let mut session = Session::new(ServerConfig::default(), 1);
+    session.current_database = Some("testdb".to_owned());
+    assert_eq!(rows(&restored, &mut session, sql), before);
+}

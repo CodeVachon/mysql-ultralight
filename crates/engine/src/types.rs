@@ -602,11 +602,17 @@ impl SqlType {
             // way in, and so does this: a column that accepted `{"a":1` would
             // fail every later read of it instead, far from the cause.
             TypeKind::Json => {
-                let text = value.as_text();
+                // Through `document_of`, so a document written by a
+                // constructor keeps its numbers as they were built and only
+                // *text* is re-read the way MySQL's parser reads it. Storing
+                // `JSON_OBJECT('a', d)` over a DECIMAL(10,2) keeps the scale;
+                // storing the string `'{"a": 2.50}'` does not, which is what
+                // 8.3 does with each. See #0071.
+                //
                 // Serde's own message, because "invalid" without a position is
                 // no help against a document of any size — and the sibling
                 // 3141 raised by `json::parse` already says where.
-                let parsed = serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+                let parsed = crate::json::document_of(&value).map_err(|e| {
                     EngineError::new(
                         3140,
                         "22032",

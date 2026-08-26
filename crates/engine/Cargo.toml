@@ -11,5 +11,16 @@ repository.workspace = true
 md5 = { package = "md-5", version = "0.10" }
 mysql-ultralight-protocol = { workspace = true }
 regex = "1.13.1"
-serde_json = "1.0.151"
+# For the JSON deserializer in src/json.rs, which serde_json cannot provide:
+# with `arbitrary_precision` on, its own `Value` reader treats the object key
+# `$serde_json::private::Number` as a private protocol rather than as a key,
+# and MySQL treats it as an ordinary key. See `Document` there.
+serde = "1"
+# `arbitrary_precision`, so a number in a document keeps the digits it was
+# written with instead of becoming an f64. That is what carries a DECIMAL's
+# scale into a document — `JSON_OBJECT('a', d)` over 2.50 is `{"a": 2.50}` on
+# 8.3 and was `{"a": 2.5}` here. See #0071 and the note on `normalise` in
+# src/json.rs: the feature also stops serde rejecting a number too big for a
+# double, which that function now does instead.
+serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
 sqlparser = "0.62"

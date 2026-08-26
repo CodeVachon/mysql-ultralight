@@ -219,3 +219,6 @@
 {"at":"2026-08-25T23:29:12Z","id":118,"by":"Christopher Vachon","as":"user","type":"created","title":"A quotient's value carries more places than its column declares","state":"Todo"}
 {"at":"2026-08-25T23:42:34Z","id":119,"by":"Christopher Vachon","as":"user","type":"created","title":"A decimal wider than 65 digits saturates through a temp table","state":"Todo"}
 {"at":"2026-08-26T00:18:26Z","id":120,"by":"Christopher Vachon","as":"user","type":"created","title":"CAST to an integer truncates where MySQL rounds","state":"Todo"}
+{"at":"2026-08-26T00:52:54Z","id":70,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-08-26T00:52:54Z","id":85,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-08-26T00:53:01Z","id":71,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}

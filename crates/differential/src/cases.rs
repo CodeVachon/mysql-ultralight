@@ -56,6 +56,35 @@ pub const GROUPS: &[Group] = &[
             "INSERT INTO J VALUES (1, '{\"a\":[1,2],\"b\":\"s\"}', '[9,9]')",
             "CREATE TABLE Norm (id INT, kept JSON)",
             "INSERT INTO Norm VALUES (1, '{\"b\":1,  \"a\":2}'), (2, '[ 1 , 2 ]')",
+            // A decimal inside a document keeps its scale, which is a thing
+            // the corpus had no case for at all — every number in it was an
+            // integer or a double. #0071.
+            "CREATE TABLE Money (id INT NOT NULL, a DECIMAL(10,2) NULL, b DECIMAL(10,4) NULL, \
+             c DECIMAL(10,0) NULL, w DECIMAL(30,2) NULL, PRIMARY KEY (id))",
+            "INSERT INTO Money VALUES (1, '2.50', '2.5000', '2', '123456789012345678901.00'), \
+             (2, '-3.10', '-3.1000', '-3', '123456789012345678902.00'), \
+             (3, '0.00', '0.0000', '0', '0.00')",
+            // Two ways into a JSON column, which are two different parses:
+            // the constructor's document keeps the decimal, the string is
+            // source text and its `2.50` is the double 2.5.
+            "CREATE TABLE MoneyJ (id INT NOT NULL, doc JSON NULL, PRIMARY KEY (id))",
+            "INSERT INTO MoneyJ SELECT id, JSON_OBJECT('a', a) FROM Money",
+            "INSERT INTO MoneyJ VALUES (9, '{\"a\": 2.50}')",
+            // `$serde_json::private::Number` is how serde_json passes a
+            // number it holds as text through a visitor, and an ordinary key
+            // to MySQL. Row 4 is built by a constructor rather than written
+            // as text, and row 7 holds that key beside a real number.
+            "CREATE TABLE Sentinel (id INT NOT NULL, doc JSON NULL, PRIMARY KEY (id))",
+            "INSERT INTO Sentinel VALUES \
+             (1, '{\"$serde_json::private::Number\": \"1\"}'), \
+             (2, '{\"$serde_json::private::Number\": 1}'), \
+             (3, '{\"$serde_json::private::Number\": \"abc\"}'), \
+             (5, '{\"$serde_json::private::Number\": \"1\", \"b\": 2}'), \
+             (6, '{\"b\": 2, \"$serde_json::private::Number\": \"1\"}'), \
+             (7, '[2.50, {\"$serde_json::private::Number\": \"1\"}]')",
+            "INSERT INTO Sentinel VALUES (4, JSON_OBJECT('$serde_json::private::Number', 1))",
+            "CREATE TABLE Approx (f FLOAT NULL, d DOUBLE NULL)",
+            "INSERT INTO Approx VALUES (1.234567890123, 1.234567890123), (16777217, 16777217)",
         ],
         cases: &[
             same("SELECT JSON_OBJECT('a', JSON_ARRAY(1, 2))"),
@@ -98,6 +127,52 @@ pub const GROUPS: &[Group] = &[
             // A JSON column holds the document, not the text it was written
             // as, so reading it back normalises the spacing and the key order.
             same("SELECT kept FROM Norm ORDER BY id"),
+            // A decimal keeps the digits its scale declares, whichever
+            // constructor builds the document — `2.50` and not `2.5`.
+            same(
+                "SELECT id, JSON_OBJECT('a', a, 'b', b, 'c', c), JSON_ARRAY(a, b, c) \
+                 FROM Money ORDER BY id",
+            ),
+            same("SELECT id, CAST(a AS JSON), JSON_SET('{\"x\": 1}', '$.x', a) FROM Money ORDER BY id"),
+            same("SELECT id, JSON_MERGE_PATCH(JSON_OBJECT('a', a), '{\"b\": 2}') FROM Money ORDER BY id"),
+            same("SELECT JSON_ARRAYAGG(a), JSON_ARRAY(SUM(a)), JSON_ARRAY(MIN(a)) FROM Money"),
+            same("SELECT JSON_UNQUOTE(JSON_EXTRACT(JSON_OBJECT('a', a), '$.a')) FROM Money WHERE id = 1"),
+            // Stored and read back. Row 9 arrived as a string rather than as
+            // a document, so its `2.50` is the double the text spells.
+            same("SELECT id, doc, doc->'$.a', doc->>'$.a' FROM MoneyJ ORDER BY id"),
+            same("SELECT id, JSON_EXTRACT(doc, '$.a') = 2.50, JSON_EXTRACT(doc, '$.a') = 2.5 FROM MoneyJ ORDER BY id"),
+            // Source text is the other side of that boundary and has no
+            // decimal in it: `2.50` is the double 2.5, `-0` the integer 0,
+            // and `1E2` is written back as `100.0`.
+            same("SELECT CAST('[2.50, 2.0, 2, -0, 1E2]' AS JSON)"),
+            // Every spelling of one number is one number, and the key agrees
+            // with the comparison.
+            same("SELECT CAST('2.50' AS JSON) = CAST('2.5' AS JSON), JSON_OBJECT('a', 2.50) = JSON_OBJECT('a', 2.5)"),
+            same("SELECT JSON_CONTAINS(JSON_OBJECT('a', a), '2.5', '$.a'), JSON_CONTAINS('[2.0]', '2'), JSON_CONTAINS('[2]', '2.0') FROM Money WHERE id = 1"),
+            // Two decimals one double cannot tell apart are two documents.
+            same("SELECT id, JSON_ARRAY(w) FROM Money ORDER BY id"),
+            same("SELECT COUNT(DISTINCT JSON_ARRAY(w)) FROM Money"),
+            // A number no double can hold is not valid JSON text, which is a
+            // refusal the parser has to make now that the digits are kept.
+            same("SELECT JSON_VALID('1e2000'), JSON_VALID('[1e2000]'), JSON_VALID('1e308')"),
+            // Serde's number sentinel is a key like any other here. Reading
+            // it as its private protocol turned row 1 into the number 1,
+            // made rows 2 and 3 invalid JSON, and refused row 4 against this
+            // engine's own rendering.
+            same("SELECT id, doc, JSON_TYPE(doc), JSON_LENGTH(doc) FROM Sentinel ORDER BY id"),
+            same(
+                "SELECT JSON_VALID('{\"$serde_json::private::Number\": \"1\"}'), \
+                 JSON_VALID('{\"$serde_json::private::Number\": 1}'), \
+                 JSON_VALID('{\"$serde_json::private::Number\": \"abc\"}')",
+            ),
+            same(
+                "SELECT JSON_EXTRACT(doc, '$.\"$serde_json::private::Number\"') \
+                 FROM Sentinel WHERE id = 1",
+            ),
+            // A cast converts an approximate number rather than reading back
+            // the text its column displays, which for a FLOAT is six
+            // significant digits. Both routes into a document agree.
+            same("SELECT CAST(f AS JSON), JSON_ARRAY(f), CAST(d AS JSON), JSON_ARRAY(d) FROM Approx ORDER BY f"),
         ],
     },
     Group {
