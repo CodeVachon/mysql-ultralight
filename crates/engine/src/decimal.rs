@@ -8,8 +8,17 @@
 //!
 //! The representation stays text, because that is how a decimal arrives on the
 //! wire and how it leaves. What is added here is arithmetic on the *units* of
-//! the last place, which is exact for anything an `i128` holds and keeps the
-//! scale explicit rather than implied by whatever a float printed.
+//! the last place, which keeps the scale explicit rather than implied by
+//! whatever a float printed.
+//!
+//! Two counts of those units live here. [`units`] and [`render`] carry them in
+//! an `i128`, which the aggregates use because a fold is a running total and a
+//! machine integer is the cheap way to keep one. The operators use the digit
+//! strings below instead, and they have to: an `i128` is 38 digits where
+//! MySQL's DECIMAL is 65, so a `DECIMAL(30,10)` times a `DECIMAL(65,30)`
+//! overflows one and is an ordinary value to the other — and the fallback for
+//! an overflow was the `f64` path, which is how a product of two exact
+//! operands came back 5.25 for 5.250000000000000000000000000000.
 
 /// How many digits a decimal's text carries after the point.
 pub fn scale_of(text: &str) -> usize {
@@ -108,25 +117,433 @@ pub fn rescale_wide(text: &str, scale: usize) -> Option<String> {
         }
     }
 
-    let (whole, fraction) = digits.split_at(digits.len() - scale);
-    let whole = std::str::from_utf8(whole).ok()?.trim_start_matches('0');
-    let fraction = std::str::from_utf8(fraction).ok()?;
-    // Never empty before the point: `render` left-pads for the same reason,
-    // because five units at scale two is `0.05` and not `.05`.
-    let whole = if whole.is_empty() { "0" } else { whole };
-    let written = if scale == 0 {
-        whole.to_owned()
-    } else {
-        format!("{whole}.{fraction}")
+    for digit in &mut digits {
+        *digit -= b'0';
+    }
+    Some(spell(negative, &digits, scale))
+}
+
+/// A run of digits and a point position, written out as a decimal.
+///
+/// The digits are values, not characters, because that is what the arithmetic
+/// below carries them as; `rescale_wide` subtracts `b'0'` to reach here rather
+/// than keeping a second spelling of this.
+fn spell(negative: bool, digits: &[u8], scale: usize) -> String {
+    let all = padded(digits, scale);
+    let split = all.len() - scale;
+    let mut written = String::with_capacity(all.len() + 2);
+    for (at, digit) in all.iter().enumerate() {
+        // Leading zeros are not written, but the last digit before the point
+        // is not a leading zero however small the number is.
+        if written.is_empty() && *digit == 0 && at + 1 < split {
+            continue;
+        }
+        if at == split {
+            written.push('.');
+        }
+        written.push(char::from(b'0' + digit));
+    }
+    // A value that came out zero has no sign, which is `render`'s answer too:
+    // -0.4 at scale zero is `0` and not `-0`.
+    if negative && all.iter().any(|d| *d != 0) {
+        written.insert(0, '-');
+    }
+    written
+}
+
+/// `digits` with enough leading zeros to carry `scale` places and one digit in
+/// front of them.
+///
+/// Every operator can hand back fewer digits than its scale — a remainder of
+/// nothing is the extreme — and both readers need the same answer for it:
+/// spelled, that is `0.000` rather than `0`, and rounded, it is a number
+/// smaller than the place being rounded at rather than one whose leading digit
+/// happens to sit there.
+fn padded(digits: &[u8], scale: usize) -> Vec<u8> {
+    let padding = (scale + 1).saturating_sub(digits.len());
+    std::iter::repeat_n(0, padding)
+        .chain(digits.iter().copied())
+        .collect()
+}
+
+/// The largest scale a MySQL DECIMAL *column* carries, and the ceiling a
+/// product or a quotient is clamped to.
+///
+/// Only those two. Measured on 8.3 over a literal written to 37 places, which
+/// is the one way a scale past 30 gets into an expression at all: `+`, `-`,
+/// `%` and a sign all keep every one of the 37, while `* 1` and `/ 1` come
+/// back at 30 — MySQL clamps in the two operators whose rule *adds* scales and
+/// nowhere else, and this follows it rather than tidying the difference away.
+///
+/// The *precision* has a documented maximum of 65 and is deliberately not
+/// clamped here, because MySQL does not clamp the value either: two 35-digit
+/// `DECIMAL(65,0)` operands multiply to a 70-digit answer there, printed in
+/// full under a column still described `decimal(65,0)`.
+pub const MAX_SCALE: usize = 30;
+
+/// The extra decimal places MySQL gives a quotient over its left operand.
+///
+/// `div_precision_increment`, whose documented default is 4. It is a session
+/// variable there and a constant here: this engine does not know the variable
+/// at all, so `SET div_precision_increment` is 1193 rather than a quiet change
+/// of answer, which is the honest half of the gap.
+pub const DIV_PRECISION_INCREMENT: usize = 4;
+
+/// The extra digits MySQL gives an average over the scale it averaged.
+///
+/// The same `div_precision_increment`, which is why it is that constant rather
+/// than a second 4: `AVG` of a `DECIMAL(10,2)` is a `DECIMAL(_,6)` and `AVG`
+/// of an integer is a `DECIMAL(_,4)`.
+pub const AVERAGE_EXTRA_SCALE: usize = DIV_PRECISION_INCREMENT;
+
+/// A decimal with the point taken out: its sign, its digits, and how many of
+/// them fall after the point.
+struct Parts {
+    negative: bool,
+    digits: Vec<u8>,
+    scale: usize,
+}
+
+impl Parts {
+    /// Whether this is zero, however many places it is spelled to. The
+    /// divisor test for `/`, `%` and `DIV`, all three of which answer NULL
+    /// rather than a number.
+    fn is_zero(&self) -> bool {
+        self.digits.iter().all(|d| *d == 0)
+    }
+}
+
+/// `text` split up, or `None` if it is not a plain decimal.
+///
+/// An exponent is not one: MySQL types `1e3` DOUBLE and computes over it
+/// approximately, so reading it here would answer a whole family of
+/// expressions exactly that MySQL does not.
+fn parts(text: &str) -> Option<Parts> {
+    let trimmed = text.trim();
+    let (negative, rest) = match trimmed.strip_prefix(['-', '+']) {
+        Some(rest) => (trimmed.starts_with('-'), rest),
+        None => (false, trimmed),
     };
-    // A value that rounded to zero has no sign, which is `render`'s answer
-    // too: -0.4 at scale zero is `0` and not `-0`.
-    let zero = whole == "0" && fraction.bytes().all(|b| b == b'0');
-    Some(if negative && !zero {
-        format!("-{written}")
-    } else {
-        written
+    let (whole, fraction) = rest.split_once('.').unwrap_or((rest, ""));
+    let plain = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if !plain(whole) || !plain(fraction) || (whole.is_empty() && fraction.is_empty()) {
+        return None;
+    }
+    Some(Parts {
+        negative,
+        digits: whole
+            .bytes()
+            .chain(fraction.bytes())
+            .map(|b| b - b'0')
+            .collect(),
+        scale: fraction.len(),
     })
+}
+
+/// `text` without its sign, keeping the scale.
+///
+/// `ABS` is the same rule as the unary minus — a sign says nothing about how
+/// many places a number is written to — and MySQL agrees: `ABS(-1.50)` is 1.50
+/// on 8.3 and is declared `decimal(3,2)`.
+pub fn absolute(text: &str) -> Option<String> {
+    let value = parts(text)?;
+    Some(spell(false, &value.digits, value.scale))
+}
+
+/// Whether `text` is zero, however many places it is spelled to.
+///
+/// The divisor test for `/`, `%` and `DIV`, all three of which MySQL answers
+/// NULL rather than refusing: `1/0`, `1.5 MOD 0` and `1 DIV 0` are NULL on 8.3
+/// under every `sql_mode` a `SELECT` can be run in, strict included.
+pub fn is_zero(text: &str) -> bool {
+    parts(text).is_some_and(|value| value.is_zero())
+}
+
+/// `a` against `b`, exactly, over two decimals.
+///
+/// The comparison to match the arithmetic. Read through an `f64` a decimal
+/// loses everything past the seventeenth significant digit, so two
+/// `DECIMAL(65,0)` columns holding 10000000000000000000000000000000000001 and
+/// ...000 compared *equal* while their difference was 1 — one row saying two
+/// things. MySQL answers 0 for `a = b` and 1 for `a > b`, and this does too.
+///
+/// Zero has no sign, so `-0.00` and `0` are one value however they were
+/// written — which is also what [`shortest`] keys them as, and the two have to
+/// agree or `GROUP BY` and `=` disagree about the same pair.
+///
+/// `None` for an operand that is not a plain decimal; those still read as
+/// numbers, which is a different question and a different answer.
+pub fn compare(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    let (a, b) = (parts(a)?, parts(b)?);
+    let sign = |value: &Parts| {
+        if value.is_zero() {
+            0i8
+        } else if value.negative {
+            -1
+        } else {
+            1
+        }
+    };
+    let (a_sign, b_sign) = (sign(&a), sign(&b));
+    if a_sign != b_sign {
+        return Some(a_sign.cmp(&b_sign));
+    }
+    let (x, y) = aligned(&a, &b, a.scale.max(b.scale));
+    let magnitude = cmp_magnitude(&x, &y);
+    // Two negatives order by the reverse of their magnitudes: -2 is below -1.
+    Some(if a_sign < 0 {
+        magnitude.reverse()
+    } else {
+        magnitude
+    })
+}
+
+/// Two magnitudes compared, ignoring the leading zeros either may carry.
+fn cmp_magnitude(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let trim = |d: &[u8]| d.iter().position(|v| *v != 0).unwrap_or(d.len());
+    let (a, b) = (&a[trim(a)..], &b[trim(b)..]);
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// `a + b` over two magnitudes of the same scale.
+fn add_magnitude(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let width = a.len().max(b.len()) + 1;
+    let mut sum = vec![0u8; width];
+    let mut carry = 0u8;
+    for i in 0..width {
+        let at = |d: &[u8]| d.len().checked_sub(i + 1).map_or(0, |at| d[at]);
+        let total = at(a) + at(b) + carry;
+        sum[width - 1 - i] = total % 10;
+        carry = total / 10;
+    }
+    sum
+}
+
+/// `a - b` over two magnitudes of the same scale, where `a` is the larger.
+fn sub_magnitude(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut difference = vec![0u8; a.len()];
+    let mut borrow = 0i8;
+    for i in 0..a.len() {
+        let at = |d: &[u8]| d.len().checked_sub(i + 1).map_or(0i8, |at| d[at] as i8);
+        let mut total = at(a) - at(b) - borrow;
+        borrow = 0;
+        if total < 0 {
+            total += 10;
+            borrow = 1;
+        }
+        difference[a.len() - 1 - i] = total as u8;
+    }
+    difference
+}
+
+/// `a * b` over two magnitudes, long multiplication.
+fn mul_magnitude(a: &[u8], b: &[u8]) -> Vec<u8> {
+    // A `u32` per column rather than a `u16`, because the partial products
+    // pile up before the carry runs: each is at most 81 and there is one per
+    // digit of the shorter operand, so a `u16` overflows at 809 digits. MySQL
+    // stops at 65, but nothing stops a *literal* being longer than that and a
+    // wrapped column would be a wrong answer rather than a refusal.
+    let mut product = vec![0u32; a.len() + b.len()];
+    for (i, x) in a.iter().rev().enumerate() {
+        for (j, y) in b.iter().rev().enumerate() {
+            product[i + j] += u32::from(*x) * u32::from(*y);
+        }
+    }
+    let mut carry = 0u32;
+    for cell in &mut product {
+        let total = *cell + carry;
+        *cell = total % 10;
+        carry = total / 10;
+    }
+    debug_assert_eq!(carry, 0, "the width is the sum of the two operands'");
+    product.iter().rev().map(|d| *d as u8).collect()
+}
+
+/// `a / b` and `a % b` over two magnitudes, long division.
+///
+/// `b` must not be zero; the callers all test for that first, because a zero
+/// divisor is NULL rather than an answer of any kind.
+fn divmod_magnitude(a: &[u8], b: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut quotient = vec![0u8; a.len()];
+    let mut remainder: Vec<u8> = Vec::with_capacity(b.len() + 1);
+    for (at, digit) in a.iter().enumerate() {
+        remainder.push(*digit);
+        // The remainder never reaches the divisor's width plus one, so the
+        // repeated subtraction below runs at most nine times per digit.
+        while cmp_magnitude(&remainder, b) != std::cmp::Ordering::Less {
+            remainder = sub_magnitude(&remainder, b);
+            let start = remainder
+                .iter()
+                .position(|v| *v != 0)
+                .unwrap_or(remainder.len());
+            remainder.drain(..start);
+            quotient[at] += 1;
+        }
+    }
+    (quotient, remainder)
+}
+
+/// Both operands' digits at one scale, which is what every operator but `*`
+/// needs before it can work on them.
+fn aligned(a: &Parts, b: &Parts, scale: usize) -> (Vec<u8>, Vec<u8>) {
+    debug_assert!(
+        scale >= a.scale && scale >= b.scale,
+        "widening only: a scale below an operand's own would drop its digits"
+    );
+    let widen = |p: &Parts| {
+        let mut digits = p.digits.clone();
+        digits.resize(digits.len() + (scale - p.scale), 0);
+        digits
+    };
+    (widen(a), widen(b))
+}
+
+/// Digits carrying `from` places, written at `to` of them.
+///
+/// Rounds half away from zero, which is MySQL's rule everywhere a decimal is
+/// shortened: measured on 8.3, a `DECIMAL(65,20)` times another is declared
+/// with 30 places, and 5e-31 comes back 1e-30 while 4e-31 comes back zero.
+fn rounded(negative: bool, digits: &[u8], from: usize, to: usize) -> String {
+    if to >= from {
+        return spell(negative, digits, from);
+    }
+    let all = padded(digits, from);
+    let keep = all.len() - (from - to);
+    let mut kept = all[..keep].to_vec();
+    if all.get(keep).is_some_and(|d| *d >= 5) {
+        kept = add_magnitude(&kept, &[1]);
+    }
+    spell(negative, &kept, to)
+}
+
+/// `a` at `scale`, clamped to [`MAX_SCALE`].
+///
+/// A product's clamp, and the one place a value can lose digits it computed
+/// exactly: a `DECIMAL(65,20)` times another is declared with 30 places, not
+/// 40.
+fn narrowed(negative: bool, digits: &[u8], scale: usize) -> String {
+    rounded(negative, digits, scale, scale.min(MAX_SCALE))
+}
+
+/// `a + b`, exactly, at the wider of the two scales.
+///
+/// Measured on 8.3: a `DECIMAL(10,2)` plus a `DECIMAL(8,3)`, both holding 1.5,
+/// is 3.000 and is declared with three places.
+pub fn add(a: &str, b: &str) -> Option<String> {
+    combine(a, b, false)
+}
+
+/// `a - b`, exactly, at the wider of the two scales.
+pub fn subtract(a: &str, b: &str) -> Option<String> {
+    combine(a, b, true)
+}
+
+/// The sum or the difference, which differ only in the sign given to `b`.
+fn combine(a: &str, b: &str, negate: bool) -> Option<String> {
+    let (a, b) = (parts(a)?, parts(b)?);
+    let widest = a.scale.max(b.scale);
+    let (x, y) = aligned(&a, &b, widest);
+    let (a_negative, b_negative) = (a.negative, b.negative != negate);
+    let (negative, digits) = if a_negative == b_negative {
+        (a_negative, add_magnitude(&x, &y))
+    } else if cmp_magnitude(&x, &y) == std::cmp::Ordering::Less {
+        (b_negative, sub_magnitude(&y, &x))
+    } else {
+        (a_negative, sub_magnitude(&x, &y))
+    };
+    Some(spell(negative, &digits, widest))
+}
+
+/// `a * b`, exactly, at the two scales added together.
+///
+/// Measured on 8.3: a `DECIMAL(10,2)` times a `DECIMAL(8,3)` is declared with
+/// five places, so 1.5 times 1.5 is 2.25000.
+pub fn multiply(a: &str, b: &str) -> Option<String> {
+    let (a, b) = (parts(a)?, parts(b)?);
+    let scale = a.scale + b.scale;
+    Some(narrowed(
+        a.negative != b.negative,
+        &mul_magnitude(&a.digits, &b.digits),
+        scale,
+    ))
+}
+
+/// `a / b`, at the left operand's scale plus [`DIV_PRECISION_INCREMENT`].
+///
+/// The rounding is not simply "round the true quotient", and the difference is
+/// measurable. MySQL computes the quotient to a whole number of nine-digit
+/// words — `frac1 + frac2 + div_precision_increment` rounded up to a multiple
+/// of nine — truncating there, and rounds *that* to the result's scale. Where
+/// the two coincide the truncation is what shows: `1.00001 / 3` is 0.333336666
+/// on 8.3, at nine places, where rounding the true quotient gives
+/// 0.333336667. `1 / 7` is 0.1429 because the nine-digit intermediate does get
+/// rounded down to four.
+///
+/// What comes back is the quotient at the scale MySQL *displays*, which is not
+/// quite the number MySQL holds. Measured on 8.3, `JSON_ARRAY(1/3)` is
+/// `[0.333333333]` — nine places, where the column is declared with four —
+/// so the interim survives in the value and only the rendering rounds it. The
+/// difference is visible wherever something reads a quotient rather than
+/// printing it: `1/3 = 0.3333` is false there, `SUM(v/3)` over 32768 rows
+/// totals the nine-digit values, and `(1/3)*3` is 1.0000 for 0.9999. Rounding
+/// here instead is deliberate — the engine has nowhere to put a scale a value
+/// does not carry, since a column is described without one at all — and it is
+/// the choice that makes every *printed* quotient right. See #0118.
+///
+/// `None` for an operand that is not a decimal. A zero divisor is the caller's
+/// to test with [`is_zero`], because its answer is NULL rather than a number.
+pub fn divide(a: &str, b: &str) -> Option<String> {
+    let (a, b) = (parts(a)?, parts(b)?);
+    if b.is_zero() {
+        return None;
+    }
+    let interim = (a.scale + b.scale + DIV_PRECISION_INCREMENT).div_ceil(9) * 9;
+    // `a`'s digits carry a factor of 10^-a.scale and `b`'s a factor of
+    // 10^-b.scale, so the shift that leaves the quotient at `interim` places
+    // is `interim + b.scale - a.scale` — never negative, since `interim` is at
+    // least `a.scale + b.scale + 4`.
+    let mut numerator = a.digits.clone();
+    numerator.resize(numerator.len() + interim + b.scale - a.scale, 0);
+    let (quotient, _) = divmod_magnitude(&numerator, &b.digits);
+    let scale = (a.scale + DIV_PRECISION_INCREMENT).min(MAX_SCALE);
+    Some(rounded(a.negative != b.negative, &quotient, interim, scale))
+}
+
+/// `a % b`, at the wider of the two scales, with the dividend's sign.
+///
+/// Measured on 8.3: `10.5 MOD 3.00` is 1.50 — padded to the divisor's two
+/// places — and `-10.5 MOD 3` and `10.5 MOD -3` are -1.5 and 1.5, so the sign
+/// is the dividend's and the divisor's is ignored.
+///
+/// `None` for an operand that is not a decimal, or for a zero divisor.
+pub fn remainder(a: &str, b: &str) -> Option<String> {
+    let (a, b) = (parts(a)?, parts(b)?);
+    if b.is_zero() {
+        return None;
+    }
+    let scale = a.scale.max(b.scale);
+    let (x, y) = aligned(&a, &b, scale);
+    let (_, rest) = divmod_magnitude(&x, &y);
+    Some(spell(a.negative, &rest, scale))
+}
+
+/// `a DIV b`, truncated toward zero, as the digits of a whole number.
+///
+/// Truncated rather than floored: MySQL answers -3 for `-7.5 DIV 2` where a
+/// floor would say -4. The answer is a string because it is not yet known to
+/// fit a BIGINT — `99999999999999999999999.0 DIV 1` is 1690 on 8.3 — and that
+/// is the caller's refusal to raise.
+///
+/// `None` for an operand that is not a decimal, or for a zero divisor.
+pub fn integer_divide(a: &str, b: &str) -> Option<String> {
+    let (a, b) = (parts(a)?, parts(b)?);
+    if b.is_zero() {
+        return None;
+    }
+    let scale = a.scale.max(b.scale);
+    let (x, y) = aligned(&a, &b, scale);
+    let (quotient, _) = divmod_magnitude(&x, &y);
+    Some(spell(a.negative != b.negative, &quotient, 0))
 }
 
 /// A number written with an exponent, spelled out in plain digits.
@@ -217,11 +634,14 @@ pub fn rescale(text: &str, scale: usize) -> Option<String> {
     units(text, scale).map(|units| render(units, scale))
 }
 
-/// `numerator / denominator`, rounded half away from zero.
+/// `numerator / denominator` over two counts of units, rounded half away from
+/// zero.
 ///
-/// The division an average is: MySQL rounds the result at its own scale rather
-/// than truncating, so 2.99 over three rows is 0.996667 and not 0.996666.
-pub fn divide(numerator: i128, denominator: i128) -> Option<i128> {
+/// The division an average is, which is why it is counted rather than spelled
+/// out like [`divide`]: MySQL rounds the result at its own scale rather than
+/// truncating, so 2.99 over three rows is 0.996667 and not 0.996666, and the
+/// fold that reaches here already holds its total as units.
+pub fn divide_units(numerator: i128, denominator: i128) -> Option<i128> {
     if denominator == 0 {
         return None;
     }
@@ -238,13 +658,6 @@ pub fn divide(numerator: i128, denominator: i128) -> Option<i128> {
         Some(quotient)
     }
 }
-
-/// The extra digits MySQL gives an average over the scale it averaged.
-///
-/// Four, from `div_precision_increment`, which is the documented default:
-/// `AVG` of a `DECIMAL(10,2)` is a `DECIMAL(_,6)` and `AVG` of an integer is a
-/// `DECIMAL(_,4)`.
-pub const AVERAGE_EXTRA_SCALE: usize = 4;
 
 /// A float written at `scale` digits, for the values that are not decimals at
 /// all.
@@ -290,20 +703,284 @@ pub fn from_f64(value: f64, scale: usize) -> String {
 /// The same number with as few digits after the point as spell it.
 ///
 /// `2.50` at scale two is `2.5` at scale one and `2` at scale zero is the same
-/// number as `2.00`, which is what lets one key stand for every spelling. The
-/// scale comes back with the units: dropping it would make `2.50` and `25.00`
-/// the same 25.
-pub fn shortest(mut units: i128, mut scale: usize) -> (i128, usize) {
-    while scale > 0 && units % 10 == 0 {
-        units /= 10;
-        scale -= 1;
+/// number as `2.00`, which is what lets one key stand for every spelling.
+///
+/// Worked on the characters rather than counted in an `i128`, because the
+/// counted form stops at 38 digits and arithmetic now reaches past that: a
+/// product of two 35-digit operands is 70 digits and MySQL prints all of them.
+/// Keyed by its raw text at that width, `big * big` and `big * big * 1.0`
+/// were two groups for one number, so a `UNION` over them stopped
+/// de-duplicating.
+///
+/// `None` for text that is not a decimal, which has no number to shorten.
+pub fn shortest(text: &str) -> Option<String> {
+    let mut value = parts(text)?;
+    while value.scale > 0 && value.digits.last() == Some(&0) {
+        value.digits.pop();
+        value.scale -= 1;
     }
-    (units, scale)
+    Some(spell(value.negative, &value.digits, value.scale))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scale rules, measured on 8.3 over a `DECIMAL(10,2)` and a
+    /// `DECIMAL(8,3)` both holding 1.5. Every one of these was read off the
+    /// server, and the table in the issue was checked against it rather than
+    /// trusted.
+    #[test]
+    fn the_operators_carry_mysql_s_scales() {
+        assert_eq!(add("1.50", "1.500").as_deref(), Some("3.000"));
+        assert_eq!(add("1.500", "1.50").as_deref(), Some("3.000"));
+        assert_eq!(subtract("1.50", "1.500").as_deref(), Some("0.000"));
+        assert_eq!(subtract("1.500", "1.50").as_deref(), Some("0.000"));
+        assert_eq!(multiply("1.50", "1.500").as_deref(), Some("2.25000"));
+        assert_eq!(multiply("1.500", "1.50").as_deref(), Some("2.25000"));
+        assert_eq!(divide("1.50", "1.500").as_deref(), Some("1.000000"));
+        assert_eq!(divide("1.500", "1.50").as_deref(), Some("1.0000000"));
+        assert_eq!(remainder("1.50", "1.500").as_deref(), Some("0.000"));
+        assert_eq!(integer_divide("1.50", "1.500").as_deref(), Some("1"));
+        // And against an integer, whose scale is zero.
+        assert_eq!(add("1.50", "1").as_deref(), Some("2.50"));
+        assert_eq!(multiply("1.50", "2").as_deref(), Some("3.00"));
+        assert_eq!(add("1.50", "0.5").as_deref(), Some("2.00"));
+    }
+
+    /// A sign says nothing about how many places a number is written to, and
+    /// neither operand's sign reaches the other's scale.
+    #[test]
+    fn a_sign_keeps_the_scale_and_the_dividend_keeps_its_own() {
+        assert_eq!(subtract("0", "1.50").as_deref(), Some("-1.50"));
+        assert_eq!(subtract("0", "-1.50").as_deref(), Some("1.50"));
+        assert_eq!(absolute("-1.50").as_deref(), Some("1.50"));
+        assert_eq!(absolute("-0.00").as_deref(), Some("0.00"));
+        // Measured: the remainder takes the *dividend's* sign, and the
+        // divisor's is ignored entirely.
+        assert_eq!(remainder("10.5", "3").as_deref(), Some("1.5"));
+        assert_eq!(remainder("-10.5", "3").as_deref(), Some("-1.5"));
+        assert_eq!(remainder("10.5", "-3").as_deref(), Some("1.5"));
+        assert_eq!(remainder("-10.5", "-3").as_deref(), Some("-1.5"));
+        // And it pads to the wider scale rather than to its own digits.
+        assert_eq!(remainder("10.5", "3.00").as_deref(), Some("1.50"));
+        assert_eq!(remainder("3.00", "1").as_deref(), Some("0.00"));
+        // `DIV` truncates toward zero rather than flooring.
+        assert_eq!(integer_divide("-7.5", "2").as_deref(), Some("-3"));
+        assert_eq!(integer_divide("7.5", "-2").as_deref(), Some("-3"));
+        assert_eq!(integer_divide("1.5", "0.4").as_deref(), Some("3"));
+    }
+
+    /// Division is not "round the true quotient". MySQL computes it to a whole
+    /// number of nine-digit words and truncates there, then rounds *that* to
+    /// the result's scale — so where the two coincide the truncation shows.
+    #[test]
+    fn division_truncates_at_nine_digit_words_before_it_rounds() {
+        // 0.33333666666… truncated at nine places, not rounded to …667.
+        assert_eq!(divide("1.00001", "3").as_deref(), Some("0.333336666"));
+        // And where there are digits to spare it does round: 1/7 at nine
+        // places is 0.142857142, rounded to four.
+        assert_eq!(divide("1", "7").as_deref(), Some("0.1429"));
+        assert_eq!(divide("2", "3").as_deref(), Some("0.6667"));
+        assert_eq!(divide("-2", "3").as_deref(), Some("-0.6667"));
+        // 25 places on the left asks for 29 and computes 36, which is where
+        // the rounding at the far end is visible.
+        assert_eq!(
+            divide("1.0000000000000000000000000", "7").as_deref(),
+            Some("0.14285714285714285714285714286")
+        );
+        assert_eq!(divide("1", "3").as_deref(), Some("0.3333"));
+        assert_eq!(divide("10", "3").as_deref(), Some("3.3333"));
+        // A zero divisor has no answer here; NULL is the caller's to give.
+        assert_eq!(divide("1", "0"), None);
+        assert_eq!(remainder("1", "0.00"), None);
+        assert_eq!(integer_divide("1", "0"), None);
+        assert!(is_zero("0.00") && is_zero("-0") && !is_zero("0.01"));
+    }
+
+    /// Past what an `i128` counts, which is where the `f64` fallback used to
+    /// take over and lose the scale along with the digits.
+    #[test]
+    fn the_operators_reach_past_an_i128() {
+        let big = "99999999999999999999999999999999999";
+        // 70 digits: MySQL prints it in full under a column it still
+        // describes `decimal(65,0)`, so the precision is not clamped.
+        assert_eq!(
+            multiply(big, big).as_deref(),
+            Some("9999999999999999999999999999999999800000000000000000000000000000000001")
+        );
+        // A `DECIMAL(30,10)` times a `DECIMAL(65,30)`: 40 places asked for,
+        // 30 given, and the digits kept exactly.
+        assert_eq!(
+            multiply("3.5000000000", "1.500000000000000000000000000000").as_deref(),
+            Some("5.250000000000000000000000000000")
+        );
+        assert_eq!(
+            add(
+                "1.500000000000000000000000000000",
+                "1.500000000000000000000000000000"
+            )
+            .as_deref(),
+            Some("3.000000000000000000000000000000")
+        );
+        // Only `*` and `/` clamp, and they round half away from zero doing it:
+        // 5e-31 is 1e-30 and 4e-31 is nothing.
+        let tiny = |digits: &str| multiply(digits, "0.00000000000000000001");
+        assert_eq!(
+            tiny("0.00000000005").as_deref(),
+            Some("0.000000000000000000000000000001")
+        );
+        assert_eq!(
+            tiny("0.00000000004").as_deref(),
+            Some("0.000000000000000000000000000000")
+        );
+        assert_eq!(
+            tiny("-0.00000000005").as_deref(),
+            Some("-0.000000000000000000000000000001")
+        );
+        // 37 places, which only a literal reaches: `+`, `-` and `%` keep all
+        // of them where `*` and `/` do not.
+        let long = "1.5000000000000000000000000000000000000";
+        assert_eq!(add(long, "0").as_deref(), Some(long));
+        assert_eq!(subtract(long, "0").as_deref(), Some(long));
+        assert_eq!(
+            remainder(long, "1").as_deref(),
+            Some("0.5000000000000000000000000000000000000")
+        );
+        assert_eq!(
+            multiply(long, "1").as_deref(),
+            Some("1.500000000000000000000000000000")
+        );
+        assert_eq!(
+            divide(long, "1").as_deref(),
+            Some("1.500000000000000000000000000000")
+        );
+    }
+
+    /// The digit-string operators against the counted ones, on the values both
+    /// can hold. The same argument `the_wide_rescaler_agrees_with_the_counted_one`
+    /// makes: two ways to compute one answer is two answers waiting to drift,
+    /// and the aggregates still fold in an `i128`.
+    #[test]
+    fn the_wide_operators_agree_with_a_counted_reference() {
+        let values = [
+            "0",
+            "1",
+            "-1",
+            "1.5",
+            "-1.5",
+            "2.25",
+            "-2.25",
+            "0.001",
+            "-0.001",
+            "10.5",
+            "-10.5",
+            "100",
+            "-100",
+            "0.5",
+            "7",
+            "-7",
+            "12345.6789",
+        ];
+        for a in values {
+            for b in values {
+                let scale = scale_of(a).max(scale_of(b));
+                let (x, y) = (units(a, scale).unwrap(), units(b, scale).unwrap());
+                assert_eq!(
+                    add(a, b).as_deref(),
+                    Some(render(x + y, scale).as_str()),
+                    "{a} + {b}"
+                );
+                assert_eq!(
+                    subtract(a, b).as_deref(),
+                    Some(render(x - y, scale).as_str()),
+                    "{a} - {b}"
+                );
+                let product = scale_of(a) + scale_of(b);
+                let counted = units(a, scale_of(a)).unwrap() * units(b, scale_of(b)).unwrap();
+                assert_eq!(
+                    multiply(a, b).as_deref(),
+                    Some(render(counted, product).as_str()),
+                    "{a} * {b}"
+                );
+                if y == 0 {
+                    assert_eq!(remainder(a, b), None, "{a} % {b}");
+                    continue;
+                }
+                assert_eq!(
+                    remainder(a, b).as_deref(),
+                    Some(render(x % y, scale).as_str()),
+                    "{a} % {b}"
+                );
+                assert_eq!(
+                    integer_divide(a, b).as_deref(),
+                    Some(render(x / y, 0).as_str()),
+                    "{a} DIV {b}"
+                );
+            }
+        }
+    }
+
+    /// A decimal is written the one way however it was reached: nothing before
+    /// the point is still a zero, a value that came out zero has no sign, and
+    /// a remainder short of the scale is padded rather than truncated.
+    #[test]
+    fn an_answer_is_spelled_the_way_mysql_spells_it() {
+        assert_eq!(add("0.04", "0.01").as_deref(), Some("0.05"));
+        assert_eq!(subtract("0.01", "0.02").as_deref(), Some("-0.01"));
+        assert_eq!(multiply("-0.5", "0").as_deref(), Some("0.0"));
+        assert_eq!(subtract("0.5", "0.5").as_deref(), Some("0.0"));
+        assert_eq!(remainder("1.500", "1.50").as_deref(), Some("0.000"));
+        assert_eq!(add("007.5", "0").as_deref(), Some("7.5"));
+        assert_eq!(add(".5", "0").as_deref(), Some("0.5"));
+        // Text that is not a decimal is not this path's to answer.
+        assert_eq!(add("1e3", "1"), None);
+        assert_eq!(multiply("abc", "1"), None);
+        assert_eq!(divide("1", "-"), None);
+    }
+
+    /// Comparison against the counted reference, and past where the counted
+    /// one can reach. The `f64` this replaced gave up at seventeen significant
+    /// digits, which is inside the range storage and arithmetic are exact
+    /// over — so one row could say `a - b` is 1 and `a = b` is true.
+    #[test]
+    fn comparison_is_exact_at_every_width() {
+        use std::cmp::Ordering;
+        let values = [
+            "0", "-0.00", "1", "-1", "1.5", "-1.5", "1.50", "2.5", "-2.5", "10.00", "0.001",
+            "-0.001", "100", "-100",
+        ];
+        for a in values {
+            for b in values {
+                let scale = scale_of(a).max(scale_of(b));
+                let (x, y) = (units(a, scale).unwrap(), units(b, scale).unwrap());
+                assert_eq!(compare(a, b), Some(x.cmp(&y)), "{a} <=> {b}");
+            }
+        }
+        // 38 digits one apart: an `f64` calls these equal and an `i128` counts
+        // them only just, which is why the digits are compared instead.
+        let high = "10000000000000000000000000000000000001";
+        let low = "10000000000000000000000000000000000000";
+        assert_eq!(compare(high, low), Some(Ordering::Greater));
+        assert_eq!(compare(low, high), Some(Ordering::Less));
+        assert_eq!(compare(high, high), Some(Ordering::Equal));
+        // And the same pair negated, where the magnitudes order the other way.
+        let (nhigh, nlow) = (format!("-{high}"), format!("-{low}"));
+        assert_eq!(compare(&nhigh, &nlow), Some(Ordering::Less));
+        assert_eq!(compare(&nlow, &nhigh), Some(Ordering::Greater));
+        assert_eq!(compare(&nhigh, low), Some(Ordering::Less));
+        // 70 digits, which is what a product of two `DECIMAL(65,0)` reaches.
+        let wide = multiply(high, high).unwrap();
+        assert_eq!(compare(&wide, high), Some(Ordering::Greater));
+        assert_eq!(compare(&wide, &wide), Some(Ordering::Equal));
+        // A zero has no sign however it is spelled, which is what `shortest`
+        // keys it as too — the two have to agree or `GROUP BY` and `=` do not.
+        assert_eq!(compare("-0.00", "0"), Some(Ordering::Equal));
+        assert_eq!(shortest("-0.00").as_deref(), shortest("0").as_deref());
+        // Not this path's question.
+        assert_eq!(compare("1e3", "1000"), None);
+        assert_eq!(compare("1", "abc"), None);
+    }
 
     /// The two rescalers have to be one answer, because `decimal_digits` picks
     /// between them by whether an `i128` happened to overflow — a boundary no

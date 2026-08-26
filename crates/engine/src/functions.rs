@@ -833,6 +833,12 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
                     ))
                 }
             },
+            // A decimal keeps its scale through a sign, which is the same rule
+            // `expr.rs` gives the unary minus: 1.50 rather than 1.5.
+            Value::Decimal(ref text) => match crate::decimal::absolute(text) {
+                Some(magnitude) => Value::Decimal(magnitude),
+                None => Value::Float(crate::value::numeric_prefix(text).abs()),
+            },
             other => Value::Float(other.as_number().abs()),
         },
         "round" => {

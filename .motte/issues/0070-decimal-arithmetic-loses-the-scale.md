@@ -1,11 +1,11 @@
 ---
 id: 70
 title: Decimal arithmetic loses the scale
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-08-21T15:22:20Z
-updated: 2026-08-21T15:22:20Z
+updated: 2026-08-25T21:51:02Z
 ---
 
 ## Description

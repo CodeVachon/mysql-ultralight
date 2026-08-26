@@ -364,6 +364,19 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
                     ref exact @ (Value::Int(_) | Value::Unsigned(_)) => {
                         fitted(integer_operand(exact).map(|v| -v), false)
                     }
+                    // A sign keeps the scale: `-a` over a `DECIMAL(10,2)`
+                    // holding 1.50 is -1.50 on 8.3 and is declared
+                    // `decimal(10,2)`, where the `f64` below printed -1.5.
+                    // Subtracted from zero rather than given a `-`, because
+                    // that is the same rule spelled once: a difference already
+                    // takes the wider of the two scales, and zero has none.
+                    Value::Decimal(ref text) => Ok(match crate::decimal::subtract("0", text) {
+                        Some(negated) => Value::Decimal(negated),
+                        // A `Decimal` whose text is not one, which nothing
+                        // validates: read as a number, the way the fall-through
+                        // below reads everything else.
+                        None => Value::Float(-crate::value::numeric_prefix(text)),
+                    }),
                     other => Ok(Value::Float(-other.as_number())),
                 },
                 UnaryOperator::Plus => Ok(value),
@@ -842,20 +855,43 @@ fn function_args(f: &sqlparser::ast::Function, ctx: &Context<'_>) -> EngineResul
     Ok(out)
 }
 
+/// The value a numeric literal *is*, which for most of them is exact.
+///
+/// MySQL reads a number written without an exponent exactly, and types it by
+/// how far it reaches: `18446744073709551615` is a BIGINT UNSIGNED there and
+/// `18446744073709551616` a DECIMAL, and both answer every digit — where
+/// reading either as a double rounds the operand before anything is done with
+/// it, so the second printed 1.8446744073709552e19.
+///
+/// A point makes it a DECIMAL however short it is, and the *written* scale is
+/// the one it carries: `1.50` is `decimal(3,2)` on 8.3 and prints 1.50, so the
+/// text is kept rather than a number parsed out of it. That is what lets
+/// `a + 0.5` over a `DECIMAL(10,2)` be 2.00 — the rule reads both operands'
+/// scales, and a double has none.
+///
+/// An exponent is the exception and stays approximate, because MySQL types it
+/// DOUBLE: `1.5e3` is a double there and `1.5` is not.
+fn number_literal(text: &str) -> Value {
+    if let Ok(v) = text.parse::<i64>() {
+        return Value::Int(v);
+    }
+    if let Ok(v) = text.parse::<u64>() {
+        return Value::Unsigned(v);
+    }
+    // Spelled out rather than kept verbatim: MySQL prints `.5` as 0.5 and
+    // `007.5` as 7.5, and keeps every place that was written — 1.5 to 37
+    // places stays at 37 there, which is why the scale is the text's own and
+    // is not clamped here.
+    if let Some(exact) = crate::decimal::rescale_wide(text, crate::decimal::scale_of(text)) {
+        return Value::Decimal(exact);
+    }
+    Value::Float(text.parse::<f64>().unwrap_or(0.0))
+}
+
 /// Converts a literal from the AST.
 pub fn literal(value: &AstValue) -> EngineResult<Value> {
     Ok(match value {
-        // A whole number too big for an `i64` is UNSIGNED, not approximate:
-        // MySQL types `18446744073709551615` BIGINT UNSIGNED and answers
-        // `18446744073709551615 - 1`, where reading it as a double would have
-        // rounded the operand before subtracting anything from it.
-        AstValue::Number(n, _) => match n.parse::<i64>() {
-            Ok(v) => Value::Int(v),
-            Err(_) => match n.parse::<u64>() {
-                Ok(v) => Value::Unsigned(v),
-                Err(_) => Value::Float(n.parse::<f64>().unwrap_or(0.0)),
-            },
-        },
+        AstValue::Number(n, _) => number_literal(n),
         AstValue::SingleQuotedString(s)
         | AstValue::DoubleQuotedString(s)
         | AstValue::TripleSingleQuotedString(s)
@@ -915,6 +951,9 @@ pub fn literal_of(e: &Expr) -> Option<Value> {
         } => match literal_of(expr)? {
             Value::Int(v) => Some(Value::Int(-v)),
             Value::Float(v) => Some(Value::Float(-v)),
+            // The same subtraction the evaluator's unary minus does, so a
+            // `DEFAULT -1.50` is stored at the scale it was written with.
+            Value::Decimal(text) => crate::decimal::subtract("0", &text).map(Value::Decimal),
             _ => None,
         },
         _ => None,
@@ -1939,31 +1978,36 @@ pub(crate) fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> En
     // asked is about the *true* value: `iu - -1` is 8 and `iu - 1` is 6, both
     // answered, while `iu - 8` is refused, and all three are the same
     // subtraction over the same domain.
-    if let (Some(a), Some(b)) = (integer_operand(left), integer_operand(right)) {
-        let unsigned = unsigned_result(op, left, right);
-        return match op {
-            B::Plus => fitted(a.checked_add(b), unsigned),
-            B::Minus => fitted(a.checked_sub(b), unsigned),
-            B::Multiply => fitted(a.checked_mul(b), unsigned),
-            // Division by zero yields NULL in MySQL, not an error.
-            B::Divide if b == 0 => Ok(Value::Null),
-            B::Divide => Ok(Value::Float(a as f64 / b as f64)),
-            B::Modulo if b == 0 => Ok(Value::Null),
-            B::Modulo => fitted(Some(a % b), unsigned),
-            // `DIV` truncates toward zero rather than flooring: MySQL answers
-            // -3 for `-7 DIV 2`, where a floor would say -4. Rust's integer
-            // division truncates the same way.
-            B::MyIntegerDivide if b == 0 => Ok(Value::Null),
-            B::MyIntegerDivide => fitted(Some(a / b), unsigned),
-            _ => unreachable!("caller restricts the operator set"),
-        };
+    //
+    // `/` is the exception and goes to the exact path below: MySQL answers a
+    // division with a DECIMAL even over two integers, four places wider than
+    // its left operand, so `1 / 3` is 0.3333 there rather than an integer or a
+    // double's worth of threes.
+    if !matches!(op, B::Divide) {
+        if let (Some(a), Some(b)) = (integer_operand(left), integer_operand(right)) {
+            let unsigned = unsigned_result(op, left, right);
+            return match op {
+                B::Plus => fitted(a.checked_add(b), unsigned),
+                B::Minus => fitted(a.checked_sub(b), unsigned),
+                B::Multiply => fitted(a.checked_mul(b), unsigned),
+                // Division by zero yields NULL in MySQL, not an error.
+                B::Modulo if b == 0 => Ok(Value::Null),
+                B::Modulo => fitted(Some(a % b), unsigned),
+                // `DIV` truncates toward zero rather than flooring: MySQL
+                // answers -3 for `-7 DIV 2`, where a floor would say -4.
+                // Rust's integer division truncates the same way.
+                B::MyIntegerDivide if b == 0 => Ok(Value::Null),
+                B::MyIntegerDivide => fitted(Some(a / b), unsigned),
+                _ => unreachable!("caller restricts the operator set"),
+            };
+        }
     }
 
     // Exact where both sides are exact, which a fractional temporal makes
     // reachable: a DATETIME(3) packs to a decimal, and `dt3 + 0` through an
     // `f64` renders 20240105060708.5 where MySQL says 20240105060708.500.
     if let Some(exact) = exact_arithmetic(op, left, right) {
-        return Ok(exact);
+        return exact;
     }
 
     // Every non-NULL operand reads as some number, which is why there is no
@@ -2001,59 +2045,71 @@ pub(crate) fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> En
 
 /// The exact answer over two exact operands, where MySQL gives one.
 ///
-/// Only `+`, `-` and `*`, and only where a `Decimal` is involved — two `Int`s
-/// are answered above. `/` is left out deliberately: MySQL widens a quotient
-/// by `div_precision_increment` and this engine does not, so `1 / 3` is
-/// already 0.3333333333333333 here against MySQL's 0.3333, and adding half of
-/// that rule to one operand kind would make the gap depend on what was
-/// divided.
+/// Every operator, and only where both sides are exact — an `Int`, an
+/// `Unsigned`, or a `Decimal`. A float, a string or a JSON document on either
+/// side makes MySQL compute in a double and the caller falls through to one.
 ///
-/// The scales are MySQL's: a sum or a difference keeps the wider of the two,
-/// and a product their total, so `CAST('2.5' AS DECIMAL(10,1)) * 2` is 5.0
-/// rather than 5. `None` on any overflow, which falls back to the `f64` path
-/// rather than refusing a statement MySQL answers.
-fn exact_arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> Option<Value> {
+/// The scales are MySQL's, measured on 8.3 over a `DECIMAL(10,2)` and a
+/// `DECIMAL(8,3)` both holding 1.5:
+///
+/// | operator | scale | over 1.5 and 1.5 |
+/// |---|---|---|
+/// | `+`, `-` | the wider of the two | 3.000, 0.000 |
+/// | `*` | the two added | 2.25000 |
+/// | `/` | the left one plus `div_precision_increment` | 1.000000 |
+/// | `%`, `MOD` | the wider of the two | 0.000 |
+/// | `DIV` | none — a BIGINT whatever it divided | 1 |
+///
+/// A zero divisor is NULL rather than an error for all three of `/`, `%` and
+/// `DIV`, which is what a `SELECT` gets on 8.3 under every `sql_mode`
+/// including strict; the 1365 that `ERROR_FOR_DIVISION_BY_ZERO` names belongs
+/// to a statement that would *store* the answer.
+///
+/// `None` means "not this path's to answer", and the caller computes in an
+/// `f64`. An answer of `Some` is final, error included: `DIV` is the one
+/// operator here that can refuse, because its answer is a BIGINT and
+/// `99999999999999999999999.0 DIV 1` is 1690 on 8.3.
+fn exact_arithmetic(
+    op: &BinaryOperator,
+    left: &Value,
+    right: &Value,
+) -> Option<EngineResult<Value>> {
     use BinaryOperator as B;
-    if !matches!(op, B::Plus | B::Minus | B::Multiply) {
-        return None;
+    // An unsigned operand is exact too, and it is not range-checked here: a
+    // decimal result is not an integer one, so MySQL answers `iu - 100.5`
+    // -93.5 rather than refusing it, and `bu + 1.5` is 18446744073709551616.5
+    // — past `u64::MAX` and still an answer.
+    let (a, b) = (left.exact_decimal()?, right.exact_decimal()?);
+    if matches!(op, B::Divide | B::Modulo | B::MyIntegerDivide) && crate::decimal::is_zero(&b) {
+        return Some(Ok(Value::Null));
     }
-    let scale = |v: &Value| match v {
-        // An unsigned operand is exact too, and it is not range-checked here:
-        // a decimal result is not an integer one, so MySQL answers
-        // `iu - 100.5` -93.5 rather than refusing it, and `bu + 1.5` is
-        // 18446744073709551616.5 — past `u64::MAX` and still an answer.
-        Value::Int(_) | Value::Unsigned(_) => Some(0usize),
-        Value::Decimal(text) => Some(crate::decimal::scale_of(text)),
-        _ => None,
-    };
-    let (left_scale, right_scale) = (scale(left)?, scale(right)?);
-    let units = |v: &Value, at: usize| match v {
-        // Checked, because the scale comes from a value's own text and nothing
-        // bounds how many digits that has.
-        Value::Int(n) => i128::from(*n).checked_mul(10i128.checked_pow(u32::try_from(at).ok()?)?),
-        Value::Unsigned(n) => {
-            i128::from(*n).checked_mul(10i128.checked_pow(u32::try_from(at).ok()?)?)
+    let text = match op {
+        B::Plus => crate::decimal::add(&a, &b),
+        B::Minus => crate::decimal::subtract(&a, &b),
+        B::Multiply => crate::decimal::multiply(&a, &b),
+        B::Divide => crate::decimal::divide(&a, &b),
+        B::Modulo => crate::decimal::remainder(&a, &b),
+        B::MyIntegerDivide => {
+            let quotient = crate::decimal::integer_divide(&a, &b)?;
+            // Through `fitted`, so the answer lands in the same domain the
+            // integer path above would have put it in: MySQL keeps the
+            // UNSIGNED tag on `DIV` from either operand, and `bu DIV 1.0` is
+            // 18446744073709551615 there exactly as `bu DIV 1` is. Refusing
+            // the first because a decimal divisor took it off the integer
+            // path would make the answer depend on how the 1 was written.
+            //
+            // A quotient too long for an `i128` parses as `None`, which
+            // `fitted` already reads as out of range — the only way to get one
+            // is a numerator past 38 digits, which no BIGINT of either sign
+            // could hold either.
+            return Some(fitted(
+                quotient.parse::<i128>().ok(),
+                unsigned_result(op, left, right),
+            ));
         }
-        Value::Decimal(text) => crate::decimal::units(text, at),
-        _ => None,
+        _ => return None,
     };
-    let (total, scale) = match op {
-        B::Multiply => (
-            units(left, left_scale)?.checked_mul(units(right, right_scale)?)?,
-            left_scale.checked_add(right_scale)?,
-        ),
-        _ => {
-            let widest = left_scale.max(right_scale);
-            let (a, b) = (units(left, widest)?, units(right, widest)?);
-            let total = if matches!(op, B::Plus) {
-                a.checked_add(b)?
-            } else {
-                a.checked_sub(b)?
-            };
-            (total, widest)
-        }
-    };
-    Some(Value::Decimal(crate::decimal::render(total, scale)))
+    Some(Ok(Value::Decimal(text?)))
 }
 
 /// A bitwise chain's answer as a `Value`.
@@ -2298,79 +2354,17 @@ fn bitwise_bits(e: &Expr, ctx: &Context<'_>) -> EngineResult<Option<u64>> {
 /// an operand that cannot be read as bits at all — a binary string — is
 /// refused.
 fn operand_bits(e: &Expr, ctx: &Context<'_>) -> EngineResult<Option<u64>> {
-    // The token before the value, because the token carries a type the value
-    // does not. A literal is never NULL, so this runs ahead of the NULL check
-    // rather than after it.
-    if let Some(bits) = literal_bits(e) {
-        return Ok(Some(bits));
-    }
+    // A literal with a point used to be read off its *token* here, because
+    // the token said DECIMAL where the value it evaluated to was an `f64` and
+    // had lost the tie at the seventeenth digit. #0070 made that literal a
+    // `Decimal`, so the value now carries the same type the token did and
+    // `bit_operand` reads it exactly — including through a sign, which folded
+    // into the token by hand and folds into the value by arithmetic.
     let value = eval(e, ctx)?;
     if value.is_null() {
         return Ok(None);
     }
     bit_operand(&value).map(Some)
-}
-
-/// The bits an operand written as a literal contributes.
-///
-/// A literal is the one operand whose type is in the statement rather than on
-/// the value, and reading it off the token is what keeps the refusal in
-/// [`bit_operand`] narrow: a quoted string *is* a string however much its
-/// characters look like a date, so `'2026-01-02' | 0` still answers 2026 —
-/// MySQL's answer, and the one the DATE column beside it does not share.
-///
-/// A number with a point is the same argument the other way. MySQL types it
-/// DECIMAL and evaluates it exactly where the engine evaluates it to an `f64`,
-/// which loses the tie at the seventeenth digit: `4503599627370496.5 | 0` is
-/// 4503599627370497 there and 4503599627370496 through a double. An exponent
-/// is a DOUBLE to MySQL too, so `1e2 | 0` is left to the value.
-fn literal_bits(e: &Expr) -> Option<u64> {
-    let (negative, number) = number_token(e)?;
-    // A point and no exponent is what MySQL types DECIMAL; `1e2` is a DOUBLE
-    // there as much as here, so it keeps the reading it had. Tested on the
-    // borrowed token, so an operand that is not one of these — every column
-    // reference, every row of `WHERE id & 1` — costs no allocation at all.
-    if !number.contains('.') || number.contains(['e', 'E']) {
-        return None;
-    }
-    Some(if negative {
-        decimal_bits(&format!("-{number}"))
-    } else {
-        decimal_bits(number)
-    })
-}
-
-/// The numeric token a literal operand spells, and whether it is negated.
-///
-/// A sign is a unary operator to the parser and part of the number to MySQL,
-/// so the signs are folded here. Counted rather than concatenated: building
-/// `"-{token}"` at each step spelled `- -2.5` as `"--2.5"`, which is not a
-/// decimal, so it fell to the leading-number reader and answered 0 where MySQL
-/// and this engine's own `- -2.5` both answer 3.
-///
-/// Parentheses are transparent, because they group a number without retyping
-/// it: `-(4503599627370496.5)` is the same DECIMAL as its unparenthesised
-/// twin and has to read the same way.
-fn number_token(e: &Expr) -> Option<(bool, &str)> {
-    match e {
-        Expr::Nested(inner) => number_token(inner),
-        Expr::Value(v) => match &v.value {
-            AstValue::Number(n, _) => Some((false, n)),
-            _ => None,
-        },
-        Expr::UnaryOp {
-            op: UnaryOperator::Plus,
-            expr,
-        } => number_token(expr),
-        Expr::UnaryOp {
-            op: UnaryOperator::Minus,
-            expr,
-        } => {
-            let (negative, number) = number_token(expr)?;
-            Some((!negative, number))
-        }
-        _ => None,
-    }
 }
 
 /// The field `EXTRACT(<field> FROM x)` names.

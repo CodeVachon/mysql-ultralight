@@ -498,8 +498,11 @@ pub const GROUPS: &[Group] = &[
             "CREATE TABLE B (id INT NOT NULL, n INT NULL, neg INT NULL, u BIGINT UNSIGNED NULL, \
              PRIMARY KEY (id))",
             "INSERT INTO B VALUES (1, 5, -1, 12), (2, NULL, NULL, NULL), (3, 12, -6, 255)",
-            // Written as strings, because a decimal literal reaches a column
-            // through an f64 here and the digits are the point of the table.
+            // Written as strings, from when a decimal literal reached a column
+            // through an f64 and the digits are the point of the table. #0070
+            // made the literal exact, so the quoting no longer carries
+            // anything — it is left alone because changing it would change
+            // what these cases cover.
             "CREATE TABLE Bd (id INT NOT NULL, wide DECIMAL(20,1), one DECIMAL(10,1), \
              two DECIMAL(10,2), huge DECIMAL(30,0), near VARCHAR(30), part VARCHAR(30), \
              packed VARCHAR(30), noisy VARCHAR(30), clockish VARCHAR(30), dt DATE, \
@@ -582,9 +585,11 @@ pub const GROUPS: &[Group] = &[
             same("SELECT wide | 0, wide & 1, one | 0, two | 0, huge | 0 FROM Bd ORDER BY id"),
             same("SELECT CAST('3.7' AS DECIMAL(10,1)) | 0, CAST('2.5' AS DECIMAL(10,1)) | 0, \
                   CAST('-0.4' AS DECIMAL(10,1)) | 0"),
-            // A literal with a point is a DECIMAL to MySQL and an f64 here, so
-            // it is read off the token for the same reason. An exponent is a
-            // DOUBLE to MySQL too and keeps the reading it had.
+            // A literal with a point is a DECIMAL to MySQL, and is one here
+            // since #0070 — until then it evaluated to an f64 and had to be
+            // read off its token instead, which is the workaround these cases
+            // now hold the removal of. An exponent is a DOUBLE to MySQL and
+            // still reads as one.
             same("SELECT 4503599627370496.5 | 0, 4503599627370496.5 & 1, 1e2 | 0, 2.675 | 0"),
             // A sign is a unary operator to the parser and part of the number
             // to MySQL, so the same digits have to read the same way with one.
@@ -1985,6 +1990,203 @@ pub const GROUPS: &[Group] = &[
             // name. Compared as a predicate rather than as itself, because
             // the two servers are different versions.
             same("SELECT @@GLOBAL.version IS NOT NULL AS v, S.k FROM S ORDER BY S.id"),
+        ],
+    },
+    Group {
+        // #0070 and #0085. Arithmetic over a decimal went through an `f64` and
+        // came back with whatever the float printed, so the scale MySQL
+        // computes was lost at every operator: `a + b` over two columns
+        // holding 1.5 was 3 for 3.000, and `1 / 3` was 0.3333333333333333 for
+        // 0.3333.
+        //
+        // Every scale below was measured on 8.3 rather than derived. The rules
+        // are not one rule: `+`, `-` and `%` take the wider of the two scales,
+        // `*` adds them, `/` adds `div_precision_increment` to the left one,
+        // `DIV` has none, and a sign keeps whatever it was given. Only `*` and
+        // `/` clamp at 30 places, which is why the over-long literal is here.
+        name: "decimal arithmetic",
+        setup: &[
+            "CREATE TABLE Dm (id INT NOT NULL, two DECIMAL(10,2) NULL, \
+             three DECIMAL(8,3) NULL, whole DECIMAL(10,0) NULL, \
+             wide DECIMAL(65,30) NULL, big DECIMAL(65,0) NULL, \
+             tiny DECIMAL(65,20) NULL, n INT NULL, u BIGINT UNSIGNED NULL, \
+             f FLOAT NULL, g DOUBLE NULL, dt DATE NULL, dt3 DATETIME(3) NULL, \
+             PRIMARY KEY (id))",
+            // Written as decimal literals, not as strings: a literal with a
+            // point is a DECIMAL to MySQL, and whether one arrives in a column
+            // with its digits intact is part of what these cases hold.
+            "INSERT INTO Dm VALUES (1, 1.50, 1.500, 3, 1.5, \
+             99999999999999999999999999999999999, 0.00000000005, 3, \
+             18446744073709551615, 1.5, 1.5, '2024-01-05', \
+             '2024-01-05 06:07:08.5')",
+            "INSERT INTO Dm VALUES (2, -2.25, 0.125, 0, 0.000000000000001, 12345, \
+             0.00000000001, -7, 2, 0.5, 0.5, '2026-01-02', \
+             '2026-01-02 03:04:05.250')",
+            "INSERT INTO Dm (id) VALUES (3)",
+            // Two 38-digit values one apart, which is past both an `f64`'s
+            // seventeen significant digits and an `i128`'s count of them.
+            "CREATE TABLE Wd (id INT NOT NULL, a DECIMAL(65,0) NULL, \
+             b DECIMAL(65,0) NULL, s DECIMAL(30,10) NULL, PRIMARY KEY (id))",
+            "INSERT INTO Wd VALUES (1, 10000000000000000000000000000000000001, \
+             10000000000000000000000000000000000000, 2.5000000000)",
+            "INSERT INTO Wd VALUES (2, -10000000000000000000000000000000000001, \
+             -10000000000000000000000000000000000000, -2.5000000000)",
+            "INSERT INTO Wd VALUES (3, 0, 0, 0.0000000000)",
+            "CREATE TABLE Sq (id INT NOT NULL, n INT NULL, v DECIMAL(10,2) NULL, \
+             PRIMARY KEY (id))",
+            "INSERT INTO Sq VALUES (1, 3, 1.50), (2, 7, 2.25)",
+        ],
+        cases: &[
+            same("SELECT id, two, three, whole, wide, big, tiny FROM Dm ORDER BY id"),
+            // The issue's own table, and each operator in both operand orders:
+            // a rule that reads the *left* scale has to be asked twice.
+            same("SELECT two + three, three + two, two - three, three - two \
+                  FROM Dm ORDER BY id"),
+            same("SELECT two * three, three * two, two / three, three / two \
+                  FROM Dm ORDER BY id"),
+            same("SELECT two + 1, 1 + two, two * 2, 2 * two, two + 0.5, 0.5 + two \
+                  FROM Dm ORDER BY id"),
+            same("SELECT -two, -three, -whole, -wide FROM Dm ORDER BY id"),
+            same("SELECT ABS(-1.50), ABS(two), ABS(three), ABS(-0.00) FROM Dm ORDER BY id"),
+            // `%` and `MOD` are one operator spelled two ways and take the
+            // wider scale, padding to it: `10.5 MOD 3.00` is 1.50.
+            same("SELECT two % three, two MOD three, three MOD two, whole MOD three \
+                  FROM Dm ORDER BY id"),
+            same("SELECT 10.5 MOD 3, -10.5 MOD 3, 10.5 MOD -3, -10.5 MOD -3, \
+                  10.5 % 3.25"),
+            same("SELECT 10.5 MOD 3.00, 3.00 MOD 1, 0.0 MOD 3, 1 MOD 0.5, 4 MOD 2.0, \
+                  100 MOD 7"),
+            // `DIV` truncates toward zero and answers a BIGINT whatever it
+            // divided, so it is the one operator here that can refuse.
+            same("SELECT two DIV three, three DIV two, whole DIV 2, -whole DIV 2 \
+                  FROM Dm ORDER BY id"),
+            same("SELECT 1.5 DIV 0.4, -7.5 DIV 2, 7.5 DIV -2, 7.9 DIV 2"),
+            same("SELECT 9223372036854775807.5 DIV 1, -9223372036854775808.0 DIV 1"),
+            same("SELECT 9223372036854775808.5 DIV 1"),
+            same("SELECT 99999999999999999999999.0 DIV 1"),
+            same("SELECT big DIV 7 FROM Dm ORDER BY id"),
+            // A zero divisor is NULL for all three, not an error.
+            same("SELECT two / 0, two MOD 0, two DIV 0, 0 / two, 0 MOD two \
+                  FROM Dm ORDER BY id"),
+            // #0085: division is four places wider than its left operand even
+            // over two plain integers, and the quotient is computed to a whole
+            // number of nine-digit words and truncated there before being
+            // rounded to the result's scale. `1.00001 / 3` is where the two
+            // steps separate — 0.333336666, not 0.333336667.
+            same("SELECT 1/3, 10/3, 2/3, 1/7, 7/2, 1/8, 5/8, 1/16"),
+            same("SELECT 1.00001/3, 1.0/3, 1.00/3, 1.000/3, 1.0000/3, 1.00000/3, \
+                  1.000000/3"),
+            same("SELECT 1.0000000000000000000000000/7"),
+            same("SELECT -1/3, -2/3, 1/-3, -1/-3, -1/8, -3/8"),
+            same("SELECT SUM(two) / COUNT(*), AVG(two), SUM(two) + 0 FROM Dm"),
+            // A quotient is covered by what it *prints*. MySQL's own value
+            // carries more places than the column declares — `JSON_ARRAY(1/3)`
+            // is `[0.333333333]` against a `decimal(5,4)` column — so anything
+            // that reads a quotient instead of printing one still diverges.
+            // That is #0118, and it needs a scale on the column before it can
+            // be fixed rather than moved.
+
+            // Past what an `i128` counts, which is 38 digits: MySQL's DECIMAL
+            // is 65 and a product of two of them is 70, printed in full.
+            same("SELECT wide + wide, wide * wide, wide / wide, wide - wide \
+                  FROM Dm ORDER BY id"),
+            same("SELECT big * big, big + big, big - big FROM Dm ORDER BY id"),
+            same("SELECT tiny * tiny, tiny + tiny, tiny / tiny FROM Dm ORDER BY id"),
+            same("SELECT wide * tiny, tiny / wide, wide MOD tiny FROM Dm ORDER BY id"),
+            // Exact beside an integer and beside a BIGINT UNSIGNED, whose
+            // range no signed integer holds; approximate beside a FLOAT or a
+            // DOUBLE, which is where MySQL stops answering exactly.
+            same("SELECT two + n, two * n, two / n, n / two, n + three FROM Dm ORDER BY id"),
+            same("SELECT two + u, two * u, two / u, u / 2, u + 1.5 FROM Dm ORDER BY id"),
+            // `DIV` keeps the UNSIGNED tag from either operand, and a decimal
+            // divisor must not take it off: `u DIV 1.0` is
+            // 18446744073709551615 on 8.3 exactly as `u DIV 1` is, and
+            // answering the first 1690 would make the answer depend on how
+            // the 1 was written.
+            same("SELECT u DIV 1.0, u DIV 2.0, u MOD 1.5, u MOD 3 FROM Dm ORDER BY id"),
+            same("SELECT u DIV three, u MOD three, u / three FROM Dm ORDER BY id"),
+            same("SELECT 18446744073709551615 DIV 1.0, 18446744073709551615 DIV 2.0, \
+                  18446744073709551615 MOD 1.0"),
+            // De-duplication keys a decimal by its number rather than by its
+            // text, at every width: two spellings of one 70-digit product are
+            // one row.
+            same("SELECT COUNT(DISTINCT v) FROM (SELECT two AS v FROM Dm \
+                  UNION ALL SELECT two * 1.0 FROM Dm) t"),
+            same("SELECT COUNT(*) FROM (SELECT big * big AS v FROM Dm \
+                  UNION SELECT big * big * 1.0 FROM Dm) t"),
+            same("SELECT two + f, two * f, two / f, two + g, two / g FROM Dm ORDER BY id"),
+            // A temporal packs to a number and computes exactly with one.
+            // `-dt3` is left out: MySQL types that DOUBLE and still prints its
+            // three declared places, which is a float-formatting gap.
+            same("SELECT two + dt, two * dt, two / dt, dt / 1, dt + 0 FROM Dm ORDER BY id"),
+            same("SELECT two + dt3, two / dt3, dt3 / 1, dt3 + 0 FROM Dm ORDER BY id"),
+            // A literal keeps every place it was written and drops the zeros
+            // in front, and one past both integer types is a DECIMAL rather
+            // than a rounded double.
+            same("SELECT 0.5, 100.0, 1.50, .5, 007.5, 0.0, 00.00, -0.5"),
+            same("SELECT 0.1 + 0.2, 0.5 + 0.5, 1.50 * 2, 2.675 * 1"),
+            same("SELECT 18446744073709551615, 18446744073709551616, \
+                  99999999999999999999999"),
+            same("SELECT 18446744073709551616 + 1, 18446744073709551616 * 2, \
+                  18446744073709551616 / 2"),
+            // An exponent is a DOUBLE to MySQL, so it stays approximate and
+            // makes what it touches approximate too.
+            same("SELECT 1.5e0, 1.5e3, 1.5e0 + 1, 1.5e0 / 2, 1.5 + 1.5e0"),
+            // 37 places, which only a literal can carry: `+`, `-`, `%` and a
+            // sign keep all of them and `*` and `/` clamp at 30.
+            same("SELECT 1.5000000000000000000000000000000000000 + 0, \
+                  1.5000000000000000000000000000000000000 * 1"),
+            same("SELECT 1.5000000000000000000000000000000000000 / 1, \
+                  1.5000000000000000000000000000000000000 MOD 1"),
+            same("SELECT -1.5000000000000000000000000000000000000, \
+                  ABS(-1.5000000000000000000000000000000000000)"),
+            // NULL comes from the columns rather than from a literal: MySQL
+            // types *any* arithmetic with a NULL literal in it DOUBLE — `1 +
+            // NULL`, `two + NULL` and `-NULL` are all DOUBLE on 8.3, and only
+            // `NULL DIV 2` is not — where this engine types it by the other
+            // operand. That is a rule about NULL and not about decimals, and
+            // it is filed rather than fixed here.
+            same("SELECT two + n, two - n, two * n, two / n, -n FROM Dm WHERE id = 3"),
+            same("SELECT two + three + whole, (two + three) * two, two * three / two \
+                  FROM Dm ORDER BY id"),
+            same("SELECT id FROM Dm WHERE two / three = 1.000000 ORDER BY id"),
+            same("SELECT CAST('2.5' AS DECIMAL(10,1)) / 2, \
+                  CAST('2.5' AS DECIMAL(10,1)) * 3"),
+            // A subquery on either side of `/`. Its type cannot be worked out
+            // ahead of running it, and "cannot type" is not "approximate": a
+            // quotient whose operands are not *known* to be approximate is a
+            // NEWDECIMAL. Announced DOUBLE, the exact answer was parsed back
+            // through an `f64` on its way out, so `(SELECT 1)/2` printed 0.5
+            // as a column and 0.5000 inside a `CONCAT` — one expression, two
+            // answers.
+            same("SELECT (SELECT 1)/2, 2/(SELECT 2), (SELECT 1)/(SELECT 2), \
+                  CONCAT((SELECT 1)/2)"),
+            same("SELECT (SELECT n FROM Sq WHERE id = 1)/2, \
+                  (SELECT v FROM Sq WHERE id = 1)/2 FROM Sq ORDER BY id"),
+            same("SELECT (SELECT SUM(n) FROM Sq)/2, (SELECT SUM(v) FROM Sq)/2"),
+            same("SELECT n/(SELECT 2), v/(SELECT n FROM Sq WHERE id = 1) \
+                  FROM Sq ORDER BY id"),
+            // Comparison has to be as exact as the arithmetic beside it. Read
+            // through an `f64` these two columns compared equal while `a - b`
+            // answered 1 — the same row saying two things — and `=` disagreed
+            // with the `GROUP BY` key, which was already exact.
+            same("SELECT a, b, a - b, a = b, a > b, a < b, a >= b, b > a \
+                  FROM Wd ORDER BY id"),
+            same("SELECT id FROM Wd WHERE a = b ORDER BY id"),
+            same("SELECT id FROM Wd WHERE a > b ORDER BY id"),
+            same("SELECT a FROM Wd ORDER BY a"),
+            same("SELECT COUNT(DISTINCT a) FROM (SELECT a FROM Wd \
+                  UNION ALL SELECT b FROM Wd) t"),
+            same("SELECT 18446744073709551616 = 18446744073709551615, \
+                  18446744073709551616 > 18446744073709551615"),
+            same("SELECT 10000000000000000000000000000000000001 = \
+                  10000000000000000000000000000000000000"),
+            // And every spelling of one number is still one value, which the
+            // exact path has to keep: a sign on a zero is not a difference.
+            same("SELECT 1.50 = 1.5, 1.50 > 1.5, -0.00 = 0, 2.50 < 10.00, \
+                  -2.5 < -1.5, 0.0 = -0.0"),
+            same("SELECT s = 2.5, s = 2.50000, s > 2.4999999999, \
+                  s BETWEEN 2 AND 3 FROM Wd ORDER BY id"),
         ],
     },
 ];

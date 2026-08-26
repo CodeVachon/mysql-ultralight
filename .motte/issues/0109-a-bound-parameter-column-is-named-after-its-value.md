@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-08-25T19:32:31Z
-updated: 2026-08-25T19:32:31Z
+updated: 2026-08-25T21:50:56Z
 ---
 
 ## Description
@@ -22,3 +22,13 @@ Measured through a real prepared statement, not the CLI. This engine splices a p
 Naming it ? means params::bind reporting where it wrote, through rewrite::normalise, whose passes are not offset-preserving -- the same offset mapping #0060 exists for. Doing it inside #0059 would have made a naming change into a rewriter change.
 
 Behaviour is pinned by a_bound_parameter_column_is_named_after_its_value_where_mysql_says_question_mark in crates/engine/tests/sql.rs, which cross-references the SELECT ? assertion in describe.rs.
+
+## Notes
+
+### 2026-08-25T21:50:56Z — Christopher Vachon (user)
+
+The offset mapping this was waiting on landed with #0060 in 2517c12, so half the blocker is gone.
+
+What remains is the other half: params::bind splices bound values into the text before rewrite::normalise runs, so Normalised::written is the already-substituted text rather than the text with ? in it. Naming the column ? now needs bind to report its substitutions in the same piece terms the rewriter uses, so the two compose -- a binder change rather than a naming change.
+
+Behaviour stays pinned by a_bound_parameter_column_is_named_after_its_value_where_mysql_says_question_mark in crates/engine/tests/sql.rs, whose doc comment now says this.

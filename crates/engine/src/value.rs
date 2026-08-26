@@ -353,6 +353,24 @@ impl Value {
             return Some(a.cmp(&b));
         }
 
+        // And a decimal beside either of those, for the same reason one step
+        // further out: an `i128` is 38 digits where MySQL's DECIMAL is 65, and
+        // an `f64` gives up at seventeen. Two `DECIMAL(65,0)` columns holding
+        // 10000000000000000000000000000000000001 and ...000 compared *equal*
+        // through the `f64` path while `a - b` answered 1 — one row saying two
+        // things — and `18446744073709551616 = 18446744073709551615` was 1
+        // under columns that print all twenty digits.
+        //
+        // Reached only where at least one side is a `Decimal`, since the
+        // integer pair returned above. It has to agree with `collation_key`,
+        // which keys a decimal by its number at every width: without this,
+        // `GROUP BY` and `=` disagreed about the same two values.
+        if let (Some(a), Some(b)) = (self.exact_decimal(), other.exact_decimal()) {
+            if let Some(order) = crate::decimal::compare(&a, &b) {
+                return Some(order);
+            }
+        }
+
         // Numbers compare numerically even against numeric strings, which is
         // how MySQL behaves and what Prisma's generated comparisons rely on.
         // A decimal is a number: `2.50` equals `2.5` and sorts below `10.00`,
@@ -507,6 +525,26 @@ impl Value {
         }
     }
 
+    /// The exact decimal text this value *is*, for the three tags that hold
+    /// one.
+    ///
+    /// The operand set the exact arithmetic in `expr.rs` works over, and the
+    /// one `compare` above widens to: an integer of either sign is a decimal
+    /// with no places. `None` for everything else, a numeric string included —
+    /// MySQL reads one of those as a double, so answering it exactly here
+    /// would make `d = '2.5'` a different question from `d + '2.5'`.
+    ///
+    /// Borrowed where there is text to borrow, because this runs per row per
+    /// comparison and a `Decimal` already holds its digits.
+    pub(crate) fn exact_decimal(&self) -> Option<std::borrow::Cow<'_, str>> {
+        match self {
+            Value::Int(v) => Some(std::borrow::Cow::Owned(v.to_string())),
+            Value::Unsigned(v) => Some(std::borrow::Cow::Owned(v.to_string())),
+            Value::Decimal(text) => Some(std::borrow::Cow::Borrowed(text)),
+            _ => None,
+        }
+    }
+
     /// The exact number MySQL reads this temporal as, or `None` for anything
     /// that is not one.
     ///
@@ -574,16 +612,11 @@ impl Value {
             //
             // The bare integer, too, so `2.00` keys the same as the `2` a
             // union might put beside it.
-            Value::Decimal(text) => {
-                let scale = crate::decimal::scale_of(text);
-                match crate::decimal::units(text, scale) {
-                    Some(units) => {
-                        let (units, scale) = crate::decimal::shortest(units, scale);
-                        crate::decimal::render(units, scale)
-                    }
-                    None => text.to_lowercase(),
-                }
-            }
+            Value::Decimal(text) => match crate::decimal::shortest(text) {
+                Some(key) => key,
+                // A `Decimal` whose text is not one, which nothing validates.
+                None => text.to_lowercase(),
+            },
             other => other.as_text().to_lowercase(),
         }
     }

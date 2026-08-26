@@ -207,3 +207,15 @@
 {"at":"2026-08-25T19:32:32Z","id":110,"by":"Christopher Vachon","as":"user","type":"created","title":"A view column is materialised wider than MySQL materialises it","state":"Todo"}
 {"at":"2026-08-25T20:18:10Z","id":60,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
 {"at":"2026-08-25T20:18:10Z","id":60,"by":"Christopher Vachon","as":"user","type":"assigned","from":null,"to":"Christopher Vachon"}
+{"at":"2026-08-25T21:50:56Z","id":60,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-08-25T21:51:02Z","id":70,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-08-25T23:12:44Z","id":111,"by":"Christopher Vachon","as":"user","type":"created","title":"A numeric column is described with no precision or scale","state":"Todo"}
+{"at":"2026-08-25T23:13:03Z","id":112,"by":"Christopher Vachon","as":"user","type":"created","title":"Arithmetic with a NULL literal is a DOUBLE in MySQL","state":"Todo"}
+{"at":"2026-08-25T23:13:03Z","id":113,"by":"Christopher Vachon","as":"user","type":"created","title":"div_precision_increment is not a system variable","state":"Todo"}
+{"at":"2026-08-25T23:13:29Z","id":114,"by":"Christopher Vachon","as":"user","type":"created","title":"Unary minus over a fractional temporal drops its declared places","state":"Todo"}
+{"at":"2026-08-25T23:13:29Z","id":115,"by":"Christopher Vachon","as":"user","type":"created","title":"GREATEST and LEAST do not coerce their answer to the aggregated type","state":"Todo"}
+{"at":"2026-08-25T23:13:29Z","id":116,"by":"Christopher Vachon","as":"user","type":"created","title":"SIGN is unsupported","state":"Todo"}
+{"at":"2026-08-25T23:13:29Z","id":117,"by":"Christopher Vachon","as":"user","type":"created","title":"Unary plus is not peeled from a column's name","state":"Todo"}
+{"at":"2026-08-25T23:29:12Z","id":118,"by":"Christopher Vachon","as":"user","type":"created","title":"A quotient's value carries more places than its column declares","state":"Todo"}
+{"at":"2026-08-25T23:42:34Z","id":119,"by":"Christopher Vachon","as":"user","type":"created","title":"A decimal wider than 65 digits saturates through a temp table","state":"Todo"}
+{"at":"2026-08-26T00:18:26Z","id":120,"by":"Christopher Vachon","as":"user","type":"created","title":"CAST to an integer truncates where MySQL rounds","state":"Todo"}

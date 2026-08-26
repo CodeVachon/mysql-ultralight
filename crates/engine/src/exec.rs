@@ -2834,7 +2834,7 @@ impl Engine {
                     let widened = 10i128.pow(crate::decimal::AVERAGE_EXTRA_SCALE as u32);
                     match total
                         .checked_mul(widened)
-                        .and_then(|n| crate::decimal::divide(n, present.len() as i128))
+                        .and_then(|n| crate::decimal::divide_units(n, present.len() as i128))
                     {
                         Some(mean) => Value::Decimal(crate::decimal::render(mean, scale)),
                         None => Value::Float(approximate_total(&present) / present.len() as f64),
@@ -6211,10 +6211,20 @@ fn is_textual_code(t: ColumnType) -> bool {
     )
 }
 
+/// Whether a code is one MySQL computes over approximately.
+///
+/// A FLOAT or a DOUBLE, and the string family that converts to one. Named
+/// rather than left inside [`arithmetic_type`] because `/` has to ask this
+/// question on its own: that function answers DOUBLE for two different
+/// reasons — an operand that *is* approximate, and an operand it could not
+/// type at all — and only the first of them makes a quotient approximate.
+fn is_approximate_code(t: ColumnType) -> bool {
+    matches!(t, ColumnType::Float | ColumnType::Double) || is_textual_code(t)
+}
+
 /// The wider of two numeric codes, for an operator with two operands.
 fn arithmetic_type(a: ColumnType, b: ColumnType) -> ColumnType {
-    let approximate =
-        |t: ColumnType| matches!(t, ColumnType::Float | ColumnType::Double) || is_textual_code(t);
+    let approximate = is_approximate_code;
     let exact = |t: ColumnType| matches!(t, ColumnType::Decimal | ColumnType::NewDecimal);
     if approximate(a) || approximate(b) {
         ColumnType::Double
@@ -6493,8 +6503,15 @@ fn computed_column_type(
                     ColumnType::Double
                 } else if text.contains('.') {
                     ColumnType::NewDecimal
-                } else {
+                } else if text.parse::<i64>().is_ok() || text.parse::<u64>().is_ok() {
                     ColumnType::LongLong
+                } else {
+                    // Past both integers and still exact: MySQL types
+                    // `18446744073709551616` NEWDECIMAL and prints all twenty
+                    // digits. Announced LONGLONG, the binary protocol would
+                    // have sent eight bytes for a number that does not fit in
+                    // them.
+                    ColumnType::NewDecimal
                 }
             }
             sqlparser::ast::Value::Boolean(_) => ColumnType::LongLong,
@@ -6564,7 +6581,29 @@ fn computed_column_type(
                 // Division is exact in MySQL, so it answers a decimal even
                 // over two integers — where `DIV` is integer division and is a
                 // LONGLONG whatever it divided, including two decimals.
-                B::Divide => ColumnType::NewDecimal,
+                //
+                // Approximate on either side makes it a DOUBLE, like every
+                // other operator: measured on 8.3, `d / f` over a DECIMAL and
+                // a FLOAT is DOUBLE and `d / i` is NEWDECIMAL.
+                //
+                // Asked of the operands directly rather than read off
+                // `arithmetic_type`, whose DOUBLE also means "I could not type
+                // this" — a subquery, an unrecognised function. Routed through
+                // it, `(SELECT 1)/2` was announced DOUBLE and `reconcile`
+                // then parsed the exact quotient back through an `f64`, so the
+                // same expression answered 0.5 as a column and 0.5000 inside a
+                // `CONCAT`. An operand this cannot type is *not* known to be
+                // approximate, and a decimal is the answer MySQL gives when
+                // neither side is.
+                B::Divide => {
+                    let approximate =
+                        |e| is_approximate_code(arithmetic_operand_type(e, refs, input));
+                    if approximate(left) || approximate(right) {
+                        ColumnType::Double
+                    } else {
+                        ColumnType::NewDecimal
+                    }
+                }
                 B::MyIntegerDivide => ColumnType::LongLong,
                 B::Plus | B::Minus | B::Multiply | B::Modulo => arithmetic_type(
                     arithmetic_operand_type(left, refs, input),

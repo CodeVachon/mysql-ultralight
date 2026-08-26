@@ -1662,7 +1662,13 @@ fn an_aggregate_can_appear_inside_an_expression() {
         &mut session,
         "SELECT region, SUM(amount) / COUNT(*) FROM Sale GROUP BY region ORDER BY region",
     );
-    assert_eq!(averaged, vec![vec!["north", "150"], vec!["south", "50"]]);
+    // Four places, because a quotient is four wider than its left operand:
+    // `SUM(amount)` over an INT is a DECIMAL with no places, and MySQL answers
+    // this 150.0000 and 50.0000 on 8.3.
+    assert_eq!(
+        averaged,
+        vec![vec!["north", "150.0000"], vec!["south", "50.0000"]]
+    );
 }
 
 /// Grouping treats NULLs as one group, unlike comparison, which treats them as
@@ -1944,7 +1950,9 @@ fn an_aggregate_nested_in_an_expression_still_groups() {
             &mut session,
             "SELECT SUM(amount) / COUNT(*) FROM Sale"
         ),
-        vec![vec!["90"]]
+        // 90.0000 rather than 90: a quotient is four places wider than its
+        // left operand, which is `div_precision_increment`.
+        vec![vec!["90.0000"]]
     );
     assert_eq!(
         rows(
@@ -9442,6 +9450,349 @@ fn a_temporal_in_arithmetic_is_its_packed_number() {
     for (sql, expected) in [
         ("SELECT d + 0 FROM T WHERE id = 2", "20240105"),
         ("SELECT short + 0 FROM T WHERE id = 2", "20240105060700"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+/// #0070. Arithmetic over a decimal went through an `f64` and came back with
+/// whatever the float printed, so the scale MySQL computes was lost at every
+/// operator. Every expected value below was read off MySQL 8.3.
+#[test]
+fn decimal_arithmetic_carries_mysql_s_scale() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE D (a DECIMAL(10,2), b DECIMAL(8,3))",
+    );
+    run(&engine, &mut session, "INSERT INTO D VALUES (1.5, 1.5)");
+
+    for (sql, expected) in [
+        // The issue's own table, and then the same operators with the operands
+        // the other way round — a rule that reads the *left* scale has to be
+        // asked twice or half of it goes untested.
+        ("SELECT a + b FROM D", "3.000"),
+        ("SELECT b + a FROM D", "3.000"),
+        ("SELECT a - b FROM D", "0.000"),
+        ("SELECT b - a FROM D", "0.000"),
+        ("SELECT a * b FROM D", "2.25000"),
+        ("SELECT b * a FROM D", "2.25000"),
+        // Four places wider than the *left* operand, so this pair differs.
+        ("SELECT a / b FROM D", "1.000000"),
+        ("SELECT b / a FROM D", "1.0000000"),
+        ("SELECT a + 1 FROM D", "2.50"),
+        ("SELECT 1 + a FROM D", "2.50"),
+        ("SELECT a * 2 FROM D", "3.00"),
+        ("SELECT a + 0.5 FROM D", "2.00"),
+        ("SELECT -a FROM D", "-1.50"),
+        ("SELECT ABS(-a) FROM D", "1.50"),
+        // `%` and `MOD` are the same operator and take the wider scale,
+        // padding out to it rather than answering their own digits.
+        ("SELECT a % b FROM D", "0.000"),
+        ("SELECT a MOD b FROM D", "0.000"),
+        ("SELECT 10.5 MOD 3.00", "1.50"),
+        // `DIV` has no scale at all, whatever it divided.
+        ("SELECT a DIV b FROM D", "1"),
+        ("SELECT 7.5 DIV 2", "3"),
+        ("SELECT -7.5 DIV 2", "-3"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+/// #0085. A quotient is four places wider than its left operand —
+/// `div_precision_increment` — even over two plain integers, and the digits
+/// come from long division rather than from a double.
+#[test]
+fn division_widens_by_the_precision_increment() {
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        ("SELECT 1/3", "0.3333"),
+        ("SELECT 10/3", "3.3333"),
+        ("SELECT 2/3", "0.6667"),
+        ("SELECT -2/3", "-0.6667"),
+        ("SELECT 7/2", "3.5000"),
+        ("SELECT 1/7", "0.1429"),
+        // MySQL computes the quotient to a whole number of nine-digit words
+        // and truncates *there*, then rounds that to the result's scale. Five
+        // places on the left asks for nine and computes nine, so the
+        // truncation is what shows: 0.333336666, not 0.333336667.
+        ("SELECT 1.00001/3", "0.333336666"),
+        // 25 places asks for 29 and computes 36, so the far end does round.
+        (
+            "SELECT 1.0000000000000000000000000/7",
+            "0.14285714285714285714285714286",
+        ),
+        // A zero divisor is NULL rather than an error, for all three.
+        ("SELECT 1/0", "NULL"),
+        ("SELECT 1.5 MOD 0", "NULL"),
+        ("SELECT 1 DIV 0", "NULL"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // Exact past what a double holds, which is the other half of #0085: a
+    // BIGINT UNSIGNED over two is not a number an `f64` can halve.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 18446744073709551615 / 2"),
+        vec![vec!["9223372036854775807.5000"]]
+    );
+}
+
+/// A number written without an exponent is exact, and carries the scale it was
+/// written with. Until #0070 it evaluated to an `f64`, so `SELECT 1.50` was
+/// 1.5 and `SELECT 18446744073709551616` was 1.8446744073709552e19 — both
+/// under columns this engine already described NEWDECIMAL.
+#[test]
+fn a_numeric_literal_keeps_every_digit_it_was_written_with() {
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        ("SELECT 1.50", "1.50"),
+        ("SELECT 100.0", "100.0"),
+        // Leading zeros go and written places stay, which is how MySQL prints
+        // the same two literals.
+        ("SELECT .5", "0.5"),
+        ("SELECT 007.5", "7.5"),
+        ("SELECT 00.00", "0.00"),
+        ("SELECT 0.1 + 0.2", "0.3"),
+        ("SELECT CONCAT(1.50)", "1.50"),
+        // Past `u64::MAX` and still exact: MySQL types this NEWDECIMAL.
+        ("SELECT 18446744073709551616", "18446744073709551616"),
+        ("SELECT 18446744073709551616 + 1", "18446744073709551617"),
+        ("SELECT 99999999999999999999999", "99999999999999999999999"),
+        // An exponent is a DOUBLE to MySQL and stays approximate here, which
+        // is the one numeric literal that does.
+        ("SELECT 1.5e3", "1500"),
+        ("SELECT 0.1e0 + 0.2e0", "0.30000000000000004"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+/// The type a decimal expression is *described* with, which the binary
+/// protocol encodes by. A quotient is a NEWDECIMAL over exact operands and a
+/// DOUBLE the moment one of them is approximate — measured on 8.3, where
+/// `d / f` is DOUBLE and `d / i` is NEWDECIMAL — and describing an approximate
+/// quotient NEWDECIMAL sent a client digits the column promised were exact.
+#[test]
+fn a_quotient_is_described_by_what_it_divided() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Q (d DECIMAL(10,2), i INT, f FLOAT, g DOUBLE)",
+    );
+    let codes = |sql: &str| -> Vec<String> {
+        engine
+            .describe(&session, sql, 0)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .map(|c| format!("{:?}", c.ty))
+            .collect()
+    };
+    assert_eq!(
+        codes("SELECT d / i, i / i, d / d, d / 2 FROM Q"),
+        vec!["NewDecimal"; 4]
+    );
+    assert_eq!(
+        codes("SELECT d / f, d / g, f / i FROM Q"),
+        vec!["Double"; 3]
+    );
+    // An operand whose type cannot be worked out ahead of running it is not
+    // *known* to be approximate, and MySQL answers a decimal when neither side
+    // is: `(SELECT 1)/2` is NEWDECIMAL on 8.3. Announced DOUBLE, `reconcile`
+    // parses the exact quotient back through an `f64` on its way out — which
+    // is how the same expression printed 0.5 as a column and 0.5000 inside a
+    // `CONCAT`.
+    assert_eq!(
+        codes("SELECT (SELECT 1)/2, 2/(SELECT 2), (SELECT 1)/(SELECT 2)"),
+        vec!["NewDecimal"; 3]
+    );
+    // And a literal past both integer types is a NEWDECIMAL rather than the
+    // LONGLONG its lack of a point would otherwise say.
+    assert_eq!(
+        codes("SELECT 18446744073709551616, 18446744073709551615, 1.5"),
+        vec!["NewDecimal", "LongLong", "NewDecimal"]
+    );
+}
+
+/// A decimal past what an `i128` counts. MySQL's DECIMAL is 65 digits where an
+/// `i128` is 38, and the overflow used to fall back to the `f64` path — which
+/// answered the right number to fifteen digits and lost the scale with it.
+#[test]
+fn decimal_arithmetic_reaches_past_an_i128() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE W (wide DECIMAL(65,30), narrow DECIMAL(30,10), big DECIMAL(65,0))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO W VALUES (1.5, 3.5, 99999999999999999999999999999999999)",
+    );
+
+    for (sql, expected) in [
+        // 40 places asked for and 30 given, and every digit of the answer kept.
+        (
+            "SELECT narrow * wide FROM W",
+            "5.250000000000000000000000000000",
+        ),
+        (
+            "SELECT wide + wide FROM W",
+            "3.000000000000000000000000000000",
+        ),
+        // 70 digits, which MySQL prints in full under a column it still
+        // describes `decimal(65,0)` — the precision is not clamped, only the
+        // scale is.
+        (
+            "SELECT big * big FROM W",
+            "9999999999999999999999999999999999800000000000000000000000000000000001",
+        ),
+        // De-duplication keys a decimal by its number and not by its text, and
+        // that has to hold at a width no `i128` counts: `2.50` and `2.5` were
+        // one group already, and these two spellings of one 70-digit product
+        // became two the moment arithmetic could produce them.
+        (
+            "SELECT COUNT(*) FROM (SELECT big * big AS v FROM W \
+             UNION SELECT big * big * 1.0 FROM W) t",
+            "1",
+        ),
+        // A BIGINT is what `DIV` answers, so one that does not fit is 1690
+        // rather than a wrong number.
+        ("SELECT big DIV 7 FROM W", "!1690"),
+        ("SELECT 99999999999999999999999.0 DIV 1", "!1690"),
+        ("SELECT 9223372036854775807.5 DIV 1", "9223372036854775807"),
+        // And `DIV` keeps the UNSIGNED tag from either operand, so a decimal
+        // divisor does not shrink the range the answer is checked against:
+        // `18446744073709551615 DIV 1.0` is that number on 8.3, where an
+        // `i64`'s range would have refused it.
+        (
+            "SELECT 18446744073709551615 DIV 1.0",
+            "18446744073709551615",
+        ),
+        ("SELECT 18446744073709551615 DIV 2.0", "9223372036854775807"),
+        ("SELECT 18446744073709551615 DIV 0.5", "!1690"),
+    ] {
+        match expected.strip_prefix('!') {
+            Some(code) => {
+                let error = engine.execute(&mut session, sql, &[]).expect_err(sql);
+                assert_eq!(error.code.to_string(), code, "{sql}");
+                assert_eq!(error.sql_state, "22003", "{sql}");
+            }
+            None => assert_eq!(
+                rows(&engine, &mut session, sql),
+                vec![vec![expected]],
+                "{sql}"
+            ),
+        }
+    }
+}
+
+/// A decimal compares as exactly as it computes. Until #0070 both were read
+/// through an `f64`, so the wrongness was at least self-consistent; making
+/// storage and arithmetic exact past seventeen significant digits is what made
+/// a comparison that is not exact contradict the row it sits in.
+#[test]
+fn a_decimal_compares_as_exactly_as_it_computes() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Wd (id INT, a DECIMAL(65,0), b DECIMAL(65,0))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Wd VALUES (1, 10000000000000000000000000000000000001, \
+         10000000000000000000000000000000000000)",
+    );
+
+    // The row used to say two things at once: `a - b` was 1 and `a = b` was
+    // also 1, because the difference was exact and the comparison was not.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT a - b, a = b, a > b, a < b FROM Wd"
+        ),
+        vec![vec!["1", "0", "1", "0"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Wd WHERE a = b"),
+        Vec::<Vec<String>>::new()
+    );
+
+    // Reachable with no table at all, under columns #0070 newly and correctly
+    // prints every digit of.
+    for (sql, expected) in [
+        ("SELECT 18446744073709551616 = 18446744073709551615", "0"),
+        ("SELECT 18446744073709551616 > 18446744073709551615", "1"),
+        // And every spelling of one number is still one value: a scale is not
+        // part of what a comparison asks, and a zero has no sign.
+        ("SELECT 1.50 = 1.5", "1"),
+        ("SELECT 1.50 > 1.5", "0"),
+        ("SELECT -0.00 = 0", "1"),
+        ("SELECT 0.0 = -0.0", "1"),
+        ("SELECT 2.50 < 10.00", "1"),
+        ("SELECT -2.5 < -1.5", "1"),
+        // A numeric string still reads as a double, which is a different
+        // question with its own answer — `d + '2.5'` is approximate too.
+        ("SELECT 2.50 = '2.5'", "1"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // `=` and the GROUP BY key have to agree, and both are exact now. Keyed by
+    // its text a decimal was two groups; keyed through an `f64` it was one
+    // group that `=` then called two.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(DISTINCT v) FROM (SELECT a AS v FROM Wd \
+             UNION ALL SELECT b FROM Wd) t"
+        ),
+        vec![vec!["2"]]
+    );
+}
+
+/// An exact quotient survives the trip out. `ResultSet::reconcile` converts a
+/// value to the code its column was announced with, so announcing a quotient
+/// DOUBLE parses the exact digits back through an `f64` — and only for the
+/// reader that goes through a column, which is what made one expression give
+/// two answers.
+#[test]
+fn an_exact_quotient_is_not_announced_approximate() {
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        ("SELECT (SELECT 1)/2", "0.5000"),
+        ("SELECT CONCAT((SELECT 1)/2)", "0.5000"),
+        ("SELECT 2/(SELECT 2)", "1.0000"),
+        ("SELECT (SELECT 1)/(SELECT 2)", "0.5000"),
     ] {
         assert_eq!(
             rows(&engine, &mut session, sql),
