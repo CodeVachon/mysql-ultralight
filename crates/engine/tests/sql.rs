@@ -7224,6 +7224,132 @@ fn a_cast_to_json_converts_an_approximate_number_rather_than_reading_its_text() 
 }
 
 #[test]
+fn a_json_number_is_read_the_way_mysqls_parser_reads_one() {
+    // Which double a literal names is as much MySQL's answer as how it is
+    // written back, and the two parsers already in reach give a different one.
+    // MySQL reads JSON with rapidjson at its default precision, which keeps
+    // seventeen significant digits and scales them by one tabulated power of
+    // ten; Rust's own parse is correctly rounded and serde's keeps nineteen.
+    // #0072. Every row measured on 8.3.
+    let (engine, mut session) = engine();
+
+    for (sql, expected) in [
+        // The one the issue was written about, and its mirror.
+        // `2000000000000000.25` names a double exactly, and every one of its
+        // digits is read — it still is not that double, because the
+        // accumulator ties to 2e16 on its way into one, the seventeenth digit
+        // ties again on its way in after that, and dividing by a hundred
+        // lands on 2e15.
+        (
+            "SELECT CAST('[2000000000000000.25, -2000000000000000.25]' AS JSON)",
+            "[2e15, -2e15]",
+        ),
+        // Zeros spend the budget of seventeen like any other digit, so the
+        // padded spelling of a number is a different number: two of these
+        // zeros are read and thrown away, and one of these is a digit short.
+        (
+            "SELECT CAST('[6193038.5328500000000, 99555829226.40225000]' AS JSON)",
+            "[6193038.532849999, 99555829226.40224]",
+        ),
+        // The first digit is not one of the seventeen — rapidjson's own
+        // off-by-one. Counting it would leave one digit fewer for each of
+        // these to take, and move both answers.
+        (
+            "SELECT CAST('[945177346.838600900, 2963649940394770.84]' AS JSON)",
+            "[945177346.8386009, 2963649940394770.5]",
+        ),
+        // The exact accumulator stops the moment it passes 2^53 rather than
+        // when it runs out of digits — three fraction digits into the first
+        // of these and ten into the second — and what it leaves goes through
+        // the double one rounding at a time.
+        (
+            "SELECT CAST('[12345678901234.5678, 987119.34197208915]' AS JSON)",
+            "[12345678901234.57, 987119.3419720893]",
+        ),
+        // A negative hands over to the double at 2^63 where a positive waits
+        // for 2^64, so the same digits with a sign read differently.
+        (
+            "SELECT CAST('[-9945313574470124358, -116099708312755456469406171708]' AS JSON)",
+            "[-9.945313574470126e18, -1.1609970831275545e29]",
+        ),
+        // Scaling divides by the positive power rather than multiplying by the
+        // negative one, which is not the same rounding.
+        ("SELECT CAST('[-408.38500, 9.63e-143]' AS JSON)", "[-408.385, 9.63e-143]"),
+        // And the power comes from a table of nearest doubles; built by
+        // repeated multiplication instead, this is 4.4276401100000026e271.
+        ("SELECT CAST('[442764011e263]' AS JSON)", "[4.42764011e271]"),
+        // Below what the table holds the scaling is done in two steps, or the
+        // divisor would be zero and the answer with it.
+        (
+            "SELECT CAST('[9e-309, 33.76647131e-311]' AS JSON)",
+            "[9e-309, 3.376647131e-310]",
+        ),
+        // Leading zeros in a fraction are not significant digits, so this
+        // keeps seventeen real ones and not two.
+        (
+            "SELECT CAST('[0.000000000000000000000000021649319015913176468]' AS JSON)",
+            "[2.1649319015913174e-26]",
+        ),
+        // And where sixteen of them already pass 2^53, not counting the zeros
+        // is what leaves room for a seventeenth.
+        (
+            "SELECT CAST('[0.0000000000000000000944876924289080511, -0.000091118449507296030]' AS JSON)",
+            "[9.448769242890803e-20, -0.00009111844950729603]",
+        ),
+        // An integer past what a double holds exactly is read the same way,
+        // digit by digit into the double.
+        (
+            "SELECT CAST('[123456789012345678901234567890]' AS JSON)",
+            "[1.2345678901234566e29]",
+        ),
+        // The exponent is measured against where the point already sits, not
+        // against 308 flat: the same `e312` is out of range at one place and
+        // 1e307 five places down.
+        (
+            "SELECT CAST('[0.00001e312, 0.00000000000000001e325]' AS JSON)",
+            "[1e307, 1e308]",
+        ),
+        // And once past that point the rest of its digits are read but not
+        // added, so an exponent longer than any integer holds still underflows
+        // to zero rather than overflowing the count of it.
+        (
+            "SELECT CAST('[1e-99999999999999999999, 1e-2000]' AS JSON)",
+            "[0.0, 0.0]",
+        ),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // And what is out of range rather than a number: an exponent past what a
+    // double could hold, whatever its length, and a mantissa that passes that
+    // test and overflows on the scaling. `0.00001e3120` is the pair of
+    // `0.00001e312` above — five places down buys five, not the whole
+    // difference — and reading the ceiling as 308 flat would make it 1e307.
+    // 8.3 refuses all six.
+    for sql in [
+        "SELECT CAST('[1e309]' AS JSON)",
+        "SELECT CAST('[1e99999999999999999999]' AS JSON)",
+        "SELECT CAST('[0.00000000000000001e326]' AS JSON)",
+        "SELECT CAST('[0.00001e3120]' AS JSON)",
+        "SELECT CAST('[1.7976931348623159e308]' AS JSON)",
+        "SELECT CAST('[-1.7976931348623159e308]' AS JSON)",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 3141, "expected invalid JSON text for: {sql}");
+        assert!(
+            err.message
+                .contains("Number too big to be stored in double."),
+            "{sql} -> {}",
+            err.message
+        );
+    }
+}
+
+#[test]
 fn a_number_too_big_for_a_double_is_not_valid_json_text() {
     // serde used to refuse this on its own, reading the literal into an f64
     // and failing on the infinity. Holding a number as its digits means

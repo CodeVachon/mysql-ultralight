@@ -1,11 +1,11 @@
 ---
 id: 72
 title: serde and MySQL round a JSON literal tie differently
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-08-21T18:23:38Z
-updated: 2026-08-21T18:23:38Z
+updated: 2026-08-26T03:49:17Z
 ---
 
 ## Description

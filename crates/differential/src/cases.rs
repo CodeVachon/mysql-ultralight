@@ -85,6 +85,11 @@ pub const GROUPS: &[Group] = &[
             "INSERT INTO Sentinel VALUES (4, JSON_OBJECT('$serde_json::private::Number', 1))",
             "CREATE TABLE Approx (f FLOAT NULL, d DOUBLE NULL)",
             "INSERT INTO Approx VALUES (1.234567890123, 1.234567890123), (16777217, 16777217)",
+            // Written with more digits than a double carries, which is where
+            // the JSON parser's shortcuts decide the value. #0072.
+            "CREATE TABLE Wide (id INT NOT NULL, doc JSON NULL, PRIMARY KEY (id))",
+            "INSERT INTO Wide VALUES (1, '{\"a\": 2000000000000000.25}'), \
+             (2, '[12345678901234.5678]'), (3, '{\"a\": -9945313574470124358}')",
         ],
         cases: &[
             same("SELECT JSON_OBJECT('a', JSON_ARRAY(1, 2))"),
@@ -173,6 +178,42 @@ pub const GROUPS: &[Group] = &[
             // the text its column displays, which for a FLOAT is six
             // significant digits. Both routes into a document agree.
             same("SELECT CAST(f AS JSON), JSON_ARRAY(f), CAST(d AS JSON), JSON_ARRAY(d) FROM Approx ORDER BY f"),
+            // Which double a literal names, which is MySQL's answer as much
+            // as the spelling is. Its parser keeps seventeen significant
+            // digits and scales them by one power of ten, so a literal
+            // written with more than that lands somewhere a correctly-rounded
+            // parse does not: `2000000000000000.25` is exactly a double and
+            // is still read as 2e15.
+            same("SELECT CAST('[2000000000000000.25, -2000000000000000.25, 2000000000000000.75]' AS JSON)"),
+            // Trailing zeros count towards the seventeen, and the first digit
+            // does not — so a padded spelling is a different number, and
+            // counting the first digit would move all three of these.
+            same("SELECT CAST('[6193038.5328500000000, 945177346.838600900, 2963649940394770.84]' AS JSON)"),
+            // The exact accumulator stops the moment it passes 2^53 rather
+            // than when it runs out of digits, and what it leaves goes
+            // through the double.
+            same("SELECT CAST('[12345678901234.5678, 99555829226.40225000, 987119.34197208915]' AS JSON)"),
+            // A negative hands over to the double at 2^63 where a positive
+            // waits for 2^64, so a sign changes the value and not only its
+            // spelling.
+            same("SELECT CAST('[-9945313574470124358, -116099708312755456469406171708, 123456789012345678901234567890]' AS JSON)"),
+            // The scaling divides by the positive power from a table of
+            // nearest doubles, which is neither multiplying by the negative
+            // one nor computing the power.
+            same("SELECT CAST('[442764011e263, 9.63e-143, -408.38500]' AS JSON)"),
+            // The exponent is measured against where the point already sits,
+            // so `e312` is out of range at one place and 1e307 five places
+            // down; below the table the scaling takes two steps.
+            same("SELECT CAST('[0.00001e312, 0.00000000000000001e325, 9e-309]' AS JSON)"),
+            same("SELECT CAST('[1e-99999999999999999999, 1e-2000, 1e-320]' AS JSON)"),
+            // Leading zeros in a fraction are not significant digits.
+            same("SELECT CAST('[0.000000000000000000000000021649319015913176468, 0.0000000000000000000944876924289080511]' AS JSON)"),
+            // Which of those are numbers at all, which the exponent decides
+            // before any arithmetic happens.
+            same("SELECT JSON_VALID('1e309'), JSON_VALID('0.00000000000000001e326'), JSON_VALID('1.7976931348623159e308'), JSON_VALID('0.00001e312'), JSON_VALID('0.00001e3120')"),
+            // Stored and read back, so the value is the column's and not the
+            // expression's.
+            same("SELECT id, doc, doc->'$.a', JSON_EXTRACT(doc, '$[0]') FROM Wide ORDER BY id"),
         ],
     },
     Group {

@@ -460,20 +460,302 @@ fn as_parsed(n: &Number) -> Result<Number, String> {
     // Everything else is a double, spelled by [`double`] rather than kept as
     // it was typed: `1E2` is `100.0` on 8.3 and not `1E2`.
     //
-    // Through serde's own reading of the digits and *not* `Number::as_f64`,
-    // which is Rust's. The two do not always land on the same double, and the
-    // one that matches MySQL is serde's: both it and the rapidjson MySQL
-    // parses JSON with take the fast, approximate path by default, so
-    // `1000000000000000.5` is the double below on both and the one above in
-    // Rust. Measured on 8.3 — it answers 1000000000000000.4, and reading that
-    // literal exactly would answer .5. Where the two parsers *do* differ is
-    // #0072, which this leaves exactly where it was.
-    //
-    // Reading it that way is also the refusal: serde answers "number out of
-    // range" rather than an infinity, which is the check `normalise` promises
-    // and 8.3's own answer to `1e2000`.
-    let value: f64 = serde_json::from_str(n.as_str()).map_err(|_| TOO_BIG.to_owned())?;
+    // Read by [`rapidjson_double`] rather than by serde or by Rust, because a
+    // JSON number's *value* is as much MySQL's answer as its spelling is, and
+    // the three parsers do not agree — see there.
+    let value = rapidjson_double(n.as_str())?;
     double_number(value).ok_or_else(|| TOO_BIG.to_owned())
+}
+
+/// A JSON number read the way MySQL's parser reads one.
+///
+/// MySQL parses JSON with rapidjson, at rapidjson's default precision, and
+/// that is deliberately *not* a correctly-rounded parse: it keeps at most
+/// seventeen significant digits, accumulates them in a `double` once they pass
+/// what a `u64` holds, and then scales by a single tabulated power of ten. Two
+/// roundings and a truncation, so the double it lands on can be an ulp off the
+/// one the digits name. Which double it is is MySQL's answer, and this engine
+/// exists to give MySQL's answer.
+///
+/// Neither of the two parsers already in reach gives it. Rust's own
+/// `str::parse` is correctly rounded, so it disagrees whenever rapidjson's
+/// shortcuts cost it. serde_json's is approximate in the same *style* but not
+/// by the same rule — it accumulates into a `u64` until that overflows, which
+/// keeps nineteen or twenty digits where rapidjson keeps seventeen. That is
+/// why they agree up to fifteen significant digits and part company above it:
+/// measured against 8.3, serde answered a third of two-decimal literals in
+/// [1e15, 4.5e15) differently, and a third of *all* eighteen-digit literals at
+/// any magnitude.
+///
+/// So rapidjson's `ParseNumber` is transcribed here rather than approximated,
+/// including the parts that look like accidents — the digit limit that differs
+/// by sign, the first digit that is not counted towards the seventeen, the
+/// fraction loop that stops the moment the accumulator passes 2^53 even if
+/// that is with no digits taken. Each of those changes the answer for some
+/// input, and there is a mutation for each. What is *not* transcribed is the
+/// handful of steps that provably cannot change the answer; each is left out
+/// with the reason at the place it would have been, because a branch no test
+/// can reach is a branch nothing is checking.
+///
+/// A number out of double range comes back as an infinity rather than as an
+/// error, and [`as_parsed`] refuses it there, where every other double JSON
+/// has no number for is refused. rapidjson makes that refusal in two places
+/// instead — once on the exponent and once on the overflow — and both reach
+/// the same message; what has to be reproduced is *where* the exponent stops
+/// being readable, because that decides which literals are numbers at all.
+///
+/// The text is serde's, which is the source text with `E` folded to `e` and an
+/// explicit `+` on the exponent — neither of which rapidjson reads differently
+/// from the way it was typed.
+fn rapidjson_double(text: &str) -> Result<f64, String> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    let digit = |at: usize| -> Option<u32> {
+        match bytes.get(at) {
+            Some(c) if c.is_ascii_digit() => Some(u32::from(c - b'0')),
+            _ => None,
+        }
+    };
+
+    let minus = bytes.first() == Some(&b'-');
+    if minus {
+        at += 1;
+    }
+
+    // The integer part, accumulated exactly for as long as a `u64` holds it.
+    // The limit differs by sign because the two stop at different places —
+    // 2^63 for a value that will be negated, 2^64 - 1 for one that will not.
+    // That difference is worth keeping: it moves the answer for a negative
+    // number of nineteen digits or more.
+    //
+    // rapidjson also looks at the next digit when the accumulator is *exactly*
+    // on the limit, and takes it if it still fits. Dropping that test cannot
+    // move the answer and is left out: the two candidates — the digit taken
+    // into the `u64` or added to the double afterwards — round to the same
+    // double at both limits, for every digit the test admits. Measured across
+    // twenty-four thousand literals, several thousand of them built to sit on
+    // the boundary, nothing changed.
+    //
+    // rapidjson runs a `u32` accumulator ahead of this one and hands over at
+    // 2^31 or 2^32 - 1, which is a 32-bit machine's concern and not a rule
+    // about the answer: the same digits land in the same accumulator and
+    // `significant` counts each of them once either way, so where the handover
+    // falls cannot move the result. Measured — making the two `u32` limits the
+    // same changed nothing across twenty thousand literals.
+    let mut wide: u64 = 0;
+    // Not counting the first digit, which is rapidjson's own off-by-one and
+    // decides which input loses its seventeenth digit and which keeps it.
+    let mut significant = 0;
+    let mut value = 0f64;
+    let mut is_double = false;
+
+    if bytes.get(at) == Some(&b'0') {
+        at += 1;
+    } else if let Some(first) = digit(at) {
+        wide = u64::from(first);
+        at += 1;
+        let limit: u64 = if minus {
+            0x0ccc_cccc_cccc_cccc
+        } else {
+            0x1999_9999_9999_9999
+        };
+        while let Some(d) = digit(at) {
+            if wide >= limit {
+                value = wide as f64;
+                is_double = true;
+                break;
+            }
+            wide = wide * 10 + u64::from(d);
+            at += 1;
+            significant += 1;
+        }
+    } else {
+        // serde has already accepted this as a JSON number, so there is no
+        // input that reaches here. Saying so is still cheaper than a silent 0.
+        return Err("Invalid value.".to_owned());
+    }
+
+    // Past what a `u64` holds the digits go straight into the double, one
+    // rounding each — which is the first place the answer stops being the one
+    // the digits name.
+    if is_double {
+        while let Some(d) = digit(at) {
+            value = value * 10.0 + f64::from(d);
+            at += 1;
+        }
+    }
+
+    // The fraction. `exp_frac` counts how far the point has been shifted, and
+    // is what the digits are scaled back by at the end.
+    let mut exp_frac: i64 = 0;
+    if bytes.get(at) == Some(&b'.') {
+        at += 1;
+        if !is_double {
+            // Exactly 2^53 - 1: past that the accumulator stops being the
+            // integer it reads as. The test is made *before* the digit rather
+            // than after, so how many digits it takes depends on how far the
+            // integer part already got — three of `12345678901234.5678`, and
+            // none at all of `12345678901234567.5`, whose point arrives with
+            // the accumulator already past. Whatever it leaves goes through
+            // the double below.
+            while let Some(d) = digit(at) {
+                if wide > 0x001f_ffff_ffff_ffff {
+                    break;
+                }
+                wide = wide * 10 + u64::from(d);
+                at += 1;
+                exp_frac -= 1;
+                if wide != 0 {
+                    significant += 1;
+                }
+            }
+            value = wide as f64;
+            is_double = true;
+        }
+        // Seventeen significant digits and no more; the rest are read and
+        // thrown away. Zeros spend that budget like any other digit, which is
+        // why `6193038.53285` and `6193038.5328500000000` are different
+        // doubles on 8.3 — the padded one loses its last two zeros here, and
+        // reached this loop with an accumulator the padding had pushed past
+        // 2^53 and out of being exact.
+        //
+        // rapidjson counts a digit here only while the accumulator is
+        // non-zero. It cannot be zero: this loop is reached either with the
+        // integer part already in the double, or after the loop above stopped
+        // on an accumulator past 2^53, and both are greater than zero.
+        while let Some(d) = digit(at) {
+            if significant < 17 {
+                value = value * 10.0 + f64::from(d);
+                exp_frac -= 1;
+                significant += 1;
+            }
+            at += 1;
+        }
+    }
+
+    let mut exponent: i64 = 0;
+    if matches!(bytes.get(at), Some(b'e' | b'E')) {
+        at += 1;
+        if !is_double {
+            value = wide as f64;
+            is_double = true;
+        }
+        let negative = match bytes.get(at) {
+            Some(b'+') => {
+                at += 1;
+                false
+            }
+            Some(b'-') => {
+                at += 1;
+                true
+            }
+            _ => false,
+        };
+        // The largest exponent worth reading, past which the rest of the
+        // digits are counted but not accumulated. Upwards that point is where
+        // the value stops fitting a double, measured against where the point
+        // already sits rather than against 308 flat — which is why `1e309` is
+        // out of range and `0.00001e312`, the same exponent five places
+        // further down, is `1e307`. rapidjson refuses right here; stopping
+        // instead leaves an exponent past the table of powers, so the scaling
+        // reaches an infinity and [`as_parsed`] refuses that with the same
+        // wording. Downwards there is nothing to refuse at all: the value
+        // underflows to zero, and the ceiling only stops the count of digits
+        // from overflowing the integer holding it.
+        //
+        // That downward constant is copied rather than derived, because
+        // deriving it is where a reader goes wrong: it comes from `-INT_MIN`
+        // and not from `INT_MAX`, and `exp_frac` is added to it and not
+        // subtracted. Checked against the copy of rapidjson MySQL 8.3 itself
+        // builds — `extra/rapidjson/include/rapidjson/reader.h`, whose
+        // `ParseNumber` is the upstream one but for two guards behind a flag
+        // MySQL does not set. Either spelling answers the same for every
+        // input, since both sit near 2.1e8 and anything past either underflows
+        // to zero, so nothing here can tell them apart; it is written the way
+        // MySQL writes it so that the next reader diffing the two finds
+        // nothing to explain.
+        let max = if negative {
+            (exp_frac + 2_147_483_639) / 10
+        } else {
+            308 - exp_frac
+        };
+        let mut past = false;
+        while let Some(d) = digit(at) {
+            at += 1;
+            if past {
+                continue;
+            }
+            exponent = exponent * 10 + i64::from(d);
+            past = exponent > max;
+        }
+        if negative {
+            exponent = -exponent;
+        }
+    }
+
+    if !is_double {
+        // An integer that never needed a double. `as_parsed` has already taken
+        // every such number, so this is only here to be total.
+        let whole = wide as f64;
+        return Ok(if minus { -whole } else { whole });
+    }
+
+    let scaled = scale_by_power_of_ten(value, exponent + exp_frac);
+    Ok(if minus { -scaled } else { scaled })
+}
+
+/// rapidjson's `StrtodNormalPrecision`: one multiply or divide by a tabulated
+/// power of ten, split in two when the power is smaller than the table holds
+/// so that the divisor never becomes zero.
+fn scale_by_power_of_ten(significand: f64, power: i64) -> f64 {
+    if power < -308 {
+        let partial = one_scaling(significand, -308);
+        return one_scaling(partial, power + 308);
+    }
+    one_scaling(significand, power)
+}
+
+fn one_scaling(significand: f64, power: i64) -> f64 {
+    if power < -308 {
+        return 0.0;
+    }
+    // Dividing rather than multiplying by the negative power is rapidjson's
+    // choice and not an equivalent one: `x / 1e2` and `x * 1e-2` round
+    // differently, because 1e-2 is not a double and 1e2 is.
+    if power >= 0 {
+        significand * power_of_ten(power)
+    } else {
+        significand / power_of_ten(-power)
+    }
+}
+
+/// 10^n as the nearest double, which is what rapidjson's table holds.
+///
+/// That table is written out as the literals `1e0 .. 1e308`, so each entry is
+/// whatever the compiler makes of that text — the nearest double to the power,
+/// which is exactly what Rust's correctly-rounded parse of the same text
+/// gives. Building it that way rather than by repeated multiplication matters:
+/// above 10^22 the power is no longer exact, and an entry a single ulp out
+/// moves the answer for every number scaled by it.
+///
+/// Infinity for anything the table has no entry for, which is a power past
+/// 308 and — because the conversion to an index fails the same way — a
+/// negative one. The caller passes only 0..=308 and turns an infinity into
+/// the out-of-range refusal; a caller that passed a negative power would get
+/// an infinity where it wanted a small number, so pass the magnitude.
+fn power_of_ten(power: i64) -> f64 {
+    static TABLE: std::sync::OnceLock<[f64; 309]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut table = [0.0; 309];
+        for (n, slot) in table.iter_mut().enumerate() {
+            *slot = format!("1e{n}").parse().expect("a power of ten in range");
+        }
+        table
+    });
+    usize::try_from(power)
+        .ok()
+        .and_then(|n| table.get(n).copied())
+        .unwrap_or(f64::INFINITY)
 }
 
 /// A double as a JSON number, spelled the way MySQL spells one.

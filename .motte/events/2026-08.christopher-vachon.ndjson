@@ -222,3 +222,8 @@
 {"at":"2026-08-26T00:52:54Z","id":70,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-08-26T00:52:54Z","id":85,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-08-26T00:53:01Z","id":71,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-08-26T03:48:49Z","id":71,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-08-26T03:49:12Z","id":121,"by":"Christopher Vachon","as":"user","type":"created","title":"JSON_TYPE of a decimal is DOUBLE where MySQL says DECIMAL","state":"Todo"}
+{"at":"2026-08-26T03:49:12Z","id":122,"by":"Christopher Vachon","as":"user","type":"created","title":"A decimal embedded in a document keeps its internal scale, not its displayed one","state":"Todo"}
+{"at":"2026-08-26T03:49:12Z","id":123,"by":"Christopher Vachon","as":"user","type":"created","title":"UNION does not unify a decimal's scale across branches","state":"Todo"}
+{"at":"2026-08-26T03:49:17Z","id":72,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
