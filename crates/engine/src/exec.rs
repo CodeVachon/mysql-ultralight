@@ -347,6 +347,104 @@ impl Engine {
         self.split_name(session, name)
     }
 
+    /// Read access for the DDL module, which lives outside this impl.
+    pub(crate) fn catalog_public(&self) -> EngineResult<std::sync::RwLockReadGuard<'_, Catalog>> {
+        self.catalog()
+    }
+
+    /// Fills a table `CREATE TABLE ... AS SELECT` is building with the rows
+    /// its query produced.
+    ///
+    /// On the same path INSERT writes by, and that is the whole point of it
+    /// being here rather than in the DDL module. Writing the rows straight
+    /// into `table.rows` skipped every row-level rule the engine has, and 8.3
+    /// applies all of them — measured, each one refusing the statement outright
+    /// and leaving no table behind:
+    ///
+    /// | statement | 8.3 |
+    /// |---|---|
+    /// | `CREATE TABLE Dup (k INT PRIMARY KEY) AS SELECT 1 AS k UNION ALL SELECT 1` | 1062 |
+    /// | `CREATE TABLE E (a INT NOT NULL) AS SELECT NULL AS a` | 1048 |
+    /// | `CREATE TABLE C (id INT, CHECK (id > 100)) AS SELECT id FROM Src` | 3819 |
+    /// | `CREATE TABLE A (seq INT AUTO_INCREMENT PRIMARY KEY) AS SELECT id FROM Src` | seq counts 1, 2 |
+    ///
+    /// The last is the one that had to be measured rather than assumed: an
+    /// AUTO_INCREMENT column the query does not fill is assigned as if the
+    /// rows had been inserted, so the counter advances and the next insert
+    /// does not collide. It had been getting the type's implicit default —
+    /// zero in every row, in a PRIMARY KEY column, with the counter still at
+    /// one.
+    ///
+    /// Nothing is written to the catalog until this returns, so a refusal
+    /// leaves no table, which is what 8.3 does too.
+    ///
+    /// `first` is where the query's columns begin: an explicit definition the
+    /// query does not name sits in front of them and takes its default, the
+    /// same as a column omitted from an INSERT.
+    /// `fk_parents` is captured by the caller, under the read guard it drops
+    /// before calling: taking it here would mean holding a second lock across
+    /// the subqueries a CHECK or an expression default can run.
+    pub(crate) fn fill_new_table(
+        &self,
+        session: &Session,
+        table: &mut Table,
+        mut fk_parents: Vec<foreign_keys::ParentKeys>,
+        first: usize,
+        coerce: &[bool],
+        selected: Vec<Vec<Value>>,
+    ) -> EngineResult<Option<u64>> {
+        let ctx = Context::rowless(session).with_executor(self);
+        // The *first* id generated, which is what `LAST_INSERT_ID()` answers
+        // after a CTAS: 8.3 reports 1 for a two-row `CREATE TABLE t (s INT
+        // AUTO_INCREMENT PRIMARY KEY) AS SELECT ...`, not 2.
+        let mut first_id = None;
+
+        for values in selected {
+            let mut row = default_row(table, &ctx)?;
+            for (slot, (value, coerce)) in (first..).zip(values.into_iter().zip(coerce)) {
+                let column = &table.columns[slot];
+                // A column derived from an expression carries only the
+                // widening its wire type implies, so coercing into it would
+                // narrow the value the expression already computed — see
+                // `merge_selected_columns`.
+                row[slot] = if *coerce {
+                    column.ty.coerce(value, &column.name)?
+                } else {
+                    value
+                };
+            }
+
+            // Bound rather than discarded so this call site is its own: the
+            // one INSERT makes is the same call with the same arguments.
+            let generated = assign_auto_increment(table, &mut row)?;
+            first_id = first_id.or(generated);
+
+            let row = self.finalise_row(table, row, session)?;
+            foreign_keys::check(&fk_parents, &row, &table.name)?;
+            table.check_unique(&row, None)?;
+            for parent in &mut fk_parents {
+                parent.note_inserted(&row);
+            }
+            table.rows.push(row);
+        }
+        Ok(first_id)
+    }
+
+    /// Runs a query for the DDL module, which lives outside this impl.
+    ///
+    /// `CREATE TABLE ... AS SELECT` is defined by its query's *result*: MySQL
+    /// declares the table from the result metadata and fills it with the rows,
+    /// so the DDL needs exactly the answer a bare SELECT would have given.
+    ///
+    /// Not reconciled, and deliberately: `execute` reconciles on the way out
+    /// only, because a value about to be sent has to match the code the client
+    /// will decode it by, while an intermediate one should keep what it
+    /// computed. These rows are on their way into a column, where `coerce`
+    /// settles the same question against the type the column actually has.
+    pub(crate) fn query_public(&self, session: &Session, query: &Query) -> EngineResult<ResultSet> {
+        self.query(session, query)
+    }
+
     /// Parses and executes one statement.
     ///
     /// Parameters are substituted into the text before parsing, so a
@@ -2057,7 +2155,8 @@ impl Engine {
                     }
                     columns.push(
                         OutColumn::from_sql_type(&column.name, &column.ty, column.nullable)
-                            .in_table(&column.schema, &column.table),
+                            .in_table(&column.schema, &column.table)
+                            .projected_from(&column.name),
                     );
                     plan.push(Projection::Column(i));
                 }
@@ -2447,7 +2546,11 @@ impl Engine {
                 &column.ty,
                 column.nullable,
             )
-            .in_table(&column.schema, &column.table);
+            .in_table(&column.schema, &column.table)
+            // The source column's own name, not the alias: `SELECT id AS name`
+            // is `id`'s column under `name`'s name, and a `CREATE TABLE ... AS
+            // SELECT` over it has to copy `id`'s attributes.
+            .projected_from(&column.name);
             return Ok((out, Projection::Column(i)));
         }
 
@@ -2572,7 +2675,8 @@ impl Engine {
         let columns: Vec<OutColumn> = items
             .iter()
             .map(|(alias, e)| match direct_column(e, refs, input_columns) {
-                Some(column) => OutColumn::from_sql_type(alias, &column.ty, column.nullable),
+                Some(column) => OutColumn::from_sql_type(alias, &column.ty, column.nullable)
+                    .projected_from(&column.name),
                 None => {
                     let mut column =
                         OutColumn::new(alias.clone(), computed_column_type(e, refs, input_columns));
@@ -3202,42 +3306,7 @@ impl Engine {
                 row[*slot] = column.ty.coerce(value, &column.name)?;
             }
 
-            // The counter lives on the table, so the column list and the row
-            // are walked together rather than by index.
-            let auto_increment: Vec<usize> = table
-                .columns
-                .iter()
-                .enumerate()
-                .filter(|(_, c)| c.auto_increment)
-                .map(|(i, _)| i)
-                .collect();
-            let mut generated_id = None;
-            for slot in auto_increment {
-                if row[slot].is_null() {
-                    // Through `coerce` like any other value, because a
-                    // generated id is subject to the column's width too. The
-                    // doc on `column_type` rests on nothing outliving the
-                    // declared code, and a `TINYINT AUTO_INCREMENT` counting
-                    // past 127 would otherwise be sent as one byte and read
-                    // back negative.
-                    row[slot] = table.columns[slot].ty.coerce(
-                        Value::Int(table.next_auto_increment),
-                        &table.columns[slot].name,
-                    )?;
-                    // Recorded rather than reported: an `ON DUPLICATE KEY
-                    // UPDATE` that updates instead of inserting must not hand
-                    // back an id for a row that does not exist. MySQL still
-                    // consumes the counter value, which is why it advances
-                    // here either way.
-                    generated_id = Some(table.next_auto_increment as u64);
-                    table.next_auto_increment += 1;
-                } else if let Some(explicit) = row[slot].as_int() {
-                    // An explicit value moves the counter past it, as MySQL
-                    // does. Without this, a fixture that inserts explicit ids
-                    // collides with generated ones later.
-                    table.next_auto_increment = table.next_auto_increment.max(explicit + 1);
-                }
-            }
+            let generated_id = assign_auto_increment(table, &mut row)?;
 
             // IGNORE downgrades a strict-mode error to a warning, so a NOT
             // NULL column left out of the statement takes its type's implicit
@@ -5333,6 +5402,52 @@ fn parse_expression(text: &str) -> EngineResult<Expr> {
 }
 
 /// Builds a row of column defaults.
+/// Fills any AUTO_INCREMENT column the row left empty, and advances the
+/// counter past one it filled in itself.
+///
+/// Shared by INSERT and by `CREATE TABLE ... AS SELECT`, because a counter
+/// advanced on one path and not the other leaves a table whose next insert
+/// collides in its own primary key — which is what CTAS did before it came
+/// through here, every row taking the type's implicit default of zero.
+///
+/// Answers the value it generated, if any. Recorded rather than reported: an
+/// `ON DUPLICATE KEY UPDATE` that updates instead of inserting must not hand
+/// back an id for a row that does not exist, and MySQL consumes the counter
+/// value either way, which is why it advances here regardless.
+fn assign_auto_increment(table: &mut Table, row: &mut [Value]) -> EngineResult<Option<u64>> {
+    // The counter lives on the table, so the columns are collected first and
+    // the row walked by index rather than the two being iterated together.
+    let auto_increment: Vec<usize> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.auto_increment)
+        .map(|(i, _)| i)
+        .collect();
+    let mut generated = None;
+    for slot in auto_increment {
+        if row[slot].is_null() {
+            // Through `coerce` like any other value, because a generated id is
+            // subject to the column's width too. The doc on `column_type`
+            // rests on nothing outliving the declared code, and a `TINYINT
+            // AUTO_INCREMENT` counting past 127 would otherwise be sent as one
+            // byte and read back negative.
+            row[slot] = table.columns[slot].ty.coerce(
+                Value::Int(table.next_auto_increment),
+                &table.columns[slot].name,
+            )?;
+            generated = Some(table.next_auto_increment as u64);
+            table.next_auto_increment += 1;
+        } else if let Some(explicit) = row[slot].as_int() {
+            // An explicit value moves the counter past it, as MySQL does.
+            // Without this, a fixture that inserts explicit ids collides with
+            // generated ones later.
+            table.next_auto_increment = table.next_auto_increment.max(explicit + 1);
+        }
+    }
+    Ok(generated)
+}
+
 fn default_row(table: &Table, ctx: &Context<'_>) -> EngineResult<Vec<Value>> {
     let mut row = Vec::with_capacity(table.columns.len());
     for column in &table.columns {

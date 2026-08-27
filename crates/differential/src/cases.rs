@@ -2551,4 +2551,170 @@ pub const GROUPS: &[Group] = &[
                   s BETWEEN 2 AND 3 FROM Wd ORDER BY id"),
         ],
     },
+    Group {
+        // A table built out of a query's result. The engine had no CTAS at
+        // all: it ignored the query and made a table with no columns, which
+        // reported success and then desynchronised the connection on the next
+        // statement, because a zero column count is byte-for-byte an OK
+        // packet. #0125.
+        //
+        // The metadata is the point here rather than the rows. MySQL declares
+        // the table from the result's own description, so what it keeps and
+        // what it drops -- a copied column's DEFAULT survives, its
+        // AUTO_INCREMENT and its keys do not -- is only visible through
+        // `information_schema`, and `SHOW CREATE TABLE`, which is where it is
+        // written on 8.3, is not a statement this engine answers.
+        //
+        // What this group deliberately cannot ask: MySQL narrows a computed
+        // column to the width its expression can produce, so `AS SELECT 1`
+        // declares `int` where this engine declares `bigint`, and
+        // `AS SELECT 'x'` declares `varchar(1)` against `varchar(512)`. That
+        // width is `Item::max_length`, which the engine does not model at all
+        // -- #0126 -- so a case for it would be a case for that issue and not
+        // for this one.
+        name: "a table built from a query",
+        setup: &[
+            "CREATE TABLE Src (id INT NOT NULL AUTO_INCREMENT, \
+             name VARCHAR(40) NOT NULL DEFAULT 'x', qty INT UNSIGNED NULL DEFAULT 7, \
+             note TEXT NULL, amt DECIMAL(10,2) NULL, \
+             PRIMARY KEY (id), UNIQUE KEY uk_name (name))",
+            "INSERT INTO Src (name, qty, note, amt) VALUES \
+             ('a', 1, 'n1', 1.50), ('b', 2, 'n2', 2.50)",
+            "CREATE TABLE Star AS SELECT * FROM Src",
+            "CREATE TABLE Expr AS SELECT id + 1 AS a, name FROM Src",
+            "CREATE TABLE Nul AS SELECT NULL AS a",
+            "CREATE TABLE Nada AS SELECT id FROM Src WHERE 0",
+            "CREATE TABLE Ex1 (z BIGINT, y VARCHAR(5)) AS SELECT id, name FROM Src",
+            "CREATE TABLE Ex2 (name VARCHAR(5)) AS SELECT id, name FROM Src",
+            "CREATE TABLE Copy LIKE Src",
+            "CREATE TABLE One (a INT)",
+            "CREATE TABLE Two (a INT, b INT)",
+            // An AUTO_INCREMENT column the query does not fill, which has to
+            // be assigned as if the rows had been inserted rather than taking
+            // the type's implicit default.
+            "CREATE TABLE Auto (seq INT NOT NULL AUTO_INCREMENT PRIMARY KEY) \
+             AS SELECT id FROM Src",
+            // An alias renames the result column and leaves the underlying one
+            // alone, so the declaration has to follow the source column and
+            // not the name. `Src.name` is a NOT NULL VARCHAR with a default.
+            "CREATE TABLE Alias AS SELECT id AS name FROM Src",
+            // Two columns of one type and different defaults, so following the
+            // name rather than the source is visible even where the types
+            // agree.
+            "CREATE TABLE Pair (a INT DEFAULT 1, b INT DEFAULT 2)",
+            "INSERT INTO Pair VALUES (7, 8)",
+            "CREATE TABLE Renamed AS SELECT a AS b FROM Pair",
+        ],
+        cases: &[
+            // The count a CTAS reports is the rows it inserted. Asked as a
+            // case rather than in setup because that count is half the answer;
+            // the second protocol asks it again and gets 1050 from both
+            // servers, which is the other half.
+            same("CREATE TABLE Star2 AS SELECT * FROM Src"),
+            same("CREATE TABLE Nada2 AS SELECT id FROM Src WHERE 0"),
+            same("CREATE TABLE Copy2 LIKE Src"),
+            // A copied column keeps its type, its nullability and its DEFAULT
+            // and loses its AUTO_INCREMENT and its keys.
+            same("SELECT COLUMN_NAME, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, \
+                  EXTRA FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Star' \
+                  ORDER BY ORDINAL_POSITION"),
+            same("SELECT * FROM Star ORDER BY id"),
+            // An expression is typed by what it computes, and is NOT NULL
+            // where its operand is -- which is where the implicit DEFAULT 0
+            // comes from, since a plain CREATE TABLE would leave it none.
+            same("SELECT COLUMN_NAME, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE \
+                  FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Expr' \
+                  ORDER BY ORDINAL_POSITION"),
+            same("SELECT * FROM Expr ORDER BY a"),
+            // An all-NULL column is binary(0) -- the statement #0073 settled
+            // that measurement with, now that the engine can answer it.
+            same("SELECT COLUMN_NAME, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE \
+                  FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Nul' \
+                  ORDER BY ORDINAL_POSITION"),
+            same("SELECT * FROM Nul"),
+            // An empty result still declares the table.
+            same("SELECT COLUMN_NAME, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE \
+                  FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Nada' \
+                  ORDER BY ORDINAL_POSITION"),
+            same("SELECT COUNT(*) FROM Nada"),
+            // Explicit definitions are merged with the query's columns rather
+            // than replacing them: one the query does not name keeps its place
+            // in front, one it does names that column in the query's position.
+            same("SELECT COLUMN_NAME, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE \
+                  FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Ex1' \
+                  ORDER BY ORDINAL_POSITION"),
+            same("SELECT * FROM Ex1 ORDER BY id"),
+            same("SELECT COLUMN_NAME, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE \
+                  FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Ex2' \
+                  ORDER BY ORDINAL_POSITION"),
+            same("SELECT * FROM Ex2 ORDER BY id"),
+            // LIKE is the opposite of AS SELECT in what it keeps: the whole
+            // definition, including the AUTO_INCREMENT and both keys, and none
+            // of the rows.
+            same("SELECT COLUMN_NAME, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, \
+                  EXTRA FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Copy' \
+                  ORDER BY ORDINAL_POSITION"),
+            same("SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Copy' \
+                  ORDER BY INDEX_NAME, SEQ_IN_INDEX"),
+            same("SELECT COUNT(*) FROM Copy"),
+            // Two columns of one name is not a table, however it arose.
+            same("CREATE TABLE D1 AS SELECT id, id FROM Src"),
+            same("CREATE TABLE D2 AS SELECT * FROM Src a JOIN Src b ON a.id = b.id"),
+            // The query is resolved before the name is checked, so a bad query
+            // is reported as one even under IF NOT EXISTS on a name in use.
+            same("CREATE TABLE D3 AS SELECT * FROM Nope"),
+            same("CREATE TABLE IF NOT EXISTS Src AS SELECT * FROM Nope"),
+            same("CREATE TABLE Src AS SELECT 1 AS a"),
+            same("CREATE TABLE D4 LIKE Nope"),
+            same("CREATE TABLE Src LIKE Src"),
+            // The rows go in on the same path INSERT writes by, so every
+            // row-level rule the new table declares applies to them. Each of
+            // these was accepted before, and the table was born holding rows
+            // its own constraints forbid.
+            same("CREATE TABLE Dup (k INT PRIMARY KEY) AS SELECT 1 AS k UNION ALL SELECT 1"),
+            same("CREATE TABLE Bad (a INT NOT NULL) AS SELECT NULL AS a"),
+            same("CREATE TABLE Chk (id INT, CHECK (id > 100)) AS SELECT id FROM Src"),
+            // And a refused CTAS leaves no table behind, which is the other
+            // half of the claim: the count would be 3 if it did.
+            same("SELECT COUNT(*) FROM information_schema.tables \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('Dup', 'Bad', 'Chk')"),
+            // An unfilled AUTO_INCREMENT column counts from one rather than
+            // filling every row with the implicit default -- which, in a
+            // PRIMARY KEY column, was every row holding 0.
+            same("SELECT * FROM Auto ORDER BY seq"),
+            same("SELECT COLUMN_NAME, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, \
+                  EXTRA FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Auto' \
+                  ORDER BY ORDINAL_POSITION"),
+            // An alias takes the source column's attributes under the alias's
+            // name. Following the name found a different column and copied a
+            // VARCHAR default into an INT.
+            same("SELECT COLUMN_NAME, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE \
+                  FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Alias' \
+                  ORDER BY ORDINAL_POSITION"),
+            same("SELECT COLUMN_NAME, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE \
+                  FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Renamed' \
+                  ORDER BY ORDINAL_POSITION"),
+            // The other route to a table with no columns, and the one that
+            // does not go through CREATE at all.
+            same("ALTER TABLE One DROP COLUMN a"),
+            // One ALTER is one statement however many operations it lists, so
+            // a refusal must undo the ones before it. This answered 1090 and
+            // dropped `a` and its data anyway.
+            same("ALTER TABLE Two DROP COLUMN a, DROP COLUMN b"),
+            same("SELECT COLUMN_NAME FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Two' \
+                  ORDER BY ORDINAL_POSITION"),
+        ],
+    },
 ];

@@ -1,11 +1,11 @@
 ---
 id: 125
 title: CREATE TABLE AS SELECT makes a zero-column table and desynchronises the connection
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-08-26T08:49:09Z
-updated: 2026-08-26T08:49:09Z
+updated: 2026-08-27T18:28:26Z
 ---
 
 ## Description

@@ -12,7 +12,7 @@ use mysql_ultralight_protocol::buf::BufReader;
 use mysql_ultralight_protocol::packet::{read_packet, write_packet, Sequence};
 use mysql_ultralight_protocol::{BufWriter, Capabilities, ColumnDef, ColumnType, ErrPacket, Value};
 use mysql_ultralight_server::{
-    Config, Handler, HandlerResult, Prepared, Response, ResultSet, Server,
+    Answered, Config, Handler, HandlerResult, Prepared, Response, ResultSet, Server,
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -49,9 +49,46 @@ impl Handler for TestHandler {
                 ],
                 vec![vec![Value::I64(1)]],
             ))),
+            // Deliberately a result set with no columns, which the protocol
+            // has no way to say: a zero column count is byte-for-byte an OK
+            // packet, so the row that follows would be read as the answer to
+            // the *next* command.
+            "NOCOLS" => Ok(Response::ResultSet(ResultSet::with_rows(
+                Vec::new(),
+                vec![vec![Value::I64(1)]],
+            ))),
             "BOOM" => Err(ErrPacket::parse_error("deliberate failure")),
             "UPDATE" => Ok(Response::affected(7)),
             _ => Ok(Response::ok()),
+        }
+    }
+
+    /// A batch whose middle statement produces a result set with no columns.
+    ///
+    /// The one shape that needs a *batch* to express: the refusal ends the
+    /// command, so whatever the handler produced after it can no longer be
+    /// delivered, and delivering it anyway is the desynchronisation the
+    /// refusal exists to prevent.
+    fn query_multi(&mut self, sql: &str, _allow_multi: bool) -> Answered {
+        if sql.trim() == "BATCH" {
+            return Answered {
+                responses: vec![
+                    self.query("MULTI").unwrap(),
+                    self.query("NOCOLS").unwrap(),
+                    self.query("MULTI").unwrap(),
+                ],
+                error: None,
+            };
+        }
+        match self.query(sql) {
+            Ok(response) => Answered {
+                responses: vec![response],
+                error: None,
+            },
+            Err(e) => Answered {
+                responses: Vec::new(),
+                error: Some(e),
+            },
         }
     }
 
@@ -126,7 +163,11 @@ impl Client {
         let mut caps = Capabilities::PROTOCOL_41
             | Capabilities::SECURE_CONNECTION
             | Capabilities::PLUGIN_AUTH
-            | Capabilities::TRANSACTIONS;
+            | Capabilities::TRANSACTIONS
+            // Negotiated by every client here, because a batch is only legal
+            // when it is: without it the server refuses to run a second
+            // statement at all, and the batched case below could not be asked.
+            | Capabilities::MULTI_STATEMENTS;
         if deprecate_eof {
             caps |= Capabilities::DEPRECATE_EOF;
         }
@@ -648,6 +689,79 @@ async fn a_malformed_row_does_not_reach_the_client_as_data() {
     assert!(
         !saw_row,
         "a mismatched row must never be written to the wire"
+    );
+}
+
+/// A result set with no columns has no encoding, so the server must refuse it
+/// rather than write a header the client will read as the end of the command.
+///
+/// This is the failure #0125 arrived as. `CREATE TABLE q1 AS SELECT 1 AS a`
+/// made a table with no columns, and it was the *next* statement that broke:
+/// `SELECT * FROM q1` wrote a zero column count, which is byte-for-byte an OK
+/// packet, and the column definitions and rows behind it were then read as the
+/// answers to whatever came after. CTAS was one route in and is fixed at its
+/// own level; this is the backstop for the next one, so it is asked here
+/// directly rather than through any statement.
+///
+/// Both halves are asserted. The error is what makes the failure nameable, and
+/// the working query after it is what proves the stream is still aligned —
+/// a server that dropped the connection instead would satisfy the first.
+#[tokio::test]
+async fn a_result_set_with_no_columns_is_refused_rather_than_written() {
+    let addr = start_server(None).await;
+    let mut client = Client::connect(&addr, "", true).await.unwrap();
+
+    let refused = client.query("NOCOLS").await.unwrap_err();
+    assert!(
+        refused.starts_with("1105 (HY000): a result set must have at least one column"),
+        "expected a refusal naming the cause, got {refused}"
+    );
+
+    assert_eq!(
+        client.query("SELECT 1").await.unwrap(),
+        vec![vec![Some("1".to_owned())]],
+        "the connection must still be synchronised"
+    );
+}
+
+/// The refusal must end the command, not skip one response inside it.
+///
+/// An error packet carries no `MORE_RESULTS_EXISTS`, so a client that
+/// negotiated MULTI_STATEMENTS reads it as the last packet of the command and
+/// stops. Writing the rest of the batch after it puts packets on the wire that
+/// nothing is reading for this command, and the next statement's reply is then
+/// read from the middle of them — which is the desynchronisation the guard
+/// exists to prevent, reached the long way round.
+///
+/// The last assertion is the one that bites: were the third result still
+/// written, `SELECT 1` would be answered with its rows.
+#[tokio::test]
+async fn a_refused_result_set_ends_the_whole_batch() {
+    let addr = start_server(None).await;
+    let mut client = Client::connect(&addr, "", true).await.unwrap();
+
+    client.send(0x03, b"BATCH").await.unwrap();
+
+    // The statement before it is delivered in full.
+    assert_eq!(
+        client.read_result_set(false).await.unwrap(),
+        vec![
+            vec![Some("1".to_owned()), Some("one".to_owned())],
+            vec![Some("2".to_owned()), None],
+            vec![Some("3".to_owned()), Some("three".to_owned())],
+        ]
+    );
+
+    let refused = decode_err(&client.recv().await.unwrap());
+    assert!(
+        refused.starts_with("1105 (HY000): a result set must have at least one column"),
+        "expected a refusal naming the cause, got {refused}"
+    );
+
+    assert_eq!(
+        client.query("SELECT 1").await.unwrap(),
+        vec![vec![Some("1".to_owned())]],
+        "the batch must have ended at the refusal"
     );
 }
 

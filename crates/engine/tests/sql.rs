@@ -15491,3 +15491,543 @@ fn default_week_format_is_bounded_the_way_mysql_bounds_it() {
     // And it follows the session's own value once one is set.
     assert_eq!(listed(&engine, &mut session), vec!["1".to_owned()]);
 }
+
+/// The source table the `CREATE TABLE ... AS SELECT` tests below build from,
+/// declared so that every attribute MySQL drops on the way through has
+/// something to drop: an AUTO_INCREMENT primary key, a unique key, a NOT NULL
+/// column with a default, a nullable one with a default, and two with none.
+fn ctas_source(engine: &Engine, session: &mut Session) {
+    run(
+        engine,
+        session,
+        "CREATE TABLE Src (
+            id INT NOT NULL AUTO_INCREMENT,
+            name VARCHAR(40) NOT NULL DEFAULT 'x',
+            qty INT UNSIGNED NULL DEFAULT 7,
+            note TEXT NULL,
+            amt DECIMAL(10,2) NULL,
+            PRIMARY KEY (id),
+            UNIQUE KEY uk_name (name)
+        )",
+    );
+    run(
+        engine,
+        session,
+        "INSERT INTO Src (name, qty, note, amt) VALUES ('a', 1, 'n1', 1.50), ('b', 2, 'n2', 2.50)",
+    );
+}
+
+/// What `information_schema` reports for every column of a table, in order,
+/// which is where a derived declaration is observable at all.
+fn declared(engine: &Engine, session: &mut Session, table: &str) -> Vec<Vec<String>> {
+    rows(
+        engine,
+        session,
+        &format!(
+            "SELECT COLUMN_NAME, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA \
+             FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = '{table}' ORDER BY ORDINAL_POSITION"
+        ),
+    )
+}
+
+/// `CREATE TABLE ... AS SELECT` declares the table from its query's result
+/// metadata and fills it with the query's rows.
+///
+/// Every expectation here was measured against mysql:8.3 with `SHOW CREATE
+/// TABLE` and `information_schema.columns`; the differential corpus asks the
+/// same questions of both servers, and this pins the answers where a change to
+/// them has to be deliberate.
+///
+/// Mismatches are collected rather than asserted one at a time, so a mutation
+/// reports every claim it broke instead of the first.
+#[test]
+fn create_table_as_select_declares_its_columns_and_inserts_its_rows() {
+    let (engine, mut session) = engine();
+    ctas_source(&engine, &mut session);
+
+    let mut wrong: Vec<String> = Vec::new();
+    fn check(wrong: &mut Vec<String>, claim: &str, got: Vec<Vec<String>>, want: Vec<Vec<&str>>) {
+        let want: Vec<Vec<String>> = want
+            .into_iter()
+            .map(|row| row.into_iter().map(str::to_owned).collect())
+            .collect();
+        if got != want {
+            wrong.push(format!("{claim}\n  got  {got:?}\n  want {want:?}"));
+        }
+    }
+
+    // A copied column keeps its type, its nullability and its DEFAULT, and
+    // loses everything else: the AUTO_INCREMENT and both keys are gone, which
+    // is the whole difference between this and LIKE. A NOT NULL column with no
+    // default to copy gets the type's implicit one, which is where `id`'s
+    // DEFAULT 0 comes from -- a plain CREATE TABLE would leave it with none.
+    let inserted = affected(
+        &engine,
+        &mut session,
+        "CREATE TABLE Star AS SELECT * FROM Src",
+    );
+    if inserted != 2 {
+        wrong.push(format!("SELECT * inserted {inserted} rows, want 2"));
+    }
+    check(
+        &mut wrong,
+        "SELECT *",
+        declared(&engine, &mut session, "Star"),
+        vec![
+            vec!["id", "0", "NO", "int", "", ""],
+            vec!["name", "x", "NO", "varchar(40)", "", ""],
+            vec!["qty", "7", "YES", "int unsigned", "", ""],
+            vec!["note", "NULL", "YES", "text", "", ""],
+            vec!["amt", "NULL", "YES", "decimal(10,2)", "", ""],
+        ],
+    );
+    check(
+        &mut wrong,
+        "SELECT * rows",
+        rows(&engine, &mut session, "SELECT * FROM Star ORDER BY id"),
+        vec![
+            vec!["1", "a", "1", "n1", "1.50"],
+            vec!["2", "b", "2", "n2", "2.50"],
+        ],
+    );
+
+    // An expression is typed by what it computes, and takes the implicit
+    // default where it is NOT NULL. `id + 1` is NOT NULL because `id` is.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Expr AS SELECT id + 1 AS a, name FROM Src",
+    );
+    check(
+        &mut wrong,
+        "an expression beside a copied column",
+        declared(&engine, &mut session, "Expr"),
+        vec![
+            vec!["a", "0", "NO", "bigint", "", ""],
+            vec!["name", "x", "NO", "varchar(40)", "", ""],
+        ],
+    );
+
+    // An all-NULL column is `binary(0)`, which is what #0073 measured this
+    // very statement to settle.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Nul AS SELECT NULL AS a",
+    );
+    check(
+        &mut wrong,
+        "SELECT NULL",
+        declared(&engine, &mut session, "Nul"),
+        vec![vec!["a", "NULL", "YES", "binary(0)", "", ""]],
+    );
+
+    // An aggregate keeps the value it computed, at the scale it computed it.
+    // The engine's derived type for it is only `decimal`, because a result
+    // column carries no scale, and coercing into that would have written 2.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Agg AS SELECT COUNT(*) AS c, SUM(qty) AS s, AVG(amt) AS av FROM Src",
+    );
+    check(
+        &mut wrong,
+        "an aggregate's rows",
+        rows(&engine, &mut session, "SELECT * FROM Agg"),
+        vec![vec!["2", "3", "2.000000"]],
+    );
+
+    // An empty result still declares the table.
+    let none = affected(
+        &engine,
+        &mut session,
+        "CREATE TABLE Empty AS SELECT id FROM Src WHERE 0",
+    );
+    if none != 0 {
+        wrong.push(format!("an empty result inserted {none} rows, want 0"));
+    }
+    check(
+        &mut wrong,
+        "an empty result",
+        declared(&engine, &mut session, "Empty"),
+        vec![vec!["id", "0", "NO", "int", "", ""]],
+    );
+
+    // Explicit definitions are merged with the query's columns rather than
+    // replacing them: one the query does not name keeps its own place in
+    // front, and one it does names *its* column, in the query's position.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Ex1 (z BIGINT, y VARCHAR(5)) AS SELECT id, name FROM Src",
+    );
+    check(
+        &mut wrong,
+        "explicit columns the query does not name",
+        declared(&engine, &mut session, "Ex1"),
+        vec![
+            vec!["z", "NULL", "YES", "bigint", "", ""],
+            vec!["y", "NULL", "YES", "varchar(5)", "", ""],
+            vec!["id", "0", "NO", "int", "", ""],
+            vec!["name", "x", "NO", "varchar(40)", "", ""],
+        ],
+    );
+    check(
+        &mut wrong,
+        "an unfilled explicit column takes its default",
+        rows(&engine, &mut session, "SELECT * FROM Ex1 ORDER BY id"),
+        vec![
+            vec!["NULL", "NULL", "1", "a"],
+            vec!["NULL", "NULL", "2", "b"],
+        ],
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Ex2 (name VARCHAR(5)) AS SELECT id, name FROM Src",
+    );
+    check(
+        &mut wrong,
+        "an explicit column the query names",
+        declared(&engine, &mut session, "Ex2"),
+        vec![
+            vec!["id", "0", "NO", "int", "", ""],
+            vec!["name", "NULL", "YES", "varchar(5)", "", ""],
+        ],
+    );
+
+    // An AUTO_INCREMENT column the query does not fill is assigned as if the
+    // rows had been inserted -- measured on 8.3, where `seq` counts 1 and 2.
+    // It had been taking the type's implicit default, so every row of a
+    // PRIMARY KEY column held 0.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Auto (seq INT NOT NULL AUTO_INCREMENT PRIMARY KEY) AS SELECT id FROM Src",
+    );
+    check(
+        &mut wrong,
+        "an unfilled AUTO_INCREMENT column",
+        rows(&engine, &mut session, "SELECT * FROM Auto ORDER BY seq"),
+        vec![vec!["1", "1"], vec!["2", "2"]],
+    );
+    // And the ids it generated are reported the way MySQL reports them: the
+    // *first*, not the last, which is 1 for these two rows on 8.3.
+    check(
+        &mut wrong,
+        "LAST_INSERT_ID() after a CTAS",
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        vec![vec!["1"]],
+    );
+
+    // An alias renames the result column and leaves the underlying one alone,
+    // so the declaration follows the source column. Following the *name*
+    // found `Src.name` -- a different column -- and copied its VARCHAR default
+    // into an INT one, which then stored the string 'x'.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Alias AS SELECT id AS name FROM Src",
+    );
+    check(
+        &mut wrong,
+        "an alias takes the source column's attributes",
+        declared(&engine, &mut session, "Alias"),
+        vec![vec!["name", "0", "NO", "int", "", ""]],
+    );
+    // Two columns of one type and different defaults, so the source is
+    // distinguishable from the name even where the types agree.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Pair (a INT DEFAULT 1, b INT DEFAULT 2)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Renamed AS SELECT a AS b FROM Pair",
+    );
+    check(
+        &mut wrong,
+        "an alias onto another column's name, same type",
+        declared(&engine, &mut session, "Renamed"),
+        vec![vec!["b", "1", "YES", "int", "", ""]],
+    );
+
+    // A table *alias* that shadows the name of a real table. The default is
+    // looked up under `column.table`, which is the alias, so this finds a
+    // table the query never touched -- and without the type check it would
+    // copy `Other.name`'s INT default 5 into a VARCHAR column.
+    //
+    // The answer asserted is the engine's own, and it is not MySQL's: 8.3
+    // declares `name varchar(40) NOT NULL DEFAULT 'x'`, the aliased source
+    // table's real default, because it builds the column from the source
+    // Field. This engine cannot reach that field -- a result column carries
+    // the alias and nothing else -- so it declines to copy at all and takes
+    // the type's implicit default. Declining is the conservative half of a
+    // divergence; copying the wrong column's value would be the other kind.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Other (name INT DEFAULT 5)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Shadow AS SELECT Other.name FROM Src Other",
+    );
+    check(
+        &mut wrong,
+        "a table alias shadowing a real table",
+        declared(&engine, &mut session, "Shadow"),
+        vec![vec!["name", "", "NO", "varchar(40)", "", ""]],
+    );
+
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The statements MySQL refuses, refused for the same reasons and with the
+/// same codes. Measured on 8.3.
+#[test]
+fn create_table_as_select_refuses_what_mysql_refuses() {
+    let (engine, mut session) = engine();
+    ctas_source(&engine, &mut session);
+
+    let mut wrong: Vec<String> = Vec::new();
+    let mut refuses = |sql: &str, code: u16| match engine.execute(&mut session, sql, &[]) {
+        Err(e) if e.code == code => {}
+        Err(e) => wrong.push(format!("{sql}\n  -> {e}, want {code}")),
+        Ok(_) => wrong.push(format!("{sql}\n  -> accepted, want {code}")),
+    };
+
+    // Two columns of one name is not a table, however it arose.
+    refuses("CREATE TABLE D1 AS SELECT id, id FROM Src", 1060);
+    refuses(
+        "CREATE TABLE D2 AS SELECT * FROM Src a JOIN Src b ON a.id = b.id",
+        1060,
+    );
+    // The query is resolved before the name is checked, so a bad query is
+    // reported as a bad query even under IF NOT EXISTS on a name in use.
+    refuses("CREATE TABLE D3 AS SELECT * FROM Nope", 1146);
+    refuses("CREATE TABLE IF NOT EXISTS Src AS SELECT * FROM Nope", 1146);
+    refuses("CREATE TABLE Src AS SELECT 1 AS a", 1050);
+    // `CREATE TABLE t ()` is a syntax error on 8.3; `sqlparser` parses it, so
+    // the engine is the only thing that can refuse it.
+    refuses("CREATE TABLE Z ()", 1064);
+
+    // The rows go in on the path INSERT writes by, so every row-level rule the
+    // new table declares applies to them. Each of these was accepted before,
+    // and left a table holding rows its own constraints forbid -- the CHECK
+    // one most plainly: it stored 1 and 2 and then refused an insert of 5.
+    refuses(
+        "CREATE TABLE Dup (k INT PRIMARY KEY) AS SELECT 1 AS k UNION ALL SELECT 1",
+        1062,
+    );
+    refuses(
+        "CREATE TABLE Bad (a INT NOT NULL) AS SELECT NULL AS a",
+        1048,
+    );
+    refuses(
+        "CREATE TABLE Chk (id INT, CHECK (id > 100)) AS SELECT id FROM Src",
+        3819,
+    );
+    // And a refusal leaves no table behind, which is what 8.3 does: nothing
+    // reaches the catalog until every row has been admitted.
+    for name in ["Dup", "Bad", "Chk"] {
+        let left = declared(&engine, &mut session, name);
+        if !left.is_empty() {
+            wrong.push(format!("a refused CTAS left {name} behind: {left:?}"));
+        }
+    }
+
+    // And IF NOT EXISTS on a name in use is a success that changes nothing.
+    match engine.execute(
+        &mut session,
+        "CREATE TABLE IF NOT EXISTS Src AS SELECT 1 AS a",
+        &[],
+    ) {
+        Ok(_) => {
+            let columns = declared(&engine, &mut session, "Src");
+            if columns.len() != 5 {
+                wrong.push(format!("IF NOT EXISTS replaced Src: {columns:?}"));
+            }
+        }
+        Err(e) => wrong.push(format!("IF NOT EXISTS on a name in use -> {e}")),
+    }
+
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// `CREATE TABLE ... LIKE` is the opposite of `AS SELECT` in what it keeps:
+/// the whole definition, and none of the rows.
+#[test]
+fn create_table_like_copies_the_definition_and_none_of_the_rows() {
+    let (engine, mut session) = engine();
+    ctas_source(&engine, &mut session);
+    run(&engine, &mut session, "CREATE TABLE Copy LIKE Src");
+
+    let mut wrong: Vec<String> = Vec::new();
+    // The AUTO_INCREMENT and both keys survive, which `AS SELECT` drops.
+    let want: Vec<Vec<String>> = vec![
+        vec!["id", "NULL", "NO", "int", "PRI", "auto_increment"],
+        vec!["name", "x", "NO", "varchar(40)", "UNI", ""],
+        vec!["qty", "7", "YES", "int unsigned", "", ""],
+        vec!["note", "NULL", "YES", "text", "", ""],
+        vec!["amt", "NULL", "YES", "decimal(10,2)", "", ""],
+    ]
+    .into_iter()
+    .map(|row| row.into_iter().map(str::to_owned).collect())
+    .collect();
+    let got = declared(&engine, &mut session, "Copy");
+    if got != want {
+        wrong.push(format!("LIKE\n  got  {got:?}\n  want {want:?}"));
+    }
+
+    // No rows, and the counter starts over rather than resuming the source's.
+    let count = rows(&engine, &mut session, "SELECT COUNT(*) FROM Copy");
+    if count != vec![vec!["0".to_owned()]] {
+        wrong.push(format!("LIKE copied rows: {count:?}"));
+    }
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Copy (name) VALUES ('z')",
+    );
+    let first = rows(&engine, &mut session, "SELECT id FROM Copy");
+    if first != vec![vec!["1".to_owned()]] {
+        wrong.push(format!("the copy's first id was {first:?}, want 1"));
+    }
+
+    // `CREATE TABLE Copy2 (LIKE Src)` is the same statement to MySQL and is
+    // deliberately absent: `sqlparser`'s MySQL dialect reads it as a column
+    // named LIKE of type Src, so the engine answers 1235 for a column type
+    // rather than copying anything. A clear error rather than a wrong answer,
+    // and a parser gap of its own -- the arm that would handle it is written
+    // and unreachable until the parser produces it.
+
+    // A view is in the same namespace and is not a base table.
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW VSrc AS SELECT id FROM Src",
+    );
+    for (sql, code) in [
+        ("CREATE TABLE C3 LIKE VSrc", 1347u16),
+        ("CREATE TABLE C4 LIKE Nope", 1146),
+        ("CREATE TABLE Copy LIKE Src", 1050),
+        // A table cannot be copied from itself, and 8.3 says so before it
+        // looks anything up: the same statement over a name that does not
+        // exist at all is 1066 too, not 1146.
+        ("CREATE TABLE Src LIKE Src", 1066),
+        ("CREATE TABLE Nope2 LIKE Nope2", 1066),
+        ("CREATE TABLE IF NOT EXISTS Src LIKE Src", 1066),
+    ] {
+        match engine.execute(&mut session, sql, &[]) {
+            Err(e) if e.code == code => {}
+            Err(e) => wrong.push(format!("{sql}\n  -> {e}, want {code}")),
+            Ok(_) => wrong.push(format!("{sql}\n  -> accepted, want {code}")),
+        }
+    }
+
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A table with no columns cannot be answered for -- a result set has no
+/// encoding for zero columns -- so no statement may leave one behind.
+///
+/// The engine's own half of #0125: the wire refuses to send such a result at
+/// all, and these are the routes that used to produce one. Both were measured
+/// on 8.3, which refuses them too and with these codes.
+#[test]
+fn no_statement_leaves_a_table_with_no_columns() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE One (a INT, b INT)");
+
+    let mut wrong: Vec<String> = Vec::new();
+    for (sql, code) in [
+        // `sqlparser` accepts the empty column list that MySQL's grammar does
+        // not, so this is the engine's to refuse.
+        ("CREATE TABLE Zero ()", 1064u16),
+    ] {
+        match engine.execute(&mut session, sql, &[]) {
+            Err(e) if e.code == code => {}
+            Err(e) => wrong.push(format!("{sql}\n  -> {e}, want {code}")),
+            Ok(_) => wrong.push(format!("{sql}\n  -> accepted, want {code}")),
+        }
+    }
+
+    // Dropping columns is fine until the last one, which is the point: the
+    // guard is about the table being emptied, not about DROP COLUMN.
+    run(&engine, &mut session, "ALTER TABLE One DROP COLUMN b");
+    match engine.execute(&mut session, "ALTER TABLE One DROP COLUMN a", &[]) {
+        Err(e) if e.code == 1090 => {}
+        Err(e) => wrong.push(format!("dropping the last column -> {e}, want 1090")),
+        Ok(_) => wrong.push("dropping the last column was accepted".to_owned()),
+    }
+    // And the column it refused to drop is still there.
+    let left = declared(&engine, &mut session, "One");
+    if left.len() != 1 {
+        wrong.push(format!("the refused drop still took effect: {left:?}"));
+    }
+
+    // One ALTER is one statement however many operations it lists. This
+    // answered 1090 -- correctly -- and dropped `a` and its data anyway,
+    // because the loop mutated the stored table in place and the guard fired
+    // on the second operation.
+    run(&engine, &mut session, "CREATE TABLE Two (a INT, b INT)");
+    run(&engine, &mut session, "INSERT INTO Two VALUES (1, 2)");
+    match engine.execute(
+        &mut session,
+        "ALTER TABLE Two DROP COLUMN a, DROP COLUMN b",
+        &[],
+    ) {
+        Err(e) if e.code == 1090 => {}
+        Err(e) => wrong.push(format!("dropping both columns -> {e}, want 1090")),
+        Ok(_) => wrong.push("dropping both columns was accepted".to_owned()),
+    }
+    let names: Vec<String> = declared(&engine, &mut session, "Two")
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect();
+    if names != vec!["a".to_owned(), "b".to_owned()] {
+        wrong.push(format!("a refused ALTER was partly applied: {names:?}"));
+    }
+    let kept = rows(&engine, &mut session, "SELECT a, b FROM Two");
+    if kept != vec![vec!["1".to_owned(), "2".to_owned()]] {
+        wrong.push(format!("a refused ALTER lost the rows: {kept:?}"));
+    }
+
+    // The same hazard reached by a different operation: an unknown column in
+    // the second position must undo the first, which is why the whole
+    // statement runs against a copy rather than the guard being special.
+    //
+    // The code is the engine's own and is asserted as such: 8.3 answers 1091
+    // `Can't DROP 'nosuch'` where this answers 1054 `Unknown column`. That is
+    // a separate, pre-existing gap in DROP COLUMN and not what this is about
+    // -- which is that both columns are still there afterwards, and they are
+    // on both servers.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Three (a INT, b INT, c INT)",
+    );
+    match engine.execute(
+        &mut session,
+        "ALTER TABLE Three DROP COLUMN a, DROP COLUMN nosuch",
+        &[],
+    ) {
+        Err(e) if e.code == 1054 => {}
+        Err(e) => wrong.push(format!("dropping an unknown column -> {e}, want 1054")),
+        Ok(_) => wrong.push("dropping an unknown column was accepted".to_owned()),
+    }
+    let names: Vec<String> = declared(&engine, &mut session, "Three")
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect();
+    if names != vec!["a".to_owned(), "b".to_owned(), "c".to_owned()] {
+        wrong.push(format!("a refused ALTER was partly applied: {names:?}"));
+    }
+
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

@@ -240,3 +240,6 @@
 {"at":"2026-08-26T11:18:03Z","id":129,"by":"Christopher Vachon","as":"user","type":"created","title":"A column's own character set is not honoured","state":"Todo"}
 {"at":"2026-08-26T11:18:03Z","id":130,"by":"Christopher Vachon","as":"user","type":"created","title":"HEX is unsupported","state":"Todo"}
 {"at":"2026-08-26T11:18:10Z","id":75,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-08-26T16:18:32Z","id":75,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-08-26T16:18:44Z","id":131,"by":"Christopher Vachon","as":"user","type":"created","title":"A row predating an ALTER that adds a scale is re-rendered","state":"Todo"}
+{"at":"2026-08-27T18:28:26Z","id":125,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}

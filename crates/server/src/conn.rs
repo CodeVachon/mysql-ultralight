@@ -304,8 +304,16 @@ where
         let last = answered.responses.len().saturating_sub(1);
         let failed = answered.error.is_some();
         for (index, response) in answered.responses.into_iter().enumerate() {
-            self.send_response_with(response, started, false, failed || index != last)
-                .await?;
+            // A refused response ended the command with an error packet that
+            // said nothing follows it. The statements after it in the batch
+            // have already run, but their answers cannot be delivered — and
+            // writing them anyway is what would desynchronise the connection.
+            if !self
+                .send_response_with(response, started, false, failed || index != last)
+                .await?
+            {
+                return Ok(());
+            }
         }
         match answered.error {
             Some(err) => self.send_error(&err).await,
@@ -419,8 +427,10 @@ where
 
         match self.handler.execute(&stmt, &params) {
             Ok(response) => {
+                // One response, so there is nothing after it to abandon.
                 self.send_response_with(response, started, true, false)
                     .await
+                    .map(|_| ())
             }
             Err(err) => self.send_error(&err).await,
         }
@@ -563,20 +573,37 @@ where
     }
 
     async fn send_response(&mut self, response: Response, started: Instant) -> std::io::Result<()> {
+        // A single response has nothing after it to abandon, so whether the
+        // command was cut short is the caller's answer to nobody.
         self.send_response_with(response, started, false, false)
             .await
+            .map(|_| ())
     }
 
     /// Writes one response. `more` sets `MORE_RESULTS_EXISTS`, which is how a
     /// client knows to read another result rather than treating this as the
     /// end of the command.
+    ///
+    /// Answers `false` when the response was refused rather than written, and
+    /// the caller must stop: an error packet carries no `MORE_RESULTS_EXISTS`,
+    /// so it *is* the end of the command whatever the caller intended to send
+    /// next. Writing the rest of a batch after one would put packets on the
+    /// wire that the client has already stopped reading for this command —
+    /// the same desynchronisation the refusal exists to prevent, reached the
+    /// long way round.
     async fn send_response_with(
         &mut self,
         response: Response,
         started: Instant,
         binary: bool,
         more: bool,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<bool> {
+        if matches!(&response, Response::ResultSet(rs) if rs.columns.is_empty()) {
+            self.send_error(&ErrPacket::new(1105, "HY000", Self::NO_COLUMNS))
+                .await?;
+            return Ok(false);
+        }
+
         let summary = match &response {
             Response::ResultSet(rs) => {
                 format!("{} row(s), {} column(s)", rs.rows.len(), rs.columns.len())
@@ -599,8 +626,36 @@ where
             summary: &summary,
             elapsed: started.elapsed(),
         });
-        Ok(())
+        Ok(true)
     }
+
+    /// A result set with no columns, which the wire protocol has no way to
+    /// say.
+    ///
+    /// The header of a result set is a length-encoded column count, and a
+    /// payload beginning `0x00` *is* an OK packet — the two are the same byte.
+    /// So writing zero here does not describe an empty result: it tells the
+    /// client the command is over, and the column definitions, rows and
+    /// terminator that follow are then read as the answers to whatever the
+    /// client sends next. That is the failure mode this whole file exists to
+    /// prevent, and it surfaces one statement later, on the connection rather
+    /// than on the statement that caused it.
+    ///
+    /// MySQL never has to encode this, because it has no way to produce it.
+    /// Every route was measured against 8.3 and every one is refused before it
+    /// gets near a result set: `SELECT` with an empty list is 1064, `SELECT *`
+    /// with no FROM is 1096, `CREATE TABLE t ()` is 1064, dropping a table's
+    /// last column is 1090, and `VALUES ROW()` is 3942. A table with no
+    /// columns cannot be made, so a `SELECT *` over one cannot be asked.
+    ///
+    /// The engine refuses the same routes, and this is the backstop for the
+    /// one that has not been thought of yet: refusing *here*, before the
+    /// header is written, is what keeps the connection usable — nothing has
+    /// been sent, so an error packet is a complete and correct answer and the
+    /// next statement still works. Refusing later, as a mismatched row must be
+    /// because its header is already gone, cannot offer that.
+    const NO_COLUMNS: &'static str =
+        "a result set must have at least one column; the wire protocol cannot express one with none";
 
     async fn write_result_set(
         &mut self,

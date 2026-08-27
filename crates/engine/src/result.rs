@@ -25,6 +25,19 @@ pub struct OutColumn {
     /// `None` for a computed expression, which genuinely has no declared type:
     /// inventing one would be worse than widening it.
     pub declared: Option<SqlType>,
+    /// The stored column this one is a direct projection of, where it is one.
+    ///
+    /// The *source* column's own name, which is not `name`: an alias renames
+    /// the result column and leaves the underlying one alone. MySQL builds a
+    /// `CREATE TABLE ... AS SELECT` column from the source `Field` and takes
+    /// only the name from the alias, so `SELECT id AS name FROM src` declares
+    /// `name int NOT NULL DEFAULT '0'` — `id`'s attributes under `name`'s
+    /// name. Looking the default up by `name` instead found `src.name` and
+    /// copied a `VARCHAR` default into an `INT` column, which then stored the
+    /// string `'x'` in it.
+    ///
+    /// `None` for anything computed, which has no stored column behind it.
+    pub origin: Option<String>,
     /// Whether the values are unsigned, for a column with no declared type to
     /// say so.
     ///
@@ -45,6 +58,7 @@ impl OutColumn {
             nullable: true,
             unsigned: false,
             declared: None,
+            origin: None,
         }
     }
 
@@ -57,7 +71,15 @@ impl OutColumn {
             nullable,
             unsigned: ty.unsigned,
             declared: Some(ty.clone()),
+            origin: None,
         }
+    }
+
+    /// Records the stored column this one is a direct projection of. See
+    /// `origin`.
+    pub fn projected_from(mut self, column: &str) -> Self {
+        self.origin = Some(column.to_owned());
+        self
     }
 
     /// The type a relation built from this column should carry.
