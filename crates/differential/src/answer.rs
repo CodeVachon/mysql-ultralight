@@ -1,18 +1,58 @@
 //! What one statement produced, in a form the two servers can be compared in.
 
-use mysql::consts::{ColumnFlags, ColumnType};
+use mysql::consts::ColumnType;
 use mysql::prelude::Queryable;
 use mysql::{Conn, Row, Value};
 
 /// One result column, as the server described it.
+///
+/// The fields of `ColumnDefinition41` this harness reads. It read four of them
+/// for its first year — name, type, and two bits of the flags word — and the
+/// engine sent 4096 as the length of every string column that whole time,
+/// green.
+///
+/// The rest of the packet is audited and not read, which is a decision rather
+/// than an oversight, and `README.md` carries the count behind each:
+///
+/// - `decimals`, a DECIMAL's places and a temporal's fractional digits: the
+///   engine reports 0 for every column, 1148 divergences over 260 statements.
+/// - `character_set` as an id: the engine ignores the connection's result
+///   charset and answers 255 where MySQL converts to 45, on 458 divergences
+///   over 118 statements. Whether that id is the *binary* one is compared,
+///   because that half is a fact about the column rather than about the
+///   client — see `Column::binary_values`.
+/// - `schema`, `table`, `org_table` and `org_name`, where the engine names a
+///   table and an original column for expressions that have neither: 2924 over
+///   583. `org_table` is read, but as the *scope* of the comparison rather
+///   than as something compared — see `compare.rs`.
+/// - `catalog`, which is the constant `def` on both servers and says nothing
+///   about the column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
     pub name: String,
     pub ty: ColumnType,
-    pub nullable: bool,
-    /// Whether the column is UNSIGNED, which the binary protocol needs in
-    /// order to read the bytes back as the number that was sent.
-    pub unsigned: bool,
+    /// The whole flags word, not the two bits that used to be read out of it.
+    /// NOT_NULL and UNSIGNED were compared and the other fourteen were not, so
+    /// an ENUM described without ENUM_FLAG and a temporal without BINARY_FLAG
+    /// both compared equal.
+    pub flags: u16,
+    /// The declared width, in bytes of the connection's result charset — so a
+    /// `VARCHAR(10)` under utf8mb4 is 40 and not 10.
+    pub length: u32,
+    /// The table the column was read out of, which MySQL leaves empty for
+    /// anything computed. Not compared; it decides *what* is compared, because
+    /// a column with a table behind it has a declared shape and one without it
+    /// has a computed one.
+    pub org_table: String,
+    /// Whether the server described the column's values as bytes.
+    ///
+    /// The binary character set, id 63, and not the id itself: MySQL converts
+    /// a result into the connection's character set and reports the collation
+    /// it converted *to*, so the exact id says as much about the client as
+    /// about the column. Binary against not-binary is the part that is a fact
+    /// about the column, and it is the one a client reads to decide whether to
+    /// hand back a String or a Buffer.
+    pub binary_values: bool,
 }
 
 /// Everything a statement told the client.
@@ -142,8 +182,14 @@ impl Answer {
             .map(|c| Column {
                 name: c.name_str().into_owned(),
                 ty: c.column_type(),
-                nullable: !c.flags().contains(ColumnFlags::NOT_NULL_FLAG),
-                unsigned: c.flags().contains(ColumnFlags::UNSIGNED_FLAG),
+                // `bits()` rather than the named flags: the point is to carry
+                // every bit the server set, including the ones this client
+                // library has no name for, since a bit nobody has named is
+                // exactly the kind this harness kept missing.
+                flags: c.flags().bits(),
+                length: c.column_length(),
+                org_table: c.org_table_str().into_owned(),
+                binary_values: c.character_set() == 63,
             })
             .collect();
 

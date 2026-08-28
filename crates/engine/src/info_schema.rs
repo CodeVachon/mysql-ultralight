@@ -167,9 +167,13 @@ type TableSpec = (&'static str, &'static [ColumnSpec]);
 /// that narrow even when materialised are spelled as they arrive.
 ///
 /// The spelling carries the sign, as a declared type does everywhere else, and
-/// the flag is NOT NULL. Only the columns this engine actually serves are
-/// here; a name absent from the table falls back to inference rather than
-/// being invented.
+/// a trailing ` binary` carries the collation — MySQL declares most of these
+/// columns `utf8mb3_bin`, which is not part of `COLUMN_TYPE` but does put the
+/// BINARY flag on the wire, and a client that introspects a schema reads every
+/// one of them. The flag after the spelling is NOT NULL.
+///
+/// Only the columns this engine actually serves are here; a name absent from
+/// the table falls back to inference rather than being invented.
 /// One column: its name, the type MySQL declares it with, and whether MySQL
 /// marks it NOT NULL.
 const COLUMN_SPEC: &[TableSpec] = &[
@@ -196,23 +200,23 @@ const COLUMN_SPEC: &[TableSpec] = &[
     (
         "COLUMNS",
         &[
-            ("TABLE_CATALOG", "varchar(64)", true),
-            ("TABLE_SCHEMA", "varchar(64)", true),
-            ("TABLE_NAME", "varchar(64)", true),
+            ("TABLE_CATALOG", "varchar(64) binary", true),
+            ("TABLE_SCHEMA", "varchar(64) binary", true),
+            ("TABLE_NAME", "varchar(64) binary", true),
             ("COLUMN_NAME", "varchar(64)", false),
             ("ORDINAL_POSITION", "int unsigned", true),
-            ("COLUMN_DEFAULT", "text", false),
+            ("COLUMN_DEFAULT", "text binary", false),
             ("IS_NULLABLE", "varchar(3)", true),
-            ("DATA_TYPE", "text", false),
+            ("DATA_TYPE", "text binary", false),
             ("CHARACTER_MAXIMUM_LENGTH", "bigint", false),
             ("NUMERIC_PRECISION", "bigint unsigned", false),
             ("NUMERIC_SCALE", "bigint unsigned", false),
             ("DATETIME_PRECISION", "int unsigned", false),
-            ("COLUMN_TYPE", "text", true),
-            ("COLUMN_KEY", "char(3)", true),
+            ("COLUMN_TYPE", "mediumtext binary", true),
+            ("COLUMN_KEY", "char(3) binary", true),
             ("EXTRA", "varchar(256)", false),
             ("COLLATION_NAME", "varchar(64)", false),
-            ("COLUMN_COMMENT", "text", true),
+            ("COLUMN_COMMENT", "text binary", true),
         ],
     ),
     (
@@ -229,16 +233,16 @@ const COLUMN_SPEC: &[TableSpec] = &[
     (
         "KEY_COLUMN_USAGE",
         &[
-            ("CONSTRAINT_CATALOG", "varchar(64)", true),
-            ("CONSTRAINT_SCHEMA", "varchar(64)", true),
+            ("CONSTRAINT_CATALOG", "varchar(64) binary", true),
+            ("CONSTRAINT_SCHEMA", "varchar(64) binary", true),
             ("CONSTRAINT_NAME", "varchar(64)", false),
-            ("TABLE_SCHEMA", "varchar(64)", true),
-            ("TABLE_NAME", "varchar(64)", true),
+            ("TABLE_SCHEMA", "varchar(64) binary", true),
+            ("TABLE_NAME", "varchar(64) binary", true),
             ("COLUMN_NAME", "varchar(64)", false),
             ("ORDINAL_POSITION", "int unsigned", true),
             ("POSITION_IN_UNIQUE_CONSTRAINT", "int unsigned", false),
-            ("REFERENCED_TABLE_SCHEMA", "varchar(64)", false),
-            ("REFERENCED_TABLE_NAME", "varchar(64)", false),
+            ("REFERENCED_TABLE_SCHEMA", "varchar(64) binary", false),
+            ("REFERENCED_TABLE_NAME", "varchar(64) binary", false),
             ("REFERENCED_COLUMN_NAME", "varchar(64)", false),
         ],
     ),
@@ -258,24 +262,24 @@ const COLUMN_SPEC: &[TableSpec] = &[
     (
         "REFERENTIAL_CONSTRAINTS",
         &[
-            ("CONSTRAINT_CATALOG", "varchar(64)", true),
-            ("CONSTRAINT_SCHEMA", "varchar(64)", true),
+            ("CONSTRAINT_CATALOG", "varchar(64) binary", true),
+            ("CONSTRAINT_SCHEMA", "varchar(64) binary", true),
             ("CONSTRAINT_NAME", "varchar(64)", false),
-            ("UNIQUE_CONSTRAINT_CATALOG", "varchar(64)", true),
-            ("UNIQUE_CONSTRAINT_SCHEMA", "varchar(64)", true),
+            ("UNIQUE_CONSTRAINT_CATALOG", "varchar(64) binary", true),
+            ("UNIQUE_CONSTRAINT_SCHEMA", "varchar(64) binary", true),
             ("UNIQUE_CONSTRAINT_NAME", "varchar(64)", false),
-            ("MATCH_OPTION", "char(7)", true),
-            ("UPDATE_RULE", "char(11)", true),
-            ("DELETE_RULE", "char(11)", true),
-            ("TABLE_NAME", "varchar(64)", true),
-            ("REFERENCED_TABLE_NAME", "varchar(64)", true),
+            ("MATCH_OPTION", "char(7) binary", true),
+            ("UPDATE_RULE", "char(11) binary", true),
+            ("DELETE_RULE", "char(11) binary", true),
+            ("TABLE_NAME", "varchar(64) binary", true),
+            ("REFERENCED_TABLE_NAME", "varchar(64) binary", true),
         ],
     ),
     (
         "SCHEMATA",
         &[
-            ("CATALOG_NAME", "varchar(64)", true),
-            ("SCHEMA_NAME", "varchar(64)", true),
+            ("CATALOG_NAME", "varchar(64) binary", true),
+            ("SCHEMA_NAME", "varchar(64) binary", true),
             ("DEFAULT_CHARACTER_SET_NAME", "varchar(64)", true),
             ("DEFAULT_COLLATION_NAME", "varchar(64)", true),
             ("SQL_PATH", "binary(0)", false),
@@ -284,30 +288,30 @@ const COLUMN_SPEC: &[TableSpec] = &[
     (
         "STATISTICS",
         &[
-            ("TABLE_CATALOG", "varchar(64)", true),
-            ("TABLE_SCHEMA", "varchar(64)", true),
-            ("TABLE_NAME", "varchar(64)", true),
+            ("TABLE_CATALOG", "varchar(64) binary", true),
+            ("TABLE_SCHEMA", "varchar(64) binary", true),
+            ("TABLE_NAME", "varchar(64) binary", true),
             ("NON_UNIQUE", "int", true),
-            ("INDEX_SCHEMA", "varchar(64)", true),
+            ("INDEX_SCHEMA", "varchar(64) binary", true),
             ("INDEX_NAME", "varchar(64)", false),
             ("SEQ_IN_INDEX", "int unsigned", true),
             ("COLUMN_NAME", "varchar(64)", false),
             ("COLLATION", "varchar(1)", false),
             ("CARDINALITY", "bigint", false),
             ("SUB_PART", "bigint", false),
-            ("INDEX_TYPE", "varchar(11)", true),
+            ("INDEX_TYPE", "varchar(11) binary", true),
         ],
     ),
     (
         "TABLES",
         &[
-            ("TABLE_CATALOG", "varchar(64)", true),
-            ("TABLE_SCHEMA", "varchar(64)", true),
-            ("TABLE_NAME", "varchar(64)", true),
-            ("TABLE_TYPE", "char(11)", true),
+            ("TABLE_CATALOG", "varchar(64) binary", true),
+            ("TABLE_SCHEMA", "varchar(64) binary", true),
+            ("TABLE_NAME", "varchar(64) binary", true),
+            ("TABLE_TYPE", "char(11) binary", true),
             ("ENGINE", "varchar(64)", false),
             ("VERSION", "int", false),
-            ("ROW_FORMAT", "char(10)", false),
+            ("ROW_FORMAT", "char(10) binary", false),
             ("TABLE_ROWS", "bigint unsigned", false),
             ("TABLE_COLLATION", "varchar(64)", false),
             ("TABLE_COMMENT", "text", false),
@@ -317,26 +321,26 @@ const COLUMN_SPEC: &[TableSpec] = &[
     (
         "TABLE_CONSTRAINTS",
         &[
-            ("CONSTRAINT_CATALOG", "varchar(64)", true),
-            ("CONSTRAINT_SCHEMA", "varchar(64)", true),
+            ("CONSTRAINT_CATALOG", "varchar(64) binary", true),
+            ("CONSTRAINT_SCHEMA", "varchar(64) binary", true),
             ("CONSTRAINT_NAME", "varchar(64)", false),
-            ("TABLE_SCHEMA", "varchar(64)", true),
-            ("TABLE_NAME", "varchar(64)", true),
-            ("CONSTRAINT_TYPE", "varchar(11)", true),
-            ("ENFORCED", "varchar(3)", true),
+            ("TABLE_SCHEMA", "varchar(64) binary", true),
+            ("TABLE_NAME", "varchar(64) binary", true),
+            ("CONSTRAINT_TYPE", "varchar(11) binary", true),
+            ("ENFORCED", "varchar(3) binary", true),
         ],
     ),
     (
         "VIEWS",
         &[
-            ("TABLE_CATALOG", "varchar(64)", true),
-            ("TABLE_SCHEMA", "varchar(64)", true),
-            ("TABLE_NAME", "varchar(64)", true),
-            ("VIEW_DEFINITION", "longtext", false),
-            ("CHECK_OPTION", "char(8)", false),
-            ("IS_UPDATABLE", "char(3)", false),
-            ("DEFINER", "varchar(288)", false),
-            ("SECURITY_TYPE", "varchar(7)", false),
+            ("TABLE_CATALOG", "varchar(64) binary", true),
+            ("TABLE_SCHEMA", "varchar(64) binary", true),
+            ("TABLE_NAME", "varchar(64) binary", true),
+            ("VIEW_DEFINITION", "longtext binary", false),
+            ("CHECK_OPTION", "char(8) binary", false),
+            ("IS_UPDATABLE", "char(3) binary", false),
+            ("DEFINER", "varchar(288) binary", false),
+            ("SECURITY_TYPE", "varchar(7) binary", false),
             ("CHARACTER_SET_CLIENT", "varchar(64)", true),
             ("COLLATION_CONNECTION", "varchar(64)", true),
         ],
@@ -358,8 +362,15 @@ fn specified(table: &str, column: &str) -> Option<(SqlType, bool)> {
 ///
 /// The same spellings a `CREATE TABLE` would use, so `SqlType` reports them the
 /// way it reports any other column — including `int unsigned`, which is the
-/// form `COLUMN_TYPE` itself uses.
+/// form `COLUMN_TYPE` itself uses, and `text binary`, which is how MySQL's own
+/// DDL asks for the binary collation of a character set. The collation is not
+/// part of `COLUMN_TYPE`, so it is stripped back off the spelling: a client
+/// asking what these columns are declared as reads `mediumtext`.
 fn spec_type(spelling: &str) -> Option<SqlType> {
+    let (spelling, binary_collation) = match spelling.strip_suffix(" binary") {
+        Some(base) => (base, true),
+        None => (spelling, false),
+    };
     let (base, unsigned) = match spelling.strip_suffix(" unsigned") {
         Some(base) => (base, true),
         None => (spelling, false),
@@ -384,6 +395,7 @@ fn spec_type(spelling: &str) -> Option<SqlType> {
         scale: None,
         unsigned,
         variants: Vec::new(),
+        binary_collation,
     })
 }
 
@@ -395,6 +407,7 @@ fn integer_type() -> SqlType {
         scale: None,
         unsigned: false,
         variants: Vec::new(),
+        binary_collation: false,
     }
 }
 
@@ -410,6 +423,7 @@ fn text_type() -> SqlType {
         scale: None,
         unsigned: false,
         variants: Vec::new(),
+        binary_collation: false,
     }
 }
 

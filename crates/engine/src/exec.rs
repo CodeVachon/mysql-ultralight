@@ -2156,7 +2156,7 @@ impl Engine {
                     columns.push(
                         OutColumn::from_sql_type(&column.name, &column.ty, column.nullable)
                             .in_table(&column.schema, &column.table)
-                            .projected_from(&column.name),
+                            .projected_from(&column.name, base_table(relation, &column.table)),
                     );
                     plan.push(Projection::Column(i));
                 }
@@ -2549,8 +2549,10 @@ impl Engine {
             .in_table(&column.schema, &column.table)
             // The source column's own name, not the alias: `SELECT id AS name`
             // is `id`'s column under `name`'s name, and a `CREATE TABLE ... AS
-            // SELECT` over it has to copy `id`'s attributes.
-            .projected_from(&column.name);
+            // SELECT` over it has to copy `id`'s attributes. The table it
+            // lives in travels with it for the same reason, and is the base
+            // table rather than what the query called it.
+            .projected_from(&column.name, base_table(relation, &column.table));
             return Ok((out, Projection::Column(i)));
         }
 
@@ -2675,8 +2677,11 @@ impl Engine {
         let columns: Vec<OutColumn> = items
             .iter()
             .map(|(alias, e)| match direct_column(e, refs, input_columns) {
+                // No table: this path has the columns and not the relation
+                // that produced them, so the base table behind an alias is out
+                // of reach. See `OutColumn::origin_table`.
                 Some(column) => OutColumn::from_sql_type(alias, &column.ty, column.nullable)
-                    .projected_from(&column.name),
+                    .projected_from(&column.name, None),
                 None => {
                     let mut column =
                         OutColumn::new(alias.clone(), computed_column_type(e, refs, input_columns));
@@ -5401,7 +5406,6 @@ fn parse_expression(text: &str) -> EngineResult<Expr> {
         .map_err(|e| EngineError::parse(format!("{e}")))
 }
 
-/// Builds a row of column defaults.
 /// Fills any AUTO_INCREMENT column the row left empty, and advances the
 /// counter past one it filled in itself.
 ///
@@ -5448,6 +5452,7 @@ fn assign_auto_increment(table: &mut Table, row: &mut [Value]) -> EngineResult<O
     Ok(generated)
 }
 
+/// Builds a row of column defaults.
 fn default_row(table: &Table, ctx: &Context<'_>) -> EngineResult<Vec<Value>> {
     let mut row = Vec::with_capacity(table.columns.len());
     for column in &table.columns {
@@ -6570,6 +6575,7 @@ fn merged_approximate(
         scale: Some(scale),
         unsigned: false,
         variants: Vec::new(),
+        binary_collation: false,
     })
 }
 
@@ -8255,6 +8261,20 @@ impl Drop for Source {
         let previous = self.0.take();
         SOURCE.with(|s| *s.borrow_mut() = previous);
     }
+}
+
+/// The stored table behind the name a relation calls one of its sources.
+///
+/// `RelColumn::table` is the alias where the FROM clause gave one, and a
+/// default has to be read out of the table that alias stands for — reading it
+/// out of a *table* of that name is how `SELECT Other2.name FROM Src Other2`
+/// copied the wrong default. `sources` and `base_tables` are parallel, which
+/// is what makes the translation a lookup rather than a guess.
+fn base_table<'a>(relation: &'a Relation, alias: &str) -> Option<&'a str> {
+    relation
+        .source_index(alias)
+        .and_then(|i| relation.base_tables.get(i))
+        .map(String::as_str)
 }
 
 fn wire_type(value: &Value) -> ColumnType {

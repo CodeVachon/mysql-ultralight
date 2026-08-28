@@ -15755,18 +15755,17 @@ fn create_table_as_select_declares_its_columns_and_inserts_its_rows() {
         vec![vec!["b", "1", "YES", "int", "", ""]],
     );
 
-    // A table *alias* that shadows the name of a real table. The default is
-    // looked up under `column.table`, which is the alias, so this finds a
-    // table the query never touched -- and without the type check it would
-    // copy `Other.name`'s INT default 5 into a VARCHAR column.
+    // A table *alias*, including one that shadows the name of a real table.
+    // The default follows the table the alias stands for, which is what 8.3
+    // does: all three of these declare `name varchar(40) NOT NULL DEFAULT 'x'`
+    // there, out of `Src`.
     //
-    // The answer asserted is the engine's own, and it is not MySQL's: 8.3
-    // declares `name varchar(40) NOT NULL DEFAULT 'x'`, the aliased source
-    // table's real default, because it builds the column from the source
-    // Field. This engine cannot reach that field -- a result column carries
-    // the alias and nothing else -- so it declines to copy at all and takes
-    // the type's implicit default. Declining is the conservative half of a
-    // divergence; copying the wrong column's value would be the other kind.
+    // Looking the table up by the alias was wrong twice over. It missed the
+    // plain case -- there is no table `s` for `FROM Src s` to read a default
+    // out of -- and it answered the shadowed one out of a table the query
+    // never touched. A type check narrowed the second to the differently-typed
+    // spelling and left `Other2` below, whose `name` is the same VARCHAR(40),
+    // copying `'z'` where the source column says `'x'`.
     run(
         &engine,
         &mut session,
@@ -15775,14 +15774,31 @@ fn create_table_as_select_declares_its_columns_and_inserts_its_rows() {
     run(
         &engine,
         &mut session,
+        "CREATE TABLE Other2 (name VARCHAR(40) DEFAULT 'z')",
+    );
+    run(
+        &engine,
+        &mut session,
         "CREATE TABLE Shadow AS SELECT Other.name FROM Src Other",
     );
-    check(
-        &mut wrong,
-        "a table alias shadowing a real table",
-        declared(&engine, &mut session, "Shadow"),
-        vec![vec!["name", "", "NO", "varchar(40)", "", ""]],
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Shadow2 AS SELECT Other2.name FROM Src Other2",
     );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Aliased AS SELECT s.name FROM Src s",
+    );
+    for table in ["Shadow", "Shadow2", "Aliased"] {
+        check(
+            &mut wrong,
+            &format!("a default copied through the alias in {table}"),
+            declared(&engine, &mut session, table),
+            vec![vec!["name", "x", "NO", "varchar(40)", "", ""]],
+        );
+    }
 
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
@@ -15801,12 +15817,25 @@ fn create_table_as_select_refuses_what_mysql_refuses() {
         Ok(_) => wrong.push(format!("{sql}\n  -> accepted, want {code}")),
     };
 
-    // Two columns of one name is not a table, however it arose.
+    // Two columns of one name is not a table, however it arose -- including
+    // the plain spelling, which the check missed for as long as it lived on
+    // the `AS SELECT` path: `CREATE TABLE t (a INT, a INT)` made exactly the
+    // table the refusal exists to prevent.
     refuses("CREATE TABLE D1 AS SELECT id, id FROM Src", 1060);
     refuses(
         "CREATE TABLE D2 AS SELECT * FROM Src a JOIN Src b ON a.id = b.id",
         1060,
     );
+    refuses("CREATE TABLE D4 (a INT, a INT)", 1060);
+    // Case-insensitively, as MySQL compares column names.
+    refuses("CREATE TABLE D5 (a INT, A INT)", 1060);
+    // Before the key is looked at, which is why the check runs ahead of
+    // `apply_constraint` rather than after it: 8.3 answers this 1060, not the
+    // 1072 the key alone would raise there. This engine answers 1060 for the
+    // right reason and not by accident -- it does not raise 1072 for a key
+    // naming an unknown column at all, which is a separate gap and is why
+    // there is no case for that spelling here.
+    refuses("CREATE TABLE D6 (a INT, a INT, PRIMARY KEY (nope))", 1060);
     // The query is resolved before the name is checked, so a bad query is
     // reported as a bad query even under IF NOT EXISTS on a name in use.
     refuses("CREATE TABLE D3 AS SELECT * FROM Nope", 1146);
@@ -16030,4 +16059,210 @@ fn no_statement_leaves_a_table_with_no_columns() {
     }
 
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Every number here was measured against MySQL 8.3 rather than derived, by
+/// declaring the column and reading `column_length` and the flags word back
+/// off the wire. See `crates/differential/README.md`, which is where the
+/// harness now compares them.
+#[test]
+fn a_column_is_described_with_the_width_it_was_declared_with() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE D (\
+           c1 CHAR(1), c10 CHAR(10), v10 VARCHAR(10), v1000 VARCHAR(1000), \
+           b16 BINARY(16), vb9 VARBINARY(9), \
+           tt TINYTEXT, t TEXT, mt MEDIUMTEXT, lt LONGTEXT, \
+           tb TINYBLOB, bb BLOB, mb MEDIUMBLOB, lb LONGBLOB, \
+           e ENUM('a','bb','ccc'), s SET('a','bb','ccc'), j JSON, \
+           dt DATE, tm TIME, tm3 TIME(3), dtm DATETIME, dtm6 DATETIME(6), \
+           ts TIMESTAMP NULL, ts2 TIMESTAMP(2) NULL, y YEAR, \
+           ti TINYINT, tiu TINYINT UNSIGNED, ti1 TINYINT(1), bo BOOLEAN, \
+           si SMALLINT, siu SMALLINT UNSIGNED, mi MEDIUMINT, miu MEDIUMINT UNSIGNED, \
+           i INT, iu INT UNSIGNED, i4 INT(4), bi BIGINT, biu BIGINT UNSIGNED, \
+           f FLOAT, fd FLOAT(10,4), d DOUBLE, dd DOUBLE(12,5), \
+           de DECIMAL(10,2), de0 DECIMAL(10,0), de65 DECIMAL(65,30), \
+           deu DECIMAL(8,3) UNSIGNED)",
+    );
+    let described = engine
+        .describe(&session, "SELECT * FROM D", 0)
+        .unwrap()
+        .unwrap();
+    let widths: Vec<(String, u32)> = described
+        .iter()
+        .map(|c| (c.name.clone(), c.to_wire().column_length))
+        .collect();
+    let want: Vec<(&str, u32)> = vec![
+        // A character is four bytes in utf8mb4, and the width is in bytes.
+        ("c1", 4),
+        ("c10", 40),
+        ("v10", 40),
+        ("v1000", 4000),
+        // Bytes are bytes: no multiplier on a binary string.
+        ("b16", 16),
+        ("vb9", 9),
+        ("tt", 1020),
+        ("t", 262140),
+        ("mt", 67108860),
+        // Four times 4294967295 does not fit in the four bytes the field has,
+        // so MySQL sends what does.
+        ("lt", 4294967295),
+        ("tb", 255),
+        ("bb", 65535),
+        ("mb", 16777215),
+        ("lb", 4294967295),
+        // The widest member, and for a SET every member and its commas.
+        ("e", 12),
+        ("s", 32),
+        ("j", 4294967295),
+        ("dt", 10),
+        ("tm", 10),
+        ("tm3", 14),
+        ("dtm", 19),
+        ("dtm6", 26),
+        ("ts", 19),
+        ("ts2", 22),
+        ("y", 4),
+        // Display widths. The unsigned one is a digit narrower because there
+        // is no sign to print — except a BIGINT, whose 20 digits are already
+        // what its unsigned range needs.
+        ("ti", 4),
+        ("tiu", 3),
+        ("ti1", 1),
+        ("bo", 1),
+        ("si", 6),
+        ("siu", 5),
+        ("mi", 9),
+        ("miu", 8),
+        ("i", 11),
+        ("iu", 10),
+        ("i4", 4),
+        ("bi", 20),
+        ("biu", 20),
+        // A declared `(M,D)` reports M; without one, what the type can print.
+        ("f", 12),
+        ("fd", 10),
+        ("d", 22),
+        ("dd", 12),
+        // Digits, plus the point where there is a scale, plus the sign where
+        // the column can be negative.
+        ("de", 12),
+        ("de0", 11),
+        ("de65", 67),
+        ("deu", 9),
+    ];
+    let want: Vec<(String, u32)> = want.into_iter().map(|(n, w)| (n.to_owned(), w)).collect();
+    assert_eq!(widths, want);
+}
+
+/// The BINARY flag, which this engine set for nothing at all until #0126.
+///
+/// Measured on 8.3. The rule has two halves: a column read out of a table is
+/// binary when its values are bytes and never when it is a number, and an
+/// expression is binary whenever its collation is — which numbers are, so
+/// `SELECT 1` carries the flag where the `INT` column it came from does not.
+#[test]
+fn a_column_says_whether_its_values_are_bytes() {
+    use mysql_ultralight_protocol::column::flags;
+
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE B (i INT, v VARCHAR(10), t TEXT, b BLOB, j JSON, \
+         d DATE, dt DATETIME(3), y YEAR, de DECIMAL(6,2))",
+    );
+    let named = |sql: &str| -> Vec<String> {
+        engine
+            .describe(&session, sql, 0)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                let wire = c.to_wire();
+                let mut set = Vec::new();
+                for (bit, name) in [
+                    (flags::NOT_NULL, "NOT_NULL"),
+                    (flags::BLOB, "BLOB"),
+                    (flags::UNSIGNED, "UNSIGNED"),
+                    (flags::ZEROFILL, "ZEROFILL"),
+                    (flags::BINARY, "BINARY"),
+                ] {
+                    if wire.flags & bit != 0 {
+                        set.push(name);
+                    }
+                }
+                set.join("|")
+            })
+            .collect()
+    };
+    let stored = named("SELECT i, v, t, b, j, d, dt, y, de FROM B");
+    assert_eq!(
+        stored,
+        vec![
+            // A number is not binary, whatever character set it reports.
+            "".to_owned(),
+            "".to_owned(),
+            // A TEXT is a blob and is not binary; a BLOB is both.
+            "BLOB".to_owned(),
+            "BLOB|BINARY".to_owned(),
+            "BLOB|BINARY".to_owned(),
+            "BINARY".to_owned(),
+            "BINARY".to_owned(),
+            // A YEAR is reported zero-filled as well as unsigned.
+            "UNSIGNED|ZEROFILL".to_owned(),
+            "".to_owned(),
+        ]
+    );
+
+    let mut computed =
+        named("SELECT 1, 'x', i + 1, NOW(), CONCAT(v, 'x'), JSON_OBJECT('a', 1) FROM B");
+    // A string function whose answer this engine types as a blob: MySQL sends
+    // all three in the connection's character set, `GROUP_CONCAT(v)` with no
+    // flags at all on 8.3. Described binary they arrive as bytes, which is a
+    // client handing back a Buffer where the query asked for text.
+    let charset = |sql: &str| -> Vec<(String, u16)> {
+        engine
+            .describe(&session, sql, 0)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .unwrap_or_else(|| panic!("{sql} described nothing"))
+            .iter()
+            .map(|c| {
+                let wire = c.to_wire();
+                (format!("{:?}", wire.column_type), wire.charset)
+            })
+            .collect()
+    };
+    for sql in [
+        "SELECT GROUP_CONCAT(v) FROM B",
+        "SELECT JSON_UNQUOTE(j) FROM B",
+        "SELECT j ->> '$.a' FROM B",
+    ] {
+        assert_eq!(named(sql), vec!["".to_owned()], "{sql}");
+        for (code, cs) in charset(sql) {
+            assert_ne!(cs, 63, "{sql} was described binary, as a {code}");
+        }
+    }
+    // Asked on its own, because an aggregate beside a bare column is not a
+    // statement ONLY_FULL_GROUP_BY allows.
+    computed.insert(3, named("SELECT COUNT(*) FROM B").remove(0));
+    assert_eq!(
+        computed,
+        vec![
+            // An expression over numbers is binary where the stored column is
+            // not, because the flag follows the item's collation.
+            "NOT_NULL|BINARY".to_owned(),
+            "NOT_NULL".to_owned(),
+            "BINARY".to_owned(),
+            "NOT_NULL|BINARY".to_owned(),
+            "NOT_NULL|BINARY".to_owned(),
+            "".to_owned(),
+            // A blob-typed expression carries no BLOB flag: there is no field
+            // behind it for MySQL to read one off, and the stored `j` column
+            // two assertions up carries both.
+            "BINARY".to_owned(),
+        ]
+    );
 }

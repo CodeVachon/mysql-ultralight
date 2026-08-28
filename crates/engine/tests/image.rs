@@ -920,11 +920,11 @@ fn a_boolean_never_reaches_the_image_and_is_written_as_its_integer_if_it_does() 
         Value::Int(1)
     );
 
-    // And the boolean did not move the version: 7 was #0068's ENUM tag and 8
-    // is #0069's unsigned one, neither of them this. Pinned rather than
-    // derived, so the day something *does* give a boolean a tag of its own it
-    // has to come back here and say so.
-    assert_eq!(image::FORMAT_VERSION, 8);
+    // And the boolean did not move the version: 7 was #0068's ENUM tag, 8 was
+    // #0069's unsigned one and 9 is #0126's binary collation, none of them
+    // this. Pinned rather than derived, so the day something *does* give a
+    // boolean a tag of its own it has to come back here and say so.
+    assert_eq!(image::FORMAT_VERSION, 9);
 }
 
 #[test]
@@ -1054,4 +1054,45 @@ fn a_document_holding_serde_s_number_key_still_reloads() {
     let mut session = Session::new(ServerConfig::default(), 1);
     session.current_database = Some("testdb".to_owned());
     assert_eq!(rows(&restored, &mut session, sql), before);
+}
+
+/// A binary-collated column keeps its collation across a save and a reload.
+///
+/// Nothing in the DDL declares one — `COLLATE` is not a clause this engine
+/// accepts — but `CREATE TABLE ... AS SELECT` off `information_schema` copies
+/// one into a user table, which is exactly what 8.3 does: the copy of
+/// `COLUMN_TYPE` is `utf8mb3_bin` there too. The collation is the only thing
+/// that puts the BINARY flag on a text column's wire definition, so an image
+/// that dropped it would make the same table describe itself one way before a
+/// snapshot and another way after — with nothing in the rows to show for it.
+#[test]
+fn a_binary_collation_survives_a_reload() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Copied AS SELECT COLUMN_TYPE, COLUMN_NAME \
+         FROM information_schema.columns WHERE TABLE_NAME = 'Copied'",
+    );
+
+    let binary_flags = |engine: &Engine, session: &Session| -> Vec<bool> {
+        engine
+            .describe(session, "SELECT * FROM Copied", 0)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .map(|c| c.to_wire().flags & mysql_ultralight_protocol::column::flags::BINARY != 0)
+            .collect()
+    };
+    // The first column carries the collation and the second does not, which is
+    // what makes this a round-trip test rather than a constant.
+    let before = binary_flags(&engine, &session);
+    assert_eq!(before, vec![true, false]);
+
+    let encoded = image::encode(&engine.catalog_snapshot().unwrap());
+    let decoded = image::decode(&encoded).unwrap();
+    let restored = Engine::from_catalog(decoded, ServerConfig::default()).unwrap();
+    let mut session = Session::new(ServerConfig::default(), 1);
+    session.current_database = Some("testdb".to_owned());
+    assert_eq!(binary_flags(&restored, &session), before);
 }

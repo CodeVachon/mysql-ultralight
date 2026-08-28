@@ -23,6 +23,18 @@ pub struct SqlType {
     pub unsigned: bool,
     /// Permitted values for ENUM and SET.
     pub variants: Vec<String>,
+    /// Whether the column's text sorts and compares as bytes.
+    ///
+    /// MySQL calls such a column binary on the wire — a `_bin` collation sets
+    /// BINARY_FLAG the same way the binary character set does — while still
+    /// sending the text in the connection's character set. It is the only way
+    /// a `MYSQL_TYPE_BLOB` carrying characters can carry that flag.
+    ///
+    /// Nothing in the DDL sets it yet, because `COLLATE` is not a clause this
+    /// engine accepts. `information_schema` does: MySQL declares
+    /// `COLUMN_TYPE`, `COLUMN_DEFAULT` and their neighbours `utf8mb3_bin`, and
+    /// a client reading those columns is told they are binary.
+    pub binary_collation: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +63,7 @@ impl SqlType {
             scale: None,
             unsigned: false,
             variants: Vec::new(),
+            binary_collation: false,
         }
     }
 
@@ -211,6 +224,7 @@ impl SqlType {
             scale: None,
             unsigned: false,
             variants: Vec::new(),
+            binary_collation: false,
         }
     }
 
@@ -227,6 +241,7 @@ impl SqlType {
             scale: None,
             unsigned: false,
             variants: Vec::new(),
+            binary_collation: false,
         };
         match ty {
             ColumnType::Tiny => simple(TypeKind::Bool, "tinyint(1)"),
@@ -286,6 +301,118 @@ impl SqlType {
     /// This is what the binary protocol encodes by, so the code and what the
     /// column can hold have to agree — an `INT` may say `LONG` only because
     /// `coerce` refuses anything four bytes cannot hold.
+    /// The `column_length` a result set reports for a column of this type.
+    ///
+    /// MySQL sends the *declaration's* width, and it sends it in bytes of the
+    /// character set the result is being returned in — so a `VARCHAR(10)` is
+    /// 40 under utf8mb4 and not 10, and a `latin1` column read back over a
+    /// utf8mb4 connection is 40 too, because the server converts it on the way
+    /// out. This engine speaks utf8mb4 and nothing else, so the multiplier is
+    /// a constant here; it stops being one the day a second charset exists.
+    ///
+    /// Every number below is measured against 8.3 rather than derived, and the
+    /// three that look arbitrary are the ones worth keeping: a `LONGTEXT` is
+    /// 4294967295 and not 4×4294967295, because the width saturates at what
+    /// four bytes hold; a `DECIMAL`'s length counts the point and the sign as
+    /// well as the digits; and a `TINYINT UNSIGNED` is 3 against a signed 4,
+    /// because the sign is a column of display width.
+    pub fn wire_length(&self) -> u32 {
+        /// utf8mb4, the only character set this engine has.
+        const BYTES_PER_CHAR: u64 = 4;
+        // In characters, then multiplied — the saturation is at the end, so a
+        // LONGTEXT lands on u32::MAX rather than wrapping through it.
+        let chars = |n: u64| u32::try_from(n.saturating_mul(BYTES_PER_CHAR)).unwrap_or(u32::MAX);
+        let bytes = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+        // A temporal's fractional seconds are parsed into `length`, not
+        // `scale`: `datetime(3)` is 19 + the point + three digits.
+        let fractional = |base: u64| match self.length {
+            Some(precision) if precision > 0 => base + 1 + precision,
+            _ => base,
+        };
+        match self.kind {
+            // `TINYINT(1)`, and the only integer whose declared width MySQL
+            // still reports in `COLUMN_TYPE` as well as on the wire.
+            TypeKind::Bool => 1,
+            TypeKind::Int => bytes(self.length.unwrap_or_else(|| {
+                let widest = match self.base_name().as_str() {
+                    "tinyint" => 4,
+                    "smallint" => 6,
+                    "mediumint" => 9,
+                    "bigint" => 20,
+                    _ => 11,
+                };
+                // One narrower where there is no sign to print. A BIGINT is
+                // the exception both ways: 20 digits is what its unsigned
+                // range needs, so there is no sign column to give back.
+                if self.unsigned && widest != 20 {
+                    widest - 1
+                } else {
+                    widest
+                }
+            })),
+            // A declared `(M,D)` reports M. Without one MySQL reports the
+            // widest value the type can print: 12 for four bytes, 22 for eight.
+            TypeKind::Float => bytes(self.length.unwrap_or({
+                if self.base_name() == "float" {
+                    12
+                } else {
+                    22
+                }
+            })),
+            // The digits, plus a place for the decimal point where there is a
+            // scale, plus a place for the sign where the column can be
+            // negative. `DECIMAL(10,2)` is 12, `DECIMAL(10,0)` is 11 and
+            // `DECIMAL(8,3) UNSIGNED` is 9.
+            TypeKind::Decimal => {
+                let precision = self.length.unwrap_or(10);
+                let point = u64::from(self.scale.unwrap_or(0) > 0);
+                let sign = u64::from(!self.unsigned);
+                bytes(precision + point + sign)
+            }
+            TypeKind::Text => match self.base_name().as_str() {
+                "tinytext" => chars(255),
+                "text" => chars(65535),
+                "mediumtext" => chars(16777215),
+                "longtext" => chars(4294967295),
+                // A bare `CHAR` is `CHAR(1)`.
+                _ => chars(self.length.unwrap_or(1)),
+            },
+            // Bytes, so no multiplier: the declared width of a `VARBINARY(9)`
+            // is nine bytes however many characters they would make.
+            TypeKind::Blob => match self.base_name().as_str() {
+                "tinyblob" => 255,
+                "blob" => 65535,
+                "mediumblob" => 16777215,
+                "longblob" => u32::MAX,
+                _ => bytes(self.length.unwrap_or(1)),
+            },
+            TypeKind::Date => 10,
+            // `datetime` and `timestamp` both print 19 characters before the
+            // fraction; `time` prints `[-]HHH:MM:SS`, which is 10.
+            TypeKind::DateTime => bytes(fractional(19)),
+            TypeKind::Time => bytes(fractional(10)),
+            TypeKind::Year => 4,
+            TypeKind::Json => u32::MAX,
+            // The widest member, which is what a value of the column can be.
+            TypeKind::Enum => chars(
+                self.variants
+                    .iter()
+                    .map(|v| v.chars().count() as u64)
+                    .max()
+                    .unwrap_or(0),
+            ),
+            // Every member at once, separated by commas, which is what a value
+            // of the column can be: `SET('a','bb','ccc')` is `a,bb,ccc`.
+            TypeKind::Set => chars(
+                self.variants
+                    .iter()
+                    .map(|v| v.chars().count() as u64)
+                    .sum::<u64>()
+                    + self.variants.len().saturating_sub(1) as u64,
+            ),
+        }
+    }
+
     pub fn column_type(&self) -> ColumnType {
         match self.kind {
             TypeKind::Bool => ColumnType::Tiny,
@@ -852,6 +979,7 @@ fn int_type(name: &str, display: Option<u64>, unsigned: bool) -> SqlType {
         scale: None,
         unsigned,
         variants: Vec::new(),
+        binary_collation: false,
     }
 }
 
@@ -899,6 +1027,7 @@ fn decimal_type(info: &sqlparser::ast::ExactNumberInfo, unsigned: bool) -> SqlTy
         scale,
         unsigned,
         variants: Vec::new(),
+        binary_collation: false,
     }
 }
 
@@ -948,6 +1077,7 @@ fn float_type(name: &str, info: &sqlparser::ast::ExactNumberInfo, unsigned: bool
         scale,
         unsigned,
         variants: Vec::new(),
+        binary_collation: false,
     }
 }
 
@@ -1067,6 +1197,7 @@ fn char_type(name: &str, length: Option<u64>) -> SqlType {
         scale: None,
         unsigned: false,
         variants: Vec::new(),
+        binary_collation: false,
     }
 }
 
@@ -1087,6 +1218,7 @@ fn datetime_type(name: &str, precision: Option<u64>) -> SqlType {
         scale: None,
         unsigned: false,
         variants: Vec::new(),
+        binary_collation: false,
     }
 }
 

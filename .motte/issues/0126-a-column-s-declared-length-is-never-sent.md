@@ -1,11 +1,11 @@
 ---
 id: 126
 title: A column's declared length is never sent
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-08-26T08:49:10Z
-updated: 2026-08-26T08:49:10Z
+updated: 2026-08-28T13:36:59Z
 ---
 
 ## Description

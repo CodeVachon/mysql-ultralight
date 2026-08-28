@@ -27,6 +27,15 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// not fail cleanly, it would silently produce a catalog with the wrong shape,
 /// and every test running against it would be wrong in a way nothing reports.
 ///
+/// v9 adds a field to a column's type: whether its text sorts as bytes. A
+/// `_bin` collation is what puts the BINARY flag on a text column's wire
+/// definition, and `CREATE TABLE t AS SELECT COLUMN_TYPE FROM
+/// information_schema.columns` puts such a column into a user table — 8.3
+/// declares that copy `utf8mb3_bin` too. A v8 image would reload it without
+/// the flag, so the same table would describe itself one way before a snapshot
+/// and another way after it, which is the class of silent difference this
+/// version check exists to stop.
+///
 /// v8 adds another: an UNSIGNED integer. A v7 image cannot hold one at all —
 /// its widest tag is an `i64`, so a `BIGINT UNSIGNED` column was capped at
 /// `i64::MAX` and 18446744073709551615 could not be stored — and a v7 image
@@ -57,7 +66,7 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// answering it, which is the wrong answer the version check exists to
 /// prevent. An image is a file a user keeps and boots from with `--state`, so
 /// the stale one has to fail rather than mislead.
-pub const FORMAT_VERSION: u32 = 8;
+pub const FORMAT_VERSION: u32 = 9;
 
 /// Writes the whole catalog.
 pub fn encode(catalog: &Catalog) -> Vec<u8> {
@@ -385,6 +394,12 @@ fn write_type(w: &mut Writer, ty: &SqlType) {
     }
     w.bool(ty.unsigned);
     w.strs(&ty.variants);
+    // Appended, as the format's rule requires: v9. Nothing in the DDL declares
+    // a binary-collated column, but `CREATE TABLE ... AS SELECT` off
+    // `information_schema` copies one into a user table, and a column that
+    // loses the flag across a save and a reload describes itself differently
+    // than it did before.
+    w.bool(ty.binary_collation);
 }
 
 fn read_type(r: &mut Reader<'_>) -> EngineResult<SqlType> {
@@ -394,6 +409,7 @@ fn read_type(r: &mut Reader<'_>) -> EngineResult<SqlType> {
     let scale = if r.bool()? { Some(r.u64()?) } else { None };
     let unsigned = r.bool()?;
     let variants = r.strs()?;
+    let binary_collation = r.bool()?;
 
     Ok(SqlType {
         kind,
@@ -402,6 +418,7 @@ fn read_type(r: &mut Reader<'_>) -> EngineResult<SqlType> {
         scale,
         unsigned,
         variants,
+        binary_collation,
     })
 }
 

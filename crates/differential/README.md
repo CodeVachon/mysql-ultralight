@@ -72,10 +72,10 @@ Two things fail a run:
 
 So the file only ever shrinks, and it shrinks by fixing things.
 
-**It is empty.** All 1684 statements answer exactly as MySQL 8.3 answers them,
-in both protocols — the rows, the column names, the type codes, and the
-nullability and signedness flags. It started at 108 divergences across 66
-statements.
+**It is empty.** All 1692 statements answer exactly as MySQL 8.3 answers them,
+in both protocols — the rows, and every part of the column definition listed
+under "What a column is compared on" below. It started at 108 divergences
+across 66 statements.
 
 That is a statement about the corpus, not about the engine: it means every
 question this file knows how to ask now gets MySQL's answer. The way to find
@@ -87,6 +87,108 @@ While the file has lines in it, each is covered by an issue under
 trusting after a run that fixes anything — five of those issues were written
 only once the file was counted against the issue list, because the harness
 reports what is *new* and never what is unclaimed.
+
+## What a column is compared on
+
+A `ColumnDefinition41` carries eleven things about a column. For its first year
+this harness read four of them — the name, the type code, and two bits of the
+flags word — and reported everything else as agreement. The engine sent 4096 as
+the width of every string column and 20 as the width of every number for that
+whole time, green, and #0126 was found by a reviewer rather than by this.
+
+Widening it was measured before it was fixed: against the engine as it stood,
+comparing the rest of the definition produced **11382 divergences over the 1684
+statements the corpus held then**, in five classes. That number is the point of
+the exercise, and it is recorded here rather than smoothed away.
+
+| Field | Compared | |
+|---|---|---|
+| `name` | yes | |
+| `column_type` | yes | |
+| `flags` | most bits, on a column from a table | see below |
+| `column_length` | on a column from a table | see below |
+| `decimals` | **no** | 1148 divergences over 260 statements |
+| `character_set` | as bytes-or-characters, on every column | the id itself: 458 over 118 |
+| `schema`, `table`, `org_table`, `org_name` | **no** | 2924 over 583 |
+| `catalog` | no | the constant `def` on both servers |
+
+The three left out are left out because each is a gap of its own and not this
+one, and each needs an issue rather than a silence:
+
+- **`decimals`** is 0 for every column this engine describes. MySQL reports a
+  DECIMAL's places, a temporal's fractional digits, and 31 — `NOT_FIXED_DEC` —
+  for a string and for a FLOAT with no declared scale. #0111 has the numbers.
+- **`character_set`** is 255 here and 45 there, because MySQL converts a result
+  into the connection's character set and reports the collation it converted
+  to, and this engine reports the column's own. The id says as much about the
+  client as about the column, so it is not compared — but *whether it is the
+  binary one* is, on every column, computed ones included. See below.
+- **the origin fields** are wrong in the other direction: this engine names a
+  table and an original column for expressions that have neither, so
+  `SELECT COUNT(*)` claims an `org_name` of `COUNT(*)` where MySQL leaves it
+  empty.
+
+### Bytes or characters, on every column
+
+The one part of a column definition asked of a computed column. A column of
+characters described as bytes reaches the caller as a Buffer it cannot convert
+to a string — `as_text` records what that costs Prisma — and the two servers
+have to agree on which it is even where the exact charset id cannot be
+compared.
+
+It is here because of the hole it fills. `GROUP_CONCAT` went out of this engine
+with the binary character set for exactly one review cycle, and no other line in
+`compare.rs` could have seen it: a computed column is out of scope for the width
+and for the flags, and the charset id differs on every text column for a reason
+that is not the engine's. This comparison is the one that would have failed.
+
+Eleven cases decline it, each with its reason written above it, and both
+directions are MySQL following a collation this engine does not model: a string
+function over a NULL literal or over an explicitly `BINARY` value is binary
+there (`UPPER(NULL)`, `SOUNDEX(BINARY 'x')`), and a temporal that has been
+through a temporary table comes back in the connection's character set where the
+same column read from its table is binary (`MIN(tm)`, a `DATETIME(3)` through a
+view). They are `Case::value_kind`.
+
+### Only a column that came from a table
+
+`column_length` and the rest of the flags word are asked only where MySQL
+reports a non-empty `org_table` — a column read out of a table or a view, whose
+shape is a *declaration*. A computed column's shape is `Item::max_length` and
+the collation arithmetic around it, a width per function, per operator and per
+literal, and this engine models none of it: asking would report the same
+missing feature on 560 statements and drown every other signal in the file.
+
+The scope is read off the reference's answer alone, so an engine that wrongly
+claimed a table for a computed column could not exempt itself from the
+comparison by doing so.
+
+A handful of cases opt out of the width alone, each with its reason written
+above it, because a view's column *is* an expression and MySQL declares it from
+that expression's width — `varchar(2)` for a view over `'ab'`, where this
+engine declares `varchar(512)`. They are `Case::widths`, and like the baseline
+that list only ever gets shorter.
+
+### The bits of the flags word
+
+Compared: NOT_NULL, UNSIGNED, BINARY, BLOB, ZEROFILL, TIMESTAMP.
+
+Not compared, and each for its own reason:
+
+- **PRI_KEY, UNIQUE_KEY, MULTIPLE_KEY, PART_KEY, AUTO_INCREMENT,
+  NO_DEFAULT_VALUE, ON_UPDATE_NOW** — the bits that describe a column's role in
+  the schema rather than what it holds. This engine sends none of them: a
+  primary key arrives with no PRI_KEY. 224 divergences over 81 statements, and
+  its own gap — closing it means carrying the catalog out to the wire, where
+  everything else here needs only the type.
+- **ENUM and SET** — #0087, which is exactly this: an ENUM column described
+  with no ENUM_FLAG, on 24 statements. The two bits are left out rather than
+  those cases narrowed, because the cases are what the enum groups are *for*.
+  Deleting two names from `UNMODELLED` in `compare.rs` is how that issue gets
+  proved.
+- **NUM** — not a fact about the column at all. MySQL sets it on a field a
+  temporary table produced, so the same column carries it under `GROUP BY` and
+  not without one; comparing it would compare the two servers' query plans.
 
 ## Writing a case
 

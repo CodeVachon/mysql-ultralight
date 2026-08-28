@@ -1,5 +1,6 @@
 //! What executing a statement produces.
 
+use mysql_ultralight_protocol::column::charset;
 use mysql_ultralight_protocol::{ColumnDef, ColumnType};
 
 use crate::types::SqlType;
@@ -38,6 +39,22 @@ pub struct OutColumn {
     ///
     /// `None` for anything computed, which has no stored column behind it.
     pub origin: Option<String>,
+    /// The stored table that column lives in, which is not `table`.
+    ///
+    /// `table` is what the query *called* it — the alias where the FROM clause
+    /// gave one — and a default has to be read out of the real table. Looking
+    /// it up by the alias was not merely a miss: `SELECT Other2.name FROM Src
+    /// Other2`, where a table named `Other2` also exists, found that table's
+    /// `name` column and copied its default into a column built from `Src`.
+    /// 8.3 declares `'x'` there, out of `Src`.
+    ///
+    /// `None` where the column did not come from a stored table, and where the
+    /// path that produced it does not know which one — the grouped projection
+    /// has the columns but not the relation behind them, so a `CREATE TABLE
+    /// ... AS SELECT name FROM src GROUP BY name` takes the implicit default
+    /// where 8.3 copies the source's. A missing default rather than a wrong
+    /// one, which is the side to be on.
+    pub origin_table: Option<String>,
     /// Whether the values are unsigned, for a column with no declared type to
     /// say so.
     ///
@@ -59,6 +76,7 @@ impl OutColumn {
             unsigned: false,
             declared: None,
             origin: None,
+            origin_table: None,
         }
     }
 
@@ -72,13 +90,19 @@ impl OutColumn {
             unsigned: ty.unsigned,
             declared: Some(ty.clone()),
             origin: None,
+            origin_table: None,
         }
     }
 
-    /// Records the stored column this one is a direct projection of. See
-    /// `origin`.
-    pub fn projected_from(mut self, column: &str) -> Self {
+    /// Records the stored column this one is a direct projection of, and the
+    /// table that column lives in. See `origin` and `origin_table`.
+    ///
+    /// The table is an `Option` because one caller genuinely does not have it:
+    /// both are attributes of the same projection, so they are set together
+    /// rather than in two calls that could disagree.
+    pub fn projected_from(mut self, column: &str, base_table: Option<&str>) -> Self {
         self.origin = Some(column.to_owned());
+        self.origin_table = base_table.map(str::to_owned);
         self
     }
 
@@ -124,6 +148,11 @@ impl OutColumn {
         // what it had before there was a declared type to ask.
         if let Some(declared) = &self.declared {
             def = def.as_text(declared.is_textual());
+            // The width MySQL sends is the one the column was declared with.
+            // Everything without a declaration keeps the type's default, which
+            // is a guess: MySQL takes an expression's width from
+            // `Item::max_length`, an arithmetic this engine does not model.
+            def = def.with_length(declared.wire_length());
         }
         // Without this the binary protocol reads the bytes back signed, so an
         // `INT UNSIGNED` holding three billion arrives as a negative number. It
@@ -132,7 +161,65 @@ impl OutColumn {
         if self.unsigned {
             def = def.unsigned();
         }
-        def.nullable(self.nullable)
+        // The BLOB flag is read off the field, so a stored TEXT, BLOB or JSON
+        // column carries it and an expression that produces one does not:
+        // `GROUP_CONCAT` is a `MYSQL_TYPE_LONG_BLOB` with no flag on 8.3.
+        let blob = matches!(
+            self.ty,
+            ColumnType::Blob
+                | ColumnType::TinyBlob
+                | ColumnType::MediumBlob
+                | ColumnType::LongBlob
+                | ColumnType::Json
+        );
+        // An expression under a blob type code is a string function's answer,
+        // and MySQL sends it as text. `GROUP_CONCAT(v)` over a `VARCHAR` is
+        // `cs=45 flags=[]` on 8.3, and so are `CONCAT(t,'x')`, `LOWER(t)` and
+        // `HEX(b)`; `JSON_UNQUOTE` is `cs=45 flags=[BINARY]`, binary by its
+        // `utf8mb4_bin` collation and still sent in characters. Every
+        // expression this engine gives a blob code is one of those —
+        // `GROUP_CONCAT`, `JSON_UNQUOTE` and `->>` — where the *default* for a
+        // blob code in `ColumnDef::new` is the binary character set, which is
+        // what a client reads to hand back bytes instead of a String.
+        //
+        // A computed document goes the same way and keeps the flag: 8.3 sends
+        // `JSON_OBJECT('a',1)` as `cs=45 flags=[BINARY]` — characters on the
+        // wire, binary by collation, which is the shape `binary_collation`
+        // describes for a stored column. A *stored* JSON column is different
+        // and is left alone: that one really is `cs=63`.
+        //
+        // What this cannot follow is MySQL's real rule, which is the operand's
+        // collation: `GROUP_CONCAT(b)` over a `BLOB` is binary on 8.3 and text
+        // here, and so is `UPPER(NULL)`. This engine has no collation to
+        // propagate, and text is the side that keeps a string a string.
+        let computed_document = self.declared.is_none() && self.ty == ColumnType::Json;
+        if self.declared.is_none() && blob {
+            def = def.as_text(true);
+        }
+        // Binary is a claim about the character set first: a column whose
+        // values are characters is not binary, whatever else it is — with one
+        // exception, below. Among the columns whose values are bytes, whether
+        // MySQL calls one binary depends on which kind of column it is. A
+        // *declared* column is a field, and a field is binary for a temporal,
+        // a BLOB or a JSON document but never for a number, which is why an
+        // `INT` column carries no BINARY flag on 8.3. A *computed* column is
+        // an item, and an item is binary whenever its collation is — which
+        // includes every number, so `SELECT 1` is `len=2 flags=[BINARY]`
+        // there while the `INT` column it was added to is not.
+        //
+        // The exception is a `_bin` collation, the one way a column of
+        // characters is binary: MySQL sends the text in the connection's
+        // character set and sets the flag anyway. Every `information_schema`
+        // column a client introspects with arrives that way.
+        let binary = self.declared.as_ref().is_some_and(|d| d.binary_collation)
+            || computed_document
+            || (def.charset == charset::BINARY
+                && (self.declared.is_none() || !is_numeric(self.ty)));
+        def.blob(self.declared.is_some() && blob)
+            .binary(binary)
+            // A stored YEAR only. `YEAR(x)` is UNSIGNED and not zero-filled.
+            .zerofill(self.declared.is_some() && self.ty == ColumnType::Year)
+            .nullable(self.nullable)
     }
 }
 
@@ -270,6 +357,28 @@ impl ResultSet {
             rows: vec![vec![value]],
         }
     }
+}
+
+/// Whether a type code is one of MySQL's numbers.
+///
+/// The split that decides the BINARY flag on a stored column, and it is by the
+/// code rather than by the charset: a number and a date both report the binary
+/// character set, and only one of them is flagged binary.
+fn is_numeric(ty: ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::Tiny
+            | ColumnType::Short
+            | ColumnType::Int24
+            | ColumnType::Long
+            | ColumnType::LongLong
+            | ColumnType::Float
+            | ColumnType::Double
+            | ColumnType::Decimal
+            | ColumnType::NewDecimal
+            | ColumnType::Year
+            | ColumnType::Bit
+    )
 }
 
 /// The number of decimal places a column shows every value at, where it has

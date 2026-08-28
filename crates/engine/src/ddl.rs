@@ -68,6 +68,31 @@ pub fn create_table(
         }
     };
 
+    // Two columns of one name is not a table: every reference to the name
+    // would be answered with the first of them. `CREATE TABLE t (a INT, a
+    // INT)`, `AS SELECT id, id` and `AS SELECT * FROM src a JOIN src b` are
+    // all 1060 on 8.3, and the check lived on the `AS SELECT` path alone until
+    // a review found the plain spelling still made the table.
+    //
+    // Before the constraints and not after: 8.3 answers `(a INT, a INT,
+    // PRIMARY KEY (nope))` with 1060 and not the 1072 the key would raise, so
+    // a check that ran after `apply_constraint` would report the second
+    // problem in a statement that has two. The comparison is case-insensitive
+    // and the name reported is the later spelling, both measured — `(a INT, A
+    // INT)` is `Duplicate column name 'A'`.
+    for (index, column) in table.columns.iter().enumerate() {
+        if table.columns[..index]
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(&column.name))
+        {
+            return Err(EngineError::new(
+                1060,
+                "42S21",
+                format!("Duplicate column name '{}'", column.name),
+            ));
+        }
+    }
+
     for constraint in &create.constraints {
         apply_constraint(&mut table, constraint)?;
     }
@@ -213,16 +238,13 @@ pub fn create_table(
 ///   That width is `Item::max_length`, which this engine does not model at
 ///   all — #0126 — and inventing one per expression here would be guessing.
 ///   Only the integer case is visible on the wire, as LONGLONG for LONG.
-/// - A default is copied out of the *table* the result column names, and that
-///   is the alias where the FROM clause gave one. `SELECT s.name FROM src s`
-///   therefore takes the implicit default where 8.3 copies `'x'`, because
-///   there is no table `s` to read it from. A result column carries the alias;
-///   the base table behind it is known only to the relation that produced it,
-///   which is why the column's own name travels — as `OutColumn::origin` — and
-///   its table does not. The type check below is what keeps that from
-///   becoming a wrong answer rather than a missing one: an alias that shadows
-///   a real table would otherwise read defaults out of a table the query
-///   never touched.
+/// - A default is copied out of the table the *relation* says the column came
+///   from, which the alias does not change: `SELECT s.name FROM src s` and
+///   `SELECT Other2.name FROM Src Other2` both copy `src`'s `'x'`, as 8.3
+///   does. One projection still cannot: the grouped path has the columns
+///   without the relation behind them, so `AS SELECT name FROM src GROUP BY
+///   name` takes the implicit default where 8.3 copies `'x'`. A missing
+///   default rather than a wrong one. See `OutColumn::origin_table`.
 fn merge_selected_columns(
     catalog: &Catalog,
     database: &str,
@@ -266,22 +288,6 @@ fn merge_selected_columns(
         column.position = index + 1;
     }
 
-    // `SELECT id, id` and `SELECT * FROM src a JOIN src b` are both 1060 on
-    // 8.3. Two columns of one name is not a table, and the engine would answer
-    // every reference to the name with the first of them.
-    for (index, column) in table.columns.iter().enumerate() {
-        if table.columns[..index]
-            .iter()
-            .any(|c| c.name.eq_ignore_ascii_case(&column.name))
-        {
-            return Err(EngineError::new(
-                1060,
-                "42S21",
-                format!("Duplicate column name '{}'", column.name),
-            ));
-        }
-    }
-
     // An explicit column the query does not fill is a column omitted from an
     // INSERT, and takes whatever that would give it — its default, its
     // expression default, or a generated or AUTO_INCREMENT value. Working that
@@ -296,30 +302,39 @@ fn derived_column(catalog: &Catalog, database: &str, column: &OutColumn) -> Colu
     let ty = column.sql_type();
     let mut built = Column::new(column.name.clone(), ty.clone());
     built.nullable = column.nullable;
-    // By the *source* column's name, which an alias does not change, and only
-    // when its declared type is the one this column ended up with.
+    // By the *source* column's name and the *source* table, neither of which
+    // an alias changes.
     //
-    // Both halves were needed. Looking it up by the result column's name found
-    // a different column of the same name: `CREATE TABLE t AS SELECT id AS
-    // name FROM src` copied `src.name`'s `VARCHAR` default `'x'` into an `INT`
-    // column, so a later insert stored the string `'x'` there and `name + 1`
-    // read it as 1. 8.3 declares `name int NOT NULL DEFAULT '0'` — the source
-    // field's attributes under the alias's name. The type check is then the
-    // guard against the table name being a coincidence rather than the table:
-    // `column.table` is the alias where the FROM clause gave one, so a query
-    // aliasing a table to the name of a real one would otherwise read
-    // defaults out of a table it never touched.
+    // Both halves were needed. Looking the column up by the result column's
+    // name found a different column of the same name: `CREATE TABLE t AS
+    // SELECT id AS name FROM src` copied `src.name`'s `VARCHAR` default `'x'`
+    // into an `INT` column, so a later insert stored the string `'x'` there
+    // and `name + 1` read it as 1. 8.3 declares `name int NOT NULL DEFAULT
+    // '0'` — the source field's attributes under the alias's name.
+    //
+    // Looking the *table* up by `column.table` was the same mistake one level
+    // out: that is the alias where the FROM clause gave one, so `SELECT
+    // Other2.name FROM Src Other2` read `Other2`'s default where 8.3 copies
+    // `Src`'s — a wrong answer, and one an added type check only narrowed,
+    // since the shadowing table's column can have the same type. The relation
+    // knows which table an alias stands for, and now says so through
+    // `OutColumn::origin_table`.
+    //
+    // The type check stays, for the case neither name settles: a column read
+    // through a widening — a union branch, say — is not the source column any
+    // more, and 8.3 gives those the implicit default too.
     let copied = column
         .origin
         .as_deref()
-        .and_then(|source_name| {
+        .zip(column.origin_table.as_deref())
+        .and_then(|(source_name, source_table)| {
             catalog
                 .database(if column.schema.is_empty() {
                     database
                 } else {
                     &column.schema
                 })
-                .and_then(|db| db.table(&column.table))
+                .and_then(|db| db.table(source_table))
                 .and_then(|table| table.column(source_name))
         })
         .filter(|source| source.ty == ty)

@@ -55,6 +55,10 @@ pub mod flags {
     pub const AUTO_INCREMENT: u16 = 0x0200;
     pub const TIMESTAMP: u16 = 0x0400;
     pub const SET: u16 = 0x0800;
+    /// Set by MySQL on a column a temporary table produced, and on an ENUM.
+    /// Nothing here sends it: it was on every numeric column until the
+    /// differential harness compared the flags word and MySQL turned out not
+    /// to send it for one at all — an `INT` column is `flags=0` on 8.3.
     pub const NUM: u16 = 0x8000;
 }
 
@@ -98,7 +102,8 @@ impl ColumnDef {
             | ColumnType::Float
             | ColumnType::Double
             | ColumnType::Decimal
-            | ColumnType::NewDecimal => (charset::BINARY, 20, flags::NOT_NULL | flags::NUM),
+            // No NUM: MySQL does not send it for a number. See `flags::NUM`.
+            | ColumnType::NewDecimal => (charset::BINARY, 20, flags::NOT_NULL),
             ColumnType::Blob
             | ColumnType::LongBlob
             | ColumnType::MediumBlob
@@ -172,6 +177,62 @@ impl ColumnDef {
 
     pub fn with_flags(mut self, flags: u16) -> Self {
         self.flags = flags;
+        self
+    }
+
+    /// The width the column was declared with, in bytes of the result's
+    /// character set.
+    ///
+    /// Not decoration: `column_length` is what a client sizes an input widget
+    /// or a generated field from, and every string column left here saying
+    /// 4096 until the differential harness learned to compare it.
+    pub fn with_length(mut self, column_length: u32) -> Self {
+        self.column_length = column_length;
+        self
+    }
+
+    /// Whether the column's values are bytes rather than characters.
+    ///
+    /// Sets the flag as well as clearing it, for the same reason `nullable`
+    /// does: the defaults in `new` are by type code, and a column can be
+    /// either side of this for one code — a `MYSQL_TYPE_STRING` is binary as a
+    /// `BINARY(16)` and not as a `CHAR(16)`.
+    pub fn binary(mut self, binary: bool) -> Self {
+        if binary {
+            self.flags |= flags::BINARY;
+        } else {
+            self.flags &= !flags::BINARY;
+        }
+        self
+    }
+
+    /// Whether the column is zero-filled to its display width.
+    ///
+    /// Only a stored `YEAR` is, of the types this engine has: MySQL reports it
+    /// `UNSIGNED ZEROFILL` on the wire while `information_schema` says plain
+    /// `year`. `YEAR(x)` computes one and is not zero-filled, which is why
+    /// this is a setter rather than a default in `new`.
+    pub fn zerofill(mut self, zerofill: bool) -> Self {
+        if zerofill {
+            self.flags |= flags::ZEROFILL;
+        } else {
+            self.flags &= !flags::ZEROFILL;
+        }
+        self
+    }
+
+    /// Whether MySQL describes the column as a blob.
+    ///
+    /// True of a stored `TEXT`, `BLOB` or `JSON` column and false of an
+    /// expression that happens to produce one: `GROUP_CONCAT` is a
+    /// `MYSQL_TYPE_LONG_BLOB` with no BLOB flag on 8.3, because the flag comes
+    /// off the field a column is read from and there is no field behind it.
+    pub fn blob(mut self, blob: bool) -> Self {
+        if blob {
+            self.flags |= flags::BLOB;
+        } else {
+            self.flags &= !flags::BLOB;
+        }
         self
     }
 
