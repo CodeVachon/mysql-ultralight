@@ -254,3 +254,5 @@
 {"at":"2026-08-31T13:34:50Z","id":136,"by":"Christopher Vachon","as":"user","type":"created","title":"ESCAPE does not accept an expression","state":"Todo"}
 {"at":"2026-08-31T13:35:08Z","id":137,"by":"Christopher Vachon","as":"user","type":"created","title":"INSERT reads its table name through Display","state":"Todo"}
 {"at":"2026-08-31T13:35:09Z","id":138,"by":"Christopher Vachon","as":"user","type":"created","title":"An identifier's rendering leaks into the names the engine reports","state":"Todo"}
+{"at":"2026-08-31T14:42:57Z","id":93,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-08-31T15:07:01Z","id":87,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}

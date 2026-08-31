@@ -55,11 +55,27 @@ pub mod flags {
     pub const AUTO_INCREMENT: u16 = 0x0200;
     pub const TIMESTAMP: u16 = 0x0400;
     pub const SET: u16 = 0x0800;
-    /// Set by MySQL on a column a temporary table produced, and on an ENUM.
-    /// Nothing here sends it: it was on every numeric column until the
-    /// differential harness compared the flags word and MySQL turned out not
-    /// to send it for one at all — an `INT` column is `flags=0` on 8.3.
+    /// Set by MySQL on a column a temporary table produced, and on nothing
+    /// else — not on a number and not on an ENUM. Measured on 8.3:
+    /// `SELECT e FROM t` over an `ENUM` is `flags=[ENUM]` and only
+    /// `SELECT e FROM t GROUP BY e` is `flags=[ENUM|NUM]`, so the bit follows
+    /// the plan rather than the column. Nothing here sends it: it was on every
+    /// numeric column until the differential harness compared the flags word
+    /// and MySQL turned out not to send it for one at all — an `INT` column is
+    /// `flags=0` on 8.3. Which is also why the harness does not compare it;
+    /// see `UNMODELLED` in `crates/differential/src/compare.rs`.
     pub const NUM: u16 = 0x8000;
+}
+
+/// Which of the two types declared as a list of members a column is.
+///
+/// Modelled as one value rather than two booleans because no column is both,
+/// and the flags word has room to say so: a `ColumnDef` that had set ENUM and
+/// SET together would describe a column MySQL cannot declare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberList {
+    Enum,
+    Set,
 }
 
 /// Character set ids. `utf8mb4_0900_ai_ci` is the MySQL 8 default; `binary`
@@ -232,6 +248,29 @@ impl ColumnDef {
             self.flags |= flags::BLOB;
         } else {
             self.flags &= !flags::BLOB;
+        }
+        self
+    }
+
+    /// Which list-of-members type the column is, if it is either.
+    ///
+    /// The only thing on the wire that says so. MySQL sends an ENUM and a SET
+    /// as `MYSQL_TYPE_STRING`, the same code a `CHAR(n)` goes out under, so
+    /// without the flag a client cannot tell a three-member ENUM from a
+    /// `CHAR(1)` — measured on 8.3, an `ENUM('a','b')` is
+    /// `type=STRING flags=[ENUM] len=4` and a `SET('a','bb','ccc')` is
+    /// `type=STRING flags=[SET] len=32`.
+    ///
+    /// Clears as well as sets, for the reason `nullable` does: a set operation
+    /// materialises an ENUM into a plain string, and a column that came back
+    /// through one must lose the flag rather than keep whatever it started
+    /// with.
+    pub fn member_list(mut self, list: Option<MemberList>) -> Self {
+        self.flags &= !(flags::ENUM | flags::SET);
+        match list {
+            Some(MemberList::Enum) => self.flags |= flags::ENUM,
+            Some(MemberList::Set) => self.flags |= flags::SET,
+            None => {}
         }
         self
     }

@@ -213,7 +213,13 @@ const COLUMN_SPEC: &[TableSpec] = &[
             ("NUMERIC_SCALE", "bigint unsigned", false),
             ("DATETIME_PRECISION", "int unsigned", false),
             ("COLUMN_TYPE", "mediumtext binary", true),
-            ("COLUMN_KEY", "char(3) binary", true),
+            // An ENUM rather than a string, and the only one in this table:
+            // MySQL declares it `enum('','PRI','UNI','MUL')` and sends it with
+            // ENUM_FLAG, so a client introspecting a schema through this
+            // column reads it as a member list. The width is the same either
+            // way — the widest member is three characters, which is what
+            // `char(3)` said.
+            ("COLUMN_KEY", "enum('','PRI','UNI','MUL') binary", true),
             ("EXTRA", "varchar(256)", false),
             ("COLLATION_NAME", "varchar(64)", false),
             ("COLUMN_COMMENT", "text binary", true),
@@ -375,9 +381,25 @@ fn spec_type(spelling: &str) -> Option<SqlType> {
         Some(base) => (base, true),
         None => (spelling, false),
     };
-    let (name, length) = match base.split_once('(') {
-        Some((name, rest)) => (name, rest.trim_end_matches(')').parse().ok()),
+    let (name, argument) = match base.split_once('(') {
+        Some((name, rest)) => (name, Some(rest.trim_end_matches(')'))),
         None => (base, None),
+    };
+    // An ENUM's parenthesis holds its members and every other type's holds a
+    // number, so the two are read apart rather than both through `parse`:
+    // `enum('','PRI')` would otherwise be a type with no length and no
+    // members, which is an ENUM whose widest member is nothing — and the width
+    // is what `column_length` is computed from.
+    let (length, variants) = match name {
+        "enum" => (
+            None,
+            argument
+                .unwrap_or_default()
+                .split(',')
+                .map(|member| member.trim().trim_matches('\'').to_owned())
+                .collect(),
+        ),
+        _ => (argument.and_then(|a| a.parse().ok()), Vec::new()),
     };
     let kind = match name {
         "int" | "bigint" => TypeKind::Int,
@@ -386,6 +408,9 @@ fn spec_type(spelling: &str) -> Option<SqlType> {
         // answers NULL for.
         "binary" => TypeKind::Blob,
         "timestamp" | "datetime" => TypeKind::DateTime,
+        // `COLUMNS.COLUMN_KEY`, which is a real ENUM on 8.3 and reaches the
+        // wire with ENUM_FLAG.
+        "enum" => TypeKind::Enum,
         _ => return None,
     };
     Some(SqlType {
@@ -394,7 +419,7 @@ fn spec_type(spelling: &str) -> Option<SqlType> {
         length,
         scale: None,
         unsigned,
-        variants: Vec::new(),
+        variants,
         binary_collation,
     })
 }

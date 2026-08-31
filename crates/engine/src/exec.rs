@@ -1452,9 +1452,7 @@ impl Engine {
             // Same reason, one clause further in: an ESCAPE is settled per row
             // too, so `WHERE s LIKE 'a' ESCAPE '!!'` over an empty table came
             // back empty where 8.3 raises 1210.
-            if let Some(bad) = malformed_escape(predicate) {
-                return Err(bad);
-            }
+            refuse_malformed_escape([predicate])?;
         }
 
         let mut matching: Vec<&Vec<Value>> = Vec::new();
@@ -1545,9 +1543,7 @@ impl Engine {
         // below turns any evaluation error into "could not sort", and over no
         // rows it does not run at all — so `ORDER BY s LIKE 'a' ESCAPE '!!'`
         // sorted nothing and answered an empty set where 8.3 raises 1210.
-        if let Some(bad) = items.iter().find_map(|i| malformed_escape(&i.expr)) {
-            return Err(bad);
-        }
+        refuse_malformed_escape(items.iter().map(|i| &i.expr))?;
 
         let mut keys: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
         for row in rows.iter() {
@@ -1720,6 +1716,13 @@ impl Engine {
             other => return Err(unsupported(format!("join type `{other:?}`"))),
         };
 
+        // Before the loop over the left rows, for the reason an ordinary
+        // join's is before its own: an empty left side expands nothing, so a
+        // clause only read per produced row is never read at all.
+        if let Some(JoinConstraint::On(predicate)) = constraint {
+            refuse_malformed_escape([predicate])?;
+        }
+
         let refs = left.refs();
         let mut columns: Option<Vec<crate::relation::RelColumn>> = None;
         let mut rows = Vec::new();
@@ -1866,6 +1869,13 @@ impl Engine {
             Some(JoinConstraint::Using(names)) => Some(using_condition(names, &left, &right)?),
             Some(other) => return Err(unsupported(format!("join constraint `{other:?}`"))),
         };
+
+        // Settled before the loops, because the condition is only otherwise
+        // read once per pair of rows: a join where either side is empty
+        // produces no pair, so `ON a.s LIKE b.s ESCAPE '!!'` answered no rows
+        // where 8.3 raises 1210. A `USING` clause is built here rather than
+        // written, so it has no ESCAPE to be wrong.
+        refuse_malformed_escape(condition.as_ref())?;
 
         let null_right = vec![Value::Null; right.columns.len()];
         let null_left = vec![Value::Null; left.columns.len()];
@@ -2112,9 +2122,7 @@ impl Engine {
             // never evaluated: `SELECT CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE
             // '!!') ELSE 9 END` answered 9 where 8.3 raises 1210. The
             // table-backed projection is guarded at the same point.
-            if let Some(bad) = malformed_escape(e) {
-                return Err(bad);
-            }
+            refuse_malformed_escape([e])?;
             let value = if let Expr::Function(f) = e {
                 if f.over.is_none() && is_aggregate(&f.name.to_string()) {
                     let name = f.name.to_string().to_ascii_lowercase();
@@ -2235,9 +2243,7 @@ impl Engine {
                     if let Some(name) = unresolved_column(e, refs) {
                         return Err(EngineError::unknown_column(&name, "field list"));
                     }
-                    if let Some(bad) = malformed_escape(e) {
-                        return Err(bad);
-                    }
+                    refuse_malformed_escape([e])?;
                     let alias = match item {
                         SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
                         _ => None,
@@ -2669,9 +2675,23 @@ impl Engine {
         if let Some(name) = items.iter().find_map(|(_, e)| unresolved_column(e, refs)) {
             return Err(EngineError::unknown_column(&name, "field list"));
         }
-        if let Some(bad) = items.iter().find_map(|(_, e)| malformed_escape(e)) {
-            return Err(bad);
-        }
+        refuse_malformed_escape(items.iter().map(|(_, e)| e))?;
+        // GROUP BY and HAVING, the two clauses #0093 left behind. Both are
+        // only otherwise settled inside `for group in &groups`, so a query
+        // that produces no groups never settles them: over an empty table
+        // `... GROUP BY s HAVING s LIKE 'a' ESCAPE '!!'` came back as an empty
+        // set where 8.3 raises 1210, and so did `GROUP BY s LIKE 'a' ESCAPE
+        // '!!'`.
+        //
+        // HAVING is read unsubstituted because an alias is an identifier and
+        // an ESCAPE lives on a `LIKE`, so aliasing cannot hide one — and where
+        // it could, the expression is in the projection and the line above
+        // already read it.
+        //
+        // Ahead of `check_full_group_by` because 8.3 answers 1210 before 1055:
+        // `SELECT s FROM LE GROUP BY id HAVING s LIKE 'a' ESCAPE '!!'` is 1210
+        // there, not the grouping complaint.
+        refuse_malformed_escape(group_exprs.iter().chain(select.having.as_ref()))?;
 
         // Under ONLY_FULL_GROUP_BY a selected column must be grouped by or
         // aggregated. Silently evaluating it against the group's first row
@@ -2688,9 +2708,7 @@ impl Engine {
             Some(_) => return Err(unsupported("this ORDER BY form")),
             None => Vec::new(),
         };
-        if let Some(bad) = order_items.iter().find_map(|i| malformed_escape(&i.expr)) {
-            return Err(bad);
-        }
+        refuse_malformed_escape(order_items.iter().map(|i| &i.expr))?;
         let descending: Vec<bool> = order_items
             .iter()
             .map(|i| i.options.asc == Some(false))
@@ -3511,6 +3529,23 @@ impl Engine {
             .map(|c| ColumnRef::new(&addressed_as, &c.name))
             .collect();
 
+        // Before any row is considered, and after the table has been resolved
+        // because 8.3 answers 1146 for a missing table ahead of 1210. The
+        // predicate and the assigned values are otherwise only read per row,
+        // so over an empty table `UPDATE LE SET id = 2 WHERE s LIKE 'a'
+        // ESCAPE '!!'` reported nothing affected where 8.3 raises 1210 — and a
+        // caller cannot tell that from a WHERE nothing matched, which is what
+        // makes the silence worse on a write than on a query. Ahead of the
+        // assignment targets for the same reason: `UPDATE LE SET nope = 'x'
+        // WHERE s LIKE 'a' ESCAPE '!!'` is 1210 on 8.3, not 1054.
+        //
+        // The *name* half of the same ordering is not checked on this path at
+        // all — #0102 owns it — so a statement wrong both ways answers 1210
+        // here where 8.3 answers 1054. That issue's fix belongs beside this
+        // line rather than in place of it.
+        let assigned = assignments.iter().map(|a| &a.value);
+        refuse_malformed_escape(selection.into_iter().chain(assigned))?;
+
         // Checked once, before any row is considered: whether writing to a
         // generated column is an error must not depend on the data.
         for assignment in assignments {
@@ -3632,6 +3667,12 @@ impl Engine {
         let relation = self.build_relation(&session_snapshot, from)?;
         reject_duplicate_sources(&relation)?;
         let refs = relation.refs();
+
+        // As on the single-table path, and after the relation is built so a
+        // missing table is still 1146 first. The ON clauses of the join are
+        // settled inside `join()`; this is the WHERE and the assigned values.
+        let assigned = assignments.iter().map(|a| &a.value);
+        refuse_malformed_escape(selection.into_iter().chain(assigned))?;
 
         // Each assignment is resolved to a source table and a column within it.
         struct Target {
@@ -3875,6 +3916,11 @@ impl Engine {
             .map(|c| ColumnRef::new(&addressed_as, &c.name))
             .collect();
 
+        // As on the UPDATE path, and for the same reason: the predicate is
+        // only read per row, so `DELETE FROM LE WHERE s LIKE 'a' ESCAPE '!!'`
+        // over an empty table reported nothing deleted where 8.3 raises 1210.
+        refuse_malformed_escape(delete.selection.as_ref())?;
+
         let mut matching = Vec::new();
         for (index, row) in table.rows.iter().enumerate() {
             let ctx = Context {
@@ -3963,6 +4009,10 @@ impl Engine {
 
         let relation = self.build_relation_list(&session_snapshot, from)?;
         let refs = relation.refs();
+
+        // The multi-table half of the same clause. The join's own ON is
+        // settled in `join()`.
+        refuse_malformed_escape(delete.selection.as_ref())?;
 
         // MySQL rejects `DELETE FROM a JOIN b` outright: with a join, the
         // target has to be named. Defaulting to every table in the join would
@@ -7406,6 +7456,22 @@ fn malformed_escape(e: &Expr) -> Option<EngineError> {
         // a bare unit keyword is not an expression to descend into.
         Expr::Function(f) => value_arguments(f).iter().find_map(malformed_escape),
         other => subexpressions(other).into_iter().find_map(malformed_escape),
+    }
+}
+
+/// Refuses a clause whose ESCAPE cannot be one, before any row is evaluated.
+///
+/// One function rather than the `if let Some(bad)` written out at each clause,
+/// because the number of clauses is the whole problem this has: #0093 wired
+/// the check into five of them and shipped with HAVING, GROUP BY, ON and
+/// every DML predicate still settling it per row, which over no rows is not
+/// settling it at all. A clause that needs it says so in one line here, and
+/// `malformed_escape` stays the single point a mutation can neuter to prove
+/// every one of them at once.
+fn refuse_malformed_escape<'a>(clauses: impl IntoIterator<Item = &'a Expr>) -> EngineResult<()> {
+    match clauses.into_iter().find_map(malformed_escape) {
+        Some(bad) => Err(bad),
+        None => Ok(()),
     }
 }
 

@@ -815,6 +815,22 @@ fn an_escape_of_more_than_one_character_is_rejected() {
     assert_eq!(accepted, vec![vec!["1", "1", "1"]]);
 }
 
+/// The error a statement was refused with, naming it if it was not refused.
+///
+/// `unwrap_err` panics with the result set instead, which in a loop over a
+/// dozen near-identical statements says nothing about which one got through —
+/// and telling them apart is the entire content of the test below.
+fn refusal_of(
+    engine: &Engine,
+    session: &mut Session,
+    sql: &str,
+) -> mysql_ultralight_engine::EngineError {
+    match engine.execute(session, sql, &[]) {
+        Err(e) => e,
+        Ok(_) => panic!("expected a refusal, got an answer for: {sql}"),
+    }
+}
+
 /// A malformed ESCAPE is settled while the item is resolved, not per row.
 ///
 /// The distinction is the whole test. Evaluating the clause where the pattern
@@ -824,6 +840,10 @@ fn an_escape_of_more_than_one_character_is_rejected() {
 ///
 /// Every statement here is chosen so the LIKE is evaluated for *no* row, which
 /// is what a mutation moving the check back into the row path cannot survive.
+/// A bare-aggregate HAVING is not such a statement and was here as one: it runs
+/// over a single implicit group whatever the table holds, so it was answered by
+/// the row path and proved nothing. Each HAVING below carries a GROUP BY for
+/// that reason.
 #[test]
 fn a_malformed_escape_is_refused_even_where_no_row_evaluates_it() {
     let (engine, mut session) = engine();
@@ -832,20 +852,69 @@ fn a_malformed_escape_is_refused_even_where_no_row_evaluates_it() {
         &mut session,
         "CREATE TABLE LE (id INT NOT NULL, s VARCHAR(30) NULL)",
     );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE LF (id INT NOT NULL, s VARCHAR(30) NULL)",
+    );
 
     for sql in [
         // An empty table, through each clause that reaches an expression.
         "SELECT s LIKE 'a' ESCAPE '!!' FROM LE",
         "SELECT id FROM LE WHERE s LIKE 'a' ESCAPE '!!'",
         "SELECT id FROM LE ORDER BY s LIKE 'a' ESCAPE '!!'",
-        "SELECT 1 FROM LE HAVING MAX(s) LIKE 'a' ESCAPE '!!'",
+        // `GROUP BY s` is what makes this one bite. Without it the HAVING is
+        // a bare aggregate, which runs over one implicit group even with no
+        // rows — so it is caught by the per-row path and passes with every
+        // resolve-time check removed, which is exactly a test that does not
+        // bite. With a GROUP BY there are no groups, and nothing settles the
+        // clause but the guard.
+        "SELECT 1 FROM LE GROUP BY s HAVING MAX(s) LIKE 'a' ESCAPE '!!'",
+        "SELECT s, COUNT(*) FROM LE GROUP BY s HAVING s LIKE 'a' ESCAPE '!!'",
+        "SELECT COUNT(*) FROM LE GROUP BY s LIKE 'a' ESCAPE '!!'",
+        // A join produces no pair of rows when either side is empty, so an ON
+        // clause is settled for no row at all.
+        "SELECT a.id FROM LE a JOIN LF b ON a.s LIKE b.s ESCAPE '!!'",
+        "SELECT a.id FROM LE a LEFT JOIN LF b ON a.s LIKE b.s ESCAPE '!!'",
         // One row, and the LIKE still never evaluated.
         "SELECT CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE '!!') ELSE 9 END",
         "SELECT 0 AND ('a' LIKE 'b' ESCAPE '!!')",
     ] {
-        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        // Matched rather than unwrapped, so a statement that succeeds names
+        // itself. Half of these differ from their neighbours by one clause,
+        // and `unwrap_err` on the wrong one panics with a result set and no
+        // hint of which statement produced it.
+        let err = refusal_of(&engine, &mut session, sql);
         assert_eq!(err.code, 1210, "expected ER_WRONG_ARGUMENTS for: {sql}");
     }
+
+    // A write is the worse half: `Affected { rows: 0 }` is what a WHERE that
+    // matched nothing looks like too, so the caller cannot tell an illegal
+    // statement from an empty one. Kept apart from the queries above because
+    // the failure mode is, and because a write that got through would leave
+    // the table changed for everything after it.
+    for sql in [
+        "UPDATE LE SET id = 2 WHERE s LIKE 'a' ESCAPE '!!'",
+        "DELETE FROM LE WHERE s LIKE 'a' ESCAPE '!!'",
+        "UPDATE LE SET s = CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE '!!') ELSE 'z' END",
+        "UPDATE LE a JOIN LF b ON a.id = b.id SET a.s = 'x' \
+         WHERE a.s LIKE 'a' ESCAPE '!!'",
+        "DELETE a FROM LE a JOIN LF b ON a.id = b.id WHERE a.s LIKE 'a' ESCAPE '!!'",
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, 1210, "expected ER_WRONG_ARGUMENTS for: {sql}");
+    }
+
+    // A missing table is still answered first, as on 8.3 — the guard is after
+    // the table is resolved and not before it.
+    let err = engine
+        .execute(
+            &mut session,
+            "DELETE FROM nosuch WHERE s LIKE 'a' ESCAPE '!!'",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1146, "1146 is resolved before 1210");
 
     // A name nothing answers to wins over it, as on 8.3.
     let err = engine
@@ -16409,6 +16478,130 @@ fn a_column_is_described_with_the_width_it_was_declared_with() {
     ];
     let want: Vec<(String, u32)> = want.into_iter().map(|(n, w)| (n.to_owned(), w)).collect();
     assert_eq!(widths, want);
+}
+
+/// The ENUM and SET flags, which this engine set for nothing at all until
+/// #0087 — an `ENUM('a','b')` reached a client as an indistinguishable
+/// `CHAR`, because MySQL sends both under `MYSQL_TYPE_STRING` and the flag is
+/// the only thing on the wire that separates them.
+///
+/// Every expectation here was measured on 8.3 rather than derived. The shapes
+/// that keep the flag and the shapes that lose it are both asserted: a
+/// derived table, a CTE and a view keep it, a set operation materialises it
+/// away, and an expression over the column never had it.
+#[test]
+fn an_enum_or_set_column_says_which_list_it_belongs_to() {
+    use mysql_ultralight_protocol::column::flags;
+
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE M (\
+           e ENUM('a','bb','ccc') NULL, en ENUM('a','b') NOT NULL, \
+           s SET('a','bb','ccc') NULL, sn SET('a','b') NOT NULL, \
+           c CHAR(3) NULL, v VARCHAR(3) NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO M VALUES ('a', 'a', 'bb', 'a', 'x', 'y')",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW MV AS SELECT e, s FROM M",
+    );
+
+    // Named rather than compared as a number, so a failure says which bit.
+    let listed = |sql: &str| -> Vec<String> {
+        engine
+            .describe(&session, sql, 0)
+            .unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
+            .unwrap_or_else(|| panic!("{sql} described nothing"))
+            .iter()
+            .map(|c| {
+                let wire = c.to_wire();
+                match (wire.flags & flags::ENUM != 0, wire.flags & flags::SET != 0) {
+                    (true, false) => "ENUM".to_owned(),
+                    (false, true) => "SET".to_owned(),
+                    (false, false) => String::new(),
+                    // MySQL declares no column that is both, so an engine
+                    // sending both bits is a bug this must not read as one.
+                    (true, true) => "ENUM|SET".to_owned(),
+                }
+            })
+            .collect()
+    };
+    let blank = || String::new();
+
+    // A stored column, nullable and not, beside the two string types that
+    // share its type code and must stay bare.
+    assert_eq!(
+        listed("SELECT e, en, s, sn, c, v FROM M"),
+        vec![
+            "ENUM".to_owned(),
+            "ENUM".to_owned(),
+            "SET".to_owned(),
+            "SET".to_owned(),
+            blank(),
+            blank(),
+        ]
+    );
+
+    // The declaration survives everything that reads the column back out of a
+    // table rather than computing a new one: 8.3 reports a table and the flag
+    // through every one of these.
+    for sql in [
+        "SELECT e, s FROM (SELECT e, s FROM M) d",
+        "WITH c AS (SELECT e, s FROM M) SELECT e, s FROM c",
+        "SELECT e, s FROM MV",
+        "SELECT e, s FROM M GROUP BY e, s",
+        "SELECT DISTINCT e, s FROM M",
+        "SELECT e, s FROM M ORDER BY e",
+    ] {
+        assert_eq!(
+            listed(sql),
+            vec!["ENUM".to_owned(), "SET".to_owned()],
+            "{sql}"
+        );
+    }
+
+    // A set operation materialises the column into a plain string, so the flag
+    // goes with the ordinal: `SELECT e FROM M UNION ALL SELECT e FROM M` is a
+    // VAR_STRING with no flags on 8.3, even with the same declaration on both
+    // sides.
+    assert_eq!(
+        listed("SELECT e, s FROM M UNION ALL SELECT e, s FROM M"),
+        vec![blank(), blank()]
+    );
+
+    // An expression is an item and not a field, so there is no declaration for
+    // the flag to come off: 8.3 sends every one of these as a VAR_STRING or a
+    // number with the ENUM bit clear.
+    assert_eq!(
+        listed("SELECT CONCAT(e, ''), IF(1, e, e), e + 0, CONCAT(s, ''), s + 0 FROM M"),
+        vec![blank(), blank(), blank(), blank(), blank()]
+    );
+    // Asked on its own: an aggregate beside a bare column is not a statement
+    // ONLY_FULL_GROUP_BY allows.
+    assert_eq!(
+        listed("SELECT MAX(e), MAX(s) FROM M"),
+        vec![blank(), blank()]
+    );
+
+    // `information_schema.columns.COLUMN_KEY` is a real ENUM on 8.3 —
+    // `enum('','PRI','UNI','MUL')` — and reaches the wire with the flag, so a
+    // client introspecting a schema reads it as a member list. It is the one
+    // column of that table this applies to.
+    assert_eq!(
+        listed(
+            "SELECT COLUMN_NAME, COLUMN_TYPE, COLUMN_KEY, EXTRA \
+             FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'M'"
+        ),
+        vec![blank(), blank(), "ENUM".to_owned(), blank()]
+    );
 }
 
 /// The BINARY flag, which this engine set for nothing at all until #0126.

@@ -1,6 +1,6 @@
 //! The SQL type system, and coercion of values into declared column types.
 
-use mysql_ultralight_protocol::ColumnType;
+use mysql_ultralight_protocol::{ColumnType, MemberList};
 use sqlparser::ast::DataType;
 
 use crate::error::{unsupported, EngineError, EngineResult};
@@ -399,6 +399,19 @@ impl SqlType {
                     .sum::<u64>()
                     + self.variants.len().saturating_sub(1) as u64,
             ),
+        }
+    }
+
+    /// Whether the column is declared as a list of members, and which kind.
+    ///
+    /// Separate from `column_type`, because that answer is `STRING` for both
+    /// and for a `CHAR(n)` besides: the flag is the only place the difference
+    /// survives to the wire.
+    pub fn member_list(&self) -> Option<MemberList> {
+        match self.kind {
+            TypeKind::Enum => Some(MemberList::Enum),
+            TypeKind::Set => Some(MemberList::Set),
+            _ => None,
         }
     }
 

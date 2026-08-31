@@ -127,7 +127,7 @@ pub fn differences(
                     }
                     continue;
                 }
-                // The flags word, less three groups of bits, each left out for
+                // The flags word, less two groups of bits, each left out for
                 // its own reason and each counted so that leaving it out is a
                 // debt rather than a blind spot:
                 //
@@ -140,24 +140,24 @@ pub fn differences(
                 // its own gap — it needs the catalog carried out to the wire,
                 // where everything else here needs only the type.
                 //
-                // ENUM and SET, which #0087 owns: MySQL describes an ENUM
-                // column with ENUM_FLAG and this engine with nothing, on 24
-                // statements. The bits are left out rather than the cases
-                // narrowed because the cases are what the enum groups are
-                // *for*; adding them back is deleting two names from this
-                // list, and is how that issue will be proved.
-                //
                 // NUM, which is not a fact about the column at all: MySQL sets
                 // it on a field a temporary table produced, so the same column
-                // carries it under `GROUP BY` and not without one. Comparing
-                // it would compare the two servers' query plans.
+                // carries it under `GROUP BY` and not without one. Measured on
+                // 8.3, and not only in principle: `SELECT many FROM E` reports
+                // an `ENUM` and `SELECT many FROM E GROUP BY many` the same
+                // column as `ENUM|NUM`. Comparing it would compare the two
+                // servers' query plans.
                 //
                 // What is left is compared: NOT_NULL and UNSIGNED, which were
-                // the only two bits this harness read for its first year, and
+                // the only two bits this harness read for its first year;
                 // BINARY, BLOB, ZEROFILL and TIMESTAMP, which it read none of
                 // — so a `DATE` column described without BINARY, and a
                 // materialised NULL described as anything at all, compared
-                // equal to MySQL.
+                // equal to MySQL; and ENUM and SET, which #0087 took out of
+                // this list. Those two were excluded and counted here for as
+                // long as the engine set neither: 50 divergences over 24
+                // statements, which is what removing the names reported before
+                // anything was fixed.
                 const UNMODELLED: u16 = PRI_KEY
                     | UNIQUE_KEY
                     | MULTIPLE_KEY
@@ -165,8 +165,6 @@ pub fn differences(
                     | NO_DEFAULT_VALUE
                     | ON_UPDATE_NOW
                     | PART_KEY
-                    | ENUM
-                    | SET
                     | NUM;
                 let (fa, fb) = (a.flags & !UNMODELLED, b.flags & !UNMODELLED);
                 if fa != fb {
@@ -212,9 +210,7 @@ const PRI_KEY: u16 = 0x0002;
 const UNIQUE_KEY: u16 = 0x0004;
 const MULTIPLE_KEY: u16 = 0x0008;
 const UNSIGNED: u16 = 0x0020;
-const ENUM: u16 = 0x0100;
 const AUTO_INCREMENT: u16 = 0x0200;
-const SET: u16 = 0x0800;
 const NO_DEFAULT_VALUE: u16 = 0x1000;
 const ON_UPDATE_NOW: u16 = 0x2000;
 const PART_KEY: u16 = 0x4000;
@@ -345,24 +341,45 @@ mod tests {
     }
 
     /// The bits deliberately left out stay out, and each for its own reason:
-    /// ENUM and SET belong to #0087, the key flags to the gap that needs the
-    /// catalog on the wire, and NUM to MySQL's choice of plan.
+    /// the key flags belong to the gap that needs the catalog on the wire, and
+    /// NUM to MySQL's choice of plan.
     #[test]
     fn the_unmodelled_flags_are_not_reported() {
-        for unmodelled in [
-            ENUM,
-            SET,
-            NUM,
-            PRI_KEY,
-            PART_KEY,
-            NO_DEFAULT_VALUE,
-            AUTO_INCREMENT,
-        ] {
+        for unmodelled in [NUM, PRI_KEY, PART_KEY, NO_DEFAULT_VALUE, AUTO_INCREMENT] {
             let mysql = rows(vec![column(NOT_NULL | unmodelled, 40)]);
             let engine = rows(vec![column(NOT_NULL, 40)]);
             assert!(
                 what(&mysql, &engine, true).is_empty(),
                 "{unmodelled:#06x} was compared"
+            );
+        }
+    }
+
+    /// #0087's half of the harness: ENUM and SET are compared, having been in
+    /// the list above until the engine sent them.
+    ///
+    /// Both directions, because the flag is the only thing on the wire that
+    /// tells either from the `CHAR(n)` they share a type code with — an engine
+    /// that set ENUM on every string would be as wrong as one that set it on
+    /// none, and only the second of those was ever the bug.
+    #[test]
+    fn the_enum_and_set_flags_are_reported() {
+        const ENUM: u16 = 0x0100;
+        const SET: u16 = 0x0800;
+        for (bit, name) in [(ENUM, "ENUM"), (SET, "SET")] {
+            let mysql = rows(vec![column(NOT_NULL | bit, 40)]);
+            let engine = rows(vec![column(NOT_NULL, 40)]);
+            assert_eq!(
+                what(&mysql, &engine, true),
+                vec![format!(
+                    "flags of column 0: mysql NOT_NULL|{name} engine NOT_NULL"
+                )]
+            );
+            assert_eq!(
+                what(&engine, &mysql, true),
+                vec![format!(
+                    "flags of column 0: mysql NOT_NULL engine NOT_NULL|{name}"
+                )]
             );
         }
     }

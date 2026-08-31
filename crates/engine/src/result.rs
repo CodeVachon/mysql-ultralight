@@ -215,7 +215,15 @@ impl OutColumn {
             || computed_document
             || (def.charset == charset::BINARY
                 && (self.declared.is_none() || !is_numeric(self.ty)));
-        def.blob(self.declared.is_some() && blob)
+        // Read off the declaration and nowhere else, which is what makes a
+        // materialised ENUM lose it: a set operation clears `declared` because
+        // MySQL does not carry an ENUM through one, and a derived table, a CTE
+        // and a view all keep it because MySQL keeps it there too — measured
+        // on 8.3, `SELECT e FROM (SELECT e FROM t) d` is `flags=[ENUM]` and
+        // `SELECT e FROM t UNION ALL SELECT e FROM t` is a VAR_STRING with no
+        // flag at all.
+        def.member_list(self.declared.as_ref().and_then(SqlType::member_list))
+            .blob(self.declared.is_some() && blob)
             .binary(binary)
             // A stored YEAR only. `YEAR(x)` is UNSIGNED and not zero-filled.
             .zerofill(self.declared.is_some() && self.ty == ColumnType::Year)

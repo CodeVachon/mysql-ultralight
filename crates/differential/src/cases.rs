@@ -863,6 +863,10 @@ pub const GROUPS: &[Group] = &[
             // answered an empty result set instead. A populated table cannot
             // ask that question.
             "CREATE TABLE LE (id INT NOT NULL, s VARCHAR(30) NULL, PRIMARY KEY (id))",
+            // The other side of a join, empty for the same reason: a join
+            // produces no pair of rows when either side has none, so an ON
+            // clause is settled for no row at all.
+            "CREATE TABLE LF (id INT NOT NULL, s VARCHAR(30) NULL, PRIMARY KEY (id))",
         ],
         cases: &[
             // The two from the issue. The second is the decisive one: the
@@ -946,6 +950,35 @@ pub const GROUPS: &[Group] = &[
             same("SELECT id FROM LE WHERE s LIKE 'a' ESCAPE '!!'"),
             same("SELECT id FROM LE ORDER BY s LIKE 'a' ESCAPE '!!'"),
             same("SELECT 1 FROM LE HAVING MAX(s) LIKE 'a' ESCAPE '!!'"),
+            // A bare-aggregate HAVING is not the same question as the three
+            // below it, and was standing in for them: it runs over one
+            // implicit group whatever the table holds, so it is settled by the
+            // row path and says nothing about a resolve-time guard. With a
+            // GROUP BY over an empty table there are no groups, and the clause
+            // is reached by nothing else.
+            same("SELECT 1 FROM LE GROUP BY s HAVING MAX(s) LIKE 'a' ESCAPE '!!'"),
+            same("SELECT s, COUNT(*) FROM LE GROUP BY s HAVING s LIKE 'a' ESCAPE '!!'"),
+            same("SELECT COUNT(*) FROM LE GROUP BY s LIKE 'a' ESCAPE '!!'"),
+            // The ON clause, inner and outer. The outer one is asked as well
+            // because a LEFT JOIN keeps its left rows without ever matching a
+            // pair, so it reaches the clause by a different route.
+            same("SELECT a.id FROM LE a JOIN LF b ON a.s LIKE b.s ESCAPE '!!'"),
+            same("SELECT a.id FROM LE a LEFT JOIN LF b ON a.s LIKE b.s ESCAPE '!!'"),
+            // A write, which is the worse half of the same gap: an illegal
+            // statement and a WHERE that matched nothing are both
+            // `Affected { rows: 0 }`, so a caller cannot tell them apart.
+            same("UPDATE LE SET id = 2 WHERE s LIKE 'a' ESCAPE '!!'"),
+            same("DELETE FROM LE WHERE s LIKE 'a' ESCAPE '!!'"),
+            same("UPDATE LE SET s = CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE '!!') ELSE 'z' END"),
+            same(
+                "UPDATE LE a JOIN LF b ON a.id = b.id SET a.s = 'x' \
+                 WHERE a.s LIKE 'a' ESCAPE '!!'",
+            ),
+            same("DELETE a FROM LE a JOIN LF b ON a.id = b.id WHERE a.s LIKE 'a' ESCAPE '!!'"),
+            // A table that does not exist is answered before the escape is:
+            // 8.3 is 1146 here, not 1210, so the guard sits after the table is
+            // resolved rather than in front of the statement.
+            same("DELETE FROM nosuch WHERE s LIKE 'a' ESCAPE '!!'"),
             same("SELECT CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE '!!') ELSE 9 END"),
             same("SELECT 0 AND ('a' LIKE 'b' ESCAPE '!!')"),
             // A name that resolves against nothing wins: 8.3 resolves names
@@ -954,6 +987,9 @@ pub const GROUPS: &[Group] = &[
             // The same shape with a legal clause, so the guard above is shown
             // to refuse the malformed one rather than the construct.
             same("SELECT id, s LIKE 'a!%' ESCAPE '!' FROM LE ORDER BY id"),
+            same("SELECT s, COUNT(*) FROM LE GROUP BY s HAVING s LIKE 'a!%' ESCAPE '!'"),
+            same("SELECT a.id FROM LE a JOIN LF b ON a.s LIKE b.s ESCAPE '!' ORDER BY a.id"),
+            same("DELETE FROM LE WHERE s LIKE 'a!%' ESCAPE '!'"),
         ],
     },
     Group {
@@ -1574,6 +1610,65 @@ pub const GROUPS: &[Group] = &[
             // derived table's outer projection re-derives the column type.
             same("SELECT r FROM E UNION ALL SELECT e FROM E ORDER BY r"),
             same("SELECT r AS m FROM E UNION SELECT e AS m FROM E ORDER BY m"),
+        ],
+    },
+    Group {
+        // A SET column, which the corpus had none of at all until #0087 — so
+        // the half of that issue about SET_FLAG had nothing to prove it, and
+        // the engine's SET width was the one number in #0126 that was
+        // measured and then never asked again.
+        //
+        // The point of the group is the *description*: MySQL sends a SET as
+        // `MYSQL_TYPE_STRING`, the code a `CHAR(n)` also goes out under, with
+        // SET_FLAG and a width of every member and its commas. So each case
+        // reads the column through one more thing that could lose the
+        // declaration — a derived table, a view, a CTE, a grouping, and a set
+        // operation, which is the one that is *supposed* to lose it.
+        name: "a set column",
+        setup: &[
+            // Members out of alphabetical order, so the declared order and the
+            // sorted one are different lists, and one of three characters, so
+            // the width is not the member count.
+            "CREATE TABLE S (id INT NOT NULL, s SET('b','a','ccc') NULL, \
+             sn SET('a','b') NOT NULL, PRIMARY KEY (id))",
+            // A row holding two members, a NULL, and the empty set — the three
+            // values a SET has that a string column does not.
+            "INSERT INTO S VALUES (1, 'a', 'a'), (2, 'b,a', 'a,b'), (3, NULL, '')",
+            "CREATE VIEW SV AS SELECT id, s FROM S",
+        ],
+        cases: &[
+            same("SELECT id, s, sn FROM S ORDER BY id"),
+            // Everything that reads the column back out of a table keeps the
+            // declaration on 8.3, and reports the table it came from.
+            same("SELECT id, s FROM (SELECT id, s FROM S) d ORDER BY id"),
+            same("WITH c AS (SELECT id, s FROM S) SELECT id, s FROM c ORDER BY id"),
+            same("SELECT id, s FROM SV ORDER BY id"),
+            same("SELECT s, COUNT(*) FROM S GROUP BY s ORDER BY s"),
+            same("SELECT DISTINCT s FROM S ORDER BY s"),
+            // A set operation materialises the column, and the flag goes with
+            // it: 8.3 sends this one as a VAR_STRING with no flags, where
+            // every case above it is a STRING with SET_FLAG.
+            same("SELECT id, s FROM S UNION ALL SELECT id, s FROM S ORDER BY id, s"),
+            // An expression over the column is an item and not a field, so
+            // there is nothing for the flag to be read off.
+            same(
+                "SELECT id, CONCAT(s, ''), LENGTH(s), s = 'a', s LIKE '%a%' \
+                 FROM S ORDER BY id",
+            ),
+            same("SELECT MIN(s), MAX(s), COUNT(s) FROM S"),
+            // A member list is a member list wherever it is compared: an
+            // equality against the whole set matches and against one of its
+            // members does not.
+            same("SELECT id, sn FROM S WHERE sn = 'a,b' ORDER BY id"),
+            // What a schema describer reads, which is the other half of the
+            // description: `COLUMN_TYPE` carries the members in their declared
+            // order, and `CHARACTER_MAXIMUM_LENGTH` the width in characters.
+            same(
+                "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, \
+                 CHARACTER_MAXIMUM_LENGTH FROM information_schema.columns \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'S' \
+                 ORDER BY ORDINAL_POSITION",
+            ),
         ],
     },
     Group {

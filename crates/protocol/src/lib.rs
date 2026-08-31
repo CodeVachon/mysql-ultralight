@@ -14,7 +14,7 @@ pub mod value;
 
 pub use buf::{BufReader, BufWriter};
 pub use capabilities::{status, Capabilities};
-pub use column::{ColumnDef, ColumnType};
+pub use column::{ColumnDef, ColumnType, MemberList};
 pub use handshake::{Handshake, HandshakeResponse};
 pub use packet::{ErrPacket, OkPacket, Sequence};
 pub use value::Value;

@@ -72,7 +72,7 @@ Two things fail a run:
 
 So the file only ever shrinks, and it shrinks by fixing things.
 
-**It is empty.** All 1770 statements answer exactly as MySQL 8.3 answers them,
+**It is empty.** All 1820 statements answer exactly as MySQL 8.3 answers them,
 in both protocols — the rows, and every part of the column definition listed
 under "What a column is compared on" below. It started at 108 divergences
 across 66 statements.
@@ -171,7 +171,14 @@ that list only ever gets shorter.
 
 ### The bits of the flags word
 
-Compared: NOT_NULL, UNSIGNED, BINARY, BLOB, ZEROFILL, TIMESTAMP.
+Compared: NOT_NULL, UNSIGNED, BINARY, BLOB, ZEROFILL, TIMESTAMP, ENUM, SET.
+
+ENUM and SET joined that list for #0087 and are the worked example of the order
+this file argues for. They were excluded and *counted* while the engine set
+neither, and taking the two names out of `UNMODELLED` in `compare.rs` before
+touching the engine is what turned the count into a test: **50 divergences over
+24 statements**, measured against the engine as it stood. The engine then had to
+empty the list rather than the baseline absorb it.
 
 Not compared, and each for its own reason:
 
@@ -181,14 +188,12 @@ Not compared, and each for its own reason:
   primary key arrives with no PRI_KEY. 224 divergences over 81 statements, and
   its own gap — closing it means carrying the catalog out to the wire, where
   everything else here needs only the type.
-- **ENUM and SET** — #0087, which is exactly this: an ENUM column described
-  with no ENUM_FLAG, on 24 statements. The two bits are left out rather than
-  those cases narrowed, because the cases are what the enum groups are *for*.
-  Deleting two names from `UNMODELLED` in `compare.rs` is how that issue gets
-  proved.
 - **NUM** — not a fact about the column at all. MySQL sets it on a field a
   temporary table produced, so the same column carries it under `GROUP BY` and
   not without one; comparing it would compare the two servers' query plans.
+  Measured rather than assumed: on 8.3 a nullable `ENUM` column is `ENUM` from
+  `SELECT e FROM E` and `ENUM|NUM` from `SELECT e FROM E GROUP BY e`, and the
+  `NOT NULL` column beside it is `ENUM` under both.
 
 ## Writing a case
 

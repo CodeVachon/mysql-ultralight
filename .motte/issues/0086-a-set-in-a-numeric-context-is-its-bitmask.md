@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [executor]
 created: 2026-08-25T03:02:00Z
-updated: 2026-08-25T03:02:00Z
+updated: 2026-08-31T16:12:58Z
 ---
 
 ## Description
@@ -23,3 +23,13 @@ MySQL reads a SET as a bitmask over the declared members, 1 << position:
 The shape to follow is #0068's, which is now the worked example: a tagged Value variant written in types.rs::coerce where the declared members are already in hand, an appended image tag with a FORMAT_VERSION bump, numeric readings returning the mask and string readings the canonical text, and the propagation sites measured rather than assumed -- #0068 found that COALESCE/IFNULL/GREATEST/LEAST/MIN/MAX and a scalar subquery drop the tag where IF/CASE/NULLIF keep it, and that a set operation materialises it away entirely. Measure whether SET does the same before copying that list.
 
 Note 4e3b630 already materialises a SET column away through a set operation, alongside ENUM.
+
+## Notes
+
+### 2026-08-31T16:12:58Z — Christopher Vachon (user)
+
+Re-measured during #0087, confirming the bitmask rule with a wider declaration: SET('a','bb','ccc') holding 'bb' is 2 on 8.3 and 'a,ccc' is 5. The engine answers 0 for both.
+
+#0087 added a 'a set column' group to the differential corpus -- the corpus previously had no SET column at all, which is why half of #0087 had nothing to prove it. That group deliberately excludes the numeric context, since it would put a divergence in a run that must end empty. Those cases are the natural place for this issue's coverage to land once it is fixed.
+
+#0087 also established what a SET column's metadata is: MYSQL_TYPE_STRING with SET_FLAG, length (all members + commas) x 4, and the flag is kept through a derived table, CTE, view, generated column and CTAS copy but lost through a UNION.

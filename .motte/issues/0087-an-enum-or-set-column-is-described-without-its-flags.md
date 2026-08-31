@@ -1,11 +1,11 @@
 ---
 id: 87
 title: An ENUM or SET column is described without its flags
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-08-25T03:02:00Z
-updated: 2026-08-28T17:00:29Z
+updated: 2026-08-31T15:07:01Z
 ---
 
 ## Description
