@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-08-25T23:12:44Z
-updated: 2026-08-25T23:12:44Z
+updated: 2026-08-28T17:00:29Z
 ---
 
 ## Description
@@ -29,3 +29,13 @@ A NEWDECIMAL goes on the wire as a length-encoded string in both protocols, so t
 Not caught by the differential harness: `crates/differential/src/compare.rs` compares the name, the type code, nullability and the UNSIGNED flag, and not the length or the decimals. See #0087, which names the same blind spot for ENUM and SET. Widening the harness is the first half of this.
 
 Found while measuring for #0070.
+
+## Notes
+
+### 2026-08-28T17:00:29Z — Christopher Vachon (user)
+
+Partly provable after #0126 (a2e3d47): a DECIMAL column's declared length is now compared and correct -- 12 for DECIMAL(10,2), 11 for (10,0), 67 for (65,30), 9 for (8,3) UNSIGNED, the rule being M + a point if there is a scale + a sign if signed.
+
+Still not compared, and still this issue's subject: the decimals field itself (1148 divergences over 260 statements when it was measured), and the width of a computed column, which MySQL takes from Item::max_length and the engine does not model at all (2784 over 560).
+
+Both are named with those counts in compare.rs and in crates/differential/README.md. Turning either on is the first step of whoever takes this -- the counts above are what to expect.

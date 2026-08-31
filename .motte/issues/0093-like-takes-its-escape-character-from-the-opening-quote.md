@@ -1,11 +1,11 @@
 ---
 id: 93
 title: LIKE takes its escape character from the opening quote
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-08-25T12:57:57Z
-updated: 2026-08-25T12:57:57Z
+updated: 2026-08-31T12:21:03Z
 ---
 
 ## Description

@@ -839,6 +839,124 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // #0093: the escape character was read out of the *rendering* of the
+        // ESCAPE literal, so it was the opening quote and every clause here
+        // escaped with `'`. A wrong answer and a silent one -- LIKE hands back
+        // a plausible 0 or 1 either way -- which is why the corpus now asks
+        // the clause every way 8.3 answers it rather than only the one that
+        // was reported.
+        //
+        // Every case in this group is ASCII and same-case on both sides of the
+        // LIKE. That is deliberate and not incidental: LIKE is case-sensitive
+        // in this engine and case-*insensitive* on 8.3 under the default
+        // collation, so `SELECT 'ABC' LIKE 'a%'` is 1 there and 0 here. That
+        // is a gap of its own -- the engine has no collation to propagate, and
+        // folding LIKE unconditionally would break `BINARY 'A' LIKE 'a'`,
+        // which it answers correctly today -- and it is not this one.
+        name: "like and its escape character",
+        setup: &[
+            "CREATE TABLE L (id INT NOT NULL, s VARCHAR(30) NULL, PRIMARY KEY (id))",
+            "INSERT INTO L VALUES (1,'a%'),(2,'ab'),(3,'a_'),(4,'a!'),(5,NULL)",
+            // Left empty on purpose. 8.3 settles an ESCAPE clause while
+            // resolving the item, so a malformed one is an error over a table
+            // with no rows -- and this engine settled it per row, which
+            // answered an empty result set instead. A populated table cannot
+            // ask that question.
+            "CREATE TABLE LE (id INT NOT NULL, s VARCHAR(30) NULL, PRIMARY KEY (id))",
+        ],
+        cases: &[
+            // The two from the issue. The second is the decisive one: the
+            // pattern is `a'%`, and only an engine escaping with `'` can
+            // answer 1.
+            same("SELECT 'a%' LIKE 'a!%' ESCAPE '!'"),
+            same("SELECT 'a%' LIKE 'a''%' ESCAPE '!'"),
+            same("SELECT 'a%' NOT LIKE 'a!%' ESCAPE '!', 'a%' NOT LIKE 'a''%' ESCAPE '!'"),
+            // The escape before a character that is neither wildcard nor
+            // itself: 8.3 drops the escape and matches the character.
+            same("SELECT 'ab' LIKE 'a!b' ESCAPE '!', 'a!b' LIKE 'a!b' ESCAPE '!'"),
+            // The escape escaping itself.
+            same("SELECT 'a!' LIKE 'a!!' ESCAPE '!', 'a!!' LIKE 'a!!!' ESCAPE '!'"),
+            // A trailing escape matches itself rather than failing the
+            // pattern, which this engine got wrong until #0093 measured it:
+            // `'a!' LIKE 'a!' ESCAPE '!'` is 1 and `'a' LIKE 'a!'` is 0.
+            same("SELECT 'a!' LIKE 'a!' ESCAPE '!', 'a' LIKE 'a!' ESCAPE '!'"),
+            same("SELECT '!' LIKE '!' ESCAPE '!', '' LIKE '!' ESCAPE '!'"),
+            same("SELECT 'a!' LIKE '%!' ESCAPE '!', 'ab!' LIKE 'a%!' ESCAPE '!'"),
+            // The escape character *is* the wildcard. Escaping wins in every
+            // position, the trailing one included.
+            same("SELECT 'a%' LIKE 'a%%' ESCAPE '%', 'ab' LIKE 'a%' ESCAPE '%', \
+                  'a%' LIKE 'a%' ESCAPE '%'"),
+            same("SELECT 'a_' LIKE 'a__' ESCAPE '_', 'ab' LIKE 'a_' ESCAPE '_', \
+                  'a_' LIKE 'a_' ESCAPE '_'"),
+            // An empty ESCAPE turns escaping off rather than naming a
+            // character, so the default backslash goes away with it.
+            same("SELECT 'a%' LIKE 'a!%' ESCAPE '', 'a%' LIKE 'a%' ESCAPE ''"),
+            same(r"SELECT 'a%' LIKE 'a\\%' ESCAPE '', 'a\\%' LIKE 'a\\%' ESCAPE ''"),
+            // ESCAPE NULL is not that: it leaves the default backslash in
+            // place, which is the one place NULL does not propagate.
+            same(r"SELECT 'a%' LIKE 'a\\%' ESCAPE NULL, 'a%' LIKE 'a!%' ESCAPE NULL"),
+            same(r"SELECT 'a\\%' LIKE 'a\\\\%' ESCAPE NULL"),
+            // A non-string is converted to one first.
+            same("SELECT 'x%' LIKE 'x1%' ESCAPE 1, 'x' LIKE 'x' ESCAPE TRUE, \
+                  'x%' LIKE 'x!%' ESCAPE x'21'"),
+            // Double quotes are a string here, so this names `!` and not a
+            // column. The group runs without ANSI_QUOTES.
+            same("SELECT 'a%' LIKE 'a!%' ESCAPE \"!\""),
+            // The length is counted in characters and not in bytes, so a
+            // two-byte character is one escape character on a utf8mb4
+            // connection.
+            same("SELECT 'a%' LIKE CONCAT('a', 'é', '%') ESCAPE 'é'"),
+            same("SELECT 'aé' LIKE CONCAT('a', 'é', 'é') ESCAPE 'é'"),
+            // Longer than one character is ER_WRONG_ARGUMENTS. `1.5` is three
+            // characters once converted, which is why a number can raise it.
+            same("SELECT 'a%' LIKE 'a!%' ESCAPE '!!'"),
+            same("SELECT 'a%' LIKE 'a!%' ESCAPE 'ab'"),
+            same("SELECT 'x%' LIKE 'x1%' ESCAPE 1.5"),
+            // Raised while resolving and not while evaluating: the operand is
+            // NULL and the answer is still the error.
+            same("SELECT NULL LIKE 'a' ESCAPE '!!'"),
+            same("SELECT NULL LIKE 'a' ESCAPE '!', 'a' LIKE NULL ESCAPE '!'"),
+            // The default with no clause at all, which ORMs rely on: they
+            // escape user input with a backslash and write no ESCAPE.
+            same(r"SELECT 'a_b' LIKE 'a\\_b', 'axb' LIKE 'a\\_b'"),
+            same(r"SELECT 'a\\' LIKE 'a\\', 'a' LIKE 'a\\', 'ab' LIKE 'a\\'"),
+            // Per row rather than per statement, and through NOT as well: the
+            // clause is resolved once and the pattern matched for each.
+            same("SELECT id, s LIKE 'a!%' ESCAPE '!', s NOT LIKE 'a!%' ESCAPE '!' \
+                  FROM L ORDER BY id"),
+            same("SELECT id FROM L WHERE s LIKE 'a!_' ESCAPE '!' ORDER BY id"),
+            // A binary operand compares byte for byte, so the pattern's own
+            // case stops being negotiable. Bytes against characters is not
+            // asked: the operand is explicitly binary and MySQL carries that
+            // collation into the answer where this engine has none.
+            same("SELECT 'A%' LIKE BINARY 'a!%' ESCAPE '!', 'a%' LIKE BINARY 'a!%' ESCAPE '!'")
+                .without_value_kind(),
+            // A binary string is measured in bytes, because that is what one
+            // of its characters is: `x'C3A9'` is two where the same two bytes
+            // written as text are one. `x''` is off, like `''`.
+            same("SELECT 'a%' LIKE 'a!%' ESCAPE x'C3A9'"),
+            same("SELECT 'a%' LIKE 'a!%' ESCAPE x'2121'"),
+            same("SELECT 'a%' LIKE 'a!%' ESCAPE x'', 'a%' LIKE 'a%' ESCAPE x''"),
+            // Resolve time against row time. Every one of these is a statement
+            // that evaluates the LIKE for no row at all -- an empty table, a
+            // filter over one, a sort over one, a branch nothing takes, an AND
+            // that short-circuits -- and 8.3 raises 1210 for all of them.
+            // Nothing here can be caught by a case that returns a row.
+            same("SELECT s LIKE 'a' ESCAPE '!!' FROM LE"),
+            same("SELECT id FROM LE WHERE s LIKE 'a' ESCAPE '!!'"),
+            same("SELECT id FROM LE ORDER BY s LIKE 'a' ESCAPE '!!'"),
+            same("SELECT 1 FROM LE HAVING MAX(s) LIKE 'a' ESCAPE '!!'"),
+            same("SELECT CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE '!!') ELSE 9 END"),
+            same("SELECT 0 AND ('a' LIKE 'b' ESCAPE '!!')"),
+            // A name that resolves against nothing wins: 8.3 resolves names
+            // before it settles the escape, so this is 1054 and not 1210.
+            same("SELECT nope LIKE 'x' ESCAPE '!!' FROM LE"),
+            // The same shape with a legal clause, so the guard above is shown
+            // to refuse the malformed one rather than the construct.
+            same("SELECT id, s LIKE 'a!%' ESCAPE '!' FROM LE ORDER BY id"),
+        ],
+    },
+    Group {
         // MySQL names an unaliased column after its source text everywhere
         // except here. A literal is named as it is read, so a string comes
         // back named by its *contents* and the quotes are gone -- and unary

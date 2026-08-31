@@ -247,3 +247,10 @@
 {"at":"2026-08-27T22:46:01Z","id":132,"by":"Christopher Vachon","as":"user","type":"created","title":"LAST_INSERT_ID after an INSERT reports the last id, not the first","state":"Todo"}
 {"at":"2026-08-27T22:46:01Z","id":133,"by":"Christopher Vachon","as":"user","type":"created","title":"ALTER TABLE DROP COLUMN of a missing column is 1054, not 1091","state":"Todo"}
 {"at":"2026-08-28T13:36:59Z","id":126,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-08-28T17:00:12Z","id":126,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-08-31T12:21:03Z","id":93,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-08-31T13:34:50Z","id":134,"by":"Christopher Vachon","as":"user","type":"created","title":"LIKE is case-sensitive where MySQL folds case","state":"Todo"}
+{"at":"2026-08-31T13:34:50Z","id":135,"by":"Christopher Vachon","as":"user","type":"created","title":"NO_BACKSLASH_ESCAPES is not modelled","state":"Todo"}
+{"at":"2026-08-31T13:34:50Z","id":136,"by":"Christopher Vachon","as":"user","type":"created","title":"ESCAPE does not accept an expression","state":"Todo"}
+{"at":"2026-08-31T13:35:08Z","id":137,"by":"Christopher Vachon","as":"user","type":"created","title":"INSERT reads its table name through Display","state":"Todo"}
+{"at":"2026-08-31T13:35:09Z","id":138,"by":"Christopher Vachon","as":"user","type":"created","title":"An identifier's rendering leaks into the names the engine reports","state":"Todo"}

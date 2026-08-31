@@ -721,6 +721,260 @@ fn like_treats_backslash_as_the_default_escape() {
     assert_eq!(matched, vec![vec!["a_b"]], "the underscore must be literal");
 }
 
+/// The ESCAPE clause names a character, and the character has to come out of
+/// the literal's *value*.
+///
+/// `Display` on a `Value` prints the SQL that would produce it, so reading the
+/// first character of the rendering gave back the opening quote and every
+/// ESCAPE clause in this engine escaped with `'` whatever was written (#0093).
+///
+/// The second column is the one that decides it: with `!` escaping, the
+/// pattern is `a` then a literal quote then a wildcard, which `a%` does not
+/// match. Only an engine escaping with `'` can answer 1. Measured on 8.3.
+#[test]
+fn like_takes_its_escape_from_the_literals_value_and_not_its_rendering() {
+    let (engine, mut session) = engine();
+
+    let answers = rows(
+        &engine,
+        &mut session,
+        "SELECT 'a%' LIKE 'a!%' ESCAPE '!', 'a%' LIKE 'a''%' ESCAPE '!', \
+         'a%' NOT LIKE 'a!%' ESCAPE '!', 'a%' NOT LIKE 'a''%' ESCAPE '!'",
+    );
+
+    assert_eq!(answers, vec![vec!["1", "0", "0", "1"]]);
+}
+
+/// An empty ESCAPE turns escaping off; a NULL one does not.
+///
+/// The two look interchangeable and are not: `ESCAPE ''` leaves the pattern
+/// with no escape character at all, while `ESCAPE NULL` leaves the default
+/// backslash in place — the one place a NULL operand does not propagate.
+/// Both columns here hold the same pattern, `a\%`. Measured on 8.3.
+#[test]
+fn an_empty_escape_disables_escaping_where_a_null_escape_keeps_the_default() {
+    let (engine, mut session) = engine();
+
+    let answers = rows(
+        &engine,
+        &mut session,
+        r"SELECT 'a%' LIKE 'a\%' ESCAPE '', 'a%' LIKE 'a\%' ESCAPE NULL",
+    );
+
+    assert_eq!(answers, vec![vec!["0", "1"]]);
+}
+
+/// A trailing escape character has nothing to escape, and matches itself.
+///
+/// Not a failed pattern, which is what this engine answered: 8.3 reads the
+/// last character literally, so `'a!' LIKE 'a!' ESCAPE '!'` is 1 — and
+/// `'a%' LIKE 'a%' ESCAPE '%'` is too, because the wildcard reading is off
+/// even in the position where the escaping cannot apply.
+#[test]
+fn a_trailing_escape_character_matches_itself() {
+    let (engine, mut session) = engine();
+
+    let answers = rows(
+        &engine,
+        &mut session,
+        "SELECT 'a!' LIKE 'a!' ESCAPE '!', 'a' LIKE 'a!' ESCAPE '!', \
+         'a%' LIKE 'a%' ESCAPE '%', 'a!!' LIKE 'a!!!' ESCAPE '!'",
+    );
+
+    assert_eq!(answers, vec![vec!["1", "0", "1", "1"]]);
+}
+
+/// ESCAPE takes one character, counted in characters rather than bytes.
+///
+/// A non-string is converted to one first, which is how a *number* reaches
+/// this error: `1.5` is three characters. `é` is two bytes and one character,
+/// so it is accepted. All measured on 8.3 over a utf8mb4 connection.
+#[test]
+fn an_escape_of_more_than_one_character_is_rejected() {
+    let (engine, mut session) = engine();
+
+    for sql in [
+        "SELECT 'a%' LIKE 'a!%' ESCAPE '!!'",
+        "SELECT 'a%' LIKE 'a!%' ESCAPE 'ab'",
+        "SELECT 'x%' LIKE 'x1%' ESCAPE 1.5",
+        // Resolved before the operands are read, so the NULL does not get to
+        // answer NULL first: 8.3 raises this while resolving the item.
+        "SELECT NULL LIKE 'a' ESCAPE '!!'",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1210, "expected ER_WRONG_ARGUMENTS for: {sql}");
+        assert_eq!(err.sql_state, "HY000", "for: {sql}");
+    }
+
+    let accepted = rows(
+        &engine,
+        &mut session,
+        "SELECT 'a%' LIKE CONCAT('a', 'é', '%') ESCAPE 'é', \
+         'x%' LIKE 'x1%' ESCAPE 1, 'x%' LIKE 'x!%' ESCAPE x'21'",
+    );
+    assert_eq!(accepted, vec![vec!["1", "1", "1"]]);
+}
+
+/// A malformed ESCAPE is settled while the item is resolved, not per row.
+///
+/// The distinction is the whole test. Evaluating the clause where the pattern
+/// is matched means it is never settled for a statement that matches nothing:
+/// over an empty table, and down a CASE branch nothing takes. 8.3 raises 1210
+/// for both, and this engine answered an empty result set and `9`.
+///
+/// Every statement here is chosen so the LIKE is evaluated for *no* row, which
+/// is what a mutation moving the check back into the row path cannot survive.
+#[test]
+fn a_malformed_escape_is_refused_even_where_no_row_evaluates_it() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE LE (id INT NOT NULL, s VARCHAR(30) NULL)",
+    );
+
+    for sql in [
+        // An empty table, through each clause that reaches an expression.
+        "SELECT s LIKE 'a' ESCAPE '!!' FROM LE",
+        "SELECT id FROM LE WHERE s LIKE 'a' ESCAPE '!!'",
+        "SELECT id FROM LE ORDER BY s LIKE 'a' ESCAPE '!!'",
+        "SELECT 1 FROM LE HAVING MAX(s) LIKE 'a' ESCAPE '!!'",
+        // One row, and the LIKE still never evaluated.
+        "SELECT CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE '!!') ELSE 9 END",
+        "SELECT 0 AND ('a' LIKE 'b' ESCAPE '!!')",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1210, "expected ER_WRONG_ARGUMENTS for: {sql}");
+    }
+
+    // A name nothing answers to wins over it, as on 8.3.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT nope LIKE 'x' ESCAPE '!!' FROM LE",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1054, "1054 is resolved before 1210");
+
+    // The same shapes with a legal clause still run, so the guard refuses the
+    // clause rather than the construct.
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT id FROM LE ORDER BY s LIKE 'a!%' ESCAPE '!'"
+    )
+    .is_empty());
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE '!') ELSE 9 END"
+        ),
+        vec![vec!["9"]]
+    );
+}
+
+/// A prepare that cannot succeed has to fail at prepare.
+///
+/// `describe` runs the statement as a probe over no rows and swallows what the
+/// probe itself caused, keeping only the refusals that are the statement's
+/// fault. 1210 is one: no row and no bound argument can make `ESCAPE '!!'`
+/// name one character. Without it in `refused_at_prepare` the probe raised the
+/// error, the filter said no, and COM_STMT_PREPARE succeeded describing zero
+/// columns where MySQL fails the prepare.
+#[test]
+fn a_malformed_escape_fails_the_prepare_rather_than_describing_nothing() {
+    let (engine, session) = engine();
+
+    let err = engine
+        .describe(&session, "SELECT 'a' LIKE 'b' ESCAPE '!!'", 0)
+        .unwrap_err();
+    assert_eq!(err.code, 1210);
+
+    // The legal clause still describes its one column, so the code above is
+    // not refusing every LIKE.
+    let described = engine
+        .describe(&session, "SELECT 'a%' LIKE 'a!%' ESCAPE '!'", 0)
+        .unwrap()
+        .expect("a legal ESCAPE still describes");
+    assert_eq!(described.len(), 1);
+}
+
+/// A binary ESCAPE is counted and read as bytes, or refused.
+///
+/// `as_text` on a binary string decodes lossily, which made `x'FF'` and
+/// `x'FE'` the same one-character escape — U+FFFD, which neither of them names
+/// and no pattern can hold — and let `x'C3A9'` through as one character where
+/// 8.3 counts two. Measured on 8.3: `x'21'` is `!`, `x''` is off, `x'C3A9'`
+/// and `x'2121'` are 1210, and `x'FF'` escapes with the byte 0xFF.
+///
+/// The last of those this engine cannot do — it matches over `char`s, both
+/// operands having come through `as_text` — so it refuses rather than
+/// escaping with something else. #0134 is the collation work that would fix it.
+#[test]
+fn a_binary_escape_is_measured_in_bytes() {
+    let (engine, mut session) = engine();
+
+    let accepted = rows(
+        &engine,
+        &mut session,
+        "SELECT 'x%' LIKE 'x!%' ESCAPE x'21', 'a%' LIKE 'a!%' ESCAPE x'', \
+         'a%' LIKE 'a%' ESCAPE x''",
+    );
+    assert_eq!(accepted, vec![vec!["1", "0", "1"]]);
+
+    for sql in [
+        "SELECT 'a%' LIKE 'a!%' ESCAPE x'C3A9'",
+        "SELECT 'a%' LIKE 'a!%' ESCAPE x'2121'",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1210, "two bytes is two characters, for: {sql}");
+    }
+
+    // Refused, not answered wrongly, and not silently equal to `x'FE'`.
+    for sql in [
+        "SELECT 'a%' LIKE 'a!%' ESCAPE x'FF'",
+        "SELECT 'a%' LIKE 'a!%' ESCAPE x'FE'",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1235, "expected a refusal for: {sql}");
+    }
+}
+
+/// A NULL ESCAPE makes the column nullable without making any answer NULL.
+///
+/// The two halves disagree and both are 8.3's: `'a%' LIKE 'a\%' ESCAPE NULL`
+/// is 1 and never NULL, because a NULL escape leaves the default backslash
+/// alone — and the column still comes back without NOT_NULL, where the same
+/// LIKE with `ESCAPE ''` or with no clause at all carries it. Found by the
+/// differential corpus; reasoning from the values says the opposite.
+#[test]
+fn a_null_escape_clause_makes_a_like_nullable_without_making_it_null() {
+    let (engine, mut session) = engine();
+
+    let not_null: Vec<bool> = engine
+        .describe(
+            &session,
+            r"SELECT 'a%' LIKE 'a\%' ESCAPE NULL, 'a%' LIKE 'a\%' ESCAPE '',
+              'a%' LIKE 'a\%', 'a%' NOT LIKE 'a\%' ESCAPE NULL",
+            0,
+        )
+        .unwrap()
+        .unwrap()
+        .iter()
+        .map(|c| !c.nullable)
+        .collect();
+    assert_eq!(not_null, vec![false, true, true, false]);
+
+    let answers = rows(
+        &engine,
+        &mut session,
+        r"SELECT 'a%' LIKE 'a\%' ESCAPE NULL, 'a%' NOT LIKE 'a\%' ESCAPE NULL",
+    );
+    assert_eq!(answers, vec![vec!["1", "0"]], "the value is never NULL");
+}
+
 /// A NOT NULL column added to a populated table must not back-fill NULL into
 /// rows the metadata says cannot hold one.
 #[test]

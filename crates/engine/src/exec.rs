@@ -1449,6 +1449,12 @@ impl Engine {
             if let Some(name) = unresolved_column(predicate, &refs) {
                 return Err(EngineError::unknown_column(&name, "where clause"));
             }
+            // Same reason, one clause further in: an ESCAPE is settled per row
+            // too, so `WHERE s LIKE 'a' ESCAPE '!!'` over an empty table came
+            // back empty where 8.3 raises 1210.
+            if let Some(bad) = malformed_escape(predicate) {
+                return Err(bad);
+            }
         }
 
         let mut matching: Vec<&Vec<Value>> = Vec::new();
@@ -1535,6 +1541,13 @@ impl Engine {
         let OrderByKind::Expressions(items) = &order.kind else {
             return Err(unsupported("this ORDER BY form"));
         };
+        // Before the row loop, and returned rather than swallowed: the loop
+        // below turns any evaluation error into "could not sort", and over no
+        // rows it does not run at all — so `ORDER BY s LIKE 'a' ESCAPE '!!'`
+        // sorted nothing and answered an empty set where 8.3 raises 1210.
+        if let Some(bad) = items.iter().find_map(|i| malformed_escape(&i.expr)) {
+            return Err(bad);
+        }
 
         let mut keys: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
         for row in rows.iter() {
@@ -2095,6 +2108,13 @@ impl Engine {
                 SelectItem::ExprWithAlias { expr, alias } => (alias.value.clone(), expr),
                 other => return Err(unsupported(format!("select item `{other}`"))),
             };
+            // Before the item is evaluated, because a branch nothing takes is
+            // never evaluated: `SELECT CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE
+            // '!!') ELSE 9 END` answered 9 where 8.3 raises 1210. The
+            // table-backed projection is guarded at the same point.
+            if let Some(bad) = malformed_escape(e) {
+                return Err(bad);
+            }
             let value = if let Expr::Function(f) = e {
                 if f.over.is_none() && is_aggregate(&f.name.to_string()) {
                     let name = f.name.to_string().to_ascii_lowercase();
@@ -2214,6 +2234,9 @@ impl Engine {
                     // column called `b` and returned successfully.
                     if let Some(name) = unresolved_column(e, refs) {
                         return Err(EngineError::unknown_column(&name, "field list"));
+                    }
+                    if let Some(bad) = malformed_escape(e) {
+                        return Err(bad);
                     }
                     let alias = match item {
                         SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
@@ -2646,6 +2669,9 @@ impl Engine {
         if let Some(name) = items.iter().find_map(|(_, e)| unresolved_column(e, refs)) {
             return Err(EngineError::unknown_column(&name, "field list"));
         }
+        if let Some(bad) = items.iter().find_map(|(_, e)| malformed_escape(e)) {
+            return Err(bad);
+        }
 
         // Under ONLY_FULL_GROUP_BY a selected column must be grouped by or
         // aggregated. Silently evaluating it against the group's first row
@@ -2662,6 +2688,9 @@ impl Engine {
             Some(_) => return Err(unsupported("this ORDER BY form")),
             None => Vec::new(),
         };
+        if let Some(bad) = order_items.iter().find_map(|i| malformed_escape(&i.expr)) {
+            return Err(bad);
+        }
         let descending: Vec<bool> = order_items
             .iter()
             .map(|i| i.options.asc == Some(false))
@@ -6184,9 +6213,30 @@ fn never_null(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]
         Expr::Between {
             expr, low, high, ..
         } => recur(expr) && recur(low) && recur(high),
-        Expr::Like { expr, pattern, .. }
-        | Expr::ILike { expr, pattern, .. }
-        | Expr::RLike { expr, pattern, .. } => recur(expr) && recur(pattern),
+        // The ESCAPE clause counts as an operand for the *flag* and not for
+        // the answer: `SELECT 'a%' LIKE 'a\%' ESCAPE NULL` is 1 on 8.3 and
+        // never NULL — a NULL escape leaves the default backslash in place —
+        // yet the column comes back without NOT_NULL. Measured, because
+        // reasoning from the values says the opposite.
+        Expr::Like {
+            expr,
+            pattern,
+            escape_char,
+            ..
+        }
+        | Expr::ILike {
+            expr,
+            pattern,
+            escape_char,
+            ..
+        } => {
+            let escape_known = !matches!(
+                escape_char.as_ref().map(|c| &c.value),
+                Some(sqlparser::ast::Value::Null)
+            );
+            recur(expr) && recur(pattern) && escape_known
+        }
+        Expr::RLike { expr, pattern, .. } => recur(expr) && recur(pattern),
         // Only the results decide, and only with an `ELSE`: without one a
         // statement that matches no branch answers NULL.
         Expr::Case {
@@ -7233,11 +7283,18 @@ fn column_slot(refs: &[ColumnRef], e: &Expr) -> Option<usize> {
 /// which is why MySQL raises 1054 and 1051 at prepare time too — and why a
 /// client that prepares its statements up front should hear about it there.
 fn refused_at_prepare(e: &EngineError) -> bool {
-    // ER_BAD_FIELD_ERROR and ER_BAD_TABLE_ERROR. Listed rather than matched on
-    // a range: every other code this engine raises is either about a value or
-    // about the probe, and a new one has to be considered rather than
-    // inherited.
-    matches!(e.code, 1054 | 1051)
+    // ER_BAD_FIELD_ERROR, ER_BAD_TABLE_ERROR and ER_WRONG_ARGUMENTS. Listed
+    // rather than matched on a range: every other code this engine raises is
+    // either about a value or about the probe, and a new one has to be
+    // considered rather than inherited.
+    //
+    // 1210 is here for the same reason as the other two and not by analogy:
+    // `ESCAPE '!!'` names two characters however the statement is run, so no
+    // row and no bound argument can make it legal, and 8.3 raises it while
+    // resolving the item. Without this line the probe raised it, this said no,
+    // and the error was swallowed into `Ok(None)` — so COM_STMT_PREPARE
+    // succeeded describing zero columns where MySQL fails the prepare.
+    matches!(e.code, 1054 | 1051 | 1210)
 }
 
 /// The first column reference in `e` that nothing in scope answers to.
@@ -7309,6 +7366,46 @@ fn written_name(e: &Expr) -> String {
             .collect::<Vec<_>>()
             .join("."),
         other => other.to_string(),
+    }
+}
+
+/// The first `LIKE ... ESCAPE` clause in `e` that names anything but one
+/// character.
+///
+/// 8.3 settles the escape while *resolving* the item, not while evaluating it,
+/// so a malformed clause is an error even where nothing is ever evaluated:
+///
+/// ```sql
+/// SELECT s LIKE 'a' ESCAPE '!!' FROM L               -- 1210, L empty
+/// SELECT CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE '!!') ELSE 9 END  -- 1210
+/// ```
+///
+/// The evaluator settles it per row, which answers both of those with a
+/// result: an empty set for the first and 9 for the second. That is the same
+/// shape as the 1054 hole above it — over no rows, or down a branch nothing
+/// takes, a check that lives in the row path does not run — and it is fixed
+/// the same way, at the same three points, from the same `subexpressions`
+/// list.
+///
+/// Ordered after `unresolved_column` at every one of them, because MySQL
+/// resolves names first: `SELECT nope LIKE 'x' ESCAPE '!!' FROM L` is 1054 on
+/// 8.3 and not 1210.
+///
+/// Conservative in the same way, and for the same reason: a variant missing
+/// from `subexpressions` is a place this looks at nothing and the statement is
+/// accepted as it is today, which is the safe direction.
+fn malformed_escape(e: &Expr) -> Option<EngineError> {
+    if let Expr::Like { escape_char, .. } | Expr::ILike { escape_char, .. } = e {
+        if let Err(bad) = crate::expr::like_escape(escape_char.as_ref()) {
+            return Some(bad);
+        }
+    }
+    match e {
+        // A function's arguments are read here too, and `subexpressions` does
+        // not carry them. `value_arguments` for the reason it is used above:
+        // a bare unit keyword is not an expression to descend into.
+        Expr::Function(f) => value_arguments(f).iter().find_map(malformed_escape),
+        other => subexpressions(other).into_iter().find_map(malformed_escape),
     }
 }
 

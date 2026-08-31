@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-08-26T08:49:10Z
-updated: 2026-08-26T08:49:10Z
+updated: 2026-08-28T17:00:29Z
 ---
 
 ## Description
@@ -21,3 +21,11 @@ crates/engine's widen falls to VAR_STRING wherever a union mixes a string with s
 Related to #0065, which taught a union to keep a column's type when a branch is NULL, and to #0123, which is the same aggregation applied to a decimal's scale. This is the string half of the same rule.
 
 Not in the corpus. Note the length half cannot be proven by the harness until it compares column_length at all -- see the length issue filed alongside this one.
+
+## Notes
+
+### 2026-08-28T17:00:29Z — Christopher Vachon (user)
+
+Not provable by #0126's widening, stated plainly there: the harness compares column_length only for a column MySQL reports with a non-empty org_table, and a union column has an empty one, so its width is out of scope.
+
+That matters for this issue because the length is half its content -- MySQL declares char(8) where the engine says VAR_STRING, and the 8 is a computed width. Closing it needs either the origin-field comparison turned on (2924 divergences over 583 statements as measured in #0126) or a separate route to compare a computed column's width, which is #0111's Item::max_length gap.

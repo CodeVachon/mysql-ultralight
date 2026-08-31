@@ -290,17 +290,6 @@ impl SqlType {
         matches!(self.kind, TypeKind::Text | TypeKind::Enum | TypeKind::Set)
     }
 
-    /// The MySQL type code reported in result set metadata.
-    ///
-    /// By the declared type rather than the kind, because MySQL's codes are
-    /// finer than this engine's kinds: an `INT` is `LONG` and a `BIGINT` is
-    /// `LONGLONG`, a `CHAR` is `STRING` where a `VARCHAR` is `VAR_STRING`, and
-    /// every `TEXT` is a `BLOB`. Reporting one code for a whole kind told a
-    /// typed client the wrong width for nearly every column.
-    ///
-    /// This is what the binary protocol encodes by, so the code and what the
-    /// column can hold have to agree — an `INT` may say `LONG` only because
-    /// `coerce` refuses anything four bytes cannot hold.
     /// The `column_length` a result set reports for a column of this type.
     ///
     /// MySQL sends the *declaration's* width, and it sends it in bytes of the
@@ -413,6 +402,17 @@ impl SqlType {
         }
     }
 
+    /// The MySQL type code reported in result set metadata.
+    ///
+    /// By the declared type rather than the kind, because MySQL's codes are
+    /// finer than this engine's kinds: an `INT` is `LONG` and a `BIGINT` is
+    /// `LONGLONG`, a `CHAR` is `STRING` where a `VARCHAR` is `VAR_STRING`, and
+    /// every `TEXT` is a `BLOB`. Reporting one code for a whole kind told a
+    /// typed client the wrong width for nearly every column.
+    ///
+    /// This is what the binary protocol encodes by, so the code and what the
+    /// column can hold have to agree — an `INT` may say `LONG` only because
+    /// `coerce` refuses anything four bytes cannot hold.
     pub fn column_type(&self) -> ColumnType {
         match self.kind {
             TypeKind::Bool => ColumnType::Tiny,

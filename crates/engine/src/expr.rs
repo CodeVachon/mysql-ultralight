@@ -2,7 +2,7 @@
 
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, DateTimeField, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    Query, SelectItem, SetExpr, UnaryOperator, Value as AstValue,
+    Query, SelectItem, SetExpr, UnaryOperator, Value as AstValue, ValueWithSpan,
 };
 
 use crate::error::{unsupported, EngineError, EngineResult};
@@ -450,18 +450,15 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             escape_char,
             ..
         } => {
+            // Resolved before the operands, because 8.3 rejects a bad ESCAPE
+            // while resolving the item rather than while evaluating it:
+            // `SELECT NULL LIKE 'a' ESCAPE '!!'` is 1210 there and not NULL.
+            let escape = like_escape(escape_char.as_ref())?;
             let value = eval(expr, ctx)?;
             let pattern = eval(pattern, ctx)?;
             if value.is_null() || pattern.is_null() {
                 return Ok(Value::Null);
             }
-            // MySQL escapes with a backslash unless told otherwise. ORMs
-            // escape user input that way and omit the ESCAPE clause, so
-            // leaving this as None makes `contains` filters return nothing.
-            let escape = escape_char
-                .as_ref()
-                .and_then(|s| s.to_string().chars().next())
-                .or(Some('\\'));
             let matched = functions::like(&value.as_text(), &pattern.as_text(), escape);
             Ok(bool_value(matched != *negated))
         }
@@ -886,6 +883,95 @@ fn number_literal(text: &str) -> Value {
         return Value::Decimal(exact);
     }
     Value::Float(text.parse::<f64>().unwrap_or(0.0))
+}
+
+/// The character a `LIKE ... ESCAPE` clause names, or the default.
+///
+/// Read from the literal's *value* and not from its rendering. `Display` on a
+/// `Value` prints the SQL that would produce it, quotes included, so
+/// `to_string().chars().next()` handed back the opening quote and every
+/// ESCAPE clause in this engine escaped with `'` whatever was written —
+/// `'a%' LIKE 'a''%' ESCAPE '!'` answered 1 where 8.3 answers 0 (#0093).
+///
+/// Measured against 8.3, all of which the rendering could not have got right:
+///
+/// - `ESCAPE '!'` is `!`. The length is counted in characters and not bytes,
+///   so `ESCAPE 'é'` is legal on a utf8mb4 connection and 1210 on a latin1 one.
+/// - `ESCAPE ''` turns escaping *off* rather than selecting a character:
+///   `'a%' LIKE 'a\%' ESCAPE ''` is 0, where the same pattern with no ESCAPE
+///   clause is 1.
+/// - `ESCAPE NULL` is not that. It leaves the default backslash in place, so
+///   `'a%' LIKE 'a\%' ESCAPE NULL` is 1 — the one place here where NULL does
+///   not propagate.
+/// - A non-string is converted first: `ESCAPE 1` is `1`, `ESCAPE TRUE` is `1`,
+///   `ESCAPE x'21'` is `!`, and `ESCAPE 1.5` is three characters and an error.
+/// - Anything longer than one character is ER_WRONG_ARGUMENTS.
+/// - A *binary* string is counted in bytes, because that is what one of its
+///   characters is: `ESCAPE x'FF'` is one character and legal on 8.3, and
+///   `ESCAPE x'C3A9'` is two and 1210 — where the same two bytes written as
+///   text, `ESCAPE 'é'`, are one character and legal. `ESCAPE x''` is off,
+///   like `ESCAPE ''`.
+///
+/// Called at resolve time as well as per row, by `exec::malformed_escape`,
+/// because 8.3 raises 1210 for a statement it never evaluates: over an empty
+/// table, and down a CASE branch that is not taken.
+pub(crate) fn like_escape(clause: Option<&ValueWithSpan>) -> EngineResult<Option<char>> {
+    // MySQL escapes with a backslash unless told otherwise. ORMs escape user
+    // input that way and omit the ESCAPE clause, so leaving this as None
+    // makes `contains` filters return nothing.
+    //
+    // NO_BACKSLASH_ESCAPES takes it away on 8.3, and this engine does not
+    // model that mode at all — not here and not in the tokenizer — so the
+    // default does not consult it. Measured with the pattern held constant:
+    // `SELECT 'a%' LIKE 'a\%', HEX('a\%')` answers `1, 615C25` by default and
+    // `0, 615C25` under the mode, so the same three bytes stop escaping.
+    const DEFAULT: Option<char> = Some('\\');
+
+    let Some(clause) = clause else {
+        return Ok(DEFAULT);
+    };
+    let named = literal(&clause.value)?;
+    if named.is_null() {
+        return Ok(DEFAULT);
+    }
+
+    // A binary string is measured and read as bytes, before `as_text` gets to
+    // it. Going through `as_text` decodes lossily, which turned `ESCAPE x'FF'`
+    // and `ESCAPE x'FE'` into the same one-character escape — U+FFFD, a
+    // character neither of them names and no pattern can contain — and let
+    // `ESCAPE x'C3A9'` through as one character where 8.3 counts two and
+    // raises 1210.
+    if let Value::Bytes(bytes) = &named {
+        return match bytes[..] {
+            [] => Ok(None),
+            [byte] if byte.is_ascii() => Ok(Some(char::from(byte))),
+            // 8.3 escapes with the byte itself. This engine matches over
+            // `char`s — both operands reach `functions::like` through
+            // `as_text` — so it has no way to name a byte that is not one,
+            // and refuses rather than escaping with something else. The
+            // collation work that would fix it is #0134.
+            [_] => Err(unsupported(
+                "a LIKE escape that is a byte rather than a character",
+            )),
+            _ => Err(wrong_escape()),
+        };
+    }
+
+    let text = named.as_text();
+    let mut chars = text.chars();
+    let first = chars.next();
+    if chars.next().is_some() {
+        return Err(wrong_escape());
+    }
+    // `None` from an empty string, which is the same "no escape character" the
+    // matcher already understands rather than a separate state.
+    Ok(first)
+}
+
+/// ER_WRONG_ARGUMENTS, which 8.3 words for the clause rather than for the
+/// value it was given.
+fn wrong_escape() -> EngineError {
+    EngineError::new(1210, "HY000", "Incorrect arguments to ESCAPE")
 }
 
 /// Converts a literal from the AST.

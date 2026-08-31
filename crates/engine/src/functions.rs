@@ -1492,9 +1492,13 @@ fn like_at(t: &[char], mut ti: usize, p: &[char], mut pi: usize, escape: Option<
 
         if Some(ch) == escape {
             // An escaped character must match literally.
-            let Some(next) = p.get(pi + 1) else {
-                return false;
-            };
+            //
+            // A trailing escape has nothing to escape, and 8.3 matches it
+            // against itself rather than failing the whole pattern:
+            // `'a!' LIKE 'a!' ESCAPE '!'` is 1 there, and so is
+            // `'a%' LIKE 'a%' ESCAPE '%'` — the wildcard reading is off even
+            // in the position where the escaping cannot apply.
+            let next = p.get(pi + 1).unwrap_or(&ch);
             if ti >= t.len() || t[ti] != *next {
                 return false;
             }
