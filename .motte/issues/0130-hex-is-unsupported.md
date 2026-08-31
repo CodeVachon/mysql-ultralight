@@ -1,11 +1,11 @@
 ---
 id: 130
 title: HEX is unsupported
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-08-26T11:18:03Z
-updated: 2026-08-26T11:18:03Z
+updated: 2026-08-31T17:26:33Z
 ---
 
 ## Description

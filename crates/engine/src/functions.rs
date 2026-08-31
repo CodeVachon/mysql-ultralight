@@ -52,6 +52,7 @@ const NULL_TOLERANT: &[&str] = &[
 /// which is the direction to drift in.
 const KNOWN: &[&str] = &[
     "abs",
+    "bin",
     "ceil",
     "ceiling",
     "char_length",
@@ -75,7 +76,9 @@ const KNOWN: &[&str] = &[
     "dayofweek",
     "dayofyear",
     "floor",
+    "from_base64",
     "greatest",
+    "hex",
     "hour",
     "if",
     "ifnull",
@@ -140,9 +143,11 @@ const KNOWN: &[&str] = &[
     "substring",
     "sysdate",
     "system_user",
+    "to_base64",
     "trim",
     "truncate",
     "ucase",
+    "unhex",
     "unix_timestamp",
     "upper",
     "user",
@@ -278,6 +283,282 @@ fn soundex_of(mut letters: impl Iterator<Item = char>) -> String {
         out.push('0');
     }
     out
+}
+
+/// The bytes of a value as `HEX`, `TO_BASE64` and `UNHEX` read them.
+///
+/// MySQL's string functions read an argument's *bytes*, and the bytes of a
+/// number are the characters it prints as: `TO_BASE64(255)` is the base64 of
+/// `"255"` and `UNHEX(616263)` is `abc`. A `Value::Bytes` is already bytes and
+/// is handed back untouched, which is the whole reason `HEX` is worth having —
+/// it is the one function that shows what a binary string actually holds.
+fn argument_bytes(value: &Value) -> Vec<u8> {
+    match value {
+        Value::Bytes(bytes) => bytes.clone(),
+        other => other.as_text().into_bytes(),
+    }
+}
+
+/// Uppercase hex, two characters a byte, which is what `HEX` sends.
+///
+/// Both halves are measured: 8.3 answers `HEX('abc')` in upper case, and
+/// `HEX(UNHEX('a'))` is `0A` rather than `A`, so a byte under 16 keeps its
+/// leading zero. Only the *numeric* branch drops leading zeros, and it does so
+/// over the whole 64-bit number rather than per byte.
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+}
+
+/// The 64-bit pattern `HEX` renders for a numeric argument.
+///
+/// A separate reading from the string one, and MySQL picks between them by the
+/// argument's *type*: `HEX(255)` is `FF` where `HEX('255')` is `323535`. The
+/// number is taken modulo 2^64, so a negative one comes back as its two's
+/// complement — `HEX(-1)` is sixteen Fs on 8.3.
+///
+/// The three ways of rounding here were measured rather than shared, because
+/// they disagree. A DECIMAL rounds half *away from zero* — `HEX(2.5)` is 3 and
+/// `HEX(-2.5)` is `...FD` — and saturates silently at the BIGINT bounds when
+/// it is too big, which is `HEX(CAST(1e30 AS DECIMAL(35,0)))` answering
+/// `7FFFFFFFFFFFFFFF`. A DOUBLE rounds half *to even* — `HEX(2.5e0)` is 2 where
+/// `HEX(3.5e0)` is 4 — and raises 1690 rather than saturating.
+///
+/// One shape is out of reach and it is the literal: 8.3 answers
+/// `HEX(1e30)` with `7FFFFFFFFFFFFFFF` and `HEX(1e30 + 0)` with 1690, because
+/// the literal's conversion is unchecked where the expression's is. This
+/// engine cannot tell a folded literal from anything else that produced the
+/// same double, and 1690 is the answer for every shape but that one — so it
+/// raises 1690 there too rather than saturating everywhere and being wrong
+/// about the arithmetic instead.
+fn hex_integer(value: &Value) -> EngineResult<u64> {
+    Ok(match value {
+        Value::Int(v) => *v as u64,
+        Value::Unsigned(v) => *v,
+        Value::Bool(b) => u64::from(*b),
+        Value::Decimal(text) if is_plain_decimal(text) => {
+            // `units` at scale 0 is the half-away-from-zero rounding MySQL
+            // does. `None` can only be more digits than an `i128` holds now
+            // that the guard above has established the text *is* digits, and
+            // that is past saturation in whichever direction the sign points.
+            let rounded = crate::decimal::units(text, 0).unwrap_or_else(|| {
+                if text.trim().starts_with('-') {
+                    i128::MIN
+                } else {
+                    i128::MAX
+                }
+            });
+            rounded.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64 as u64
+        }
+        // Everything else, and a `Value::Decimal` the guard above turned away
+        // with it: reading an unparseable one for its leading number gives 0,
+        // where sharing the saturation above would have invented the largest
+        // BIGINT there is.
+        other => {
+            let rounded = other.as_number().round_ties_even();
+            // Half-open at the top and closed at the bottom, because
+            // `i64::MAX` has no exact double: the nearest one is 2^63, which
+            // is out of range, and 8.3 raises 1690 for it.
+            if !(-(2f64.powi(63))..2f64.powi(63)).contains(&rounded) {
+                return Err(EngineError::new(
+                    1690,
+                    "22003",
+                    "BIGINT value is out of range",
+                ));
+            }
+            rounded as i64 as u64
+        }
+    })
+}
+
+/// Whether a `Value::Decimal` holds what its name says: an optional sign, at
+/// least one digit, and at most one point.
+///
+/// Nothing builds a decimal out of anything else today — they are rendered
+/// from digits at a known scale — so this is about how the *next* thing to
+/// build one would fail rather than about a case that exists. Without it,
+/// [`crate::decimal::units`] returning `None` means two unrelated things at
+/// once: a number with more digits than an `i128` holds, and text that is not
+/// a number at all. Saturating covers the first and is exactly wrong for the
+/// second, where it would answer `7FFFFFFFFFFFFFFF` — a maximal number nobody
+/// wrote — for a value whose leading number is 0.
+fn is_plain_decimal(text: &str) -> bool {
+    let digits = text.trim().trim_start_matches(['-', '+']);
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    !(whole.is_empty() && fraction.is_empty())
+        && whole.bytes().all(|b| b.is_ascii_digit())
+        && fraction.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `UNHEX`, which is `HEX` backwards and NULL for anything that is not hex.
+///
+/// An odd-length string is not refused: MySQL reads it as if a zero nibble
+/// were written in front of it, so `UNHEX('a')` is the single byte 0x0A —
+/// not NULL, and not 0xA0. Measured on 8.3, along with `UNHEX('61626')` being
+/// `06 16 26`.
+///
+/// Case does not matter on the way in — `UNHEX('c3a9')` and `UNHEX('C3A9')`
+/// are the same two bytes — and nothing else is accepted: a space, a NUL byte
+/// and a minus sign each make the answer NULL rather than being skipped.
+fn unhex(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(bytes.len() / 2 + 1);
+    let mut high = (bytes.len() % 2 == 1).then_some(0u8);
+    for byte in bytes {
+        let nibble = char::from(*byte).to_digit(16)? as u8;
+        match high.take() {
+            Some(high) => out.push(high << 4 | nibble),
+            None => high = Some(nibble),
+        }
+    }
+    Some(out)
+}
+
+/// The base64 alphabet, in the order its digits are numbered.
+const BASE64_DIGITS: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// How many characters MySQL puts on a line of `TO_BASE64` output.
+///
+/// It wraps, which nothing about the function's name says: `TO_BASE64` of 58
+/// bytes is 81 characters on 8.3 and not 80, the extra one being a newline
+/// after the 76th. Never a trailing one — 57 bytes encode to exactly 76
+/// characters and no newline at all — so the break goes *between* lines rather
+/// than after each.
+const BASE64_LINE: usize = 76;
+
+fn to_base64(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let packed = chunk
+            .iter()
+            .chain(std::iter::repeat(&0))
+            .take(3)
+            .fold(0u32, |packed, byte| packed << 8 | u32::from(*byte));
+        for i in 0..4 {
+            // A group short of three bytes ends in padding: two bytes carry
+            // three digits and one byte carries two.
+            encoded.push(if i <= chunk.len() {
+                char::from(BASE64_DIGITS[(packed >> (18 - 6 * i) & 0x3f) as usize])
+            } else {
+                '='
+            });
+        }
+    }
+
+    let mut wrapped = String::with_capacity(encoded.len() + encoded.len() / BASE64_LINE);
+    for (i, line) in encoded.as_bytes().chunks(BASE64_LINE).enumerate() {
+        if i > 0 {
+            wrapped.push('\n');
+        }
+        wrapped.push_str(std::str::from_utf8(line).expect("base64 digits are ASCII"));
+    }
+    wrapped
+}
+
+/// `FROM_BASE64`, which is NULL for anything that is not base64.
+///
+/// Whitespace anywhere in the input is skipped rather than refused, which is
+/// what makes `FROM_BASE64(TO_BASE64(x))` still equal `x` once the wrapping
+/// above has put newlines in it. Measured on 8.3: a space, a tab, a carriage
+/// return, a newline, a vertical tab and a form feed are all ignored.
+///
+/// Everything else is strict. The remaining length must be a multiple of four,
+/// so `FROM_BASE64('YWJ')` is NULL where `FROM_BASE64('YWI=')` is two bytes,
+/// and `=` closes the last group or the answer is NULL — `'Y=Wj'` and
+/// `'=YWJ'` both fail.
+///
+/// Including a *second* padded group, which is worth writing down because
+/// MySQL's decoder has a flag for allowing one and `FROM_BASE64` looks like a
+/// caller that would pass it. Measured on 8.3.0 rather than read:
+/// `FROM_BASE64('YQ==YQ==')` is NULL, and so is `'YQ== YQ=='` with the
+/// whitespace that would separate two chunks, and `'YWI=YWJj'`. Padding ends
+/// the input there as it does here.
+fn from_base64(bytes: &[u8]) -> Option<Vec<u8>> {
+    let digit = |byte: u8| match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    // `is_ascii_whitespace` is missing the vertical tab, which MySQL skips
+    // because its test is C's `isspace`.
+    let packed: Vec<u8> = bytes
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace() && *byte != 0x0b)
+        .collect();
+    if packed.len() % 4 != 0 {
+        return None;
+    }
+    let padding = packed
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'=')
+        .count();
+    if padding > 2 || packed[..packed.len() - padding].contains(&b'=') {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(packed.len() / 4 * 3);
+    for group in packed.chunks(4) {
+        let mut bits = 0u32;
+        for byte in group {
+            // A padding character contributes zero bits, and the bytes it
+            // stands for are dropped below rather than never assembled.
+            bits = bits << 6 | u32::from(if *byte == b'=' { 0 } else { digit(*byte)? });
+        }
+        out.extend_from_slice(&bits.to_be_bytes()[1..]);
+    }
+    out.truncate(out.len() - padding);
+    Some(out)
+}
+
+/// `BIN`, which is `CONV(N, 10, 2)` and reads its argument as MySQL's
+/// `CONV` does — through the characters it prints as, in base ten.
+///
+/// That is not the same as asking the value for its number, and the difference
+/// is measurable in three places on 8.3. `BIN(12.5)` is 1100 — twelve, because
+/// the parse stops at the point, where `HEX(12.5)` rounds to thirteen.
+/// `BIN(1e30)` is 1 — the parse stops at the `e`. And `BIN(DATE '2024-01-05')`
+/// is 11111101000, which is 2024 rather than the packed 20240105 a temporal
+/// reads as everywhere else.
+///
+/// `None` is NULL, and it means the empty string alone: `BIN('')` is NULL on
+/// 8.3 where `BIN('abc')` and `BIN(' ')` are both `0`.
+fn bin_digits(text: &str) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    let text = text.trim_start();
+    let (negative, digits) = match text.strip_prefix(['-', '+']) {
+        Some(rest) => (text.starts_with('-'), rest),
+        None => (false, text),
+    };
+    // Unsigned, which is what makes `BIN(18446744073709551615)` sixty-four
+    // ones rather than a saturated BIGINT, and the sign is applied to the
+    // pattern afterwards: `BIN(-1)` is also sixty-four ones.
+    let mut magnitude = 0u64;
+    let mut overflowed = false;
+    for digit in digits.bytes().map_while(|b| char::from(b).to_digit(10)) {
+        match magnitude
+            .checked_mul(10)
+            .and_then(|shifted| shifted.checked_add(u64::from(digit)))
+        {
+            Some(next) => magnitude = next,
+            None => overflowed = true,
+        }
+    }
+    // Measured rather than derived, because the two directions saturate
+    // differently: `BIN('99999999999999999999999999')` is sixty-four ones and
+    // the same number negated is `0`.
+    let value = match (overflowed, negative) {
+        (true, false) => u64::MAX,
+        (true, true) => 0,
+        (false, true) => magnitude.wrapping_neg(),
+        (false, false) => magnitude,
+    };
+    Some(format!("{value:b}"))
 }
 
 /// A value with no fractional part, as an integer where one will hold it.
@@ -751,6 +1032,89 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
                     .collect::<String>(),
             )
         }
+
+        // -- bytes and the characters that describe them --------------------
+        //
+        // `HEX` is the reason this group exists. It is the only function that
+        // makes a byte-level answer visible at all, so without it no
+        // differential case could ask what any other function returns in
+        // bytes — #0074's binary-charset bug had to be found by reading
+        // MySQL's source, because `HEX(SOUNDEX(...))` was not a statement this
+        // engine could answer.
+        //
+        // `HEX` reads a string as its bytes and a number as its 64-bit
+        // pattern, and MySQL picks between the two by the argument's declared
+        // *type* rather than by what it holds. Matched on the value here,
+        // which is the same split for every type this engine has: a temporal,
+        // an ENUM and a document all take the string branch on 8.3 —
+        // `HEX(DATE '2024-01-05')` is the hex of `2024-01-05` and not of
+        // 20240105 — and every number takes the other one.
+        //
+        // The numeric side is named type by type and the string side is the
+        // fallback, which is the direction to drift in: a variant added later
+        // is a string until somebody measures it, and being wrong that way is
+        // `HEX(x)` showing the characters rather than a number nothing meant.
+        "hex" => Value::text(match arg(0) {
+            Value::Bytes(bytes) => hex_of(&bytes),
+            number @ (Value::Int(_)
+            | Value::Unsigned(_)
+            | Value::Bool(_)
+            | Value::Decimal(_)
+            | Value::Float(_)
+            | Value::Float32(_)) => format!("{:X}", hex_integer(&number)?),
+            string => hex_of(string.as_text().as_bytes()),
+        }),
+        // Bytes, not text, and the reason is that a `String` cannot hold the
+        // answer: `UNHEX('FF')` is a byte that is not valid UTF-8, and going
+        // through a lossy decode to store it would make `HEX(UNHEX('FF'))`
+        // answer `EFBFBD` rather than `FF`. That is what the tag buys, and it
+        // is what the test asserts.
+        //
+        // What it does *not* buy, today, is the comparison. 8.3 answers
+        // `UNHEX('4142') = 'AB'` 1 and `= 'ab'` 0, because the answer carries
+        // the binary collation; this engine answers 1 to both, because
+        // `Value::compare` takes its byte-exact branch only when *both* sides
+        // are bytes and sends a bytes-against-text pair to the collation
+        // instead. That gap is older and wider than these functions — a
+        // VARBINARY column and a `CAST(x AS BINARY)` compare the same wrong
+        // way — and it is #0139. Named here so the tag is not read as having
+        // closed it.
+        //
+        // There is no numeric branch. `UNHEX(616263)` is `abc` because the
+        // number prints as those six characters, and `UNHEX(12.5)` and
+        // `UNHEX(-1)` are NULL because a point and a minus sign are not hex.
+        "unhex" => match unhex(&argument_bytes(&arg(0))) {
+            Some(bytes) => Value::Bytes(bytes),
+            None => Value::Null,
+        },
+        // Text on the way out where `FROM_BASE64` is bytes, measured: 8.3
+        // sends `TO_BASE64(x)` as `cs=45 flags=[]` and `FROM_BASE64(x)` as
+        // `cs=63 flags=[BINARY]`.
+        "to_base64" => Value::text(to_base64(&argument_bytes(&arg(0)))),
+        "from_base64" => match from_base64(&argument_bytes(&arg(0))) {
+            Some(bytes) => Value::Bytes(bytes),
+            None => Value::Null,
+        },
+        // A binary string is refused rather than read one of the two ways
+        // MySQL reads one. `CONV` — which `BIN` is — special-cases a hex or a
+        // bit literal and takes its *number*, so `BIN(X'C3A9')` is
+        // 1100001110101001 on 8.3, while the same bytes in a VARBINARY column
+        // are parsed as digits and give 0. Both arrive here as `Value::Bytes`
+        // and nothing in the value says which, so neither answer can be given
+        // honestly.
+        //
+        // #0141 is the half that would settle it: this engine reads a hex
+        // literal as bytes everywhere, so `X'C3A9' + 0` is 0 here and 50089 on
+        // 8.3. When a literal carries its number, this becomes an answer.
+        "bin" => match arg(0) {
+            Value::Bytes(_) => {
+                return Err(unsupported("`BIN()` over a binary string"));
+            }
+            other => match bin_digits(&other.as_text()) {
+                Some(digits) => Value::text(digits),
+                None => Value::Null,
+            },
+        },
 
         // -- null handling ------------------------------------------------
         //
@@ -1726,6 +2090,34 @@ mod known_names {
             missing.is_empty(),
             "listed in KNOWN but not dispatched: {missing:?}"
         );
+    }
+
+    /// The one branch of `HEX` no statement can reach, asserted at the level it
+    /// exists at.
+    ///
+    /// Nothing builds a `Value::Decimal` out of anything but digits, so this
+    /// is about the failure mode rather than about a case: `decimal::units`
+    /// answers `None` both for a number too wide for an `i128` and for text it
+    /// cannot read, and only the first of those is saturation. Sharing one
+    /// arm made an unreadable decimal the largest BIGINT there is.
+    #[test]
+    fn a_decimal_that_is_not_digits_is_not_a_saturated_number() {
+        let session = Session::new(crate::session::ServerConfig::default(), 1);
+        let hex = |text: &str| {
+            call("hex", vec![Value::Decimal(text.to_owned())], &session)
+                .expect("in range")
+                .as_text()
+        };
+        // Too wide for an `i128`, which really is saturation in both
+        // directions — this is the reachable half, through
+        // `HEX(CAST(1e30 AS DECIMAL(35,0)))`.
+        assert_eq!(hex(&"9".repeat(60)), "7FFFFFFFFFFFFFFF");
+        assert_eq!(hex(&format!("-{}", "9".repeat(60))), "8000000000000000");
+        // And not digits at all, which is read for its leading number the way
+        // every other unrecognised value is.
+        assert_eq!(hex("abc"), "0");
+        assert_eq!(hex(""), "0");
+        assert_eq!(hex("1.2.3"), "1");
     }
 
     #[test]

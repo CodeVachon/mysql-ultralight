@@ -3048,4 +3048,197 @@ pub const GROUPS: &[Group] = &[
                   ORDER BY ORDINAL_POSITION"),
         ],
     },
+    Group {
+        // The group that makes the byte level visible at all.
+        //
+        // Every other group here compares what a statement *prints*, so two
+        // answers that print the same are the same answer. `HEX` is the one
+        // function that breaks that tie -- and until it existed no case in
+        // this file could ask what any function returns in bytes. #0074's
+        // binary-charset bug was found by reading MySQL's source and probing
+        // by hand for exactly that reason, and the SOUNDEX cases below are the
+        // measurements that issue had to take against MySQL alone.
+        //
+        // So the point of the group is not `HEX`. It is that everything under
+        // "seen through HEX" is a question about another function, asked at a
+        // resolution this corpus did not have.
+        name: "bytes and the characters that describe them",
+        setup: &[
+            "CREATE TABLE Byt (id INT NOT NULL, b VARBINARY(20) NULL, v VARCHAR(20) NULL, \
+             e ENUM('a','b','c') NULL, s SET('x','y','z') NULL, n INT NULL, \
+             d DECIMAL(10,2) NULL, f FLOAT NULL, bu BIGINT UNSIGNED NULL, dt DATE NULL, \
+             PRIMARY KEY (id))",
+            "INSERT INTO Byt VALUES (1, 'abc', 'abc', 'b', 'x,z', 255, 12.50, 1.5, \
+             18446744073709551615, '2024-01-05')",
+        ],
+        cases: &[
+            // -- HEX itself -------------------------------------------------
+            //
+            // The string branch: the argument's bytes, two uppercase
+            // characters each, and a multi-byte character is all of its bytes.
+            same("SELECT HEX('abc'), HEX(''), HEX(NULL), HEX('\u{20ac}abc')"),
+            same("SELECT HEX(X'C3A9'), HEX(CAST('\u{e9}' AS BINARY))"),
+            // The numeric branch, which MySQL picks by the argument's type
+            // rather than by what it holds: the 64-bit pattern, so a negative
+            // number is its two's complement and zero is a single `0`.
+            same("SELECT HEX(255), HEX(0), HEX(-1), HEX(-255), HEX(TRUE)"),
+            // A DECIMAL rounds half away from zero on the way in. It is not
+            // the rounding a DOUBLE gets -- that one is half to even -- and it
+            // is not the truncation `BIN` does to the same values below.
+            same("SELECT HEX(1.5), HEX(1.4), HEX(-1.5), HEX(2.5), HEX(-2.5), HEX(0.5)"),
+            same("SELECT HEX(18446744073709551615), HEX(9223372036854775807), \
+                  HEX(9223372036854775808)"),
+            // A DOUBLE rounds half to *even*, which is a different answer from
+            // the DECIMAL line above for the same three values: 2.5 goes down
+            // here and up there. Nothing in `HEX(1.5)`, `HEX(d)` or `HEX(f)`
+            // can tell the two apart — every one of them answers the same
+            // under either rule — so this line is the only thing in the corpus
+            // that holds the split to MySQL rather than to a unit test's
+            // memory of it.
+            same("SELECT HEX(0.5e0), HEX(1.5e0), HEX(2.5e0), HEX(3.5e0), HEX(-0.5e0), \
+                  HEX(-1.5e0), HEX(-2.5e0)"),
+            // And the two directions past the BIGINT range, which also
+            // disagree: a DECIMAL saturates silently and a DOUBLE raises 1690.
+            same("SELECT HEX(CAST(1e30 AS DECIMAL(35,0))), \
+                  HEX(CAST(-1e30 AS DECIMAL(35,0)))"),
+            same("SELECT HEX(1e30 + 0)"),
+            // Every kind of stored column, and the split is the whole claim: a
+            // temporal, an ENUM and a SET take the string branch -- `HEX(dt)`
+            // is the hex of `2024-01-05` and not of the packed 20240105 that
+            // the same column reads as in arithmetic -- and every number takes
+            // the other one.
+            same("SELECT HEX(b), HEX(v), HEX(e), HEX(s), HEX(dt) FROM Byt"),
+            same("SELECT HEX(n), HEX(d), HEX(f), HEX(bu) FROM Byt"),
+
+            // -- seen through HEX -------------------------------------------
+            //
+            // #0074's own measurements, which had to be taken against MySQL
+            // alone because this statement did not parse here. The premise
+            // that issue was filed on -- that SOUNDEX emits a lone lead byte
+            // -- is false over utf8mb4, and this is the case that says so.
+            same("SELECT HEX(SOUNDEX('\u{20ac}abc')), HEX(SOUNDEX('\u{b5}abc')), \
+                  HEX(SOUNDEX('\u{e9}abc'))"),
+            // And the bug next door that #0074 did fix: under the binary
+            // charset only an ASCII letter counts, so the accent is skipped
+            // and the answer starts at the `a`.
+            same("SELECT HEX(SOUNDEX(CAST('\u{e9}abc' AS BINARY)))"),
+            // Whether a string function measures in characters or in bytes,
+            // which prints identically either way and does not hex
+            // identically. All four of these count characters.
+            same("SELECT HEX(LEFT('\u{20ac}abc', 2)), HEX(RIGHT('\u{20ac}abc', 2)), \
+                  HEX(SUBSTRING('\u{20ac}abc', 2)), HEX(REVERSE('\u{20ac}ab'))"),
+            same("SELECT HEX(LPAD('\u{e9}', 3, 'x')), HEX(RPAD('\u{e9}', 3, 'x')), \
+                  HEX(SPACE(3))"),
+            same("SELECT HEX(UPPER('\u{e9}')), HEX(LOWER('\u{c9}')), \
+                  HEX(CONCAT('a', '\u{e9}')), HEX(TRIM('  \u{e9}  '))"),
+
+            // -- UNHEX ------------------------------------------------------
+            //
+            // Bytes on the way out, which is the half of these functions that
+            // is a fact about the column rather than about the client: 8.3
+            // describes `UNHEX` with the binary character set where `HEX` gets
+            // the connection's, and this file compares that on every column.
+            same("SELECT UNHEX('4142'), FROM_BASE64('YWJj')"),
+            // An odd-length string is read as if a zero nibble were written in
+            // front of it, so `UNHEX('a')` is one byte and not NULL.
+            same("SELECT HEX(UNHEX('616263')), HEX(UNHEX('61626')), HEX(UNHEX('a')), \
+                  HEX(UNHEX('c3a9')), HEX(UNHEX('C3A9'))"),
+            // Bytes that are not text at all. A lone 0xFF is not valid UTF-8,
+            // so an answer that had been through a lossy decode on the way out
+            // would hex as EFBFBD -- which is a divergence nothing in this
+            // file could have seen before `HEX` was here to ask.
+            same("SELECT HEX(UNHEX('FF')), HEX(UNHEX('C3')), HEX(UNHEX('00FF'))"),
+            // Anything that is not hex is NULL rather than skipped -- a space
+            // and a minus sign included -- and the empty string is the empty
+            // string.
+            same("SELECT UNHEX('zz'), UNHEX('6g'), UNHEX('61 62'), UNHEX('-1'), \
+                  HEX(UNHEX(''))"),
+            // There is no numeric branch at all: the number prints as
+            // characters and those characters are read as hex, so `UNHEX(0)`
+            // is a NUL byte and `UNHEX(12.5)` is NULL for its point.
+            same("SELECT HEX(UNHEX(616263)), HEX(UNHEX(0)), UNHEX(12.5), UNHEX(-1)"),
+            same("SELECT HEX(UNHEX(e)), UNHEX(s), HEX(UNHEX(b)) FROM Byt"),
+            // Over a table, which the engine plans through a different
+            // projection from the bare literal above -- and it is the column
+            // definition being compared here, not the two characters.
+            same("SELECT UNHEX(v), FROM_BASE64(v), HEX(v) FROM Byt"),
+            // And through a group, which is a third projection path again.
+            same("SELECT UNHEX(v), FROM_BASE64(v), HEX(v) FROM Byt GROUP BY v"),
+            // A derived table and a CTE do not go through a projection path at
+            // all: they rebuild the column from its declared type, so they are
+            // the one place a column of bytes could turn back into a column of
+            // characters while every case above stayed green. It did.
+            same("SELECT x, h FROM (SELECT UNHEX('4142') AS x, HEX('ab') AS h) d"),
+            same("WITH c AS (SELECT FROM_BASE64('YWJj') AS x, TO_BASE64('ab') AS h) \
+                  SELECT x, h FROM c"),
+            same("SELECT UNHEX('4142') AS x UNION ALL SELECT UNHEX('4344')"),
+            // And the rows through it, at the byte level: a byte that is not
+            // UTF-8 has to come out of a derived table as the byte that went
+            // in. Nothing but `HEX` can ask that.
+            same("SELECT HEX(x) FROM (SELECT UNHEX('FF') AS x) d"),
+
+            // -- BIN --------------------------------------------------------
+            //
+            // `CONV(N, 10, 2)`, which reads its argument through the
+            // characters it prints as. That is not the number the value
+            // carries, and three cases here say so: `BIN(12.5)` truncates at
+            // the point where `HEX(12.5)` rounded, and `BIN(dt)` is 2024
+            // rather than the packed 20240105.
+            same("SELECT BIN(12), BIN(0), BIN(1), BIN(-1), BIN(255), BIN(TRUE)"),
+            same("SELECT BIN(12.5), BIN(12.4), BIN(-12.5), BIN(18446744073709551615)"),
+            // The empty string alone is NULL: a space, and text with no digits
+            // in it, are both `0`.
+            same("SELECT BIN(''), BIN(' '), BIN('abc'), BIN('12abc'), BIN('abc12'), \
+                  BIN('010')"),
+            same("SELECT BIN(n), BIN(d), BIN(f), BIN(bu), BIN(v), BIN(e), BIN(s), BIN(dt) \
+                  FROM Byt"),
+            // The parse stops at the first character that is not a digit, so
+            // an exponent is worth one bit and a point is worth none.
+            same("SELECT BIN(1e30), BIN(2.5e0), BIN(-2.5e0), BIN('12.5')"),
+            // Overflow, where the two directions do *not* mirror each other:
+            // past the top of a BIGINT UNSIGNED the answer saturates to
+            // sixty-four ones, and past the bottom it is `0` rather than the
+            // sixty-four ones the negation of a saturated magnitude would
+            // give. The boundary either side of it is here too, because a rule
+            // stated only at its extremes is a rule nothing has located.
+            same("SELECT BIN('99999999999999999999999999'), \
+                  BIN('-99999999999999999999999999'), \
+                  BIN('-18446744073709551615'), BIN('-18446744073709551616'), \
+                  BIN('-9223372036854775809')"),
+
+            // -- the base64 pair --------------------------------------------
+            //
+            // The same text-out, bytes-in split `HEX` and `UNHEX` have, over
+            // the same string reading of a number: `TO_BASE64(255)` encodes
+            // the three characters and not the byte.
+            same("SELECT TO_BASE64('abc'), TO_BASE64(''), TO_BASE64(NULL), \
+                  TO_BASE64('\u{e9}'), TO_BASE64(X'C3A9')"),
+            same("SELECT TO_BASE64(255), TO_BASE64(-1), TO_BASE64(12.5), TO_BASE64(0)"),
+            same("SELECT TO_BASE64(b), TO_BASE64(v), TO_BASE64(e), TO_BASE64(s), \
+                  TO_BASE64(dt) FROM Byt"),
+            // It wraps, which nothing about the name says: a newline after
+            // every 76 characters and never a trailing one, so 57 bytes encode
+            // to 76 characters flat and 58 bytes to 81 rather than 80.
+            same("SELECT TO_BASE64('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'), \
+                  TO_BASE64('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')"),
+            same("SELECT HEX(TO_BASE64('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'))"),
+            // Whitespace anywhere is skipped, which is what makes the round
+            // trip survive the wrapping above; everything else is refused with
+            // NULL, including a length that is not a multiple of four and an
+            // `=` anywhere but the end.
+            same("SELECT HEX(FROM_BASE64('YWJj YWJj')), HEX(FROM_BASE64('YQ==')), \
+                  HEX(FROM_BASE64('YWI=')), HEX(FROM_BASE64(''))"),
+            same("SELECT FROM_BASE64('a'), FROM_BASE64('!!!!'), FROM_BASE64('YWJ'), \
+                  FROM_BASE64('YWJj='), FROM_BASE64('Y=Wj'), FROM_BASE64(255)"),
+            // A *second* padded group, which is its own question and not one
+            // the line above asks: `'YWJj='` fails on its length and `'Y=Wj'`
+            // on where the `=` is, where each half of this is well formed on
+            // its own. MySQL's decoder has a flag for allowing multiple
+            // chunks; `FROM_BASE64` does not pass it, and this is the case
+            // that says so rather than a comment claiming it.
+            same("SELECT FROM_BASE64('YQ==YQ=='), FROM_BASE64('YQ== YQ=='), \
+                  FROM_BASE64('YWI=YWJj'), FROM_BASE64('YQ==YWJj')"),
+            same("SELECT HEX(FROM_BASE64(TO_BASE64(b))) FROM Byt"),
+        ],
+    },
 ];

@@ -2151,6 +2151,7 @@ impl Engine {
             let mut column = OutColumn::new(alias, computed_column_type(e, &[], &[]));
             column.nullable = !never_null(e, &[], &[]);
             column.unsigned = unsigned_answer(e, &[], &[]);
+            column.binary_values = binary_answer(e);
             columns.push(column);
             row.push(value);
         }
@@ -2264,6 +2265,7 @@ impl Engine {
                             // one only if it was given a default.
                             column.nullable = !never_null(e, refs, &relation.columns);
                             column.unsigned = unsigned_answer(e, refs, &relation.columns);
+                            column.binary_values = binary_answer(e);
                             columns.push(column);
                             plan.push(Projection::Window(windows.len()));
                             windows.push(values);
@@ -2601,6 +2603,7 @@ impl Engine {
         );
         column.nullable = !never_null(e, &relation.refs(), &relation.columns);
         column.unsigned = unsigned_answer(e, &relation.refs(), &relation.columns);
+        column.binary_values = binary_answer(e);
         Ok((column, Projection::Expr(Box::new(e.clone()))))
     }
 
@@ -2737,6 +2740,7 @@ impl Engine {
                     // even `SUM(1)`: an empty group has nothing to sum.
                     column.nullable = !never_null(e, refs, input_columns);
                     column.unsigned = unsigned_answer(e, refs, input_columns);
+                    column.binary_values = binary_answer(e);
                     column
                 }
             })
@@ -5891,6 +5895,36 @@ fn is_null_literal(e: &Expr) -> bool {
     }
 }
 
+/// Whether a computed column's values are bytes rather than characters.
+///
+/// Two functions, and both were measured: 8.3 describes `UNHEX(x)` and
+/// `FROM_BASE64(x)` with the binary character set and the BINARY flag, and
+/// their partners `HEX(x)` and `TO_BASE64(x)` with the connection's character
+/// set and no flag at all. The pair is the point — one direction of each
+/// conversion produces bytes and the other produces the characters that
+/// describe them.
+///
+/// Not MySQL's rule, which is the expression's collation and travels through
+/// every string function that touches a binary operand. That is #0128, and
+/// #0143 for the aggregate that loses it. This answers only for the function
+/// at the root, so `UNHEX('4142')` is bytes and `CONCAT(UNHEX('4142'), '')` is
+/// not — which is the same shape MySQL gets right and this engine does not,
+/// rather than a new one.
+///
+/// It is not the whole of what carries binariness either: a derived table, a
+/// CTE and a view never reach this, because they rebuild their columns from an
+/// `SqlType`. `OutColumn::sql_type` is the other half.
+fn binary_answer(e: &Expr) -> bool {
+    match e {
+        Expr::Nested(inner) => binary_answer(inner),
+        Expr::Function(f) => matches!(
+            f.name.to_string().to_ascii_lowercase().as_str(),
+            "unhex" | "from_base64"
+        ),
+        _ => false,
+    }
+}
+
 /// Whether an expression's values are unsigned on the wire.
 ///
 /// Measured against MySQL 8.3, and the families do not agree with each other:
@@ -6377,6 +6411,19 @@ fn function_result_type(name: &str) -> Option<ColumnType> {
         | "user" | "current_user" | "session_user" | "system_user" | "uuid" => {
             ColumnType::VarString
         }
+        // The byte-and-character conversions. `BIN` is a VAR_STRING whatever
+        // it was given, because its answer is at most sixty-four digits.
+        //
+        // The other four are a VAR_STRING only while the answer fits one.
+        // MySQL sizes them from the argument — `HEX` doubles its width and
+        // `FROM_BASE64` takes three quarters of it — and reaches for a blob
+        // code when the product outgrows a VARCHAR, so `HEX(bl)` over a `BLOB`
+        // is a MEDIUM_BLOB there and `HEX(j)` over a document a LONG_BLOB.
+        // That is `Item::max_length` arithmetic, which this engine does not
+        // model for any expression: `CONCAT(tx, tx)` and `UPPER(tx)` over a
+        // `TEXT` column are already MEDIUM_BLOB on 8.3 and VAR_STRING here.
+        // These join that gap — #0142 — rather than widening it.
+        "hex" | "unhex" | "to_base64" | "from_base64" | "bin" => ColumnType::VarString,
         _ => return None,
     })
 }

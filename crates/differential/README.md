@@ -72,7 +72,7 @@ Two things fail a run:
 
 So the file only ever shrinks, and it shrinks by fixing things.
 
-**It is empty.** All 1820 statements answer exactly as MySQL 8.3 answers them,
+**It is empty.** All 1904 statements answer exactly as MySQL 8.3 answers them,
 in both protocols — the rows, and every part of the column definition listed
 under "What a column is compared on" below. It started at 108 divergences
 across 66 statements.
@@ -141,6 +141,11 @@ with the binary character set for exactly one review cycle, and no other line in
 `compare.rs` could have seen it: a computed column is out of scope for the width
 and for the flags, and the charset id differs on every text column for a reason
 that is not the engine's. This comparison is the one that would have failed.
+
+`UNHEX` and `FROM_BASE64` are the first computed columns this engine describes
+as bytes rather than as characters, and the comparison is what holds them to
+it: nothing else in a `SELECT UNHEX('4142')` distinguishes the right answer
+from a `VAR_STRING` of text that happens to print the same two characters.
 
 Eleven cases decline it, each with its reason written above it, and both
 directions are MySQL following a collation this engine does not model: a string

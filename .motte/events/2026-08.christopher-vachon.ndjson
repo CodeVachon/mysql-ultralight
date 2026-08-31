@@ -256,3 +256,10 @@
 {"at":"2026-08-31T13:35:09Z","id":138,"by":"Christopher Vachon","as":"user","type":"created","title":"An identifier's rendering leaks into the names the engine reports","state":"Todo"}
 {"at":"2026-08-31T14:42:57Z","id":93,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-08-31T15:07:01Z","id":87,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-08-31T17:24:08Z","id":87,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-08-31T17:26:33Z","id":130,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-08-31T20:28:05Z","id":139,"by":"Christopher Vachon","as":"user","type":"created","title":"A binary string compares against text through the collation","state":"Todo"}
+{"at":"2026-08-31T20:28:05Z","id":140,"by":"Christopher Vachon","as":"user","type":"created","title":"UPPER expands the German sharp s","state":"Todo"}
+{"at":"2026-08-31T20:28:05Z","id":141,"by":"Christopher Vachon","as":"user","type":"created","title":"A hex or bit literal is not read as a number","state":"Todo"}
+{"at":"2026-08-31T20:28:22Z","id":142,"by":"Christopher Vachon","as":"user","type":"created","title":"A computed string column's type code does not widen with its argument","state":"Todo"}
+{"at":"2026-08-31T20:28:22Z","id":143,"by":"Christopher Vachon","as":"user","type":"created","title":"Binariness does not survive an aggregate","state":"Todo"}

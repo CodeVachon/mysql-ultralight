@@ -16713,3 +16713,465 @@ fn a_column_says_whether_its_values_are_bytes() {
         ]
     );
 }
+
+/// Every value below measured on MySQL 8.3 rather than reasoned about, and the
+/// asymmetries are why: `HEX` rounds a decimal where `BIN` truncates one, and
+/// `HEX` reads a number where `UNHEX` reads the characters it prints as.
+#[test]
+fn hex_reads_a_string_as_bytes_and_a_number_as_its_pattern() {
+    let (engine, mut session) = engine();
+
+    for (sql, expected) in [
+        // The string branch: the argument's bytes, uppercase, two characters
+        // each. A multi-byte character is all of its bytes.
+        ("SELECT HEX('abc')", "616263"),
+        ("SELECT HEX('€abc')", "E282AC616263"),
+        ("SELECT HEX('é')", "C3A9"),
+        ("SELECT HEX('')", ""),
+        ("SELECT HEX(NULL)", "NULL"),
+        // A binary string is already bytes, and this is the only function that
+        // shows what one holds.
+        ("SELECT HEX(X'C3A9')", "C3A9"),
+        ("SELECT HEX(CAST('é' AS BINARY))", "C3A9"),
+        // The numeric branch, which MySQL picks by the argument's declared
+        // type. Zero is one character and a negative number is its two's
+        // complement over 64 bits.
+        ("SELECT HEX(255)", "FF"),
+        ("SELECT HEX(0)", "0"),
+        ("SELECT HEX(-1)", "FFFFFFFFFFFFFFFF"),
+        ("SELECT HEX(-255)", "FFFFFFFFFFFFFF01"),
+        ("SELECT HEX(TRUE)", "1"),
+        ("SELECT HEX(18446744073709551615)", "FFFFFFFFFFFFFFFF"),
+        ("SELECT HEX(9223372036854775808)", "8000000000000000"),
+        // A DECIMAL rounds half away from zero.
+        ("SELECT HEX(1.5)", "2"),
+        ("SELECT HEX(1.4)", "1"),
+        ("SELECT HEX(0.5)", "1"),
+        ("SELECT HEX(2.5)", "3"),
+        ("SELECT HEX(-2.5)", "FFFFFFFFFFFFFFFD"),
+        ("SELECT HEX(-0.5)", "FFFFFFFFFFFFFFFF"),
+        // A DOUBLE rounds half to *even*, which is a different answer for the
+        // same three values: 2.5 goes down where the decimal went up.
+        ("SELECT HEX(2.5e0)", "2"),
+        ("SELECT HEX(3.5e0)", "4"),
+        ("SELECT HEX(0.5e0)", "0"),
+        ("SELECT HEX(-2.5e0)", "FFFFFFFFFFFFFFFE"),
+        // A decimal too big for a BIGINT saturates silently where a double
+        // raises 1690 below.
+        (
+            "SELECT HEX(CAST(1e30 AS DECIMAL(35,0)))",
+            "7FFFFFFFFFFFFFFF",
+        ),
+        (
+            "SELECT HEX(CAST(-1e30 AS DECIMAL(35,0)))",
+            "8000000000000000",
+        ),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // A double past the BIGINT range is 1690 rather than a saturated answer.
+    // 8.3 answers the bare literal `HEX(1e30)` with `7FFFFFFFFFFFFFFF` and
+    // every computed form of the same value with 1690, because the literal's
+    // conversion is the unchecked one; this cannot tell the two apart and
+    // takes the answer that is right for everything but the literal.
+    let err = engine
+        .execute(&mut session, "SELECT HEX(1e30 + 0)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1690);
+
+    // A temporal, an ENUM and a SET take the *string* branch, which is the
+    // half of the split a value-shaped dispatch could get wrong: the same DATE
+    // reads as the packed 20240105 in arithmetic and hexes as its characters.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE H (id INT NOT NULL, dt DATE NULL, e ENUM('a','b','c') NULL, \
+         s SET('x','y','z') NULL, n INT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO H VALUES (1, '2024-01-05', 'b', 'x,z', 255)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT HEX(dt), dt + 0, HEX(e), HEX(s), HEX(n) FROM H"
+        ),
+        vec![vec![
+            "323032342D30312D3035",
+            "20240105",
+            "62",
+            "782C7A",
+            "FF"
+        ]]
+    );
+}
+
+#[test]
+fn unhex_is_hex_backwards_and_null_for_anything_that_is_not_hex() {
+    let (engine, mut session) = engine();
+
+    for (sql, expected) in [
+        ("SELECT HEX(UNHEX('616263'))", "616263"),
+        // An odd-length string is read as if a zero nibble were written in
+        // front of it, so this is one byte and not NULL and not 0xA0.
+        ("SELECT HEX(UNHEX('a'))", "0A"),
+        ("SELECT HEX(UNHEX('61626'))", "061626"),
+        ("SELECT HEX(UNHEX('0'))", "00"),
+        // Either case on the way in, and the same bytes out of both.
+        ("SELECT HEX(UNHEX('c3a9'))", "C3A9"),
+        ("SELECT HEX(UNHEX('C3A9'))", "C3A9"),
+        // Bytes that are not text, which is the pair that says the answer is
+        // held as bytes: a lone 0xFF or 0xC3 is not valid UTF-8, and a string
+        // that had been through a lossy decode would hex as EFBFBD here.
+        ("SELECT HEX(UNHEX('FF'))", "FF"),
+        ("SELECT HEX(UNHEX('C3'))", "C3"),
+        // The empty string is the empty string, not NULL.
+        ("SELECT HEX(UNHEX(''))", ""),
+        // Anything that is not a hex digit is NULL rather than skipped — a
+        // space and a minus sign included.
+        ("SELECT UNHEX('zz')", "NULL"),
+        ("SELECT UNHEX('6g')", "NULL"),
+        ("SELECT UNHEX('61 62')", "NULL"),
+        ("SELECT UNHEX('-1')", "NULL"),
+        ("SELECT UNHEX(NULL)", "NULL"),
+        // No numeric branch at all: the number prints as characters and those
+        // characters are read as hex.
+        ("SELECT HEX(UNHEX(616263))", "616263"),
+        ("SELECT HEX(UNHEX(0))", "00"),
+        ("SELECT UNHEX(12.5)", "NULL"),
+        ("SELECT UNHEX(-1)", "NULL"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn the_base64_pair_wraps_its_output_and_refuses_bad_input() {
+    let (engine, mut session) = engine();
+
+    for (sql, expected) in [
+        ("SELECT TO_BASE64('abc')", "YWJj"),
+        ("SELECT TO_BASE64('')", ""),
+        ("SELECT TO_BASE64(NULL)", "NULL"),
+        // The bytes of the value's *characters*, so a number encodes its
+        // digits rather than its pattern — the opposite of `HEX`.
+        ("SELECT TO_BASE64(255)", "MjU1"),
+        ("SELECT TO_BASE64(-1)", "LTE="),
+        ("SELECT TO_BASE64(12.5)", "MTIuNQ=="),
+        ("SELECT TO_BASE64('é')", "w6k="),
+        ("SELECT TO_BASE64(X'C3A9')", "w6k="),
+        ("SELECT HEX(FROM_BASE64('YWJj'))", "616263"),
+        ("SELECT HEX(FROM_BASE64('w6k='))", "C3A9"),
+        ("SELECT HEX(FROM_BASE64('YQ=='))", "61"),
+        ("SELECT HEX(FROM_BASE64('YWI='))", "6162"),
+        ("SELECT HEX(FROM_BASE64(''))", ""),
+        // Whitespace anywhere is skipped, which is what makes the round trip
+        // survive the wrapping below.
+        ("SELECT HEX(FROM_BASE64('YWJj YWJj'))", "616263616263"),
+        // Everything else is NULL: a length that is not a multiple of four, a
+        // character outside the alphabet, and an `=` anywhere but the end.
+        ("SELECT FROM_BASE64('a')", "NULL"),
+        ("SELECT FROM_BASE64('YWJ')", "NULL"),
+        ("SELECT FROM_BASE64('!!!!')", "NULL"),
+        ("SELECT FROM_BASE64('YWJj=')", "NULL"),
+        ("SELECT FROM_BASE64('Y=Wj')", "NULL"),
+        ("SELECT FROM_BASE64('=YWJ')", "NULL"),
+        // A second padded group is refused as well, which earns an entry of
+        // its own: MySQL's decoder has a flag for allowing one, and
+        // `FROM_BASE64` looks like a caller that would pass it. Measured on
+        // 8.3.0 — all three of these are NULL there, whitespace between the
+        // groups or not.
+        ("SELECT FROM_BASE64('YQ==YQ==')", "NULL"),
+        ("SELECT FROM_BASE64('YQ== YQ==')", "NULL"),
+        ("SELECT FROM_BASE64('YWI=YWJj')", "NULL"),
+        ("SELECT FROM_BASE64(255)", "NULL"),
+        ("SELECT FROM_BASE64(NULL)", "NULL"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // It wraps, which nothing about the name says. 57 bytes encode to exactly
+    // 76 characters and get no newline at all; 58 bytes get one after the 76th
+    // and so measure 81 rather than 80. Measured on 8.3.
+    let a57 = "a".repeat(57);
+    let a58 = "a".repeat(58);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            &format!("SELECT LENGTH(TO_BASE64('{a57}')), LENGTH(TO_BASE64('{a58}'))")
+        ),
+        vec![vec!["76", "81"]]
+    );
+    // The break is *between* lines rather than after each, so two full lines
+    // carry one newline and not two: 114 bytes are 152 characters plus one.
+    let a114 = "a".repeat(114);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            &format!("SELECT LENGTH(TO_BASE64('{a114}'))")
+        ),
+        vec![vec!["153"]]
+    );
+    // Where the break falls, which no length above can see: every length this
+    // function produces is a multiple of four, and 76 and 77 give the same
+    // count of them until the output is over fifteen hundred characters long.
+    // The `0A` is the seventy-seventh character, and `HEX` is the only way to
+    // ask where it is.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            &format!("SELECT HEX(TO_BASE64('{a58}'))")
+        ),
+        vec![vec![concat!(
+            // Nineteen groups of `59574668` — the seventy-six characters of
+            // the first line — and then the newline.
+            "59574668595746685957466859574668595746685957466859574668595746685957466859574668",
+            "595746685957466859574668595746685957466859574668595746685957466859574668",
+            "0A59513D3D"
+        )]]
+    );
+
+    // And the round trip closes over the wrapping: the newline the encoder put
+    // in is one of the characters the decoder skips.
+    let a100 = "a".repeat(100);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            &format!("SELECT FROM_BASE64(TO_BASE64('{a100}')) = '{a100}'")
+        ),
+        vec![vec!["1"]]
+    );
+}
+
+#[test]
+fn bin_reads_its_argument_through_the_characters_it_prints_as() {
+    let (engine, mut session) = engine();
+
+    for (sql, expected) in [
+        ("SELECT BIN(12)", "1100"),
+        ("SELECT BIN(0)", "0"),
+        ("SELECT BIN(255)", "11111111"),
+        ("SELECT BIN(TRUE)", "1"),
+        ("SELECT BIN(NULL)", "NULL"),
+        // Unsigned, so a negative number is the same sixty-four bits `HEX`
+        // gives it and the top of the BIGINT UNSIGNED range survives.
+        (
+            "SELECT BIN(-1)",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        ),
+        (
+            "SELECT BIN(18446744073709551615)",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        ),
+        // Through the characters, which is not the number the value carries:
+        // the parse stops at the point where `HEX` rounded, and at the `e` of
+        // an exponent.
+        ("SELECT BIN(12.5)", "1100"),
+        ("SELECT BIN(12.4)", "1100"),
+        ("SELECT BIN(1e30)", "1"),
+        ("SELECT BIN('12abc')", "1100"),
+        ("SELECT BIN('abc12')", "0"),
+        ("SELECT BIN('0x10')", "0"),
+        ("SELECT BIN('010')", "1010"),
+        ("SELECT BIN(' 12')", "1100"),
+        ("SELECT BIN('+12')", "1100"),
+        // The empty string alone is NULL. A space, and text with no digits in
+        // it at all, are both zero.
+        ("SELECT BIN('')", "NULL"),
+        ("SELECT BIN(' ')", "0"),
+        ("SELECT BIN('abc')", "0"),
+        // The two directions saturate differently, which was measured rather
+        // than derived.
+        (
+            "SELECT BIN('99999999999999999999999999')",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        ),
+        ("SELECT BIN('-99999999999999999999999999')", "0"),
+        ("SELECT BIN('-18446744073709551615')", "1"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // A temporal goes through its characters too, so this is 2024 and not the
+    // packed 20240105 the same value reads as in arithmetic.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Bn (id INT NOT NULL, dt DATE NULL, b VARBINARY(9) NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Bn VALUES (1, '2024-01-05', 'abc')",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT BIN(dt), dt + 0 FROM Bn"),
+        vec![vec!["11111101000", "20240105"]]
+    );
+
+    // A binary string is refused rather than answered one of the two ways
+    // MySQL answers one. `CONV` — which `BIN` is — takes the *number* a hex or
+    // a bit literal spells, so `BIN(X'C3A9')` is 1100001110101001 on 8.3,
+    // while the same bytes in a VARBINARY column are read as digits and give
+    // 0. Both arrive as bytes here and nothing in the value says which.
+    for sql in [
+        "SELECT BIN(X'C3A9')",
+        "SELECT BIN(CAST('abc' AS BINARY))",
+        "SELECT BIN(b) FROM Bn",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1235, "expected a refusal for: {sql}");
+    }
+}
+
+/// The half of these functions that is a fact about the column rather than
+/// about the client, and the reason #0130 is worth more than five functions:
+/// a column of bytes described as characters reaches Prisma as a String it
+/// then mangles, and one of characters described as bytes as a Buffer it
+/// refuses to convert.
+///
+/// Measured on 8.3: `UNHEX(x)` and `FROM_BASE64(x)` are `cs=63 flags=[BINARY]`
+/// and `HEX(x)`, `TO_BASE64(x)` and `BIN(x)` are `cs=45 flags=[]`.
+#[test]
+fn unhex_and_from_base64_describe_their_answers_as_bytes() {
+    let (engine, mut session) = engine();
+
+    let bytes = |session: &Session, sql: &str| -> Vec<bool> {
+        engine
+            .describe(session, sql, 0)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                let wire = c.to_wire();
+                assert_eq!(
+                    wire.charset == mysql_ultralight_protocol::column::charset::BINARY,
+                    wire.flags & mysql_ultralight_protocol::column::flags::BINARY != 0,
+                    "the charset and the flag have to agree, for: {sql}"
+                );
+                wire.charset == mysql_ultralight_protocol::column::charset::BINARY
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        bytes(
+            &session,
+            "SELECT HEX('abc'), UNHEX('4142'), BIN(12), TO_BASE64('abc'), FROM_BASE64('YWJj')"
+        ),
+        vec![false, true, false, false, true]
+    );
+    // Read off the expression and not off the value, so a NULL answer is still
+    // described as bytes — which is what 8.3 does, and what a client sizing a
+    // buffer from the metadata needs before any row arrives.
+    assert_eq!(
+        bytes(&session, "SELECT UNHEX(NULL), FROM_BASE64(NULL), HEX(NULL)"),
+        vec![true, true, false]
+    );
+
+    // Over a table, which the engine plans through a different projection from
+    // the bare literals above. The two paths set this field separately, so a
+    // test that only asked one of them would pass with the other unwired.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Bin (id INT NOT NULL, v VARCHAR(20) NULL, PRIMARY KEY (id))",
+    );
+    assert_eq!(
+        bytes(&session, "SELECT UNHEX(v), FROM_BASE64(v), HEX(v) FROM Bin"),
+        vec![true, true, false]
+    );
+    // And through a group, which is a third path. The window one is the fourth
+    // and is unreachable by construction — neither of these is a window
+    // function — so it is set there for the same reason its neighbours are and
+    // has nothing to prove.
+    assert_eq!(
+        bytes(
+            &session,
+            "SELECT UNHEX(v), FROM_BASE64(v), HEX(v) FROM Bin GROUP BY v"
+        ),
+        vec![true, true, false]
+    );
+
+    // The four above are the projection paths. This is the fifth, and it is a
+    // different mechanism — which is why enumerating the four was not enough:
+    // a derived table, a CTE and a view do not re-run `binary_answer` at all.
+    // They rebuild the column from its `SqlType` through
+    // `OutColumn::from_sql_type`, so the widening in `OutColumn::sql_type` is
+    // the only thing that can carry this, and while it could not,
+    // `SELECT x FROM (SELECT UNHEX('4142') AS x) d` came back a utf8mb4 column
+    // still carrying bytes — the mangling these functions exist to stop. All
+    // of these are `cs=63 flags=[BINARY]` on 8.3.
+    for sql in [
+        "SELECT x FROM (SELECT UNHEX('4142') AS x) d",
+        "WITH c AS (SELECT UNHEX('4142') AS x) SELECT x FROM c",
+        "SELECT x FROM (SELECT FROM_BASE64('YWJj') AS x) d",
+        "SELECT UNHEX('4142') AS x UNION ALL SELECT UNHEX('4344')",
+    ] {
+        assert_eq!(bytes(&session, sql), vec![true], "{sql}");
+    }
+    // And the text half of each pair still travels as text through the same
+    // path, so the widening did not simply turn everything binary.
+    for sql in [
+        "SELECT x FROM (SELECT HEX('ab') AS x) d",
+        "WITH c AS (SELECT TO_BASE64('ab') AS x) SELECT x FROM c",
+    ] {
+        assert_eq!(bytes(&session, sql), vec![false], "{sql}");
+    }
+    // `varbinary` and not `binary` or `blob`, which the charset alone cannot
+    // say: all three carry the binary character set and only `varbinary`
+    // leaves the wire type a VAR_STRING. 8.3 sends VAR_STRING for every one of
+    // the statements above, so getting the spelling wrong would announce a
+    // `MYSQL_TYPE_BLOB` or a `MYSQL_TYPE_STRING` under a green charset check.
+    let code = |session: &Session, sql: &str| -> Vec<String> {
+        engine
+            .describe(session, sql, 0)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .map(|c| format!("{:?}", c.ty))
+            .collect()
+    };
+    for sql in [
+        "SELECT x FROM (SELECT UNHEX('4142') AS x) d",
+        "WITH c AS (SELECT FROM_BASE64('YWJj') AS x) SELECT x FROM c",
+        "SELECT UNHEX('4142') AS x UNION ALL SELECT UNHEX('4344')",
+    ] {
+        assert_eq!(code(&session, sql), vec!["VarString"], "{sql}");
+    }
+
+    // The rows survive it too: a byte that is not UTF-8 has to come back out
+    // of a derived table as the byte it went in as.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT HEX(x) FROM (SELECT UNHEX('FF') AS x) d"
+        ),
+        vec![vec!["FF"]]
+    );
+}

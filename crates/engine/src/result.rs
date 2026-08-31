@@ -55,6 +55,20 @@ pub struct OutColumn {
     /// where 8.3 copies the source's. A missing default rather than a wrong
     /// one, which is the side to be on.
     pub origin_table: Option<String>,
+    /// Whether a computed column's values are bytes rather than characters.
+    ///
+    /// A separate field for the same reason `unsigned` below is one: a
+    /// declared column answers this from its `SqlType`, and an expression has
+    /// none to answer from. `UNHEX` and `FROM_BASE64` are the two that need
+    /// it — 8.3 describes both with the binary character set and the BINARY
+    /// flag, and a client reads exactly that to hand back a Buffer rather than
+    /// a String.
+    ///
+    /// It is not MySQL's rule, which is the expression's collation and
+    /// propagates through every string function: `CONCAT(b, '')` over a
+    /// `BLOB` is binary there and text here. That is #0128, and this field is
+    /// the narrow part of it a function can state about its own answer.
+    pub binary_values: bool,
     /// Whether the values are unsigned, for a column with no declared type to
     /// say so.
     ///
@@ -74,6 +88,7 @@ impl OutColumn {
             ty,
             nullable: true,
             unsigned: false,
+            binary_values: false,
             declared: None,
             origin: None,
             origin_table: None,
@@ -88,6 +103,9 @@ impl OutColumn {
             ty: ty.column_type(),
             nullable,
             unsigned: ty.unsigned,
+            // A declared column answers this from its own type, in the
+            // `binary_collation` and charset arms of `to_wire` below.
+            binary_values: false,
             declared: Some(ty.clone()),
             origin: None,
             origin_table: None,
@@ -116,9 +134,27 @@ impl OutColumn {
     /// built from this, and the widened fallback is signed, so wrapping a
     /// computed column in a subquery used to lose a flag the bare expression
     /// had.
+    ///
+    /// So does binariness, for the same reason and with the same consequence.
+    /// A relation built from this is re-described through
+    /// [`OutColumn::from_sql_type`], which reads *only* the type — so a
+    /// widening that came back textual made `SELECT x FROM (SELECT UNHEX(x)
+    /// AS x) d` a utf8mb4 column carrying bytes that are not UTF-8, which is
+    /// the exact mangling `UNHEX` answering bytes exists to stop. MySQL agrees
+    /// that the widening is a *type*: a view over `UNHEX('4142')` is declared
+    /// `varbinary(8)` on 8.3, and the derived table, the CTE and the UNION all
+    /// come back `cs=63 flags=[BINARY]`.
+    ///
+    /// The width is 512 rather than 8 for the same reason the textual
+    /// widening is `varchar(512)` — this engine has no `Item::max_length`
+    /// arithmetic — and the two are kept the same shape deliberately.
     pub fn sql_type(&self) -> SqlType {
         self.declared.clone().unwrap_or_else(|| {
-            let mut widened = SqlType::from_column_type(self.ty);
+            let mut widened = if self.binary_values {
+                SqlType::widened_binary()
+            } else {
+                SqlType::from_column_type(self.ty)
+            };
             if self.unsigned {
                 widened.unsigned = true;
                 // The spelling too, not only the flag: `declared` *is*
@@ -195,6 +231,13 @@ impl OutColumn {
         let computed_document = self.declared.is_none() && self.ty == ColumnType::Json;
         if self.declared.is_none() && blob {
             def = def.as_text(true);
+        }
+        // The one expression that says its own answer is bytes. Set after the
+        // blob correction above rather than before it, so a function that ever
+        // answers bytes under a blob code is not turned back into text by a
+        // rule about `GROUP_CONCAT`.
+        if self.binary_values {
+            def = def.as_text(false);
         }
         // Binary is a claim about the character set first: a column whose
         // values are characters is not binary, whatever else it is — with one

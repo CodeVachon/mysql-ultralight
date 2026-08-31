@@ -228,6 +228,24 @@ impl SqlType {
         }
     }
 
+    /// The type a computed column of *bytes* widens to when a relation is
+    /// built from it.
+    ///
+    /// The binary counterpart of the `varchar(512)` catch-all in
+    /// [`Self::from_column_type`], and it has to be a type rather than a flag
+    /// because a derived table, a CTE, a view and a `CREATE TABLE ... AS
+    /// SELECT` all rebuild their columns from an `SqlType` and nothing else.
+    /// MySQL models it the same way — a view over `UNHEX('4142')` is declared
+    /// `varbinary(8)` on 8.3 — and `varbinary` is the spelling that keeps the
+    /// wire type a `VAR_STRING`, where `binary` would make it a `STRING` and
+    /// `blob` a `BLOB`.
+    pub fn widened_binary() -> Self {
+        Self {
+            length: Some(512),
+            ..Self::simple(TypeKind::Blob, "varbinary(512)")
+        }
+    }
+
     /// Recovers a type from a wire type code.
     ///
     /// Used where a result set is fed back in as a relation, such as a view or
