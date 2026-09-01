@@ -13,11 +13,33 @@ use crate::value::Value;
 /// wire if it is projected.
 #[derive(Debug, Clone)]
 pub struct RelColumn {
+    /// The database the wire metadata reports for this column.
     pub schema: String,
+    /// The database a `db.table.column` qualifier must name to reach this
+    /// column, empty where the FROM item is in no database at all.
+    ///
+    /// Not the same fact as `schema`, which is why it is not the same field.
+    /// `schema` describes the *column* — 8.3 reports `probe` for a column of
+    /// `(SELECT b FROM probe.J2) d`, because the metadata follows the field
+    /// behind the derived table. Resolution reads the *table reference*, and
+    /// that derived table is in no database: `SELECT nodb.d.b FROM (SELECT b
+    /// FROM probe.J2) d` answers on 8.3 while `SELECT probe.d.*` from the same
+    /// FROM item is 1051. One field could not be both.
+    pub qualifier_database: String,
     pub table: String,
     pub name: String,
     pub ty: SqlType,
     pub nullable: bool,
+}
+
+impl RelColumn {
+    /// This column in the shape the name matcher and the evaluator read.
+    ///
+    /// Everything that resolves a name goes through here, so the database is
+    /// carried rather than dropped on the way — which is what it used to be.
+    pub fn reference(&self) -> ColumnRef {
+        ColumnRef::in_database(&self.qualifier_database, &self.table, &self.name)
+    }
 }
 
 /// Rows plus their column metadata.
@@ -59,6 +81,11 @@ impl Relation {
                 .iter()
                 .map(|c| RelColumn {
                     schema: schema.to_owned(),
+                    // A table keeps its database under an alias: `SELECT
+                    // probe.x.b FROM J2 x` answers on 8.3, and `SELECT
+                    // probe.x.z FROM other.T x` is 1054. The alias renames the
+                    // table part and leaves the database alone.
+                    qualifier_database: schema.to_owned(),
                     table: shown.to_owned(),
                     name: c.name.clone(),
                     ty: c.ty.clone(),
@@ -81,17 +108,20 @@ impl Relation {
 
     /// Column references in the shape the expression evaluator wants.
     pub fn refs(&self) -> Vec<ColumnRef> {
-        self.columns
-            .iter()
-            .map(|c| ColumnRef::new(&c.table, &c.name))
-            .collect()
+        self.columns.iter().map(RelColumn::reference).collect()
     }
 
-    pub fn index_of(&self, table: Option<&str>, name: &str) -> Option<usize> {
-        self.columns.iter().position(|c| {
-            c.name.eq_ignore_ascii_case(name)
-                && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
-        })
+    pub(crate) fn index_of(&self, written: &crate::name::ColumnParts) -> Option<usize> {
+        self.columns
+            .iter()
+            .position(|c| c.reference().matches(written))
+    }
+
+    /// Whether a `db.table.*` names a FROM item this relation carries.
+    pub(crate) fn has_source(&self, database: Option<&str>, table: &str) -> bool {
+        self.columns
+            .iter()
+            .any(|c| c.reference().in_source(database, table))
     }
 
     /// Appends another relation's columns to this one's, for a join.

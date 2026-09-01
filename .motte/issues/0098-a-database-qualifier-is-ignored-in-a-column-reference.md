@@ -1,11 +1,11 @@
 ---
 id: 98
 title: A database qualifier is ignored in a column reference
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-08-25T14:48:39Z
-updated: 2026-08-25T14:48:39Z
+updated: 2026-09-01T20:36:01Z
 ---
 
 ## Description

@@ -331,6 +331,42 @@ const REFUSED: &[(&str, u16, &str, &str)] = &[
         "42S02",
         "Unknown table 'nope'",
     ),
+    // The database beside the qualifier, which was never compared against
+    // anything: `A` is in scope and `nodb` is not the database it is in, so
+    // 8.3 answers these two and this engine answered rows and every column.
+    // The one that matters is not the misspelling but the statement written
+    // against a *different* schema, which silently read this one.
+    (
+        "SELECT nodb.A.k FROM A",
+        1054,
+        "42S22",
+        "Unknown column 'nodb.A.k' in 'field list'",
+    ),
+    (
+        "SELECT nodb.A.* FROM A",
+        1051,
+        "42S02",
+        "Unknown table 'nodb.A'",
+    ),
+    // Back-quoted, for the reason the pair above it is: the quotes belong to
+    // the spelling, and the database part is read off the identifier like
+    // every other part.
+    (
+        "SELECT `nodb`.`A`.`k` FROM A",
+        1054,
+        "42S22",
+        "Unknown column 'nodb.A.k' in 'field list'",
+    ),
+    // A derived table is in no database, so a qualified wildcard over one is
+    // 1051 whatever database it names — including the right one. The column
+    // form of the same reference answers, and is in
+    // `a_name_in_scope_is_still_in_scope`.
+    (
+        "SELECT t.d.* FROM (SELECT id FROM A) d",
+        1051,
+        "42S02",
+        "Unknown table 't.d'",
+    ),
 ];
 
 /// A reference nothing in scope answers to is refused when the statement is
@@ -446,9 +482,21 @@ fn a_name_in_scope_is_still_in_scope() {
         "SELECT A.id FROM A JOIN B USING (id)",
         // An output alias is in scope in ORDER BY, unlike in WHERE.
         "SELECT k AS ali FROM A ORDER BY ali",
-        // The current database written out in front of the table.
+        // The current database written out in front of the table, on the
+        // reference as well as on the table, and through an alias — which
+        // renames the table part and leaves the database alone.
         "SELECT A.k FROM t.A",
         "SELECT t.A.k FROM A",
+        "SELECT t.A.k FROM t.A",
+        "SELECT t.x.k FROM A x",
+        "SELECT t.A.* FROM A",
+        // A derived table and a CTE are in no database, so the qualifier on a
+        // *column* is compared against nothing there and any database answers.
+        // Measured on 8.3, where the wildcard form of the same reference is
+        // 1051 — the two clauses read the absence in opposite directions.
+        "SELECT nodb.d.k FROM (SELECT id, k FROM A) d",
+        "SELECT t.d.k FROM (SELECT id, k FROM A) d",
+        "WITH c AS (SELECT id, k FROM A) SELECT nodb.c.k FROM c",
         // A wildcard qualified by something that is in scope.
         "SELECT A.* FROM A",
         "SELECT x.* FROM A x",

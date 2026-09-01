@@ -19069,3 +19069,554 @@ fn a_window_is_numbered_over_the_rows_in_sorted_order() {
         vec![vec!["4"], vec!["3"], vec!["2"], vec!["1"]]
     );
 }
+
+/// The `J2`/`K` schema #0098 was measured against, in `testdb` and `otherdb`.
+///
+/// `E` is empty on purpose: a refusal that only happens where a row is
+/// evaluated is a refusal that does not happen at all over an empty relation,
+/// which is the shape three separate issues under #0009 have now been.
+fn two_databases(engine: &Engine, session: &mut Session) {
+    run(engine, session, "CREATE DATABASE otherdb");
+    run(engine, session, "CREATE TABLE J2 (a INT NULL, b INT NULL)");
+    run(engine, session, "INSERT INTO J2 VALUES (1, 2), (3, 4)");
+    run(engine, session, "CREATE TABLE K (a INT NULL, c INT NULL)");
+    run(engine, session, "INSERT INTO K VALUES (1, 9)");
+    run(engine, session, "CREATE TABLE E (a INT NULL, b INT NULL)");
+    run(engine, session, "CREATE VIEW V AS SELECT b FROM J2");
+    run(
+        engine,
+        session,
+        "CREATE TABLE otherdb.T (a INT NULL, z INT NULL)",
+    );
+    run(engine, session, "INSERT INTO otherdb.T VALUES (1, 7)");
+}
+
+/// A three-part name is resolved against the database beside the table.
+///
+/// `column_slot` and `Relation::index_of` read `parts[len - 2]` as the table
+/// and looked at nothing before it, so the database was compared against
+/// nothing: `SELECT nodb.J2.b FROM J2` answered rows and `SELECT nodb.J2.*`
+/// answered every column, where 8.3 is 1054 and 1051. The case that matters is
+/// the one in the middle — a statement written against another schema silently
+/// read this one.
+///
+/// Every refusal below is over a relation nothing is evaluated against: an
+/// empty table, `WHERE 1=0`, `LIMIT 0`, a CASE branch nothing takes. The check
+/// has to be where the item is resolved, because that is where 8.3 settles it
+/// — see #0058, #0093 and #0090, which were the same mistake in three other
+/// clauses.
+#[test]
+fn a_database_qualifier_must_name_the_database_the_table_is_in() {
+    let (engine, mut session) = engine();
+    two_databases(&engine, &mut session);
+
+    for sql in [
+        // The two statements the issue was written from.
+        "SELECT nodb.J2.b FROM J2",
+        "SELECT otherdb.J2.b FROM J2",
+        // ... and the same reference where no row can settle it. Each of
+        // these answered a successful empty result set.
+        "SELECT nodb.E.b FROM E",
+        "SELECT nodb.J2.b FROM J2 WHERE 1 = 0",
+        "SELECT nodb.J2.b FROM J2 LIMIT 0",
+        "SELECT CASE WHEN 0 THEN nodb.J2.b ELSE 9 END FROM J2",
+        // Every other clause that resolves a name, each answered on 8.3 under
+        // its own clause name and all 1054 there.
+        "SELECT b FROM J2 WHERE nodb.J2.a = 1",
+        "SELECT b FROM J2 GROUP BY nodb.J2.b",
+        "SELECT b FROM J2 GROUP BY b HAVING nodb.J2.b > 0",
+        "SELECT b FROM J2 ORDER BY nodb.J2.b",
+        "SELECT J2.b FROM J2 JOIN K ON nodb.J2.a = K.a",
+        "SELECT b FROM J2 WHERE a IN (SELECT a FROM K WHERE nodb.J2.b = 2)",
+        "SELECT nodb.J2.b FROM J2 UNION SELECT 1",
+        // An alias renames the table part and leaves the database alone, so a
+        // wrong database is still wrong through one.
+        "SELECT nodb.x.b FROM J2 x",
+        // The cross-database direction: `T` is in `otherdb`, and naming this
+        // database for it is 1054 on 8.3 exactly as naming one that does not
+        // exist is.
+        "SELECT testdb.T.z FROM otherdb.T",
+        "SELECT testdb.x.z FROM otherdb.T x",
+        // A view is in a database, unlike the query behind it.
+        "SELECT nodb.V.b FROM V",
+        // More parts than MySQL's grammar has levels for. 8.3 answers 1064
+        // here and this engine answers 1054; what matters is that it stops
+        // reading the last two parts and answering rows.
+        "SELECT w.testdb.J2.b FROM J2",
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, 1054, "expected ER_BAD_FIELD_ERROR for: {sql}");
+    }
+
+    // The wildcard's code is 1051, not 1054, and it names the qualifier as it
+    // was written rather than the column.
+    for sql in [
+        "SELECT nodb.J2.* FROM J2",
+        "SELECT otherdb.J2.* FROM J2",
+        "SELECT nodb.E.* FROM E",
+        "SELECT nodb.x.* FROM J2 x",
+        "SELECT nodb.V.* FROM V",
+        "SELECT testdb.T.* FROM otherdb.T",
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, 1051, "expected ER_BAD_TABLE_ERROR for: {sql}");
+    }
+    assert_eq!(
+        refusal_of(&engine, &mut session, "SELECT nodb.J2.* FROM J2").message,
+        "Unknown table 'nodb.J2'"
+    );
+    assert_eq!(
+        refusal_of(&engine, &mut session, "SELECT nodb.J2.b FROM J2").message,
+        "Unknown column 'nodb.J2.b' in 'field list'"
+    );
+
+    // The right database still answers, which is the half a fix can break by
+    // refusing everything: the current database spelled explicitly, the table
+    // qualified by it in the FROM clause, an alias, and a view.
+    for sql in [
+        "SELECT testdb.J2.b FROM J2 ORDER BY 1",
+        "SELECT testdb.J2.b FROM testdb.J2 ORDER BY 1",
+        "SELECT J2.b FROM testdb.J2 ORDER BY 1",
+        "SELECT testdb.x.b FROM J2 x ORDER BY 1",
+        "SELECT testdb.V.b FROM V ORDER BY 1",
+        "SELECT b FROM J2 WHERE testdb.J2.a = 1",
+        "SELECT b FROM J2 GROUP BY testdb.J2.b ORDER BY 1",
+        "SELECT b FROM J2 GROUP BY b HAVING testdb.J2.b > 0 ORDER BY 1",
+        "SELECT b FROM J2 ORDER BY testdb.J2.b",
+        "SELECT J2.b FROM J2 JOIN K ON testdb.J2.a = K.a",
+        "SELECT b FROM J2 WHERE a IN (SELECT a FROM K WHERE testdb.J2.b = 2)",
+    ] {
+        run(&engine, &mut session, sql);
+    }
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT testdb.J2.* FROM J2 ORDER BY 1"
+        ),
+        vec![vec!["1", "2"], vec!["3", "4"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT testdb.x.* FROM J2 x ORDER BY 1"
+        ),
+        vec![vec!["1", "2"], vec!["3", "4"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT otherdb.T.z FROM otherdb.T"),
+        vec![vec!["7"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT otherdb.T.* FROM otherdb.T"),
+        vec![vec!["1", "7"]]
+    );
+
+    // information_schema is a database like any other here, and answers to its
+    // own name and to nothing else.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT information_schema.tables.TABLE_NAME FROM information_schema.tables \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'K'"
+        ),
+        vec![vec!["K"]]
+    );
+    assert_eq!(
+        refusal_of(
+            &engine,
+            &mut session,
+            "SELECT testdb.tables.TABLE_NAME FROM information_schema.tables"
+        )
+        .code,
+        1054
+    );
+}
+
+/// A FROM item that is in no database ignores the qualifier on a column and
+/// refuses it on a wildcard.
+///
+/// Both halves measured on 8.3, over the same derived table: `SELECT nodb.d.b`
+/// answers and `SELECT testdb.d.*` — the database spelled *correctly* — is
+/// `Unknown table 'testdb.d'`. A derived table, a CTE and a JSON_TABLE have no
+/// database for the qualifier to be compared against, and the two clauses read
+/// that absence in opposite directions. A fix that compared the database one
+/// way everywhere gets one of these wrong.
+#[test]
+fn a_from_item_in_no_database_answers_every_column_qualifier_and_no_wildcard() {
+    let (engine, mut session) = engine();
+    two_databases(&engine, &mut session);
+
+    for sql in [
+        "SELECT nodb.d.b FROM (SELECT b FROM J2) d ORDER BY 1",
+        "SELECT testdb.d.b FROM (SELECT b FROM J2) d ORDER BY 1",
+        "WITH c AS (SELECT b FROM J2) SELECT nodb.c.b FROM c ORDER BY 1",
+        "WITH c AS (SELECT b FROM J2) SELECT testdb.c.b FROM c ORDER BY 1",
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec!["2"], vec!["4"]],
+            "expected an answer for: {sql}"
+        );
+    }
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT nodb.jt.v FROM JSON_TABLE('[1,2]', '$[*]' COLUMNS(v INT PATH '$')) jt \
+             ORDER BY 1"
+        ),
+        vec![vec!["1"], vec!["2"]]
+    );
+
+    for sql in [
+        "SELECT testdb.d.* FROM (SELECT b FROM J2) d",
+        "SELECT nodb.d.* FROM (SELECT b FROM J2) d",
+        "WITH c AS (SELECT b FROM J2) SELECT testdb.c.* FROM c",
+        "SELECT testdb.jt.* FROM JSON_TABLE('[1,2]', '$[*]' COLUMNS(v INT PATH '$')) jt",
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, 1051, "expected ER_BAD_TABLE_ERROR for: {sql}");
+    }
+
+    // The unqualified wildcard over the same item still answers, so the
+    // refusal above is about the database and not about the item.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT d.* FROM (SELECT b FROM J2) d ORDER BY 1"
+        ),
+        vec![vec!["2"], vec!["4"]]
+    );
+}
+
+/// A write whose target is qualified by the wrong database is refused.
+///
+/// The worst shape of this bug: `UPDATE J2 x JOIN K ... SET nodb.x.b = 1`
+/// wrote to `testdb`.`J2`.`b`, and `INSERT INTO J2 (nodb.J2.a)` inserted into
+/// `testdb`.`J2`.`a`, because both resolved the target by its last part alone.
+/// A wrong answer a client cannot see, since the statement reports rows
+/// affected exactly as a correct one would.
+///
+/// The single-table `UPDATE`'s and `DELETE`'s own names are #0102's: they
+/// resolve nothing at prepare time, so there is no qualifier there to compare
+/// yet. What they do resolve — per row, while evaluating — now carries the
+/// database, which is the last block below.
+#[test]
+fn a_write_qualified_by_the_wrong_database_is_refused() {
+    let (engine, mut session) = engine();
+    two_databases(&engine, &mut session);
+
+    // The message names every part, not just the column: which qualifier was
+    // wrong is the whole content of the refusal.
+    assert_eq!(
+        refusal_of(
+            &engine,
+            &mut session,
+            "UPDATE J2 x JOIN K ON x.a = K.a SET nodb.x.b = 1"
+        )
+        .message,
+        "Unknown column 'nodb.x.b' in 'field list'"
+    );
+    assert_eq!(
+        refusal_of(&engine, &mut session, "UPDATE J2 SET nodb.J2.b = 1").message,
+        "Unknown column 'nodb.J2.b' in 'field list'"
+    );
+    assert_eq!(
+        refusal_of(
+            &engine,
+            &mut session,
+            "INSERT INTO J2 (nodb.J2.a) VALUES (9)"
+        )
+        .message,
+        "Unknown column 'nodb.J2.a' in 'field list'"
+    );
+
+    for sql in [
+        "UPDATE J2 x JOIN K ON x.a = K.a SET nodb.x.b = 1",
+        "UPDATE J2 x JOIN K ON x.a = K.a SET otherdb.x.b = 1",
+        "INSERT INTO J2 (nodb.J2.a) VALUES (9)",
+        "INSERT INTO J2 (otherdb.J2.a) VALUES (9)",
+        // The table half of the same qualifier, which was discarded too:
+        // `K` is in scope and is not the table being inserted into.
+        "INSERT INTO J2 (K.a) VALUES (9)",
+        "INSERT INTO J2 (a, b) VALUES (1, 2) ON DUPLICATE KEY UPDATE nodb.J2.b = 1",
+        // The single-table SET target, which read its last part and nothing
+        // else — so the table half of the qualifier was discarded too.
+        "UPDATE J2 SET nodb.J2.b = 1",
+        "UPDATE J2 SET otherdb.J2.b = 1",
+        "UPDATE J2 SET K.b = 1",
+        "UPDATE J2 x SET nodb.x.b = 1",
+        // Over an empty table as well: the targets are resolved before any row
+        // is considered, so this does not depend on there being one.
+        "UPDATE E SET nodb.E.b = 1",
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, 1054, "expected ER_BAD_FIELD_ERROR for: {sql}");
+    }
+
+    // The right database writes, as on 8.3.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE J2 x JOIN K ON x.a = K.a SET testdb.x.b = 5"
+        ),
+        1
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "INSERT INTO J2 (testdb.J2.a) VALUES (9)"
+        ),
+        1
+    );
+    assert_eq!(
+        affected(&engine, &mut session, "INSERT INTO J2 (J2.a) VALUES (10)"),
+        1
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE J2 SET testdb.J2.b = 7 WHERE a = 10"
+        ),
+        1
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE J2 x SET testdb.x.b = 8 WHERE a = 10"
+        ),
+        1
+    );
+    assert_eq!(
+        affected(&engine, &mut session, "UPDATE E SET testdb.E.b = 1"),
+        0
+    );
+
+    // Read per row rather than resolved up front — #0102 — so this bites only
+    // where a row reaches the evaluation. Over an empty table it still
+    // answers, which is that issue and not this one.
+    for sql in [
+        "UPDATE J2 SET b = b WHERE nodb.J2.a = 1",
+        "UPDATE J2 SET b = nodb.J2.b",
+        "DELETE FROM J2 WHERE nodb.J2.a = 1",
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, 1054, "expected ER_BAD_FIELD_ERROR for: {sql}");
+    }
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "DELETE FROM J2 WHERE testdb.J2.a = 10"
+        ),
+        1
+    );
+}
+
+/// A sort key the source rows answered is kept when another one cannot be.
+///
+/// `sort_rows` used to be all-or-nothing in both directions: one key it could
+/// not evaluate against a source row abandoned the sort entirely, and the
+/// retry then re-derived *every* key from the projected output — where a key
+/// naming a column the select list does not return no longer exists. So each
+/// key worked alone and the mixture was 1054, under the field list's name at
+/// that:
+///
+/// ```text
+/// SELECT id, ROW_NUMBER() OVER () rn FROM t ORDER BY 2, b   -- 1054 'b'
+/// SELECT id, ROW_NUMBER() OVER () rn FROM t ORDER BY 2      -- answered
+/// SELECT id, ROW_NUMBER() OVER () rn FROM t ORDER BY b      -- answered
+/// ```
+///
+/// The order is the assertion, not just the absence of an error. 8.3 numbers a
+/// window down the order the rows *reach* it and sorts afterwards, so the
+/// half-sort a partial fix would apply — ordering the source rows by the key
+/// that did resolve — renumbers the window and answers differently. Every
+/// expectation below was read off 8.3.
+#[test]
+fn a_window_sort_key_does_not_discard_the_keys_beside_it() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Wk (id INT NULL, b INT NULL, s VARCHAR(10) NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Wk VALUES (1, 20, 'x'), (2, 10, 'y'), (3, 30, 'x')",
+    );
+
+    // A position naming the window, then a column the select list omits. `rn`
+    // is 1,2,3 down the table's order — not down `b`'s — and the rows come
+    // back in `rn` order.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, ROW_NUMBER() OVER () rn FROM Wk ORDER BY 2, b"
+        ),
+        vec![vec!["1", "1"], vec!["2", "2"], vec!["3", "3"]]
+    );
+    // The omitted column first and the window second, which is the ordering a
+    // two-pass fix cannot get right: the least significant key is the one that
+    // only exists after the projection.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROW_NUMBER() OVER () rn, s FROM Wk ORDER BY b, 1"
+        ),
+        vec![vec!["2", "y"], vec!["1", "x"], vec!["3", "x"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, ROW_NUMBER() OVER () rn FROM Wk ORDER BY b, 2"
+        ),
+        vec![vec!["2", "2"], vec!["1", "1"], vec!["3", "3"]]
+    );
+    // Named rather than positioned, and descending, so the flags travel with
+    // the carried keys rather than being re-derived beside them.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, ROW_NUMBER() OVER () rn FROM Wk ORDER BY rn DESC, b"
+        ),
+        vec![vec!["3", "3"], vec!["2", "2"], vec!["1", "1"]]
+    );
+    // An alias inside a larger expression reaches the same retry, without a
+    // window anywhere: `q` is substituted for its expression, which the source
+    // row cannot answer either.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, id * 10 q FROM Wk ORDER BY CASE WHEN q > 1 THEN 0 ELSE 1 END, b"
+        ),
+        vec![vec!["2", "20"], vec!["1", "10"], vec!["3", "30"]]
+    );
+    // DISTINCT collapses rows after the sort, which is why the sort moved
+    // ahead of it: the carried keys line up with the projected rows one for
+    // one and a dedup between the two would break that.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT DISTINCT s, ROW_NUMBER() OVER () rn FROM Wk ORDER BY rn DESC"
+        ),
+        vec![vec!["x", "3"], vec!["y", "2"], vec!["x", "1"]]
+    );
+    // And the LIMIT is applied to the finished order rather than to the
+    // half-sorted one.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, ROW_NUMBER() OVER () rn FROM Wk ORDER BY 2, b LIMIT 2"
+        ),
+        vec![vec!["1", "1"], vec!["2", "2"]]
+    );
+    // Each key alone, which worked before and has to keep working.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, ROW_NUMBER() OVER () rn FROM Wk ORDER BY 2"
+        ),
+        vec![vec!["1", "1"], vec!["2", "2"], vec!["3", "3"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, ROW_NUMBER() OVER () rn FROM Wk ORDER BY b"
+        ),
+        vec![vec!["2", "1"], vec!["1", "2"], vec!["3", "3"]]
+    );
+}
+
+/// Two qualified wildcards over a `USING` join put the joined column in the
+/// output twice, and a bare `ORDER BY` on its name is then ambiguous.
+///
+/// Measured on 8.3 rather than reasoned about, because it has been argued both
+/// ways: `SELECT t.*, u.* FROM t JOIN u USING (id) ORDER BY id` is
+/// `Column 'id' in order clause is ambiguous` there, in either order of the
+/// two wildcards, and `GROUP BY id` is the same error under its own clause
+/// name. Only the bare `*` coalesces — `SELECT * FROM t JOIN u USING (id)`
+/// returns one `id`.
+///
+/// The distinction is which scope the clause reads. `WHERE id = 1` resolves
+/// against the FROM clause, where `USING` really has made the two columns one,
+/// and answers; ORDER BY resolves against the *output*, which has two.
+#[test]
+fn a_qualified_wildcard_does_not_coalesce_a_using_column() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Ut (id INT NULL, b INT NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Ut VALUES (1, 20), (2, 10)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Uu (id INT NULL, z INT NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Uu VALUES (1, 7), (2, 8)",
+    );
+
+    for sql in [
+        "SELECT Ut.*, Uu.* FROM Ut JOIN Uu USING (id) ORDER BY id",
+        "SELECT Uu.*, Ut.* FROM Ut JOIN Uu USING (id) ORDER BY id",
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, 1052, "expected ER_NON_UNIQ_ERROR for: {sql}");
+        assert_eq!(err.message, "Column 'id' in order clause is ambiguous");
+    }
+
+    // A position names one output column outright, so it is never ambiguous.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT Ut.*, Uu.* FROM Ut JOIN Uu USING (id) ORDER BY 1"
+        ),
+        vec![vec!["1", "20", "1", "7"], vec!["2", "10", "2", "8"]]
+    );
+    // One wildcard leaves one `id` in the output, and the same clause answers.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT Ut.* FROM Ut JOIN Uu USING (id) ORDER BY id"
+        ),
+        vec![vec!["1", "20"], vec!["2", "10"]]
+    );
+    // The WHERE reads the FROM clause, where USING has made them one column.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT Ut.*, Uu.* FROM Ut JOIN Uu USING (id) WHERE id = 1"
+        ),
+        vec![vec!["1", "20", "1", "7"]]
+    );
+}

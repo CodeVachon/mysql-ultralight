@@ -29,7 +29,7 @@
 //! identifier arrives with the same value as a backquoted one, so nothing
 //! downstream has to know which quote was used.
 
-use sqlparser::ast::{ObjectName, ObjectNamePart};
+use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
 
 /// One part of a name, as it was written.
 ///
@@ -82,6 +82,105 @@ pub(crate) fn quote(value: &str) -> String {
     format!("`{}`", value.replace('`', "``"))
 }
 
+/// A column reference split into the parts MySQL's grammar allows it.
+///
+/// `database` is `Some` only where three parts were written, and it is the
+/// part that used to be dropped: both readers of a compound identifier took
+/// `parts[len - 2]` as the table and looked at nothing before it, so
+/// `nodb.J2.b` asked for `J2`.`b` and answered rows out of a database the
+/// statement never named. A statement written against another schema silently
+/// read this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ColumnParts<'a> {
+    pub database: Option<&'a str>,
+    pub table: Option<&'a str>,
+    pub name: &'a str,
+}
+
+impl<'a> ColumnParts<'a> {
+    /// A bare column name, for a caller holding one rather than a reference as
+    /// it was written — a `USING` list, or a name already resolved elsewhere.
+    pub(crate) fn bare(name: &'a str) -> Self {
+        Self {
+            database: None,
+            table: None,
+            name,
+        }
+    }
+
+    /// The reference as it was written, for an error message.
+    ///
+    /// Every part joined, not just the last: 8.3 reports `Unknown column
+    /// 'nodb.J2.b'`, and naming the column alone would hide which qualifier
+    /// was the problem.
+    pub(crate) fn written(&self) -> String {
+        let mut out = String::new();
+        for part in [self.database, self.table].into_iter().flatten() {
+            out.push_str(part);
+            out.push('.');
+        }
+        out.push_str(self.name);
+        out
+    }
+}
+
+/// Splits the identifiers of a column reference into database, table and name.
+///
+/// Values, not renderings, for the reason this module exists: a table spelled
+/// `` `my.table` `` is one part carrying a dot, and splitting the rendered text
+/// would read it as a qualifier.
+///
+/// `None` above three parts. MySQL's grammar has no fourth level to put one
+/// at, so `SELECT w.probe.J2.b FROM J2` is 1064 on 8.3 — where this engine
+/// took the last two parts and *answered rows*. A reference this cannot split
+/// is one nothing in scope answers to, which is the refusal this engine gives
+/// instead: 1054 rather than 1064, an error rather than a wrong answer, and
+/// the difference in code is its own issue.
+///
+/// `None` for no parts at all, which the parser does not produce and a
+/// `wrapping_sub` used to turn into a lookup of the empty name.
+pub(crate) fn column_parts(parts: &[Ident]) -> Option<ColumnParts<'_>> {
+    let values: Vec<&str> = parts.iter().map(|p| p.value.as_str()).collect();
+    split(&values)
+}
+
+/// [`column_parts`] for a caller that already holds the values.
+///
+/// An assignment target arrives as an `ObjectName`, whose parts are read by
+/// [`parts`] rather than borrowed, and a `USING` list holds strings too.
+pub(crate) fn split<'a>(parts: &[&'a str]) -> Option<ColumnParts<'a>> {
+    match parts {
+        [name] => Some(ColumnParts::bare(name)),
+        [table, name] => Some(ColumnParts {
+            database: None,
+            table: Some(table),
+            name,
+        }),
+        [database, table, name] => Some(ColumnParts {
+            database: Some(database),
+            table: Some(table),
+            name,
+        }),
+        _ => None,
+    }
+}
+
+/// The database and table a `db.tbl.*` names.
+///
+/// The wildcard's half of [`column_parts`], and split here for the same reason:
+/// the caller used to hold the qualifier as one joined string and take
+/// `rsplit('.').next()` as the table, which discarded the database and could
+/// not tell it from a dot inside a name either.
+///
+/// `None` above two parts, which the grammar has no room for.
+pub(crate) fn qualifier(name: &ObjectName) -> Option<(Option<String>, String)> {
+    match parts(name).as_slice() {
+        [table] => Some((None, table.clone())),
+        [database, table] => Some((Some(database.clone()), table.clone())),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +229,83 @@ mod tests {
         assert_eq!(parts(&table_name("db.t")), vec!["db", "t"]);
         assert_eq!(dotted(&table_name("db.t")), "db.t");
         assert_eq!(dotted(&table_name("t")), "t");
+    }
+
+    /// Parses `SELECT <written> FROM t` and hands back the reference's parts.
+    fn idents(written: &str) -> Vec<Ident> {
+        let sql = format!("SELECT {written} FROM t");
+        let statements = Parser::parse_sql(&MySqlDialect {}, &sql).expect("it parses");
+        let sqlparser::ast::Statement::Query(query) = &statements[0] else {
+            panic!("not a query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("not a select");
+        };
+        match &select.projection[0] {
+            sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::CompoundIdentifier(
+                parts,
+            )) => parts.clone(),
+            sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(ident)) => {
+                vec![ident.clone()]
+            }
+            other => panic!("not a column reference: {other}"),
+        }
+    }
+
+    #[test]
+    fn a_three_part_name_keeps_its_database() {
+        let parts = idents("nodb.J2.b");
+        let split = column_parts(&parts).expect("three parts split");
+        assert_eq!(split.database, Some("nodb"));
+        assert_eq!(split.table, Some("J2"));
+        assert_eq!(split.name, "b");
+        assert_eq!(split.written(), "nodb.J2.b");
+    }
+
+    #[test]
+    fn a_shorter_name_has_no_database() {
+        let two = idents("J2.b");
+        let split = column_parts(&two).expect("two parts split");
+        assert_eq!(split.database, None);
+        assert_eq!(split.table, Some("J2"));
+        assert_eq!(split.written(), "J2.b");
+
+        let one = idents("b");
+        let split = column_parts(&one).expect("one part splits");
+        assert_eq!(split.database, None);
+        assert_eq!(split.table, None);
+        assert_eq!(split.written(), "b");
+    }
+
+    #[test]
+    fn a_fourth_part_is_not_a_column_reference() {
+        // 8.3 answers 1064 for this. What matters here is that it does not
+        // split into `J2`.`b` and quietly resolve, which is what reading the
+        // last two parts did.
+        assert!(column_parts(&idents("w.probe.J2.b")).is_none());
+        assert!(column_parts(&[]).is_none());
+    }
+
+    #[test]
+    fn a_dot_inside_a_part_is_not_a_qualifier_in_a_column_reference() {
+        let parts = idents("`my.db`.`my.table`.`my.column`");
+        let split = column_parts(&parts).expect("three parts split");
+        assert_eq!(split.database, Some("my.db"));
+        assert_eq!(split.table, Some("my.table"));
+        assert_eq!(split.name, "my.column");
+    }
+
+    #[test]
+    fn a_wildcard_qualifier_keeps_its_database() {
+        assert_eq!(
+            qualifier(&table_name("nodb.J2")),
+            Some((Some("nodb".to_owned()), "J2".to_owned()))
+        );
+        assert_eq!(qualifier(&table_name("J2")), Some((None, "J2".to_owned())));
+        assert_eq!(
+            qualifier(&table_name("`my.db`.`my.table`")),
+            Some((Some("my.db".to_owned()), "my.table".to_owned()))
+        );
     }
 
     #[test]

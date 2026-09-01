@@ -1040,21 +1040,17 @@ impl Engine {
             SetExpr::SetOperation { .. } | SetExpr::Query(_) | SetExpr::Values(_) => {
                 let mut combined = self.set_expr(session, query.body.as_ref(), outer)?;
                 check_projected_order(&combined.columns, query.order_by.as_ref(), outer)?;
-                self.order_projected(&mut combined, session, query.order_by.as_ref())?;
+                self.order_projected(&mut combined, session, query.order_by.as_ref(), &[])?;
                 apply_limit(&mut combined, session, query)?;
                 return Ok(combined);
             }
             other => return Err(unsupported(format!("query body `{other}`"))),
         };
 
-        let result = self.select(session, select, query.order_by.as_ref(), outer)?;
         // Ordering by an output alias rather than a source column is legal and
-        // could not be resolved against the table, so it is retried here.
-        let pending = result.pending_order;
-        let mut rows = result.result;
-        if pending {
-            self.order_projected(&mut rows, session, query.order_by.as_ref())?;
-        }
+        // cannot be resolved against the table; `select` finishes that itself,
+        // where the keys the source rows *did* answer are still to hand.
+        let mut rows = self.select(session, select, query.order_by.as_ref(), outer)?;
         apply_limit(&mut rows, session, query)?;
         Ok(rows)
     }
@@ -1161,7 +1157,7 @@ impl Engine {
         outer: Option<&OuterRow>,
     ) -> EngineResult<ResultSet> {
         match body {
-            SetExpr::Select(select) => Ok(self.select(session, select, None, outer)?.result),
+            SetExpr::Select(select) => self.select(session, select, None, outer),
             SetExpr::Query(query) => self.query_with_outer(session, query, outer),
             // MySQL 8's table value constructor: `VALUES ROW(1), ROW(2)` is a
             // result in its own right, usable anywhere a SELECT is.
@@ -1428,7 +1424,7 @@ impl Engine {
         select: &Select,
         order: Option<&OrderBy>,
         outer: Option<&OuterRow>,
-    ) -> EngineResult<Ordered> {
+    ) -> EngineResult<ResultSet> {
         // A SELECT with no FROM evaluates its projection once, which is the
         // shape of `SELECT 1` and every driver's preamble query. One row
         // sorts the same whatever the ORDER BY says, but what it may *name*
@@ -1437,7 +1433,7 @@ impl Engine {
         if select.from.is_empty() {
             let result = self.select_without_table(session, select, outer)?;
             check_projected_order(&result.columns, order, outer)?;
-            return Ok(Ordered::sorted(result));
+            return Ok(result);
         }
 
         // A JSON_TABLE in this FROM may take its document from the enclosing
@@ -1565,7 +1561,7 @@ impl Engine {
                 order,
             )?;
             apply_distinct(&mut grouped, select.distinct.as_ref())?;
-            return Ok(Ordered::sorted(grouped));
+            return Ok(grouped);
         }
 
         // Before the HAVING, because that is the order 8.3 resolves in:
@@ -1631,22 +1627,28 @@ impl Engine {
             &refs,
             &relation,
         )?;
-        let pending_order = if keys.is_empty() {
-            false
+        let carried = if keys.is_empty() {
+            None
         } else {
-            // An expression the source row cannot answer is left to the caller
-            // to retry against the projected output, which is how an ORDER BY
-            // over a window function is sorted: the value only exists once the
-            // projection has computed it.
-            !self.sort_rows(session, &refs, &mut matching, &keys)?
+            // A key the source row cannot answer is a window function's value,
+            // which only exists once the projection has computed it. What the
+            // source rows *did* answer comes back here to be finished with it.
+            self.sort_rows(session, &refs, &mut matching, &keys)?
         };
 
         let mut projected = self.project(session, select, &relation, &refs, &matching)?;
+        // Finished here rather than by the caller, and before DISTINCT,
+        // because `carried` lines up with these rows one for one — `project`
+        // yields a row per matching row, in order — and a dedup would break
+        // that alignment. Sorting first is what DISTINCT already assumes:
+        // rows it collapses are equal, so which of them it keeps cannot
+        // change the order, and every key is in the select list by then
+        // because `check_distinct_order` refused the ones that are not.
+        if let Some(carried) = carried {
+            self.order_projected(&mut projected, session, order, &carried)?;
+        }
         apply_distinct(&mut projected, select.distinct.as_ref())?;
-        Ok(Ordered {
-            result: projected,
-            pending_order,
-        })
+        Ok(projected)
     }
 
     /// Applies a HAVING that groups nothing, dropping the rows it rejects.
@@ -1709,8 +1711,26 @@ impl Engine {
     }
 
     /// Sorts source rows in place by keys already resolved against the select
-    /// list. Returns false when one cannot be evaluated against a source row,
-    /// leaving it for the caller to retry against the projected output.
+    /// list.
+    ///
+    /// `None` when every key was answered and the rows are now in order.
+    /// `Some(keys)` when at least one was not — one entry per row, in the
+    /// order the rows arrived, carrying `None` for each key the source row
+    /// cannot answer. The rows are left alone in that case, and the caller
+    /// finishes the sort once the projection has computed what is missing.
+    ///
+    /// What is missing is a window function's value, or an alias for one: it
+    /// exists only after the projection, and the projection numbers the rows
+    /// in the order they reach it. So no key may be applied here when one is
+    /// outstanding — sorting by the half that resolved would renumber the
+    /// window. Measured on 8.3: `SELECT id, ROW_NUMBER() OVER () rn FROM t
+    /// ORDER BY 2, b` numbers `rn` down the *table's* order and then sorts by
+    /// `(rn, b)`.
+    ///
+    /// What resolved is carried rather than thrown away, which is the point of
+    /// the shape: a key that did resolve may name a column the select list
+    /// does not return, and re-deriving every key from the output made that
+    /// same statement 1054 for `b`, under the field list's name at that.
     ///
     /// The clause's own checks — the names it writes, and its ESCAPEs — belong
     /// to `resolve_order_by` rather than here, because this loop turns any
@@ -1722,8 +1742,13 @@ impl Engine {
         refs: &[ColumnRef],
         rows: &mut [&Vec<Value>],
         items: &[SortKey],
-    ) -> EngineResult<bool> {
-        let mut keys: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+    ) -> EngineResult<Option<Vec<Vec<Option<Value>>>>> {
+        // Per key rather than per row, so a key that failed once is not
+        // evaluated again for every remaining row — and so the answer for it
+        // is the same `None` on every row rather than a value on the rows
+        // before the first failure.
+        let mut outstanding = vec![false; items.len()];
+        let mut keys: Vec<Vec<Option<Value>>> = Vec::with_capacity(rows.len());
         for row in rows.iter() {
             let ctx = Context {
                 row: Some(Row {
@@ -1734,23 +1759,44 @@ impl Engine {
                 executor: Some(self),
             };
             let mut key = Vec::with_capacity(items.len());
-            for item in items {
+            for (position, item) in items.iter().enumerate() {
+                if outstanding[position] {
+                    key.push(None);
+                    continue;
+                }
                 match expr::eval(&item.expr, &ctx) {
-                    Ok(v) => key.push(v),
-                    Err(_) => return Ok(false),
+                    Ok(v) => key.push(Some(v)),
+                    Err(_) => {
+                        outstanding[position] = true;
+                        key.push(None);
+                    }
                 }
             }
             keys.push(key);
         }
 
+        if outstanding.iter().any(|o| *o) {
+            for key in &mut keys {
+                for (position, value) in key.iter_mut().enumerate() {
+                    if outstanding[position] {
+                        *value = None;
+                    }
+                }
+            }
+            return Ok(Some(keys));
+        }
+
         let descending: Vec<bool> = items.iter().map(|i| i.descending).collect();
-        let mut paired: Vec<(Vec<Value>, &Vec<Value>)> =
-            keys.into_iter().zip(rows.iter().copied()).collect();
+        let mut paired: Vec<(Vec<Value>, &Vec<Value>)> = keys
+            .into_iter()
+            .map(|key| key.into_iter().map(|v| v.unwrap_or(Value::Null)).collect())
+            .zip(rows.iter().copied())
+            .collect();
         paired.sort_by(|a, b| compare_keys(&a.0, &b.0, &descending));
         for (slot, (_, row)) in rows.iter_mut().zip(paired) {
             *slot = row;
         }
-        Ok(true)
+        Ok(None)
     }
 
     /// Narrows the rows a single-table UPDATE or DELETE touches, in the order
@@ -1936,7 +1982,7 @@ impl Engine {
                 expanded
                     .columns
                     .iter()
-                    .map(|c| ColumnRef::new(&c.table, &c.name)),
+                    .map(crate::relation::RelColumn::reference),
             );
 
             let mut matched = false;
@@ -2037,7 +2083,7 @@ impl Engine {
         let columns = left.joined_columns(&right, outer_right, outer_left);
         let refs: Vec<ColumnRef> = columns
             .iter()
-            .map(|c| ColumnRef::new(&c.table, &c.name))
+            .map(crate::relation::RelColumn::reference)
             .collect();
 
         let condition = match constraint {
@@ -2236,6 +2282,12 @@ impl Engine {
                         .iter()
                         .map(|c| crate::relation::RelColumn {
                             schema: String::new(),
+                            // A derived table is in no database, so 8.3
+                            // compares the qualifier against nothing: `SELECT
+                            // nodb.d.b FROM (SELECT b FROM J2) d` answers
+                            // there. `SELECT probe.d.*` over the same item is
+                            // 1051, which `has_source` is where that lives.
+                            qualifier_database: String::new(),
                             table: name.clone(),
                             name: c.name.clone(),
                             ty: c.sql_type(),
@@ -2376,20 +2428,23 @@ impl Engine {
         // values are computed up front and read back by row index.
         let mut windows: Vec<Vec<Value>> = Vec::new();
 
-        let push_all =
-            |columns: &mut Vec<OutColumn>, plan: &mut Vec<Projection>, table: Option<&str>| {
-                for (i, column) in relation.columns.iter().enumerate() {
-                    if table.is_some_and(|t| !column.table.eq_ignore_ascii_case(t)) {
-                        continue;
-                    }
-                    columns.push(
-                        OutColumn::from_sql_type(&column.name, &column.ty, column.nullable)
-                            .in_table(&column.schema, &column.table)
-                            .projected_from(&column.name, base_table(relation, &column.table)),
-                    );
-                    plan.push(Projection::Column(i));
+        let push_all = |columns: &mut Vec<OutColumn>,
+                        plan: &mut Vec<Projection>,
+                        source: Option<(Option<&str>, &str)>| {
+            for (i, column) in relation.columns.iter().enumerate() {
+                if source
+                    .is_some_and(|(database, table)| !column.reference().in_source(database, table))
+                {
+                    continue;
                 }
-            };
+                columns.push(
+                    OutColumn::from_sql_type(&column.name, &column.ty, column.nullable)
+                        .in_table(&column.schema, &column.table)
+                        .projected_from(&column.name, base_table(relation, &column.table)),
+                );
+                plan.push(Projection::Column(i));
+            }
+        };
 
         // Every name and every ESCAPE in the list, before any of it is read for
         // anything else. Hoisted out of the loop below so the HAVING can be
@@ -2401,9 +2456,11 @@ impl Engine {
             match item {
                 SelectItem::Wildcard(_) => push_all(&mut columns, &mut plan, None),
                 SelectItem::QualifiedWildcard(kind, _) => {
-                    let table = wildcard_qualifier(kind);
-                    let table = table.rsplit('.').next().unwrap_or("");
-                    push_all(&mut columns, &mut plan, Some(table));
+                    // `resolve_field_list` above has already refused a
+                    // qualifier no FROM item answers to, database included.
+                    let (database, table) = wildcard_qualifier(kind)
+                        .ok_or_else(|| EngineError::bad_table(&wildcard_written(kind)))?;
+                    push_all(&mut columns, &mut plan, Some((database.as_deref(), &table)));
                 }
                 SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
                     let alias = match item {
@@ -2716,17 +2773,17 @@ impl Engine {
     ) -> EngineResult<(OutColumn, Projection)> {
         // A bare column reference keeps the column's declared type, which
         // matters: clients decode a result by the type the metadata claims.
+        // No unqualified fallback: `zz.id` must not quietly resolve to some
+        // other table's `id`, and neither must `nodb.J2.b`. Leaving it
+        // unresolved sends it down the expression path, which reports 1054.
+        //
+        // Matched on the two identifier forms rather than through
+        // `column_parts`, which also unwraps `Nested`: `SELECT (b)` is a
+        // computed item on 8.3 and takes its metadata from the expression,
+        // not from the column inside the parentheses.
         let direct = match e {
-            Expr::Identifier(ident) => relation.index_of(None, &ident.value),
-            Expr::CompoundIdentifier(parts) => {
-                let name = parts.last().map(|p| p.value.as_str()).unwrap_or_default();
-                let table = parts
-                    .get(parts.len().wrapping_sub(2))
-                    .map(|p| p.value.as_str());
-                // No unqualified fallback: `zz.id` must not quietly resolve
-                // to some other table's `id`. Leaving it unresolved sends it
-                // down the expression path, which reports 1054.
-                relation.index_of(table, name)
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                column_parts(e).and_then(|written| relation.index_of(&written))
             }
             _ => None,
         };
@@ -3387,11 +3444,26 @@ impl Engine {
     }
 
     /// Sorts an already-projected result, for ORDER BY over output aliases.
+    ///
+    /// `carried` is what the source rows already answered for each key, one
+    /// entry per row of `result` in its own order, with `None` where the
+    /// source row could not answer that key. Empty for a caller that never had
+    /// source rows to ask — a set operation, whose branches are already
+    /// projected by the time their common ORDER BY is read.
+    ///
+    /// A carried value is used in preference to anything derivable here,
+    /// because a key that resolved against a source row may name a column the
+    /// select list does not return: `SELECT id, ROW_NUMBER() OVER () rn FROM t
+    /// ORDER BY 2, b` sorts by `b`, and the output has no `b` in it. Deriving
+    /// every key from the output refused that statement with 1054 for `b`
+    /// where 8.3 answers it — and each of its two keys works alone, so only
+    /// the mixture failed.
     fn order_projected(
         &self,
         result: &mut ResultSet,
         session: &Session,
         order: Option<&OrderBy>,
+        carried: &[Vec<Option<Value>>],
     ) -> EngineResult<()> {
         let Some(order) = order else { return Ok(()) };
         let OrderByKind::Expressions(items) = &order.kind else {
@@ -3400,6 +3472,12 @@ impl Engine {
 
         // Sorting happens over the projected rows, so ORDER BY may only
         // reference output columns. That covers what Prisma emits.
+        //
+        // Without a database, deliberately: a projected result is in none, and
+        // 8.3 treats it the way it treats a derived table — `SELECT b FROM
+        // (SELECT b FROM J2) d ORDER BY nodb.d.b` answers there. Where the
+        // clause does address a FROM item, `resolve_order_by` has already
+        // resolved it against the relation, database included.
         let refs: Vec<ColumnRef> = result
             .columns
             .iter()
@@ -3407,7 +3485,7 @@ impl Engine {
             .collect();
 
         let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(result.rows.len());
-        for row in &result.rows {
+        for (index, row) in result.rows.iter().enumerate() {
             let ctx = Context {
                 row: Some(Row {
                     schema: &refs,
@@ -3417,7 +3495,15 @@ impl Engine {
                 executor: Some(self),
             };
             let mut key = Vec::with_capacity(items.len());
-            for item in items {
+            for (position, item) in items.iter().enumerate() {
+                if let Some(value) = carried
+                    .get(index)
+                    .and_then(|row| row.get(position))
+                    .and_then(Option::as_ref)
+                {
+                    key.push(value.clone());
+                    continue;
+                }
                 // `ORDER BY 2` names the second output column. Evaluated as an
                 // expression it is the constant 2, which gives every row the
                 // same sort key and leaves the result unordered.
@@ -3510,15 +3596,31 @@ impl Engine {
                 .columns
                 .iter()
                 .map(|c| {
-                    // The column, not the whole qualified name: MySQL takes
-                    // `INSERT INTO q (q.a, q.b) VALUES (1, 2)` — measured on
-                    // 8.3, and `INSERT INTO db.q (db.q.a)` with it — where
-                    // matching on the join of every part is 1054 for a column
-                    // called `q.a` that no table has.
-                    let name = name::tail(c);
+                    // The parts, not the join of them: MySQL takes `INSERT
+                    // INTO q (q.a, q.b) VALUES (1, 2)` — measured on 8.3, and
+                    // `INSERT INTO db.q (db.q.a)` with it — where matching on
+                    // the whole name is 1054 for a column called `q.a` that no
+                    // table has.
+                    //
+                    // The qualifier is *compared* rather than dropped, though,
+                    // which is what this used to do: `INSERT INTO J2
+                    // (nodb.J2.a)` and `INSERT INTO J2 (K.a)` are both 1054 on
+                    // 8.3 and both wrote to `J2`.`a` here.
+                    let parts = name::parts(c);
+                    let values: Vec<&str> = parts.iter().map(String::as_str).collect();
+                    let written = name::split(&values).ok_or_else(|| {
+                        EngineError::unknown_column(&parts.join("."), "field list")
+                    })?;
+                    let name = written.name.to_owned();
                     let index = table
-                        .column_index(&name)
-                        .ok_or_else(|| EngineError::unknown_column(&name, "field list"))?;
+                        .columns
+                        .iter()
+                        .position(|column| {
+                            ColumnRef::in_database(&db, &table_name, &column.name).matches(&written)
+                        })
+                        .ok_or_else(|| {
+                            EngineError::unknown_column(&written.written(), "field list")
+                        })?;
                     if table.columns[index].generated.is_some() {
                         return Err(EngineError::new(
                             3105,
@@ -3533,6 +3635,40 @@ impl Engine {
                     Ok(index)
                 })
                 .collect::<EngineResult<_>>()?
+        };
+
+        // Resolved before any row is read, because 8.3 settles it there: a
+        // target no column answers to is 1054 whether or not a row collides,
+        // and `INSERT INTO J2 (a,b) VALUES (1,2) ON DUPLICATE KEY UPDATE
+        // nodb.J2.b = 1` on a table with no unique key raises it having
+        // collided with nothing. Resolving inside the collision branch made
+        // the refusal depend on the data — the same shape as a check living
+        // in a row loop, which is #0009's recurring one.
+        let duplicate_targets: Vec<usize> = match duplicate_key_update {
+            None => Vec::new(),
+            Some(assignments) => assignments
+                .iter()
+                .map(|assignment| {
+                    // The qualifier compared rather than dropped, as in the
+                    // column list above: `... ON DUPLICATE KEY UPDATE
+                    // nodb.J2.b = 1` is 1054 on 8.3 and wrote to `J2`.`b`
+                    // here.
+                    let parts = assignment_parts(&assignment.target)?;
+                    let values: Vec<&str> = parts.iter().map(String::as_str).collect();
+                    let written = name::split(&values).ok_or_else(|| {
+                        EngineError::unknown_column(&parts.join("."), "field list")
+                    })?;
+                    table
+                        .columns
+                        .iter()
+                        .position(|column| {
+                            ColumnRef::in_database(&db, &table.name, &column.name).matches(&written)
+                        })
+                        .ok_or_else(|| {
+                            EngineError::unknown_column(&written.written(), "field list")
+                        })
+                })
+                .collect::<EngineResult<_>>()?,
         };
 
         let mut inserted = 0u64;
@@ -3625,14 +3761,12 @@ impl Engine {
                     let updated_refs: Vec<ColumnRef> = table
                         .columns
                         .iter()
-                        .map(|c| ColumnRef::new(&table.name, &c.name))
+                        .map(|c| ColumnRef::in_database(&db, &table.name, &c.name))
                         .collect();
 
-                    for assignment in assignments {
-                        let column_name = assignment_column(&assignment.target)?;
-                        let slot = table.column_index(&column_name).ok_or_else(|| {
-                            EngineError::unknown_column(&column_name, "field list")
-                        })?;
+                    for (assignment, slot) in assignments.iter().zip(&duplicate_targets) {
+                        let slot = *slot;
+                        let column_name = table.columns[slot].name.clone();
                         // The right-hand side sees the row as it stands, which
                         // is what `c = c + 1` means here — while `VALUES(c)`
                         // names the value the insert would have written, which
@@ -3761,10 +3895,15 @@ impl Engine {
             .table_mut(&table_name)
             .ok_or_else(|| EngineError::no_such_table(&table_name))?;
 
+        // Carrying the database, so a reference qualified by the wrong one is
+        // refused rather than read as this table's: `UPDATE J2 SET b = b WHERE
+        // nodb.J2.a = 1` is 1054 on 8.3. Over an *empty* table nothing
+        // evaluates these at all and the statement still succeeds, which is
+        // the half #0102 owns — the guard belongs beside the one below it.
         let refs: Vec<ColumnRef> = table
             .columns
             .iter()
-            .map(|c| ColumnRef::new(&addressed_as, &c.name))
+            .map(|c| ColumnRef::in_database(&db, &addressed_as, &c.name))
             .collect();
 
         // Before any row is considered, and after the table has been resolved
@@ -3784,25 +3923,41 @@ impl Engine {
         let assigned = assignments.iter().map(|a| &a.value);
         refuse_malformed_escape(selection.into_iter().chain(assigned))?;
 
-        // Checked once, before any row is considered: whether writing to a
-        // generated column is an error must not depend on the data.
-        for assignment in assignments {
-            let column_name = assignment_column(&assignment.target)?;
-            let slot = table
-                .column_index(&column_name)
-                .ok_or_else(|| EngineError::unknown_column(&column_name, "field list"))?;
-            if table.columns[slot].generated.is_some() {
-                return Err(EngineError::new(
-                    3105,
-                    "HY000",
-                    format!(
-                        "The value specified for generated column '{column_name}' in table \
-                         '{}' is not allowed.",
-                        table.name
-                    ),
-                ));
-            }
-        }
+        // Resolved once, before any row is considered: whether writing to a
+        // generated column is an error must not depend on the data, and
+        // neither must whether the target names a column at all.
+        //
+        // Through the same matcher every clause uses, so the qualifier is
+        // compared rather than dropped. Reading only the last part —
+        // `assignment_column` — made `UPDATE J2 SET nodb.J2.b = 1` and
+        // `UPDATE J2 SET nosuch.b = 1` write to `J2`.`b`, where 8.3 answers
+        // 1054 for both. `refs` carries the database this statement's table is
+        // in, which is what makes the first of those reachable from here.
+        let targets: Vec<usize> = assignments
+            .iter()
+            .map(|assignment| {
+                let parts = assignment_parts(&assignment.target)?;
+                let values: Vec<&str> = parts.iter().map(String::as_str).collect();
+                let written = name::split(&values)
+                    .ok_or_else(|| EngineError::unknown_column(&parts.join("."), "field list"))?;
+                let slot = refs
+                    .iter()
+                    .position(|c| c.matches(&written))
+                    .ok_or_else(|| EngineError::unknown_column(&written.written(), "field list"))?;
+                if table.columns[slot].generated.is_some() {
+                    return Err(EngineError::new(
+                        3105,
+                        "HY000",
+                        format!(
+                            "The value specified for generated column '{}' in table \
+                             '{}' is not allowed.",
+                            written.name, table.name
+                        ),
+                    ));
+                }
+                Ok(slot)
+            })
+            .collect::<EngineResult<_>>()?;
 
         let mut updated = 0u64;
         let mut changed: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
@@ -3845,12 +4000,8 @@ impl Engine {
 
             let mut candidate = rows[index].clone();
             let mut assigned: Vec<usize> = Vec::with_capacity(assignments.len());
-            for assignment in assignments {
-                let column_name = assignment_column(&assignment.target)?;
-                let slot = table
-                    .column_index(&column_name)
-                    .ok_or_else(|| EngineError::unknown_column(&column_name, "field list"))?;
-
+            for (assignment, slot) in assignments.iter().zip(&targets) {
+                let slot = *slot;
                 // The right-hand side sees the row as it was before this
                 // statement, so `SET a = b, b = a` swaps rather than copies.
                 let value = expr::eval(&assignment.value, &ctx)?;
@@ -3920,16 +4071,22 @@ impl Engine {
         }
         let mut targets: Vec<Target> = Vec::with_capacity(assignments.len());
         for assignment in assignments {
-            let name = assignment_column(&assignment.target)?;
-            let qualifier = assignment_qualifier(&assignment.target);
+            // Every part, so a target written `nodb.x.b` is refused rather
+            // than writing to `x`.`b`: an assignment whose database is wrong
+            // is the worst shape of this bug, because it writes.
+            let target = assignment_parts(&assignment.target)?;
+            let values: Vec<&str> = target.iter().map(String::as_str).collect();
+            let written = name::split(&values)
+                .ok_or_else(|| EngineError::unknown_column(&target.join("."), "field list"))?;
+            let name = written.name;
 
             // An unqualified name that matches more than one joined table is
             // ambiguous; picking the first would write to an arbitrary one.
-            if qualifier.is_none() {
+            if written.table.is_none() {
                 let matches = relation
                     .columns
                     .iter()
-                    .filter(|c| c.name.eq_ignore_ascii_case(&name))
+                    .filter(|c| c.name.eq_ignore_ascii_case(name))
                     .count();
                 if matches > 1 {
                     return Err(EngineError::new(
@@ -3941,8 +4098,11 @@ impl Engine {
             }
 
             let index = relation
-                .index_of(qualifier.as_deref(), &name)
-                .ok_or_else(|| EngineError::unknown_column(&name, "field list"))?;
+                .index_of(&written)
+                // Every part, as `ColumnParts::written` exists for: naming the
+                // column alone hides which qualifier was the problem, and 8.3
+                // reports `nodb.a.b` here.
+                .ok_or_else(|| EngineError::unknown_column(&written.written(), "field list"))?;
             let source = relation
                 .source_index(&relation.columns[index].table)
                 .ok_or_else(|| unsupported("updating a derived table or view"))?;
@@ -4144,10 +4304,11 @@ impl Engine {
             .table_mut(&table_name)
             .ok_or_else(|| EngineError::no_such_table(&table_name))?;
 
+        // With the database, as on the UPDATE path.
         let refs: Vec<ColumnRef> = table
             .columns
             .iter()
-            .map(|c| ColumnRef::new(&addressed_as, &c.name))
+            .map(|c| ColumnRef::in_database(&db, &addressed_as, &c.name))
             .collect();
 
         // As on the UPDATE path, and for the same reason: the predicate is
@@ -4632,6 +4793,13 @@ impl Engine {
             .iter()
             .map(|c| crate::relation::RelColumn {
                 schema: schema.clone(),
+                // A CTE resolves like a derived table and not like a table:
+                // measured on 8.3, `WITH c AS (...) SELECT nodb.c.b FROM c`
+                // answers and `SELECT probe.c.*` from it is 1051, with the
+                // current database spelled correctly. The wire metadata above
+                // still carries the database, which is why these are two
+                // fields.
+                qualifier_database: String::new(),
                 table: name.to_owned(),
                 name: c.name.clone(),
                 ty: c.sql_type(),
@@ -4703,6 +4871,10 @@ impl Engine {
             };
             rel_columns.push(crate::relation::RelColumn {
                 schema: session.current_database.clone().unwrap_or_default(),
+                // A JSON_TABLE is a derived table, and resolves like one:
+                // `SELECT nodb.jt.v FROM JSON_TABLE(...) jt` answers on 8.3
+                // and `SELECT probe.jt.*` is 1051.
+                qualifier_database: String::new(),
                 table: name.clone(),
                 name: column_name,
                 ty,
@@ -4821,6 +4993,11 @@ impl Engine {
             .enumerate()
             .map(|(i, c)| crate::relation::RelColumn {
                 schema: database.to_owned(),
+                // A view is in a database, unlike the query behind it: 8.3
+                // answers `SELECT probe.V.b FROM V` and refuses
+                // `SELECT nodb.V.b`, and `SELECT probe.V.*` is a result rather
+                // than 1051.
+                qualifier_database: database.to_owned(),
                 table: alias.to_owned(),
                 name: view
                     .columns
@@ -4997,8 +5174,8 @@ fn using_condition(
     let mut condition: Option<Expr> = None;
     for name in names {
         let column = name::dotted(name);
-        let (Some(l), Some(r)) = (left.index_of(None, &column), right.index_of(None, &column))
-        else {
+        let bare = name::ColumnParts::bare(&column);
+        let (Some(l), Some(r)) = (left.index_of(&bare), right.index_of(&bare)) else {
             return Err(EngineError::unknown_column(&column, "from clause"));
         };
         let eq = Expr::BinaryOp {
@@ -5162,28 +5339,6 @@ struct Input<'a> {
     refs: &'a [ColumnRef],
     columns: &'a [crate::relation::RelColumn],
     matching: &'a [&'a Vec<Value>],
-}
-
-/// A result together with whether its ORDER BY still needs applying.
-struct Ordered {
-    result: ResultSet,
-    pending_order: bool,
-}
-
-impl Ordered {
-    fn sorted(result: ResultSet) -> Self {
-        Self {
-            result,
-            pending_order: false,
-        }
-    }
-}
-
-impl std::ops::Deref for Ordered {
-    type Target = ResultSet;
-    fn deref(&self) -> &ResultSet {
-        &self.result
-    }
 }
 
 /// Compares two sort keys, honouring per-column direction.
@@ -6110,10 +6265,14 @@ fn output_items(
     for item in projection {
         let qualifier = match item {
             SelectItem::Wildcard(_) => None,
-            SelectItem::QualifiedWildcard(kind, _) => {
-                let written = wildcard_qualifier(kind);
-                Some(written.rsplit('.').next().unwrap_or("").to_owned())
-            }
+            // Refused rather than expanded to nothing where the qualifier
+            // names no FROM item: `resolve_field_list` has already settled
+            // that for every path that runs one, and a path that reached here
+            // without it would otherwise answer a wildcard with no columns.
+            SelectItem::QualifiedWildcard(kind, _) => Some(
+                wildcard_qualifier(kind)
+                    .ok_or_else(|| EngineError::bad_table(&wildcard_written(kind)))?,
+            ),
             SelectItem::UnnamedExpr(e) => {
                 out.push(OutItem {
                     name: render_expr(e),
@@ -6139,10 +6298,9 @@ fn output_items(
         // (id) ORDER BY 2` then sorted on the LENGTH rather than on `a.id`.
         let expansion = out.len();
         for (index, column) in relation.columns.iter().enumerate() {
-            if qualifier
-                .as_deref()
-                .is_some_and(|t| !column.table.eq_ignore_ascii_case(t))
-            {
+            if qualifier.as_ref().is_some_and(|(database, table)| {
+                !column.reference().in_source(database.as_deref(), table)
+            }) {
                 continue;
             }
             let written = if column.table.is_empty() {
@@ -6160,6 +6318,15 @@ fn output_items(
             // a working query refused. The second one resolves to the first,
             // so the name has one answer while the position count still
             // matches the columns this engine actually returns.
+            //
+            // Only within this wildcard's own expansion, which is not merely
+            // about not binding to an unrelated aliased item: 8.3 coalesces a
+            // USING column for the bare `*` and *not* across two qualified
+            // ones. Measured, because it has been argued both ways — `SELECT
+            // t.*, u.* FROM t JOIN u USING (id) ORDER BY id` is `Column 'id'
+            // in order clause is ambiguous` there, in either order of the two
+            // wildcards, while `WHERE id = 1` beside it answers because that
+            // clause reads the FROM and not the output.
             let same = coalesced
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(&column.name))
@@ -6517,6 +6684,8 @@ fn check_projected_order(
     let OrderByKind::Expressions(written) = &order.kind else {
         return Err(unsupported("this ORDER BY form"));
     };
+    // Without a database, for the reason `sort_rows` gives: what this sorts is
+    // a result rather than a table reference.
     let mut refs: Vec<ColumnRef> = columns
         .iter()
         .map(|c| ColumnRef::new(&c.table, &c.name))
@@ -8139,25 +8308,22 @@ fn equality_conjuncts(e: &Expr) -> Vec<(Expr, Expr)> {
 /// Where a column reference lands in the relation, so `sectionId` and
 /// `esa.sectionId` are recognised as the same column.
 fn column_slot(refs: &[ColumnRef], e: &Expr) -> Option<usize> {
-    let (table, name) = column_parts(e)?;
-    refs.iter().position(|c| {
-        c.name.eq_ignore_ascii_case(name) && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
-    })
+    let written = column_parts(e)?;
+    refs.iter().position(|c| c.matches(&written))
 }
 
-/// The qualifier and the name a column reference is written with.
+/// The parts a column reference is written with.
 ///
 /// Split out of `column_slot` because that one stops at the first column a
 /// name could mean, and a name that could mean two is a question of its own.
-fn column_parts(e: &Expr) -> Option<(Option<&str>, &str)> {
+///
+/// `name::column_parts` does the splitting, which is where the database part
+/// stopped being dropped: this used to read `parts[len - 2]` as the table and
+/// nothing before it, so `nodb.J2.b` resolved to `J2`.`b`.
+fn column_parts(e: &Expr) -> Option<name::ColumnParts<'_>> {
     match e {
-        Expr::Identifier(i) => Some((None, i.value.as_str())),
-        Expr::CompoundIdentifier(parts) => Some((
-            parts
-                .get(parts.len().wrapping_sub(2))
-                .map(|p| p.value.as_str()),
-            parts.last()?.value.as_str(),
-        )),
+        Expr::Identifier(i) => Some(name::ColumnParts::bare(i.value.as_str())),
+        Expr::CompoundIdentifier(parts) => name::column_parts(parts),
         Expr::Nested(inner) => column_parts(inner),
         _ => None,
     }
@@ -8317,21 +8483,37 @@ fn refuse_malformed_escape<'a>(clauses: impl IntoIterator<Item = &'a Expr>) -> E
     }
 }
 
-/// The table a `tbl.*` names, unquoted.
+/// The database and table a `db.tbl.*` names, unquoted.
 ///
 /// Read off the identifiers rather than the rendered text. Display keeps an
 /// identifier's quotes, so a back-quoted qualifier came back with the quotes
 /// still on it — which matches no table, and once the check in
-/// `resolve_field_list` existed refused a statement MySQL answers.
-/// `object_name` is the same unquoting `using_condition` already does for a
-/// USING list.
-fn wildcard_qualifier(kind: &sqlparser::ast::SelectItemQualifiedWildcardKind) -> String {
+/// `resolve_field_list` existed refused a statement MySQL answers. Split by
+/// `name::qualifier` rather than on a dot in the joined text, which discarded
+/// the database and could not tell it from a dot inside a name.
+///
+/// `None` where there is no database and table to be had: more parts than the
+/// grammar allows, or the `expr.*` form.
+fn wildcard_qualifier(
+    kind: &sqlparser::ast::SelectItemQualifiedWildcardKind,
+) -> Option<(Option<String>, String)> {
     match kind {
-        sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => name::dotted(name),
+        sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => name::qualifier(name),
         // `expr.*`, which only BigQuery and Snowflake parse —
         // `supports_select_expr_star` is false for MySQL, so this arm is
-        // unreachable here and renders rather than inventing a name for
-        // something that is not a table qualifier at all.
+        // unreachable here and names nothing rather than inventing a table for
+        // something that is not a qualifier at all.
+        _ => None,
+    }
+}
+
+/// The `db.tbl` a qualified wildcard was written with, for its 1051 message.
+///
+/// Joined from the parts rather than rendered, so a back-quoted qualifier is
+/// reported the way 8.3 reports it — as a name, without the quotes.
+fn wildcard_written(kind: &sqlparser::ast::SelectItemQualifiedWildcardKind) -> String {
+    match kind {
+        sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => name::dotted(name),
         other => other.to_string().trim_end_matches(".*").to_owned(),
     }
 }
@@ -8356,13 +8538,13 @@ fn resolve_field_list(
         match item {
             SelectItem::Wildcard(_) => {}
             SelectItem::QualifiedWildcard(kind, _) => {
-                let qualifier = wildcard_qualifier(kind);
-                let table = qualifier.rsplit('.').next().unwrap_or("");
                 // A qualifier this query's own FROM clause does not provide is
                 // 1051, not an empty column list: `SELECT a.* FROM J2` and
                 // `SELECT J2.* FROM J2 x` both raise it on 8.3, and this
                 // engine used to return a result set with no columns in it at
-                // all.
+                // all. The database beside the table is part of what the FROM
+                // clause has to provide — `SELECT nodb.J2.* FROM J2` is 1051
+                // there and was every column of `J2` here.
                 //
                 // Asked of the relation and not of `refs`, because a `*` does
                 // not see the enclosing query the way a named column does:
@@ -8372,12 +8554,11 @@ fn resolve_field_list(
                 // legal is inside EXISTS, where the select list is discarded
                 // before any `*` in it is expanded — handled where that
                 // happens, in `expr::eval`.
-                if !relation
-                    .columns
-                    .iter()
-                    .any(|c| c.table.eq_ignore_ascii_case(table))
-                {
-                    return Err(EngineError::bad_table(&qualifier));
+                let named = wildcard_qualifier(kind).is_some_and(|(database, table)| {
+                    relation.has_source(database.as_deref(), &table)
+                });
+                if !named {
+                    return Err(EngineError::bad_table(&wildcard_written(kind)));
                 }
             }
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
@@ -8487,17 +8668,16 @@ fn resolve_having_name(
     // the first one `column_slot` finds: `SELECT * FROM t a JOIN t c ON a.id =
     // c.id HAVING id > 1` puts two columns called `id` in the select list and
     // is 1052 on 8.3, and resolving to either of them would have answered it.
-    let projected_slots = |from: Option<&str>| -> Vec<usize> {
-        let Some((qualifier, name)) = column_parts(e) else {
+    let projected_slots = |from: Option<(Option<&str>, &str)>| -> Vec<usize> {
+        let Some(written) = column_parts(e) else {
             return Vec::new();
         };
         refs.iter()
             .take(own)
             .enumerate()
             .filter(|(_, c)| {
-                c.name.eq_ignore_ascii_case(name)
-                    && qualifier.is_none_or(|q| c.table.eq_ignore_ascii_case(q))
-                    && from.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+                c.matches(&written)
+                    && from.is_none_or(|(database, table)| c.in_source(database, table))
             })
             .map(|(i, _)| i)
             .collect()
@@ -8517,15 +8697,12 @@ fn resolve_having_name(
                 }
             }
             SelectItem::QualifiedWildcard(kind, _) => {
-                let qualifier = match kind {
-                    sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => {
-                        name::dotted(name)
+                // A qualifier this cannot split names no FROM item, so it
+                // projects nothing into the select list for a HAVING to find.
+                if let Some((database, table)) = wildcard_qualifier(kind) {
+                    for slot in projected_slots(Some((database.as_deref(), &table))) {
+                        found.push((format!("#{slot}"), false));
                     }
-                    other => other.to_string().trim_end_matches(".*").to_owned(),
-                };
-                let table = qualifier.rsplit('.').next().unwrap_or("").to_owned();
-                for slot in projected_slots(Some(&table)) {
-                    found.push((format!("#{slot}"), false));
                 }
             }
             SelectItem::UnnamedExpr(inner) | SelectItem::ExprWithAlias { expr: inner, .. } => {
@@ -8887,17 +9064,10 @@ fn aggregate_argument(f: &sqlparser::ast::Function) -> Option<Expr> {
     })
 }
 
-/// The table an assignment target names, if it was qualified.
-fn assignment_qualifier(target: &AssignmentTarget) -> Option<String> {
-    let AssignmentTarget::ColumnName(name) = target else {
-        return None;
-    };
-    (name.0.len() >= 2).then(|| name::part(&name.0[name.0.len() - 2]))
-}
-
-fn assignment_column(target: &AssignmentTarget) -> EngineResult<String> {
+/// Every part of an assignment target, qualifier first.
+fn assignment_parts(target: &AssignmentTarget) -> EngineResult<Vec<String>> {
     match target {
-        AssignmentTarget::ColumnName(column) => Ok(name::tail(column)),
+        AssignmentTarget::ColumnName(column) => Ok(name::parts(column)),
         other => Err(unsupported(format!("assignment target `{other}`"))),
     }
 }

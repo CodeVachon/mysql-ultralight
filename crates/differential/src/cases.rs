@@ -582,6 +582,166 @@ pub const GROUPS: &[Group] = &[
             // Inside a derived table, where the LIMIT is what makes the inner
             // clause decide anything.
             same("SELECT * FROM (SELECT id AS b FROM Ob ORDER BY b LIMIT 2) d ORDER BY b"),
+            // A window key beside a key the select list does not return. No
+            // source row can answer a window, so the sort is finished over the
+            // projected result — and finishing it by re-deriving *every* key
+            // from that result refused these for `s`, which the output has no
+            // column for. Each key alone answers, so only the mixture failed.
+            //
+            // Every window here still carries its own ORDER BY, for the reason
+            // the block above gives: `OVER ()` numbers the rows in whatever
+            // order they reach it, which is a query plan and not an answer.
+            same("SELECT id, ROW_NUMBER() OVER (ORDER BY b) AS rn FROM Ob ORDER BY 2, s"),
+            same("SELECT ROW_NUMBER() OVER (ORDER BY b) AS rn, id FROM Ob ORDER BY s, 1"),
+            same("SELECT id, ROW_NUMBER() OVER (ORDER BY b) AS rn FROM Ob ORDER BY rn DESC, s"),
+            same("SELECT id, ROW_NUMBER() OVER (ORDER BY b) AS rn FROM Ob ORDER BY 2, s LIMIT 2"),
+            // DISTINCT collapses rows after that sort rather than before it.
+            same("SELECT DISTINCT s, ROW_NUMBER() OVER (ORDER BY b) AS rn FROM Ob ORDER BY rn DESC"),
+            // The same retry with no window in sight: an alias inside a larger
+            // expression is substituted for what the select list wrote, which
+            // a source row cannot answer either.
+            same("SELECT id, id * 10 AS q FROM Ob ORDER BY CASE WHEN q > 20 THEN 0 ELSE 1 END, s"),
+            // Two qualified wildcards over a USING join put the joined column
+            // in the output twice, so a bare name in the ORDER BY is
+            // ambiguous — in either order of the wildcards. Only the bare `*`
+            // coalesces. This has been argued both ways from memory, which is
+            // why it is here.
+            same("SELECT Ob.*, Oc.* FROM Ob JOIN Oc USING (id) ORDER BY id"),
+            same("SELECT Oc.*, Ob.* FROM Ob JOIN Oc USING (id) ORDER BY id"),
+            // One wildcard leaves one `id` in the output, so the same clause
+            // answers; a position names one output column outright and is
+            // never ambiguous, which the case above `ORDER BY 2 DESC` already
+            // asks.
+            same("SELECT Ob.* FROM Ob JOIN Oc USING (id) ORDER BY id"),
+            same("SELECT Ob.*, Oc.c FROM Ob JOIN Oc USING (id) ORDER BY id"),
+            // The WHERE reads the FROM clause, where USING really has made the
+            // two columns one, so the same name answers there.
+            same("SELECT Ob.*, Oc.* FROM Ob JOIN Oc USING (id) WHERE id = 1"),
+        ],
+    },
+    Group {
+        // The database part of a three-part name was compared against nothing.
+        // `SELECT nodb.Qt.b FROM Qt` answered rows and `SELECT nodb.Qt.*`
+        // answered every column, where 8.3 raises 1054 and 1051 — so a
+        // statement written against another schema silently read this one.
+        //
+        // The database is spelled `differential` throughout, which is the
+        // database `main.rs` creates for every group. A case naming a second
+        // one would have to create it, and a database outlives the group that
+        // made it: the reset drops only this one.
+        name: "a database qualifier",
+        setup: &[
+            "CREATE TABLE Qt (a INT NULL, b INT NULL)",
+            "INSERT INTO Qt VALUES (1,2),(3,4)",
+            "CREATE TABLE Qk (a INT NULL, c INT NULL)",
+            "INSERT INTO Qk VALUES (1,9)",
+            // Empty on purpose: a refusal that only happens while a row is
+            // being evaluated does not happen at all over an empty relation,
+            // which is the shape three other issues under #0009 have been.
+            "CREATE TABLE Qe (a INT NULL, b INT NULL)",
+            "CREATE VIEW Qv AS SELECT b FROM Qt",
+        ],
+        cases: &[
+            // The two the issue was written from, and their legal twins.
+            same("SELECT nodb.Qt.b FROM Qt"),
+            same("SELECT nodb.Qt.* FROM Qt"),
+            same("SELECT differential.Qt.b FROM Qt ORDER BY 1"),
+            same("SELECT differential.Qt.* FROM Qt ORDER BY 1"),
+            same("SELECT differential.Qt.b FROM differential.Qt ORDER BY 1"),
+            same("SELECT Qt.b FROM differential.Qt ORDER BY 1"),
+            // An alias renames the table part and leaves the database alone.
+            same("SELECT differential.x.b FROM Qt x ORDER BY 1"),
+            same("SELECT nodb.x.b FROM Qt x"),
+            same("SELECT differential.x.* FROM Qt x ORDER BY 1"),
+            same("SELECT nodb.x.* FROM Qt x"),
+            // Nothing evaluates the reference in any of these, which is where
+            // a check living in the row path stops running.
+            same("SELECT nodb.Qe.b FROM Qe"),
+            same("SELECT differential.Qe.b FROM Qe"),
+            same("SELECT nodb.Qt.b FROM Qt WHERE 1 = 0"),
+            same("SELECT nodb.Qt.b FROM Qt LIMIT 0"),
+            same("SELECT CASE WHEN 0 THEN nodb.Qt.b ELSE 9 END FROM Qt"),
+            same("SELECT nodb.Qe.* FROM Qe"),
+            // Every clause that resolves a name, right and wrong.
+            same("SELECT b FROM Qt WHERE nodb.Qt.a = 1"),
+            same("SELECT b FROM Qt WHERE differential.Qt.a = 1"),
+            same("SELECT b FROM Qt GROUP BY nodb.Qt.b"),
+            same("SELECT b FROM Qt GROUP BY differential.Qt.b ORDER BY 1"),
+            same("SELECT b FROM Qt GROUP BY b HAVING nodb.Qt.b > 0"),
+            same("SELECT b FROM Qt GROUP BY b HAVING differential.Qt.b > 0 ORDER BY 1"),
+            same("SELECT b FROM Qt ORDER BY nodb.Qt.b"),
+            same("SELECT b FROM Qt ORDER BY differential.Qt.b"),
+            same("SELECT Qt.b FROM Qt JOIN Qk ON nodb.Qt.a = Qk.a"),
+            same("SELECT Qt.b FROM Qt JOIN Qk ON differential.Qt.a = Qk.a"),
+            same("SELECT b FROM Qt WHERE a IN (SELECT a FROM Qk WHERE nodb.Qt.b = 2)"),
+            same("SELECT b FROM Qt WHERE a IN (SELECT a FROM Qk WHERE differential.Qt.b = 2)"),
+            same("SELECT nodb.Qt.b FROM Qt UNION SELECT 1"),
+            // A view is in a database; the query behind it is not the view.
+            same("SELECT differential.Qv.b FROM Qv ORDER BY 1"),
+            same("SELECT nodb.Qv.b FROM Qv"),
+            same("SELECT differential.Qv.* FROM Qv ORDER BY 1"),
+            same("SELECT nodb.Qv.* FROM Qv"),
+            // A derived table, a CTE and a JSON_TABLE are in no database, and
+            // the two clauses read that absence in *opposite* directions: the
+            // column form takes any database and the wildcard takes none, the
+            // right one included.
+            same("SELECT nodb.d.b FROM (SELECT b FROM Qt) d ORDER BY 1"),
+            same("SELECT differential.d.b FROM (SELECT b FROM Qt) d ORDER BY 1"),
+            same("SELECT differential.d.* FROM (SELECT b FROM Qt) d"),
+            same("WITH q AS (SELECT b FROM Qt) SELECT nodb.q.b FROM q ORDER BY 1"),
+            same("WITH q AS (SELECT b FROM Qt) SELECT differential.q.* FROM q"),
+            same(
+                "SELECT nodb.jt.v FROM JSON_TABLE('[1,2]', '$[*]' COLUMNS(v INT PATH '$')) jt \
+                 ORDER BY 1",
+            ),
+            same(
+                "SELECT differential.jt.* FROM \
+                 JSON_TABLE('[1,2]', '$[*]' COLUMNS(v INT PATH '$')) jt",
+            ),
+            // information_schema is a database and answers to its own name.
+            same(
+                "SELECT information_schema.tables.TABLE_NAME FROM information_schema.tables \
+                 WHERE TABLE_SCHEMA = 'differential' AND TABLE_NAME = 'Qk'",
+            ),
+            same("SELECT differential.tables.TABLE_NAME FROM information_schema.tables LIMIT 1"),
+            // The writes, last, because they change what the reads above see.
+            // A target resolved by its last part alone wrote to this database
+            // whatever database was written in front of it, and reported rows
+            // affected exactly as a correct statement would.
+            same("INSERT INTO Qt (nodb.Qt.a) VALUES (9)"),
+            same("INSERT INTO Qt (Qk.a) VALUES (9)"),
+            same("INSERT INTO Qt (differential.Qt.a) VALUES (9)"),
+            // No unique key on `Qt`, so nothing collides and the assignment is
+            // never evaluated — 8.3 still resolves the target and refuses.
+            same("INSERT INTO Qt (a,b) VALUES (1,2) ON DUPLICATE KEY UPDATE nodb.Qt.b = 1"),
+            same(
+                "INSERT INTO Qt (a,b) VALUES (1,2) ON DUPLICATE KEY UPDATE \
+                 differential.Qt.b = 1",
+            ),
+            same("UPDATE Qt x JOIN Qk ON x.a = Qk.a SET nodb.x.b = 1"),
+            // Every SET below changes every row it touches, which takes some
+            // arranging: each case runs twice — once per protocol — and
+            // MySQL's affected count is the number of rows it *changed*, so
+            // `SET b = 5` reports 0 on the second run and `SET b = b + 1`
+            // reports nothing for a row where `b` is NULL. Either would make
+            // the case compare this engine's counting rule against MySQL's
+            // rather than the qualifier it is here for, and those two rules
+            // differ — the engine counts the rows it matched. That is its own
+            // divergence and not this one.
+            same(
+                "UPDATE Qt x JOIN Qk ON x.a = Qk.a SET \
+                 differential.x.b = COALESCE(x.b, 0) + 1",
+            ),
+            // The single-table SET target, which read its last part alone —
+            // so the table half of the qualifier was dropped with the
+            // database. Over the empty table too, where the targets are
+            // resolved before any row is considered.
+            same("UPDATE Qt SET nodb.Qt.b = 1"),
+            same("UPDATE Qt SET Qk.b = 1"),
+            same("UPDATE Qe SET nodb.Qe.b = 1"),
+            same("UPDATE Qt SET differential.Qt.b = COALESCE(differential.Qt.b, 0) + 1"),
+            same("DELETE FROM Qt WHERE differential.Qt.a = 9"),
+            same("SELECT a, b FROM Qt ORDER BY a, b"),
         ],
     },
     Group {

@@ -13,17 +13,82 @@ use crate::value::Value;
 /// One column visible to an expression.
 #[derive(Debug, Clone)]
 pub struct ColumnRef {
+    /// The database a `db.table.column` qualifier must name to reach this
+    /// column, empty where the FROM item it came from is in none.
+    ///
+    /// Empty means the database part is *ignored* rather than refused, which
+    /// is 8.3's answer for a FROM item that has no database of its own — a
+    /// derived table, a CTE, a `JSON_TABLE`. Measured: `SELECT nodb.d.b FROM
+    /// (SELECT b FROM J2) d` answers there. A qualified *wildcard* over the
+    /// same item is 1051 whatever database it names, so that rule lives on
+    /// `Relation` rather than here.
+    pub database: String,
     /// Table name or alias the column is reachable through, empty when none.
     pub table: String,
     pub name: String,
 }
 
 impl ColumnRef {
+    /// A column reachable without a database qualifier deciding anything.
+    ///
+    /// For a scope that is not a table reference: an already-projected result,
+    /// a hidden column carrying a computed sort key, a select-list alias. 8.3
+    /// treats those the way it treats a derived table — `SELECT b FROM (SELECT
+    /// b FROM J2) d ORDER BY nodb.d.b` answers — and the database of a real
+    /// FROM item has already been settled where that item was resolved.
     pub fn new(table: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
+            database: String::new(),
             table: table.into(),
             name: name.into(),
         }
+    }
+
+    /// A column of a FROM item that is in a database.
+    pub fn in_database(
+        database: impl Into<String>,
+        table: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            database: database.into(),
+            table: table.into(),
+            name: name.into(),
+        }
+    }
+
+    /// Whether a `db.table` names the FROM item this column came from.
+    ///
+    /// The database is *required* to match here, which is the mirror image of
+    /// [`ColumnRef::matches`] and deliberately so: a FROM item in no database
+    /// answers every database in a column reference and no database in a
+    /// qualified wildcard. Measured on 8.3, over one derived table, `SELECT
+    /// nodb.d.b` answers and `SELECT probe.d.*` — the database spelled right —
+    /// is `Unknown table 'probe.d'`.
+    pub(crate) fn in_source(&self, database: Option<&str>, table: &str) -> bool {
+        self.table.eq_ignore_ascii_case(table)
+            && database.is_none_or(|d| self.database.eq_ignore_ascii_case(d))
+    }
+
+    /// Whether a reference written `db.table.column` reaches this column.
+    ///
+    /// The one place the three parts are compared, because two comparers of
+    /// one rule is how the database part came to be compared by neither.
+    /// Identifiers compare case-insensitively here as they do everywhere else
+    /// in this engine, which is `lower_case_table_names=1`; 8.3 on Linux
+    /// defaults to 0 and compares the database and table parts exactly.
+    pub(crate) fn matches(&self, written: &crate::name::ColumnParts) -> bool {
+        self.name.eq_ignore_ascii_case(written.name)
+            && written
+                .table
+                .is_none_or(|t| self.table.eq_ignore_ascii_case(t))
+            // Ignored where this column's FROM item has no database, never
+            // matched against the empty string: `nodb.d.b` over a derived
+            // table answers on 8.3 rather than being refused for naming a
+            // database the derived table is not in.
+            && written
+                .database
+                .is_none_or(|d| self.database.is_empty() || self.database.eq_ignore_ascii_case(d))
     }
 }
 
@@ -146,20 +211,18 @@ impl<'a> Context<'a> {
     }
 
     /// Resolves a column reference, optionally qualified by table.
-    fn lookup(&self, table: Option<&str>, name: &str) -> EngineResult<Value> {
+    fn lookup(&self, written: &crate::name::ColumnParts) -> EngineResult<Value> {
         let Some(row) = &self.row else {
-            return Err(EngineError::unknown_column(name, "field list"));
+            return Err(EngineError::unknown_column(
+                &written.written(),
+                "field list",
+            ));
         };
 
         let mut found: Option<&Value> = None;
         for (i, column) in row.schema.iter().enumerate() {
-            if !column.name.eq_ignore_ascii_case(name) {
+            if !column.matches(written) {
                 continue;
-            }
-            if let Some(t) = table {
-                if !column.table.eq_ignore_ascii_case(t) {
-                    continue;
-                }
             }
             // An unqualified name matching two tables is ambiguous in SQL, but
             // Prisma always qualifies, so the first match is taken rather than
@@ -170,7 +233,7 @@ impl<'a> Context<'a> {
 
         found
             .cloned()
-            .ok_or_else(|| EngineError::unknown_column(name, "field list"))
+            .ok_or_else(|| EngineError::unknown_column(&written.written(), "field list"))
     }
 }
 
@@ -287,7 +350,7 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
     match expr {
         Expr::Identifier(ident) if ident.value.starts_with('@') => variable(&ident.value, ctx),
 
-        Expr::Identifier(ident) => ctx.lookup(None, &ident.value),
+        Expr::Identifier(ident) => ctx.lookup(&crate::name::ColumnParts::bare(&ident.value)),
 
         // `@@GLOBAL.version` parses as a compound identifier.
         Expr::CompoundIdentifier(parts)
@@ -298,23 +361,25 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
         }
 
         Expr::CompoundIdentifier(parts) => {
-            let name = parts.last().map(|i| i.value.as_str()).unwrap_or_default();
-            // `db.table.column` and `table.column` both qualify by the part
-            // immediately before the column.
-            let table = parts
-                .get(parts.len().wrapping_sub(2))
-                .map(|i| i.value.as_str());
+            // Every part, including the database: reading only the two nearest
+            // the column made `nodb.J2.b` a reference to `J2`.`b` and answered
+            // rows out of a database the statement never named.
+            //
             // No fallback to an unqualified lookup: an out-of-scope qualifier
             // would otherwise bind to another table's same-named column and
             // silently drive a write against the wrong rows.
-            ctx.lookup(table, name).map_err(|_| {
-                let shown = parts
+            let written = crate::name::column_parts(parts);
+            let shown = || {
+                parts
                     .iter()
                     .map(|p| p.value.as_str())
                     .collect::<Vec<_>>()
-                    .join(".");
-                EngineError::unknown_column(&shown, "field list")
-            })
+                    .join(".")
+            };
+            written
+                .ok_or_else(|| EngineError::unknown_column(&shown(), "field list"))
+                .and_then(|written| ctx.lookup(&written))
+                .map_err(|_| EngineError::unknown_column(&shown(), "field list"))
         }
 
         Expr::Value(v) => literal(&v.value),

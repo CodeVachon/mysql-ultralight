@@ -5,7 +5,7 @@ state: Todo
 labels: [epic, phase-8]
 blockedBy: [3, 6]
 created: 2026-08-18T14:10:54Z
-updated: 2026-08-20T14:36:42Z
+updated: 2026-09-01T20:35:52Z
 ---
 
 ## Description
@@ -37,3 +37,22 @@ Review found eight problems in the harness itself, all fixed. The ones worth rem
 Verified by breaking month clamping in the engine and watching the harness report it as new with exit 1, then go green when restored.
 
 Still to do for this epic: feed it the 604 migrations, the raw-SQL call sites, and Prisma's generated queries.
+
+### 2026-09-01T20:35:52Z — Christopher Vachon (user)
+
+A pattern worth checking for rather than rediscovering, found three times in this epic.
+
+**A check that lives in an evaluation loop does not run when there are no rows.**
+
+Over zero rows nothing is evaluated, so validation placed inside the per-row path silently disappears and the statement succeeds where MySQL refuses. Every instance so far has been a wrong answer -- usually an empty result set, once 0 rows affected on a write, which is worse because the caller cannot tell 'nothing matched' from 'the statement was illegal'.
+
+The three:
+- #0058 (09233ad) -- a name was resolved when a row was evaluated against it, so SELECT a.b FROM Empty, WHERE 1=0 and LIMIT 0 all returned a successful empty result. That issue's own premise said execution was already right; it was not.
+- #0093 (64f6ec3) -- LIKE's ESCAPE clause was checked per row, so a malformed escape passed over an empty table, in an untaken CASE branch and in ORDER BY. Fixed at five resolve points; #0087 (8ead143) then found three more clauses -- HAVING, GROUP BY and DML's WHERE -- for eleven in total.
+- #0090/#0144 (613ae1d) -- check_projected_order hoisted its name and position checks out of the row loop but not the ESCAPE check, so a union or FROM-less select answered where 8.3 raises 1210.
+
+What makes it hard to see: the non-empty case usually behaves correctly, because evaluation reaches the check anyway. #0090's union raised 1210 properly with rows and answered without them, so the divergence only appeared when the result was empty. A corpus case over a populated table proves nothing here.
+
+How to check for it: for any refusal the engine raises, ask whether the statement still refuses over an empty relation, with WHERE 1=0, with LIMIT 0, in an untaken CASE branch, and in a FROM-less SELECT. Where it does not, the check is in the wrong place -- MySQL settles these when it resolves the item, not when it evaluates a row.
+
+Related but distinct: #0102 and #0125 are the same *timing* seen from DML, where the resolution never happens at all rather than happening too late.
