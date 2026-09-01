@@ -1,11 +1,11 @@
 ---
 id: 144
 title: ORDER BY resolves a shadowed column before a select-list alias
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-09-01T02:16:08Z
-updated: 2026-09-01T02:16:08Z
+updated: 2026-09-01T14:31:09Z
 ---
 
 ## Description

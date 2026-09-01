@@ -888,6 +888,14 @@ fn a_malformed_escape_is_refused_even_where_no_row_evaluates_it() {
         // settle the clause — so the branch nothing takes is what makes this
         // reach the guard rather than the evaluation.
         "SELECT 1 HAVING CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE '!!') ELSE 9 END > 0",
+        // The two paths that sort an already-projected result. A union over
+        // two empty sides settles its ORDER BY for no row at all, and the
+        // non-empty union raises 1210 through the evaluation — so this
+        // divergence is invisible until the result is empty. The FROM-less
+        // form has its one row, and orders it by a clause the evaluator would
+        // have read; the guard has to be reached before that.
+        "SELECT s FROM LE UNION SELECT s FROM LF ORDER BY s LIKE 'a' ESCAPE '!!'",
+        "SELECT 1 AS one ORDER BY one LIKE 'a' ESCAPE '!!'",
     ] {
         // Matched rather than unwrapped, so a statement that succeeds names
         // itself. Half of these differ from their neighbours by one clause,
@@ -18261,5 +18269,803 @@ fn use_selects_the_database_it_names() {
     assert_eq!(
         rows(&engine, &mut session, "SELECT DATABASE()"),
         vec![vec!["my.db"]]
+    );
+}
+
+/// The table the ORDER BY resolution tests below read.
+///
+/// `id` and `b` run in opposite directions on purpose: every statement here
+/// answers `1,2,3,4` when it sorts on the one it should and `4,3,2,1` when it
+/// sorts on the other, so a test that reads the rows cannot pass with the two
+/// resolutions swapped. A table where they agreed would have proved nothing.
+fn order_rows(engine: &Engine, session: &mut Session) {
+    run(
+        engine,
+        session,
+        "CREATE TABLE O (id INT NOT NULL, b INT NOT NULL, s VARCHAR(10) NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        engine,
+        session,
+        "INSERT INTO O VALUES (1,4,'x'),(2,3,'y'),(3,2,'z'),(4,1,'w')",
+    );
+}
+
+/// The error a statement is refused with, so a test can name the code.
+fn refusal(
+    engine: &Engine,
+    session: &mut Session,
+    sql: &str,
+) -> mysql_ultralight_engine::EngineError {
+    engine
+        .execute(session, sql, &[])
+        .err()
+        .unwrap_or_else(|| panic!("expected a refusal from: {sql}"))
+}
+
+/// `ORDER BY <position>` counts over the select list, not over the relation.
+///
+/// #0090. `SELECT JSON_ARRAY(x) FROM (SELECT 1 AS x UNION SELECT 0) t ORDER BY
+/// 1` answers `[0]` then `[1]` on 8.3 — the position names the document the
+/// query returns. This engine evaluated the number against the source row,
+/// where position 1 is `x`, and answered `[1]` then `[0]`: every row present
+/// and plausibly ordered, which is what made it quiet.
+#[test]
+fn an_order_by_position_names_the_select_list() {
+    let (engine, mut session) = engine();
+    order_rows(&engine, &mut session);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_ARRAY(x) FROM (SELECT 1 AS x UNION SELECT 0) t ORDER BY 1"
+        ),
+        vec![vec!["[0]"], vec!["[1]"]]
+    );
+    // The second output column and not the second column of `O`, which are
+    // different columns here and sort opposite ways.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT s, id FROM O ORDER BY 2"),
+        vec![
+            vec!["x", "1"],
+            vec!["y", "2"],
+            vec!["z", "3"],
+            vec!["w", "4"]
+        ]
+    );
+    // A `*` is expanded before positions are counted, or `ORDER BY 3` would
+    // have no third column to name.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT * FROM O ORDER BY 3"),
+        vec![
+            vec!["4", "1", "w"],
+            vec!["1", "4", "x"],
+            vec!["2", "3", "y"],
+            vec!["3", "2", "z"]
+        ]
+    );
+    // Only a bare integer literal is a position. Parentheses come off — 8.3
+    // sorts `ORDER BY (2)` on the second column — but arithmetic does not:
+    // `2 + 0` is the constant two and orders nothing, which is why this one
+    // comes back in insertion order.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT s, id FROM O ORDER BY (2)"),
+        vec![
+            vec!["x", "1"],
+            vec!["y", "2"],
+            vec!["z", "3"],
+            vec!["w", "4"]
+        ]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT s, id FROM O ORDER BY 2 + 0"),
+        vec![
+            vec!["x", "1"],
+            vec!["y", "2"],
+            vec!["z", "3"],
+            vec!["w", "4"]
+        ]
+    );
+}
+
+/// A position the select list cannot answer is 1054 under this clause's name.
+///
+/// Both ends, because both are positions on 8.3 rather than constants:
+/// `ORDER BY 5` over one select item and `ORDER BY 0` are `Unknown column '5'`
+/// and `'0'` `in 'order clause'`. This engine sorted every row by the same
+/// constant and answered.
+///
+/// Over no rows as well as over some, because the position used to be read
+/// while a row was being keyed: an empty result never reached it.
+#[test]
+fn an_order_by_position_that_names_nothing_is_refused() {
+    let (engine, mut session) = engine();
+    order_rows(&engine, &mut session);
+
+    for (sql, name) in [
+        ("SELECT id FROM O ORDER BY 5", "5"),
+        ("SELECT id FROM O ORDER BY 0", "0"),
+        ("SELECT id FROM O ORDER BY b, 5", "5"),
+        ("SELECT * FROM O ORDER BY 4", "4"),
+        ("SELECT id FROM O WHERE 0 ORDER BY 5", "5"),
+        ("SELECT DISTINCT id FROM O ORDER BY 2", "2"),
+        ("SELECT id, COUNT(*) FROM O GROUP BY id ORDER BY 5", "5"),
+        ("SELECT 1 AS one ORDER BY 2", "2"),
+        (
+            "SELECT id FROM O WHERE 0 UNION SELECT b FROM O WHERE 0 ORDER BY 5",
+            "5",
+        ),
+    ] {
+        let err = refusal(&engine, &mut session, sql);
+        assert_eq!(err.code, 1054, "expected ER_BAD_FIELD_ERROR for: {sql}");
+        assert_eq!(
+            err.message,
+            format!("Unknown column '{name}' in 'order clause'"),
+            "for: {sql}"
+        );
+    }
+}
+
+/// A bare name sees the select list first; a name inside an expression sees
+/// the FROM clause first.
+///
+/// #0144, and the precedence rather than a choice of one over the other. Both
+/// directions measured on 8.3 over a table with a column `b`:
+///
+/// ```sql
+/// SELECT id AS b FROM O ORDER BY b       -- the alias:  1,2,3,4
+/// SELECT id AS b FROM O ORDER BY b + 1   -- the column: 4,3,2,1
+/// SELECT id AS zz FROM O ORDER BY zz + 1 -- the alias, since `zz` is no column
+/// ```
+///
+/// Swapping the two would answer half of these backwards, which is why they
+/// are one test: this engine sorted before the projection existed, so `b`
+/// found the column both times.
+#[test]
+fn an_order_by_name_prefers_the_select_list_and_falls_back_to_the_relation() {
+    let (engine, mut session) = engine();
+    order_rows(&engine, &mut session);
+
+    let ids = |engine: &Engine, session: &mut Session, sql: &str| -> Vec<String> {
+        rows(engine, session, sql)
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect()
+    };
+
+    // The alias, over a column of the same name.
+    assert_eq!(
+        ids(&engine, &mut session, "SELECT id AS b FROM O ORDER BY b"),
+        ["1", "2", "3", "4"]
+    );
+    // Parentheses do not make it an expression: 8.3 reads `(b)` as the bare
+    // name it wraps.
+    assert_eq!(
+        ids(
+            &engine,
+            &mut session,
+            "SELECT id AS b FROM O ORDER BY ((b))"
+        ),
+        ["1", "2", "3", "4"]
+    );
+    // The column, because the name is inside an expression.
+    assert_eq!(
+        ids(
+            &engine,
+            &mut session,
+            "SELECT id AS b FROM O ORDER BY b + 1"
+        ),
+        ["4", "3", "2", "1"]
+    );
+    assert_eq!(
+        ids(&engine, &mut session, "SELECT id AS b FROM O ORDER BY -b"),
+        ["1", "2", "3", "4"]
+    );
+    // The alias even inside an expression, because the relation has no such
+    // column to prefer.
+    assert_eq!(
+        ids(
+            &engine,
+            &mut session,
+            "SELECT id AS zz FROM O ORDER BY zz + 1"
+        ),
+        ["1", "2", "3", "4"]
+    );
+    // A qualifier never reaches an alias, at either level.
+    assert_eq!(
+        ids(&engine, &mut session, "SELECT id AS b FROM O ORDER BY O.b"),
+        ["4", "3", "2", "1"]
+    );
+    // An alias inside an expression `substitute_names` does not descend into
+    // reaches the sort unsubstituted and is retried against the projected
+    // result, which is how this engine has always answered it. The resolution
+    // has to leave that path alone rather than refuse the name it could not
+    // place.
+    assert_eq!(
+        ids(
+            &engine,
+            &mut session,
+            "SELECT id AS zz FROM O ORDER BY ABS(zz)"
+        ),
+        ["1", "2", "3", "4"]
+    );
+    // The thing the old comment was right about, which the fix had to keep:
+    // ORDER BY may name a column the select list does not return.
+    assert_eq!(
+        ids(&engine, &mut session, "SELECT id FROM O ORDER BY b"),
+        ["4", "3", "2", "1"]
+    );
+    // An alias that shadows the column it is derived from resolves to the same
+    // value either way, and has to keep answering.
+    assert_eq!(
+        ids(&engine, &mut session, "SELECT id AS id FROM O ORDER BY id"),
+        ["1", "2", "3", "4"]
+    );
+    // A join, where the shadowed column belongs to the other table.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE O2 (id INT NOT NULL, c INT NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO O2 VALUES (1,40),(2,30),(3,20),(4,10)",
+    );
+    assert_eq!(
+        ids(
+            &engine,
+            &mut session,
+            "SELECT O.id AS c FROM O JOIN O2 ON O2.id = O.id ORDER BY c"
+        ),
+        ["1", "2", "3", "4"]
+    );
+    assert_eq!(
+        ids(
+            &engine,
+            &mut session,
+            "SELECT O.id AS c FROM O JOIN O2 ON O2.id = O.id ORDER BY c + 1"
+        ),
+        ["4", "3", "2", "1"]
+    );
+    // A `USING` column is one column in MySQL and two in this engine's
+    // relation, so the two same-named items a `*` puts in front of the clause
+    // would otherwise be ambiguous and refuse a query 8.3 answers.
+    assert_eq!(
+        ids(
+            &engine,
+            &mut session,
+            "SELECT * FROM O JOIN O2 USING (id) ORDER BY id"
+        ),
+        ["1", "2", "3", "4"]
+    );
+    // And it may only reach the columns this wildcard expanded. Searching
+    // everything projected so far bound the second `id` to the aliased
+    // `LENGTH(O.s)` in front of it, which is constant here — so the rows came
+    // back in scan order where 8.3 sorts them by `O.id`. Read at the second
+    // column, because the first is that constant either way.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT LENGTH(O.s) AS id, O.*, O2.* FROM O JOIN O2 USING (id) ORDER BY 2 DESC"
+        )
+        .into_iter()
+        .map(|row| row[1].clone())
+        .collect::<Vec<_>>(),
+        ["4", "3", "2", "1"]
+    );
+}
+
+/// The same precedence on the grouped path.
+///
+/// It had the opposite bug from the ungrouped one: it substituted an alias for
+/// every name at any depth, so `ORDER BY b + 0` sorted on the alias where 8.3
+/// sorts on the grouped column. One resolution now serves both paths, which is
+/// the only way the two can be held to the same rule.
+#[test]
+fn a_grouped_order_by_resolves_the_same_way() {
+    let (engine, mut session) = engine();
+    order_rows(&engine, &mut session);
+
+    let ids = |engine: &Engine, session: &mut Session, sql: &str| -> Vec<String> {
+        rows(engine, session, sql)
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect()
+    };
+
+    // Each group holds one row, so `MAX(id)` is that row's `id` and the two
+    // readings of `b` order the four groups opposite ways.
+    assert_eq!(
+        ids(
+            &engine,
+            &mut session,
+            "SELECT MAX(id) AS b FROM O GROUP BY b ORDER BY b"
+        ),
+        ["1", "2", "3", "4"]
+    );
+    assert_eq!(
+        ids(
+            &engine,
+            &mut session,
+            "SELECT MAX(id) AS b FROM O GROUP BY b ORDER BY b + 0"
+        ),
+        ["4", "3", "2", "1"]
+    );
+    // A position still counts over the select list, and still binds the value
+    // computed for it rather than the expression behind it.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT s, COUNT(*) AS n FROM O GROUP BY s ORDER BY 1"
+        ),
+        vec![
+            vec!["w", "1"],
+            vec!["x", "1"],
+            vec!["y", "1"],
+            vec!["z", "1"]
+        ]
+    );
+    let err = refusal(
+        &engine,
+        &mut session,
+        "SELECT MAX(id) AS b FROM O GROUP BY b ORDER BY 9",
+    );
+    assert_eq!(err.code, 1054);
+    assert_eq!(err.message, "Unknown column '9' in 'order clause'");
+    // Before the grouping check, which is where 8.3 settles it: the same
+    // statement with a name the clause cannot resolve is 1054 and not the 1055
+    // that `ORDER BY b` under a different select list would raise.
+    let err = refusal(
+        &engine,
+        &mut session,
+        "SELECT MAX(id) AS b FROM O GROUP BY b ORDER BY nope",
+    );
+    assert_eq!(err.code, 1054);
+    assert_eq!(err.message, "Unknown column 'nope' in 'order clause'");
+
+    // A shadowed alias that falls through to an *ungrouped* column is 1055 on
+    // 8.3, and this path has to say so rather than read the column off the
+    // group's first row — an arbitrary member of it, and nondeterministic the
+    // moment a group holds more than one. The cases above all group by `b`,
+    // where the column is grouped and the question never arises; this one
+    // groups by `s`, so `O.b` is neither grouped nor aggregated.
+    let err = refusal(
+        &engine,
+        &mut session,
+        "SELECT s AS b, COUNT(*) FROM O GROUP BY s ORDER BY b + 0",
+    );
+    assert_eq!(err.code, 1055, "expected the grouping complaint");
+    // The alias reaches it under a name of its own too, so the refusal is
+    // about the column the clause reads and not about the spelling.
+    let err = refusal(
+        &engine,
+        &mut session,
+        "SELECT s AS zz, COUNT(*) FROM O GROUP BY s ORDER BY b + 0",
+    );
+    assert_eq!(err.code, 1055);
+    // After the select list, which 8.3 reports first, and after every name.
+    let err = refusal(
+        &engine,
+        &mut session,
+        "SELECT b, COUNT(*) FROM O GROUP BY s ORDER BY b",
+    );
+    assert_eq!(err.code, 1055);
+    let err = refusal(
+        &engine,
+        &mut session,
+        "SELECT s AS b, COUNT(*) FROM O GROUP BY s ORDER BY b + 0, nope",
+    );
+    assert_eq!(err.code, 1054);
+
+    // What still answers: the bare alias, an aggregate over the ungrouped
+    // column, and a grouped column the select list does not return.
+    assert_eq!(
+        ids(
+            &engine,
+            &mut session,
+            "SELECT s AS b, COUNT(*) FROM O GROUP BY s ORDER BY b"
+        ),
+        ["w", "x", "y", "z"]
+    );
+    assert_eq!(
+        ids(
+            &engine,
+            &mut session,
+            "SELECT s, COUNT(*) FROM O GROUP BY s ORDER BY MAX(b)"
+        ),
+        ["w", "z", "y", "x"]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM O GROUP BY s ORDER BY s"
+        )
+        .len(),
+        4
+    );
+}
+
+/// A name two select items answer to is 1052, and one that only looks like it
+/// is not.
+///
+/// Measured on 8.3: two items that are *different columns* are ambiguous —
+/// `SELECT id AS b, b FROM O ORDER BY b` and `SELECT id AS x, b AS x FROM O
+/// ORDER BY x` — and two that are the same column are not. An expression
+/// sharing the name does not make it ambiguous either; the column wins,
+/// wherever in the list it was written.
+///
+/// Without this the fix would have picked one of them and answered, which is
+/// the wrong direction for a question MySQL refuses.
+#[test]
+fn an_ambiguous_order_by_name_is_refused() {
+    let (engine, mut session) = engine();
+    order_rows(&engine, &mut session);
+
+    for (sql, name) in [
+        ("SELECT id AS b, b FROM O ORDER BY b", "b"),
+        ("SELECT id AS x, b AS x FROM O ORDER BY x", "x"),
+        ("SELECT id AS x, b AS x FROM O ORDER BY x + 0", "x"),
+        ("SELECT b AS id, id FROM O ORDER BY id", "id"),
+    ] {
+        let err = refusal(&engine, &mut session, sql);
+        assert_eq!(err.code, 1052, "expected ER_NON_UNIQ_ERROR for: {sql}");
+        assert_eq!(
+            err.message,
+            format!("Column '{name}' in order clause is ambiguous"),
+            "for: {sql}"
+        );
+    }
+
+    let ids = |engine: &Engine, session: &mut Session, sql: &str| -> Vec<String> {
+        rows(engine, session, sql)
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect()
+    };
+    // The same column twice, however it is spelled.
+    assert_eq!(
+        ids(&engine, &mut session, "SELECT b, O.b FROM O ORDER BY b"),
+        ["1", "2", "3", "4"]
+    );
+    assert_eq!(
+        ids(
+            &engine,
+            &mut session,
+            "SELECT id, id AS id FROM O ORDER BY id"
+        ),
+        ["1", "2", "3", "4"]
+    );
+    // A column and an expression sharing a name: the expression wins, from
+    // either position in the list, and nothing after it is looked at. Written
+    // DESC because `LENGTH(s)` is the same for every row here — sorting on it
+    // leaves the rows as they arrived, which is the order sorting on `id`
+    // ascending would also produce, and the two readings only separate once
+    // the direction is reversed.
+    assert_eq!(
+        ids(
+            &engine,
+            &mut session,
+            "SELECT id AS b, LENGTH(s) AS b FROM O ORDER BY b DESC"
+        ),
+        ["1", "2", "3", "4"]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT LENGTH(s) AS b, id AS b FROM O ORDER BY b DESC"
+        ),
+        vec![
+            vec!["1", "1"],
+            vec!["1", "2"],
+            vec!["1", "3"],
+            vec!["1", "4"]
+        ]
+    );
+    // An ambiguity reached before that expression is still an ambiguity, and
+    // one reached after it never happens.
+    let err = refusal(
+        &engine,
+        &mut session,
+        "SELECT id AS b, s AS b, 1 AS b FROM O ORDER BY b",
+    );
+    assert_eq!(err.code, 1052);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 1 AS b, id AS b, s AS b FROM O ORDER BY b"
+        )
+        .len(),
+        4
+    );
+}
+
+/// DISTINCT refuses an ORDER BY whose key it has already thrown away.
+///
+/// 8.3 raises 3065 rather than picking one of the duplicates. This engine
+/// sorted the rows before removing them, which answered a question MySQL
+/// declines to answer at all.
+#[test]
+fn distinct_refuses_an_order_by_the_select_list_does_not_carry() {
+    let (engine, mut session) = engine();
+    order_rows(&engine, &mut session);
+
+    for (sql, column) in [
+        ("SELECT DISTINCT s FROM O ORDER BY id", "id"),
+        ("SELECT DISTINCT id FROM O ORDER BY b", "b"),
+        ("SELECT DISTINCT id FROM O ORDER BY id + b", "b"),
+        ("SELECT DISTINCT id + 1 AS x FROM O ORDER BY id", "id"),
+    ] {
+        let err = refusal(&engine, &mut session, sql);
+        assert_eq!(
+            err.code, 3065,
+            "expected ER_FIELD_IN_ORDER_NOT_SELECT: {sql}"
+        );
+        assert_eq!(
+            err.message,
+            format!(
+                "Expression #1 of ORDER BY clause is not in SELECT list, references column \
+                 'testdb.O.{column}' which is not in SELECT list; this is incompatible with \
+                 DISTINCT"
+            ),
+            "for: {sql}"
+        );
+    }
+
+    // A derived table is in no schema, and 8.3 names its column `d.id` with
+    // no leading dot. The engine used to write the empty schema anyway and
+    // disagreed with itself, because a CTE's relation carries one.
+    let err = refusal(
+        &engine,
+        &mut session,
+        "SELECT DISTINCT s FROM (SELECT * FROM O) d ORDER BY id",
+    );
+    assert_eq!(err.code, 3065);
+    assert_eq!(
+        err.message,
+        format!(
+            "Expression #1 of ORDER BY clause is not in SELECT list, references column \
+             '{}' which is not in SELECT list; this is incompatible with DISTINCT",
+            "d.id"
+        )
+    );
+
+    // Every item's names are resolved before any of them is asked about
+    // DISTINCT: 8.3 answers this one for `nope` rather than for `id`.
+    let err = refusal(
+        &engine,
+        &mut session,
+        "SELECT DISTINCT s FROM O ORDER BY id, nope",
+    );
+    assert_eq!(err.code, 1054);
+    assert_eq!(err.message, "Unknown column 'nope' in 'order clause'");
+
+    // What the clause may still name under DISTINCT: a position, an alias, a
+    // column the select list returns — including inside an expression — and
+    // the select item written out a second time.
+    for sql in [
+        "SELECT DISTINCT s FROM O ORDER BY 1 DESC",
+        "SELECT DISTINCT id AS b FROM O ORDER BY b",
+        "SELECT DISTINCT id FROM O ORDER BY id + 1",
+        "SELECT DISTINCT s FROM O ORDER BY LENGTH(s)",
+        "SELECT DISTINCT id, b FROM O ORDER BY b",
+        "SELECT DISTINCT id + 1 AS x FROM O ORDER BY id + 1",
+        // Written a second time and spelled differently, which 8.3 accepts
+        // because it compares the expressions rather than the source text.
+        // Reading the text is what the first cut did, and it made all three
+        // of these 3065.
+        "SELECT DISTINCT id + 1 AS x FROM O ORDER BY id+1",
+        "SELECT DISTINCT UPPER(s) FROM O ORDER BY upper(s)",
+        "SELECT DISTINCT UPPER(s) AS u FROM O ORDER BY UPPER( s )",
+    ] {
+        assert_eq!(rows(&engine, &mut session, sql).len(), 4, "for: {sql}");
+    }
+}
+
+/// An aggregate in the ORDER BY of a query that aggregates nothing is 3029.
+///
+/// The clause has no group to fold over, and 8.3 says so rather than treating
+/// the aggregate as one covering the result. One inside a *subquery* belongs to
+/// that subquery and is not this.
+#[test]
+fn an_aggregate_in_an_ungrouped_order_by_is_refused() {
+    let (engine, mut session) = engine();
+    order_rows(&engine, &mut session);
+
+    let err = refusal(&engine, &mut session, "SELECT s FROM O ORDER BY MAX(id)");
+    assert_eq!(err.code, 3029);
+    assert_eq!(
+        err.message,
+        "Expression #1 of ORDER BY contains aggregate function and applies to the result of a \
+         non-aggregated query"
+    );
+    // Its own item's names first, and the next item's not at all.
+    let err = refusal(&engine, &mut session, "SELECT s FROM O ORDER BY MAX(nope)");
+    assert_eq!(err.code, 1054);
+    assert_eq!(err.message, "Unknown column 'nope' in 'order clause'");
+    let err = refusal(&engine, &mut session, "SELECT s FROM O ORDER BY MAX(id), 9");
+    assert_eq!(err.code, 3029);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT s FROM O ORDER BY (SELECT MAX(id) FROM O)"
+        )
+        .len(),
+        4
+    );
+}
+
+/// `GROUP BY <position>` counts over the select list too, and a position that
+/// names nothing is 1054 under that clause's own name.
+///
+/// An unresolvable position used to be left as the literal it was written as,
+/// which gives every row the same group key and collapses the table into one
+/// row — an answer to a different query.
+#[test]
+fn a_group_by_position_that_names_nothing_is_refused() {
+    let (engine, mut session) = engine();
+    order_rows(&engine, &mut session);
+
+    for (sql, name) in [
+        ("SELECT id FROM O GROUP BY 5", "5"),
+        ("SELECT id FROM O GROUP BY 0", "0"),
+        ("SELECT id FROM O GROUP BY 5 ORDER BY 9", "5"),
+    ] {
+        let err = refusal(&engine, &mut session, sql);
+        assert_eq!(err.code, 1054, "expected ER_BAD_FIELD_ERROR for: {sql}");
+        assert_eq!(
+            err.message,
+            format!("Unknown column '{name}' in 'group statement'"),
+            "for: {sql}"
+        );
+    }
+
+    // After the field list, which 8.3 reports first.
+    let err = refusal(&engine, &mut session, "SELECT nope FROM O GROUP BY 5");
+    assert_eq!(err.code, 1054);
+    assert_eq!(err.message, "Unknown column 'nope' in 'field list'");
+
+    // A select item that *is* a number is not a position that failed to
+    // resolve, which is the one thing checking the resolved clause would have
+    // got wrong.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 5 FROM O GROUP BY 1"),
+        vec![vec!["5"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM O GROUP BY 1 ORDER BY 1"
+        )
+        .len(),
+        4
+    );
+}
+
+/// A UNION's ORDER BY names the columns the union returns and nothing else.
+///
+/// `SELECT id AS q FROM O UNION SELECT b FROM O ORDER BY id` is 1054 on 8.3
+/// even with `id` in plain sight in `O`, because what the clause sorts is the
+/// combined result. The same holds for a SELECT with no FROM clause, where one
+/// row sorts the same whatever the clause says but what it may name does not
+/// widen because of it.
+#[test]
+fn an_order_by_over_a_finished_result_names_only_its_columns() {
+    let (engine, mut session) = engine();
+    order_rows(&engine, &mut session);
+
+    for (sql, name) in [
+        (
+            "SELECT id AS q FROM O UNION SELECT b FROM O ORDER BY id",
+            "id",
+        ),
+        ("SELECT 1 AS one ORDER BY nope", "nope"),
+    ] {
+        let err = refusal(&engine, &mut session, sql);
+        assert_eq!(err.code, 1054, "expected ER_BAD_FIELD_ERROR for: {sql}");
+        assert_eq!(
+            err.message,
+            format!("Unknown column '{name}' in 'order clause'"),
+            "for: {sql}"
+        );
+    }
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id AS q FROM O UNION SELECT b FROM O ORDER BY q"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["3"], vec!["4"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 1 AS one ORDER BY one"),
+        vec![vec!["1"]]
+    );
+    // The enclosing query's columns are in scope as well, so a correlated
+    // subquery is not refused for naming one — 8.3 answers this.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, (SELECT 1 ORDER BY id) AS q FROM O ORDER BY id"
+        ),
+        vec![
+            vec!["1", "1"],
+            vec!["2", "1"],
+            vec!["3", "1"],
+            vec!["4", "1"]
+        ]
+    );
+    let err = refusal(
+        &engine,
+        &mut session,
+        "SELECT id, (SELECT 1 ORDER BY nope) AS q FROM O ORDER BY id",
+    );
+    assert_eq!(err.code, 1054);
+    assert_eq!(err.message, "Unknown column 'nope' in 'order clause'");
+}
+
+/// A window function is still numbered down the order the rows are sorted in.
+///
+/// The guard on the fix's direction. Resolving the clause against the select
+/// list must not become *projecting* first: 8.3 answers `SELECT id,
+/// ROW_NUMBER() OVER () rn FROM O ORDER BY id DESC` with `rn` running 1 to 4
+/// down the sorted rows, and computing the window before the sort would have
+/// numbered them 4 to 1 instead. The rows are identical either way and only
+/// the window value separates them, which is how #0103's version of this got
+/// through review the first time.
+///
+/// The other half is that a position naming a window column still works: it
+/// cannot be evaluated against a source row, so the sort is retried against
+/// the projected result — where the window has been computed over the rows in
+/// the order they arrived, and `ORDER BY 2 DESC` pairs `rn` 4 with `id` 4.
+#[test]
+fn a_window_is_numbered_over_the_rows_in_sorted_order() {
+    let (engine, mut session) = engine();
+    order_rows(&engine, &mut session);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, ROW_NUMBER() OVER () AS rn FROM O ORDER BY id DESC"
+        ),
+        vec![
+            vec!["4", "1"],
+            vec!["3", "2"],
+            vec!["2", "3"],
+            vec!["1", "4"]
+        ]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, ROW_NUMBER() OVER () AS rn FROM O ORDER BY 2 DESC"
+        ),
+        vec![
+            vec!["4", "4"],
+            vec!["3", "3"],
+            vec!["2", "2"],
+            vec!["1", "1"]
+        ]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROW_NUMBER() OVER (ORDER BY b) AS rn FROM O ORDER BY rn DESC"
+        ),
+        vec![vec!["4"], vec!["3"], vec!["2"], vec!["1"]]
     );
 }

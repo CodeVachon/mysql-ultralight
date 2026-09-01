@@ -47,6 +47,48 @@ impl EngineError {
         )
     }
 
+    /// ER_AGGREGATE_ORDER_NON_AGG_QUERY.
+    ///
+    /// An aggregate in the ORDER BY of a query that aggregates nothing has
+    /// nothing to fold over: MySQL refuses rather than reading it as one group
+    /// covering the result. `SELECT s FROM t ORDER BY MAX(id)` is this on 8.3,
+    /// and an aggregate inside a *subquery* there belongs to that subquery and
+    /// is not one — `ORDER BY (SELECT MAX(id) FROM u)` answers.
+    ///
+    /// `position` is 1-based over the ORDER BY items, as 8.3 prints it.
+    pub fn aggregate_order_non_aggregated(position: usize) -> Self {
+        Self::new(
+            3029,
+            "HY000",
+            format!(
+                "Expression #{position} of ORDER BY contains aggregate function and applies to \
+                 the result of a non-aggregated query"
+            ),
+        )
+    }
+
+    /// ER_FIELD_IN_ORDER_NOT_SELECT.
+    ///
+    /// DISTINCT settles which rows there are before ORDER BY decides what
+    /// order they come in, so a sort key the select list does not carry has
+    /// been thrown away by the time the sort would read it. MySQL refuses
+    /// rather than picking one of the duplicates: `SELECT DISTINCT s FROM t
+    /// ORDER BY id` is this on 8.3, and this engine used to answer it by
+    /// sorting before the duplicates were removed.
+    ///
+    /// `position` is 1-based over the ORDER BY items, and `column` is the
+    /// column written as `schema.table.column`, both as 8.3 prints them.
+    pub fn order_not_in_select_list(position: usize, column: &str) -> Self {
+        Self::new(
+            3065,
+            "HY000",
+            format!(
+                "Expression #{position} of ORDER BY clause is not in SELECT list, references \
+                 column '{column}' which is not in SELECT list; this is incompatible with DISTINCT"
+            ),
+        )
+    }
+
     /// ER_WINDOW_INVALID_WINDOW_FUNC_USE.
     ///
     /// A window function is computed over the result, so a clause that decides

@@ -1039,6 +1039,7 @@ impl Engine {
             // handled before the single-SELECT path.
             SetExpr::SetOperation { .. } | SetExpr::Query(_) | SetExpr::Values(_) => {
                 let mut combined = self.set_expr(session, query.body.as_ref(), outer)?;
+                check_projected_order(&combined.columns, query.order_by.as_ref(), outer)?;
                 self.order_projected(&mut combined, session, query.order_by.as_ref())?;
                 apply_limit(&mut combined, session, query)?;
                 return Ok(combined);
@@ -1429,11 +1430,14 @@ impl Engine {
         outer: Option<&OuterRow>,
     ) -> EngineResult<Ordered> {
         // A SELECT with no FROM evaluates its projection once, which is the
-        // shape of `SELECT 1` and every driver's preamble query.
+        // shape of `SELECT 1` and every driver's preamble query. One row
+        // sorts the same whatever the ORDER BY says, but what it may *name*
+        // is still only what the query returns: `SELECT 1 AS one ORDER BY 2`
+        // is 1054 on 8.3, and this engine answered it.
         if select.from.is_empty() {
-            return Ok(Ordered::sorted(
-                self.select_without_table(session, select, outer)?,
-            ));
+            let result = self.select_without_table(session, select, outer)?;
+            check_projected_order(&result.columns, order, outer)?;
+            return Ok(Ordered::sorted(result));
         }
 
         // A JSON_TABLE in this FROM may take its document from the enclosing
@@ -1592,11 +1596,49 @@ impl Engine {
             &mut matching,
         )?;
 
-        // Sorting happens before projection so ORDER BY can reference a column
-        // the SELECT list does not return, which MySQL allows.
-        let pending_order = match order {
-            Some(order) => !self.sort_rows(session, &refs, &mut matching, order)?,
-            None => false,
+        // Sorting still happens before the projection, because ORDER BY may
+        // name a column the select list does not return — `SELECT a FROM t
+        // ORDER BY b` is legal on 8.3 — and because a window function is
+        // computed over the rows in the order they are handed to it: `SELECT
+        // id, ROW_NUMBER() OVER () rn FROM Hv ORDER BY id DESC` numbers the
+        // rows 1..4 down the sorted order there. Projecting first to get the
+        // select list would have renumbered them.
+        //
+        // What changes is what the key *is*. The clause is resolved against
+        // the select list before any row is read, so a position means the
+        // position in the select list and a bare name means the select list's
+        // name, and only what neither answers falls through to the relation.
+        //
+        // Built only where there is a clause to resolve, because it copies the
+        // select list and every SELECT comes through here.
+        let items = match order {
+            Some(_) => output_items(
+                &select.projection,
+                &relation,
+                &refs,
+                &coalesced_columns(&select.from),
+            )?,
+            None => Vec::new(),
+        };
+        // Not aggregated: an aggregate anywhere in the select list or the
+        // HAVING sent the statement down `grouped` instead.
+        let keys = resolve_order_by(order, &items, &refs, false, &|index| {
+            items[index].expr.clone()
+        })?;
+        check_distinct_order(
+            select.distinct.as_ref().and(order),
+            &items,
+            &refs,
+            &relation,
+        )?;
+        let pending_order = if keys.is_empty() {
+            false
+        } else {
+            // An expression the source row cannot answer is left to the caller
+            // to retry against the projected output, which is how an ORDER BY
+            // over a window function is sorted: the value only exists once the
+            // projection has computed it.
+            !self.sort_rows(session, &refs, &mut matching, &keys)?
         };
 
         let mut projected = self.project(session, select, &relation, &refs, &matching)?;
@@ -1666,25 +1708,21 @@ impl Engine {
         Ok(())
     }
 
-    /// Sorts source rows in place. Returns false when an ORDER BY expression
-    /// cannot be resolved against the relation, leaving it for the caller to
-    /// retry against the projected output.
+    /// Sorts source rows in place by keys already resolved against the select
+    /// list. Returns false when one cannot be evaluated against a source row,
+    /// leaving it for the caller to retry against the projected output.
+    ///
+    /// The clause's own checks — the names it writes, and its ESCAPEs — belong
+    /// to `resolve_order_by` rather than here, because this loop turns any
+    /// failure into "could not sort" and over no rows does not run at all: an
+    /// error raised inside it is an error the empty case never reaches.
     fn sort_rows(
         &self,
         session: &Session,
         refs: &[ColumnRef],
         rows: &mut [&Vec<Value>],
-        order: &OrderBy,
+        items: &[SortKey],
     ) -> EngineResult<bool> {
-        let OrderByKind::Expressions(items) = &order.kind else {
-            return Err(unsupported("this ORDER BY form"));
-        };
-        // Before the row loop, and returned rather than swallowed: the loop
-        // below turns any evaluation error into "could not sort", and over no
-        // rows it does not run at all — so `ORDER BY s LIKE 'a' ESCAPE '!!'`
-        // sorted nothing and answered an empty set where 8.3 raises 1210.
-        refuse_malformed_escape(items.iter().map(|i| &i.expr))?;
-
         let mut keys: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
         for row in rows.iter() {
             let ctx = Context {
@@ -1705,7 +1743,7 @@ impl Engine {
             keys.push(key);
         }
 
-        let descending: Vec<bool> = items.iter().map(|i| i.options.asc == Some(false)).collect();
+        let descending: Vec<bool> = items.iter().map(|i| i.descending).collect();
         let mut paired: Vec<(Vec<Value>, &Vec<Value>)> =
             keys.into_iter().zip(rows.iter().copied()).collect();
         paired.sort_by(|a, b| compare_keys(&a.0, &b.0, &descending));
@@ -2750,6 +2788,12 @@ impl Engine {
         // `GROUP BY 1` means the first select column, not the literal 1.
         // Treating it as a literal gives every row the same key and collapses
         // the whole table into one group.
+        //
+        // Kept as written as well as resolved, because a position that names
+        // nothing has to be told apart from a select item that *is* a number:
+        // after this map both are a bare literal, and `SELECT 5 FROM t GROUP
+        // BY 1` is a legal query whose group expression is `5`.
+        let written_groups = group_exprs;
         let group_exprs: Vec<Expr> = group_exprs
             .iter()
             .map(|e| resolve_ordinal(e, &select.projection).unwrap_or_else(|| e.clone()))
@@ -2803,6 +2847,11 @@ impl Engine {
             return Err(EngineError::unknown_column(&name, "field list"));
         }
         refuse_malformed_escape(items.iter().map(|(_, e)| e))?;
+        // After the field list and before everything else, which is the order
+        // 8.3 answers in: `SELECT nope FROM t GROUP BY 5` is 1054 for `nope`
+        // there, and `SELECT id FROM t GROUP BY 5 ORDER BY 9` complains about
+        // the GROUP BY's position rather than the ORDER BY's.
+        check_group_positions(written_groups, items.len())?;
         // GROUP BY and HAVING, the two clauses #0093 left behind. Both are
         // only otherwise settled inside `for group in &groups`, so a query
         // that produces no groups never settles them: over an empty table
@@ -2836,6 +2885,29 @@ impl Engine {
         }
         refuse_malformed_escape(select.having.as_ref())?;
 
+        // The same resolution the ungrouped path uses, and ahead of the
+        // grouping rules because that is the order 8.3 answers in: `SELECT id
+        // AS b FROM t GROUP BY b ORDER BY 9` is 1054 for the position there,
+        // and `ORDER BY s LIKE 'a' ESCAPE '!!'` beside a GROUP BY is 1210 —
+        // neither is the 1055 the grouping check would have raised.
+        //
+        // A resolved position binds the value already computed for it rather
+        // than the expression behind it, which is the one thing this path
+        // needs differently: an aggregate cannot be evaluated a second time
+        // per row, and `alias_name` gives the rest of the reason.
+        let out_items: Vec<OutItem> = items
+            .iter()
+            .map(|(name, e)| OutItem {
+                name: name.clone(),
+                expr: e.clone(),
+                slot: column_slot(refs, e),
+            })
+            .collect();
+        let order_items = resolve_order_by(order, &out_items, refs, true, &|index| {
+            Expr::Identifier(sqlparser::ast::Ident::new(alias_name(index)))
+        })?;
+        let descending: Vec<bool> = order_items.iter().map(|i| i.descending).collect();
+
         // Under ONLY_FULL_GROUP_BY a selected column must be grouped by or
         // aggregated. Silently evaluating it against the group's first row
         // returns an arbitrary value where MySQL raises an error.
@@ -2844,18 +2916,33 @@ impl Engine {
             for (_, e) in &items {
                 check_full_group_by(e, e, &group_exprs, refs, &determined)?;
             }
+            // The ORDER BY is held to the same rule, and after the select
+            // list, which is where 8.3 answers: `SELECT b, COUNT(*) FROM t
+            // GROUP BY s ORDER BY b` names the *select list* there, and
+            // `SELECT s AS b, COUNT(*) FROM t GROUP BY s ORDER BY b + 0` —
+            // where the alias is shadowed, so the clause reads `t.b` — is
+            // 1055 for the ORDER BY.
+            //
+            // Without this the shadowed case read `t.b` off the group's first
+            // row and sorted on an arbitrary member of each group, which is
+            // nondeterministic the moment a group holds more than one. It is
+            // the regression the move from `substitute_aliases` to one shared
+            // resolver would otherwise have introduced: that substitution
+            // reached every name at any depth, so no ORDER BY on this path
+            // could name an ungrouped column in the first place.
+            //
+            // The hidden columns a resolved position or alias binds to are in
+            // scope and count as determined: they carry a value the projection
+            // computed for this group, so they are grouped by construction and
+            // `ORDER BY b` on the alias still answers.
+            let mut scope = refs.to_vec();
+            scope.extend((0..items.len()).map(|index| ColumnRef::new("", alias_name(index))));
+            let mut settled = determined;
+            settled.extend(refs.len()..scope.len());
+            for key in &order_items {
+                check_full_group_by(&key.expr, &key.expr, &group_exprs, &scope, &settled)?;
+            }
         }
-
-        let order_items = match order.map(|o| &o.kind) {
-            Some(OrderByKind::Expressions(o)) => o.clone(),
-            Some(_) => return Err(unsupported("this ORDER BY form")),
-            None => Vec::new(),
-        };
-        refuse_malformed_escape(order_items.iter().map(|i| &i.expr))?;
-        let descending: Vec<bool> = order_items
-            .iter()
-            .map(|i| i.options.asc == Some(false))
-            .collect();
 
         // Column types cannot be inferred from the first group: a later group
         // may produce a different type, and the binary protocol encodes by the
@@ -2911,16 +2998,10 @@ impl Engine {
             if !order_items.is_empty() {
                 let mut key = Vec::with_capacity(order_items.len());
                 for item in &order_items {
-                    // ORDER BY may name an ordinal or an output alias; both
-                    // resolve against the projection before evaluation.
-                    let by_position = ordinal_of(&item.expr).and_then(|n| out.get(n - 1).cloned());
-                    key.push(match by_position {
-                        Some(value) => value,
-                        None => {
-                            let resolved = substitute_aliases(&item.expr, &names);
-                            self.eval_over_group(&resolved, group, refs, session, &out)?
-                        }
-                    });
+                    // Already resolved against the select list, so what is
+                    // left is either a hidden column carrying one of `out` or
+                    // an expression over the group's rows.
+                    key.push(self.eval_over_group(&item.expr, group, refs, session, &out)?);
                 }
                 sort_keys.push(key);
             }
@@ -5920,12 +6001,43 @@ fn projected_items(projection: &[SelectItem]) -> EngineResult<Vec<(String, Expr)
 
 /// The 1-based position an expression names, if it is a bare integer.
 fn ordinal_of(e: &Expr) -> Option<usize> {
-    match e {
+    written_position(e).and_then(|(position, _)| (position > 0).then_some(position))
+}
+
+/// The position a bare number literal names, and the digits it was written
+/// with.
+///
+/// Zero is a position too, which is why this exists beside `ordinal_of`: 8.3
+/// answers `ORDER BY 0` with `Unknown column '0'` rather than sorting on the
+/// constant, so the caller needs to see the number before it can decide that
+/// nothing answers to it. The digits go back because the message quotes them
+/// rather than the parsed value.
+///
+/// Only a literal, and only an integer one. Parentheses are stripped because
+/// 8.3 strips them — `ORDER BY (2)` is the second output column there — and
+/// arithmetic is not a position: `ORDER BY 1 + 1` and `ORDER BY 1.0` are
+/// constants on 8.3 and leave the rows in the order they arrived.
+fn written_position(e: &Expr) -> Option<(usize, &str)> {
+    match strip_parens(e) {
         Expr::Value(v) => match &v.value {
-            sqlparser::ast::Value::Number(n, _) => n.parse::<usize>().ok().filter(|n| *n > 0),
+            sqlparser::ast::Value::Number(n, _) if n.bytes().all(|b| b.is_ascii_digit()) => {
+                // A run of digits too long for a `usize` is still a position,
+                // and one nothing can answer to. Saturating keeps it out of
+                // range rather than letting a parse failure read it as a
+                // constant.
+                Some((n.parse::<usize>().unwrap_or(usize::MAX), n.as_str()))
+            }
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// An expression with any wrapping parentheses removed.
+fn strip_parens(e: &Expr) -> &Expr {
+    match e {
+        Expr::Nested(inner) => strip_parens(inner),
+        other => other,
     }
 }
 
@@ -5937,6 +6049,502 @@ fn resolve_ordinal(e: &Expr, projection: &[SelectItem]) -> Option<Expr> {
         SelectItem::ExprWithAlias { expr, .. } => Some(expr.clone()),
         _ => None,
     }
+}
+
+/// Refuses a `GROUP BY <position>` that names no select item.
+///
+/// `resolve_ordinal` leaves an unresolvable position as the literal it was
+/// written as, which groups every row under one constant key and answers a
+/// different query than the one asked. On 8.3 both ends are 1054 under this
+/// clause's own name: `GROUP BY 5` over one select item, and `GROUP BY 0`,
+/// are `Unknown column '5'` and `'0'` `in 'group statement'`.
+fn check_group_positions(group_exprs: &[Expr], projected: usize) -> EngineResult<()> {
+    for e in group_exprs {
+        if let Some((position, written)) = written_position(e) {
+            if position == 0 || position > projected {
+                return Err(EngineError::unknown_column(written, "group statement"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One column a select list projects: the name it answers to, the expression
+/// behind it, and which relation column it *is*, when it is one.
+///
+/// The slot is the identity ORDER BY compares candidates on. Two items that
+/// are the same column are not ambiguous however they are spelled — `SELECT
+/// t.b, b FROM t ORDER BY b` answers on 8.3 — and two that are different
+/// columns are, which no comparison of the written SQL could tell apart.
+struct OutItem {
+    name: String,
+    expr: Expr,
+    slot: Option<usize>,
+}
+
+/// One resolved ORDER BY item: what to sort on, and which way.
+struct SortKey {
+    expr: Expr,
+    descending: bool,
+}
+
+/// Every column a select list projects, with `*` expanded.
+///
+/// ORDER BY counts positions over what the query *returns*, so a `*` has to be
+/// expanded before a position can be resolved against it: `SELECT * FROM t
+/// ORDER BY 3` sorts on the third column of the table on 8.3, and `ORDER BY 4`
+/// over a three-column table is 1054.
+///
+/// A wildcard-expanded item carries its relation index directly rather than
+/// letting the identifier it is written as be looked up again, because a
+/// lookup stops at the first column of that name and a self-join has two.
+fn output_items(
+    projection: &[SelectItem],
+    relation: &Relation,
+    refs: &[ColumnRef],
+    coalesced: &[String],
+) -> EngineResult<Vec<OutItem>> {
+    use sqlparser::ast::Ident;
+
+    let mut out: Vec<OutItem> = Vec::new();
+    for item in projection {
+        let qualifier = match item {
+            SelectItem::Wildcard(_) => None,
+            SelectItem::QualifiedWildcard(kind, _) => {
+                let written = wildcard_qualifier(kind);
+                Some(written.rsplit('.').next().unwrap_or("").to_owned())
+            }
+            SelectItem::UnnamedExpr(e) => {
+                out.push(OutItem {
+                    name: render_expr(e),
+                    expr: e.clone(),
+                    slot: column_slot(refs, e),
+                });
+                continue;
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                out.push(OutItem {
+                    name: alias.value.clone(),
+                    expr: expr.clone(),
+                    slot: column_slot(refs, expr),
+                });
+                continue;
+            }
+            other => return Err(unsupported(format!("select item `{other}`"))),
+        };
+        // Where this wildcard's own columns start, because the coalescing
+        // below may only look at them. Searching everything appended so far
+        // let a `USING` column bind to an *aliased* item that merely shares
+        // its name: `SELECT LENGTH(a.s) AS id, a.*, bb.* FROM a JOIN bb USING
+        // (id) ORDER BY 2` then sorted on the LENGTH rather than on `a.id`.
+        let expansion = out.len();
+        for (index, column) in relation.columns.iter().enumerate() {
+            if qualifier
+                .as_deref()
+                .is_some_and(|t| !column.table.eq_ignore_ascii_case(t))
+            {
+                continue;
+            }
+            let written = if column.table.is_empty() {
+                Expr::Identifier(Ident::new(column.name.clone()))
+            } else {
+                Expr::CompoundIdentifier(vec![
+                    Ident::new(column.table.clone()),
+                    Ident::new(column.name.clone()),
+                ])
+            };
+            // A column `USING` joined on is one column in MySQL, which
+            // returns it once; this engine's relation keeps both sides, so
+            // `SELECT * FROM a JOIN b USING (id)` puts two columns called
+            // `id` in front of the clause and `ORDER BY id` became 1052 —
+            // a working query refused. The second one resolves to the first,
+            // so the name has one answer while the position count still
+            // matches the columns this engine actually returns.
+            let same = coalesced
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&column.name))
+                .then(|| {
+                    out[expansion..]
+                        .iter()
+                        .find(|o| o.name.eq_ignore_ascii_case(&column.name))
+                })
+                .flatten();
+            let (expr, slot) = match same {
+                Some(first) => (first.expr.clone(), first.slot),
+                None => (written, Some(index)),
+            };
+            out.push(OutItem {
+                name: column.name.clone(),
+                expr,
+                slot,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Every column name a `USING` clause in this FROM joins on.
+///
+/// MySQL coalesces such a column into one; this engine's relation keeps both,
+/// so the names it puts in front of a clause have to be read with that in
+/// mind. See `output_items`.
+fn coalesced_columns(from: &[TableWithJoins]) -> Vec<String> {
+    let mut names = Vec::new();
+    for item in from {
+        for join in &item.joins {
+            if let Some(sqlparser::ast::JoinConstraint::Using(using)) =
+                join_constraint(&join.join_operator)
+            {
+                names.extend(using.iter().map(name::dotted));
+            }
+        }
+    }
+    names
+}
+
+/// Where a bare name written in an ORDER BY lands in the select list.
+///
+/// A left-to-right scan, and the direction it walks is load-bearing rather
+/// than incidental. An item that is *not* a column of the relation wins as
+/// soon as it is reached and nothing after it is looked at; two items that are
+/// different columns are ambiguous; two that are the same column are not.
+/// Measured all three ways on 8.3, over a table with columns `id` and `s`:
+///
+/// ```sql
+/// SELECT id AS b, s AS b, 1 AS b FROM t ORDER BY b   -- 1052, before the `1`
+/// SELECT 1 AS b, id AS b, s AS b FROM t ORDER BY b   -- answers, sorts on 1
+/// SELECT id AS b, LENGTH(s) AS b FROM t ORDER BY b   -- sorts on LENGTH(s)
+/// SELECT b, t.b FROM t ORDER BY b                    -- answers, one column
+/// ```
+///
+/// The third is the one that rules out the reading this first had, that a
+/// column wins over an expression sharing its name: it sorts on the expression
+/// from either position. Both readings agree on the rows unless the sort is
+/// written `DESC`, which is how the wrong one survived a first measurement.
+fn select_list_slot(name: &str, items: &[OutItem]) -> EngineResult<Option<usize>> {
+    let mut column: Option<usize> = None;
+    for (index, item) in items.iter().enumerate() {
+        if !item.name.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let Some(slot) = item.slot else {
+            return Ok(Some(index));
+        };
+        match column {
+            Some(first) if items[first].slot != Some(slot) => {
+                return Err(EngineError::ambiguous(name, "order clause"))
+            }
+            Some(_) => {}
+            None => column = Some(index),
+        }
+    }
+    Ok(column)
+}
+
+/// Resolves one ORDER BY item against the select list, by the order 8.3
+/// resolves in.
+///
+/// Three readings, and the *shape* of the item picks which one applies rather
+/// than whatever happens to resolve:
+///
+/// - A bare integer is a position in the select list and never anything else.
+///   `SELECT JSON_ARRAY(x) FROM t ORDER BY 1` sorts on the document 8.3
+///   returns and not on `x`, which is the whole of #0090; this engine
+///   evaluated the number against the source row, where it is the column in
+///   that position.
+/// - A bare name sees the select list *first*: `SELECT id AS b FROM t ORDER BY
+///   b` sorts on `id` on 8.3 even where `t` has a column called `b`, which is
+///   #0144.
+/// - A name inside a larger expression sees the FROM clause first, and the
+///   select list only where the relation has no such column. Both directions
+///   measured on 8.3 over a table with a column `b`: `ORDER BY b` sorts on the
+///   alias and `ORDER BY b + 1` sorts on the column, while `ORDER BY zz + 1`
+///   with no column `zz` sorts on the alias. So this is a precedence and not a
+///   choice of one clause over the other — getting it backwards either way
+///   breaks half of the measured cases.
+///
+/// A qualifier never reaches an alias, at either level: `SELECT id AS b FROM t
+/// ORDER BY t.b` asks for a column of `t` on 8.3, and an alias is not one.
+///
+/// `bind` says what a resolved select-list position becomes, because the two
+/// callers need different things from it. The ungrouped path sorts source rows
+/// and takes the expression back; the grouped path has already computed one
+/// value per group and binds that instead — see `alias_name` for why a value
+/// cannot be respelled as SQL.
+fn resolve_order_expr(
+    e: &Expr,
+    items: &[OutItem],
+    refs: &[ColumnRef],
+    bind: &dyn Fn(usize) -> Expr,
+) -> EngineResult<Expr> {
+    if let Some((position, written)) = written_position(e) {
+        if position == 0 || position > items.len() {
+            return Err(EngineError::unknown_column(written, "order clause"));
+        }
+        return Ok(bind(position - 1));
+    }
+
+    if let Expr::Identifier(ident) = strip_parens(e) {
+        if let Some(index) = select_list_slot(&ident.value, items)? {
+            return Ok(bind(index));
+        }
+        return Ok(e.clone());
+    }
+
+    // Inside an expression the relation wins, so only a name it cannot answer
+    // falls back to the select list.
+    let ambiguous = std::cell::RefCell::new(None);
+    let resolved = substitute_names(e, &|written| {
+        if column_slot(refs, &Expr::Identifier(sqlparser::ast::Ident::new(written))).is_some() {
+            return None;
+        }
+        match select_list_slot(written, items) {
+            Ok(found) => found.map(bind),
+            Err(clash) => {
+                *ambiguous.borrow_mut() = Some(clash);
+                None
+            }
+        }
+    });
+    match ambiguous.into_inner() {
+        Some(clash) => Err(clash),
+        None => Ok(resolved),
+    }
+}
+
+/// Resolves a whole ORDER BY clause, refusing what 8.3 refuses.
+///
+/// Names and positions for every item first and the arguments after, which is
+/// the order 8.3 answers in: `ORDER BY 9, s LIKE 'a' ESCAPE '!!'` over one
+/// select item is 1054 for the position there, and `ORDER BY nope LIKE 'a'
+/// ESCAPE '!!'` is 1054 for the name rather than 1210.
+///
+/// `aggregated` says whether the query folds anything, because an aggregate in
+/// the clause is only meaningful if it does.
+fn resolve_order_by(
+    order: Option<&OrderBy>,
+    items: &[OutItem],
+    refs: &[ColumnRef],
+    aggregated: bool,
+    bind: &dyn Fn(usize) -> Expr,
+) -> EngineResult<Vec<SortKey>> {
+    let Some(order) = order else {
+        return Ok(Vec::new());
+    };
+    let OrderByKind::Expressions(written) = &order.kind else {
+        return Err(unsupported("this ORDER BY form"));
+    };
+
+    // What `bind` may have put in an expression is in scope for the name check
+    // below: the grouped caller binds a position to the hidden column carrying
+    // the value already computed for it, which the relation has never heard of.
+    let mut scope = refs.to_vec();
+    scope.extend((0..items.len()).map(|index| ColumnRef::new("", alias_name(index))));
+
+    let mut keys = Vec::with_capacity(written.len());
+    for (position, item) in written.iter().enumerate() {
+        let expr = resolve_order_expr(&item.expr, items, refs, bind)?;
+        // Under this clause's own name rather than the field list's, which is
+        // where the message used to come from: an ORDER BY name that resolved
+        // against nothing was evaluated per row and reported wherever the
+        // evaluation happened to fail.
+        //
+        // A name the *output* answers to is left alone rather than refused,
+        // because it is resolved further downstream: `substitute_names` does
+        // not descend into every expression, so `ORDER BY ABS(zz)` over an
+        // alias `zz` reaches the sort unsubstituted, fails to evaluate against
+        // a source row, and is retried against the projected result — which is
+        // how this engine has always answered it.
+        if let Some(name) = unresolved_column(&expr, &scope) {
+            if !items.iter().any(|out| out.name.eq_ignore_ascii_case(&name)) {
+                return Err(EngineError::unknown_column(&name, "order clause"));
+            }
+        }
+        // After this item's names and before the next item is looked at all,
+        // which is where 8.3 puts it: `ORDER BY MAX(nope)` is 1054, `ORDER BY
+        // MAX(id), 9` is 3029, and `ORDER BY 9, MAX(id)` is 1054 for the
+        // position.
+        if !aggregated && contains_aggregate(&item.expr) {
+            return Err(EngineError::aggregate_order_non_aggregated(position + 1));
+        }
+        keys.push(SortKey {
+            expr,
+            descending: item.options.asc == Some(false),
+        });
+    }
+    refuse_malformed_escape(written.iter().map(|i| &i.expr))?;
+    Ok(keys)
+}
+
+/// Refuses an ORDER BY that DISTINCT has already thrown its sort key away for.
+///
+/// DISTINCT settles which rows there are before the sort reads them, so a key
+/// that is not one of the columns the select list returns no longer exists per
+/// row. 8.3 refuses with 3065 rather than picking one of the duplicates, and
+/// this engine answered by sorting before the duplicates were removed.
+///
+/// What counts as being in the select list is the *column*, not the
+/// expression: `SELECT DISTINCT id FROM t ORDER BY id + 1` answers on 8.3
+/// because `id` is returned, and `SELECT DISTINCT id + 1 AS x FROM t ORDER BY
+/// id` is 3065 because it is not — which is why this reads the item as it was
+/// written. An item that resolved to a select-list position is in the list by
+/// construction and is not read at all.
+///
+/// After every item has been resolved, not while they are: `SELECT DISTINCT s
+/// FROM t ORDER BY id, nope` is 1054 for `nope` on 8.3, not 3065 for `id`.
+///
+/// A subquery is not descended into, so `ORDER BY (SELECT id)` is answered
+/// where 8.3 raises 3065. That is the conservative direction `unresolved_column`
+/// takes for the same reason, and the same gap.
+fn check_distinct_order(
+    order: Option<&OrderBy>,
+    items: &[OutItem],
+    refs: &[ColumnRef],
+    relation: &Relation,
+) -> EngineResult<()> {
+    let Some(OrderByKind::Expressions(written)) = order.map(|o| &o.kind) else {
+        return Ok(());
+    };
+    let returned: Vec<usize> = items.iter().filter_map(|item| item.slot).collect();
+    for (position, item) in written.iter().enumerate() {
+        // A position, or a bare name the select list answered, is in the list
+        // by definition.
+        if written_position(&item.expr).is_some() {
+            continue;
+        }
+        if let Expr::Identifier(ident) = strip_parens(&item.expr) {
+            if select_list_slot(&ident.value, items)?.is_some() {
+                continue;
+            }
+        }
+        // So is the whole expression written a second time, which is the one
+        // way a select item that is not a column can be sorted on without
+        // naming its alias: `SELECT DISTINCT id + 1 AS x FROM t ORDER BY id +
+        // 1` answers on 8.3 where `ORDER BY id` is 3065.
+        //
+        // Compared as the parser rebuilds it and not as it was typed, because
+        // 8.3 compares the expressions rather than the text: `ORDER BY id+1`
+        // against `SELECT id + 1` answers there, and so does `ORDER BY
+        // upper(s)` against `SELECT UPPER(s)`. Reading the source span instead
+        // — which is what `render_expr` does, and what this first did — made
+        // every one of those 3065.
+        let rendered = item.expr.to_string();
+        if items
+            .iter()
+            .any(|out| out.expr.to_string().eq_ignore_ascii_case(&rendered))
+        {
+            continue;
+        }
+        for slot in columns_read(&item.expr, refs) {
+            if returned.contains(&slot) {
+                continue;
+            }
+            // An enclosing query's column, which `refs` carries after this
+            // query's own, has no place in this query's select list to be
+            // compared against.
+            let Some(column) = relation.columns.get(slot) else {
+                continue;
+            };
+            // Only the parts there are: 8.3 names a stored table's column
+            // `db.t.id` and a derived table's or a CTE's `d.id`, because a
+            // derived table is in no schema. Writing the empty schema anyway
+            // gave `.d.id`, a spelling no server produces and one this engine
+            // disagreed with itself about — the same query over a CTE named
+            // the schema, because a CTE's relation carries one.
+            let written = [
+                column.schema.as_str(),
+                column.table.as_str(),
+                column.name.as_str(),
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(".");
+            return Err(EngineError::order_not_in_select_list(
+                position + 1,
+                &written,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every relation column an expression reads directly.
+///
+/// Built on the same walk as `unresolved_column` and conservative in the same
+/// direction: a variant missing from `subexpressions` is a column this does
+/// not see, and the statement is answered as it is today.
+fn columns_read(e: &Expr, refs: &[ColumnRef]) -> Vec<usize> {
+    match e {
+        Expr::Identifier(i) if i.value.starts_with('@') => Vec::new(),
+        Expr::CompoundIdentifier(parts)
+            if parts.first().is_some_and(|p| p.value.starts_with('@')) =>
+        {
+            Vec::new()
+        }
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            column_slot(refs, e).into_iter().collect()
+        }
+        Expr::Function(f) => value_arguments(f)
+            .iter()
+            .flat_map(|a| columns_read(a, refs))
+            .collect(),
+        other => subexpressions(other)
+            .into_iter()
+            .flat_map(|s| columns_read(s, refs))
+            .collect(),
+    }
+}
+
+/// Refuses an ORDER BY over a finished result that names anything the result
+/// does not carry.
+///
+/// For the two paths that sort what a query already returned: a set operation
+/// and a SELECT with no FROM clause. Both resolve against the output columns
+/// alone — `SELECT id AS q FROM t UNION SELECT b FROM t ORDER BY id` is 1054
+/// on 8.3 even with `id` in plain sight in `t`, and so is `ORDER BY 2` over
+/// one output column.
+///
+/// Hoisted out of any row loop deliberately: a position is only read while a
+/// row is being keyed, so over an empty result an out-of-range one was never
+/// looked at and the statement answered instead of being refused.
+fn check_projected_order(
+    columns: &[OutColumn],
+    order: Option<&OrderBy>,
+    outer: Option<&OuterRow>,
+) -> EngineResult<()> {
+    let Some(order) = order else { return Ok(()) };
+    let OrderByKind::Expressions(written) = &order.kind else {
+        return Err(unsupported("this ORDER BY form"));
+    };
+    let mut refs: Vec<ColumnRef> = columns
+        .iter()
+        .map(|c| ColumnRef::new(&c.table, &c.name))
+        .collect();
+    // The enclosing query's columns too, or a correlated subquery would be
+    // refused for naming one: `SELECT id, (SELECT 1 ORDER BY id) FROM t`
+    // answers on 8.3, where `id` is the outer row's.
+    if let Some(outer) = outer {
+        refs.extend(outer.schema.iter().cloned());
+    }
+    for item in written {
+        if let Some((position, digits)) = written_position(&item.expr) {
+            if position == 0 || position > columns.len() {
+                return Err(EngineError::unknown_column(digits, "order clause"));
+            }
+            continue;
+        }
+        if let Some(name) = unresolved_column(&item.expr, &refs) {
+            return Err(EngineError::unknown_column(&name, "order clause"));
+        }
+    }
+    // Out of the row loop for the reason `sort_rows` gives: `order_projected`
+    // settles an ESCAPE per row, so over an empty union — or the one row a
+    // FROM-less SELECT has, down a branch nothing takes — a malformed one was
+    // never read and the statement answered where 8.3 raises 1210. The same
+    // zero-rows shape as #0058 and #0093.
+    refuse_malformed_escape(written.iter().map(|i| &i.expr))?;
+    Ok(())
 }
 
 /// Rewrites references to a select-list alias into the hidden column carrying

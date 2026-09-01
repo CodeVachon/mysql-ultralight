@@ -409,6 +409,182 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // Which clause an ORDER BY name resolves against, and what a position
+        // counts over. #0090 and #0144 are the two halves of it: the sort ran
+        // against the relation before the projection existed, so a position
+        // meant the input column and a name found a column the select list
+        // shadowed. Every case here answers one way if the select list wins
+        // and the other way if the relation does — `id` and `b` run opposite
+        // directions so no case can pass under both readings.
+        name: "order by resolution",
+        setup: &[
+            "CREATE TABLE Ob (id INT NOT NULL, b INT NOT NULL, s VARCHAR(10) NOT NULL, \
+             PRIMARY KEY (id))",
+            "INSERT INTO Ob VALUES (1,4,'x'),(2,3,'y'),(3,2,'z'),(4,1,'w')",
+            "CREATE TABLE Oc (id INT NOT NULL, c INT NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Oc VALUES (1,40),(2,30),(3,20),(4,10)",
+        ],
+        cases: &[
+            // A position names the select list. The first is #0090 exactly.
+            same("SELECT JSON_ARRAY(x) FROM (SELECT 1 AS x UNION SELECT 0) t ORDER BY 1"),
+            same("SELECT s, id FROM Ob ORDER BY 2"),
+            same("SELECT s, id FROM Ob ORDER BY (2)"),
+            same("SELECT * FROM Ob ORDER BY 3"),
+            same("SELECT id FROM Ob ORDER BY 5"),
+            same("SELECT id FROM Ob ORDER BY 0"),
+            same("SELECT id FROM Ob ORDER BY b, 5"),
+            same("SELECT * FROM Ob ORDER BY 4"),
+            // The position is read before any row is, so an empty result is
+            // refused rather than answered.
+            same("SELECT id FROM Ob WHERE 0 ORDER BY 5"),
+            // A bare name sees the select list first; the same name inside an
+            // expression sees the FROM clause first. Both directions, because
+            // swapping them answers half of these backwards.
+            same("SELECT id AS b FROM Ob ORDER BY b"),
+            same("SELECT id AS b FROM Ob ORDER BY ((b))"),
+            same("SELECT id AS b FROM Ob ORDER BY b + 1"),
+            same("SELECT id AS b FROM Ob ORDER BY -b"),
+            same("SELECT id AS zz FROM Ob ORDER BY zz + 1"),
+            same("SELECT id AS b FROM Ob ORDER BY Ob.b"),
+            same("SELECT id AS id FROM Ob ORDER BY id"),
+            same("SELECT b AS id FROM Ob ORDER BY id"),
+            same("SELECT b AS zzz FROM Ob ORDER BY b"),
+            // The half that has to keep working: a column the select list does
+            // not return.
+            same("SELECT id FROM Ob ORDER BY b"),
+            same("SELECT id AS b FROM Ob WHERE b > 2 ORDER BY b"),
+            same("SELECT id AS b FROM Ob HAVING b > 2 ORDER BY b"),
+            same("SELECT id AS b FROM Ob HAVING b > 2 ORDER BY 1 DESC"),
+            same("SELECT id FROM Ob ORDER BY nope"),
+            // An alias shadowing a column of the *other* table in a join.
+            same("SELECT Ob.id AS c FROM Ob JOIN Oc ON Oc.id = Ob.id ORDER BY c"),
+            same("SELECT Ob.id AS c FROM Ob JOIN Oc ON Oc.id = Ob.id ORDER BY c + 1"),
+            same("SELECT Ob.s AS id FROM Ob JOIN Oc ON Oc.id = Ob.id ORDER BY id"),
+            // Two select items answering to one name: ambiguous when they are
+            // different columns, and not when they are the same one or when
+            // only one of them is a column at all.
+            same("SELECT id AS b, b FROM Ob ORDER BY b"),
+            same("SELECT id AS x, b AS x FROM Ob ORDER BY x"),
+            same("SELECT id AS x, b AS x FROM Ob ORDER BY x + 0"),
+            same("SELECT id AS x, b AS x FROM Ob ORDER BY 1"),
+            same("SELECT b AS id, id FROM Ob ORDER BY id"),
+            same("SELECT id AS b, s AS b FROM Ob ORDER BY b"),
+            same("SELECT b, Ob.b FROM Ob ORDER BY b"),
+            same("SELECT id, id AS id FROM Ob ORDER BY id"),
+            // An item that is not a column wins outright and stops the scan,
+            // from either position. DESC and a tiebreak because `LENGTH(s)` is
+            // constant here: sorting on it leaves the rows as they arrived,
+            // which is what sorting on `id` ascending also looks like.
+            same("SELECT id AS b, LENGTH(s) AS b FROM Ob ORDER BY b DESC, id"),
+            same("SELECT LENGTH(s) AS b, id AS b FROM Ob ORDER BY b DESC, id"),
+            same("SELECT id AS b, s AS b, 1 AS b FROM Ob ORDER BY b"),
+            same("SELECT 1 AS b, id AS b, s AS b FROM Ob ORDER BY b, id"),
+            same("SELECT id AS b, 1 AS b, s AS b FROM Ob ORDER BY b DESC, id"),
+            // DISTINCT has thrown the key away by the time the sort reads it.
+            same("SELECT DISTINCT s FROM Ob ORDER BY id"),
+            same("SELECT DISTINCT id FROM Ob ORDER BY b"),
+            same("SELECT DISTINCT id FROM Ob ORDER BY id + b"),
+            same("SELECT DISTINCT id + 1 AS x FROM Ob ORDER BY id"),
+            same("SELECT DISTINCT id FROM Ob ORDER BY 2"),
+            same("SELECT DISTINCT s FROM Ob ORDER BY id, nope"),
+            same("SELECT DISTINCT s FROM Ob ORDER BY 1 DESC"),
+            same("SELECT DISTINCT id AS b FROM Ob ORDER BY b"),
+            same("SELECT DISTINCT id FROM Ob ORDER BY id + 1"),
+            same("SELECT DISTINCT s FROM Ob ORDER BY LENGTH(s), s"),
+            same("SELECT DISTINCT id, b FROM Ob ORDER BY b"),
+            same("SELECT DISTINCT id + 1 AS x FROM Ob ORDER BY id + 1"),
+            // A derived table is in no schema, and 8.3 names its column
+            // without one rather than with a leading dot.
+            same("SELECT DISTINCT s FROM (SELECT * FROM Ob) d ORDER BY id"),
+            // Written a second time and spelled differently: 8.3 compares the
+            // expressions, not the text they were typed as.
+            same("SELECT DISTINCT id + 1 AS x FROM Ob ORDER BY id+1"),
+            same("SELECT DISTINCT UPPER(s) FROM Ob ORDER BY upper(s)"),
+            same("SELECT DISTINCT UPPER(s) AS u FROM Ob ORDER BY UPPER( s )"),
+            // An aggregate in the clause of a query that aggregates nothing,
+            // and one inside a subquery, which belongs to that subquery.
+            same("SELECT s FROM Ob ORDER BY MAX(id)"),
+            same("SELECT s FROM Ob ORDER BY MAX(nope)"),
+            same("SELECT s FROM Ob ORDER BY MAX(id), 9"),
+            same("SELECT s FROM Ob ORDER BY (SELECT MAX(id) FROM Oc), s"),
+            // GROUP BY counts positions the same way, under its own clause
+            // name, and after the field list.
+            same("SELECT id FROM Ob GROUP BY 5"),
+            same("SELECT id FROM Ob GROUP BY 0"),
+            same("SELECT id FROM Ob GROUP BY 5 ORDER BY 9"),
+            same("SELECT nope FROM Ob GROUP BY 5"),
+            same("SELECT 5 FROM Ob GROUP BY 1"),
+            same("SELECT id FROM Ob GROUP BY 1 ORDER BY 1"),
+            same("SELECT id, b FROM Ob GROUP BY 1, 2 ORDER BY 2"),
+            // The grouped path resolves by the same rule, and settles the
+            // clause before the grouping rules.
+            same("SELECT MAX(id) AS b FROM Ob GROUP BY b ORDER BY b"),
+            same("SELECT MAX(id) AS b FROM Ob GROUP BY b ORDER BY b + 0"),
+            same("SELECT MAX(id) AS b FROM Ob GROUP BY b ORDER BY 9"),
+            same("SELECT MAX(id) AS b FROM Ob GROUP BY b ORDER BY nope"),
+            same("SELECT COUNT(*) AS c, b FROM Ob GROUP BY b ORDER BY 2"),
+            same("SELECT s, COUNT(*) AS n FROM Ob GROUP BY s ORDER BY 2, 1"),
+            same("SELECT s, COUNT(*) AS n FROM Ob GROUP BY s ORDER BY n + 0, s"),
+            same("SELECT s AS n, COUNT(*) AS s FROM Ob GROUP BY s ORDER BY s, n"),
+            // A `USING` column is one column to the clause, and the
+            // coalescing may only reach the columns that wildcard expanded:
+            // binding the second `id` to an aliased item in front of it that
+            // merely shares the name sorted on the wrong expression.
+            same("SELECT LENGTH(Ob.s) AS id, Ob.*, Oc.* FROM Ob JOIN Oc USING (id) ORDER BY 2 DESC"),
+            same("SELECT Ob.*, Oc.* FROM Ob JOIN Oc USING (id) ORDER BY 1"),
+            // ONLY_FULL_GROUP_BY reaches the ORDER BY as well: a shadowed
+            // alias falls through to a column, and a column that is neither
+            // grouped nor aggregated is 1055 rather than a value read off an
+            // arbitrary row of the group.
+            same("SELECT s AS b, COUNT(*) AS n FROM Ob GROUP BY s ORDER BY b + 0"),
+            same("SELECT s AS zz, COUNT(*) AS n FROM Ob GROUP BY s ORDER BY b + 0"),
+            same("SELECT b, COUNT(*) AS n FROM Ob GROUP BY s ORDER BY b"),
+            same("SELECT s AS b, COUNT(*) AS n FROM Ob GROUP BY s ORDER BY b + 0, nope"),
+            same("SELECT s AS b, COUNT(*) AS n FROM Ob GROUP BY s ORDER BY b"),
+            same("SELECT s, COUNT(*) AS n FROM Ob GROUP BY s ORDER BY MAX(b)"),
+            same("SELECT COUNT(*) AS n FROM Ob GROUP BY s ORDER BY s"),
+            // Names before arguments, in this clause as in the others.
+            same("SELECT id FROM Ob ORDER BY nope LIKE 'a' ESCAPE '!!'"),
+            same("SELECT id FROM Ob ORDER BY 9, s LIKE 'a' ESCAPE '!!'"),
+            same("SELECT id FROM Ob GROUP BY b ORDER BY s LIKE 'a' ESCAPE '!!'"),
+            same("SELECT id FROM Ob GROUP BY b ORDER BY nope LIKE 'a' ESCAPE '!!'"),
+            // A set operation and a FROM-less SELECT sort a finished result,
+            // so their ORDER BY names its columns and nothing else.
+            same("SELECT id AS q FROM Ob UNION SELECT b FROM Ob ORDER BY q"),
+            same("SELECT id AS q FROM Ob UNION SELECT b FROM Ob ORDER BY id"),
+            same("SELECT id AS q FROM Ob UNION SELECT b FROM Ob ORDER BY 2"),
+            same("SELECT id FROM Ob WHERE 0 UNION SELECT b FROM Ob WHERE 0 ORDER BY 5"),
+            // Their ESCAPEs are settled while resolving too, which only shows
+            // over a result with no rows in it: the same union with rows
+            // raises 1210 through the evaluation.
+            same("SELECT id FROM Ob WHERE 0 UNION SELECT b FROM Ob WHERE 0 ORDER BY s LIKE 'a' ESCAPE '!!'"),
+            same("SELECT 1 AS one ORDER BY one LIKE 'a' ESCAPE '!!'"),
+            same("SELECT 1 AS one ORDER BY 2"),
+            same("SELECT 1 AS one ORDER BY nope"),
+            same("SELECT 1 AS one ORDER BY one"),
+            same("SELECT 1 AS one, 2 AS two ORDER BY 2"),
+            // A correlated subquery's ORDER BY sees the enclosing row too.
+            // Asked from the WHERE clause rather than the select list, because
+            // this engine describes a scalar subquery's column as a string
+            // where 8.3 describes it as the INT it holds — a gap of its own,
+            // and one that would put ten divergences in the baseline for a
+            // reason that has nothing to do with this clause.
+            same("SELECT id FROM Ob WHERE (SELECT 1 ORDER BY id) = 1 ORDER BY id"),
+            same("SELECT id FROM Ob WHERE (SELECT 1 ORDER BY nope) = 1 ORDER BY id"),
+            // A window is computed over the rows in the order they reach it,
+            // which is the order the sort put them in. Every window here has
+            // an ORDER BY of its own or a value that does not depend on one,
+            // because anything else would be comparing two query plans.
+            same("SELECT ROW_NUMBER() OVER (ORDER BY b) AS rn FROM Ob ORDER BY rn DESC"),
+            same("SELECT ROW_NUMBER() OVER (ORDER BY b) AS rn FROM Ob ORDER BY 1 DESC"),
+            same("SELECT id, ROW_NUMBER() OVER (ORDER BY b) AS rn FROM Ob ORDER BY id DESC"),
+            same("SELECT id, COUNT(*) OVER () AS c FROM Ob ORDER BY id DESC"),
+            // Inside a derived table, where the LIMIT is what makes the inner
+            // clause decide anything.
+            same("SELECT * FROM (SELECT id AS b FROM Ob ORDER BY b LIMIT 2) d ORDER BY b"),
+        ],
+    },
+    Group {
         // Everything here is about what the *binary* protocol sends, which the
         // harness could not see until it started asking both ways. Each case
         // is one where a declared type code narrower than the value it carries

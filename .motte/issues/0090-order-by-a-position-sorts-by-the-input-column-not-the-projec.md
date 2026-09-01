@@ -1,11 +1,11 @@
 ---
 id: 90
 title: ORDER BY a position sorts by the input column, not the projection
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-08-25T05:12:45Z
-updated: 2026-08-25T05:12:45Z
+updated: 2026-09-01T14:31:09Z
 ---
 
 ## Description

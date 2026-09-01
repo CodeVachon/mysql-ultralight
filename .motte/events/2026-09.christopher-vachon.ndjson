@@ -8,3 +8,7 @@
 {"at":"2026-09-01T06:09:08Z","id":148,"by":"Christopher Vachon","as":"user","type":"created","title":"information_schema names compare case-sensitively in MySQL","state":"Todo"}
 {"at":"2026-09-01T06:09:09Z","id":149,"by":"Christopher Vachon","as":"user","type":"created","title":"A DDL COLLATE the engine cannot honour is now refused","state":"Todo"}
 {"at":"2026-09-01T06:09:09Z","id":150,"by":"Christopher Vachon","as":"user","type":"created","title":"A duplicate CREATE INDEX is accepted","state":"Todo"}
+{"at":"2026-09-01T07:46:27Z","id":137,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-01T07:46:27Z","id":138,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-01T14:31:09Z","id":90,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-01T14:31:09Z","id":144,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}

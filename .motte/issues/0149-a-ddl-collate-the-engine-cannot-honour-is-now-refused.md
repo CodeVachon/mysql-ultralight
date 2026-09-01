@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-09-01T06:09:09Z
-updated: 2026-09-01T06:09:09Z
+updated: 2026-09-01T07:46:39Z
 ---
 
 ## Description
@@ -24,3 +24,13 @@ So this is a narrowing, not a fix: 8.3 accepts the statement and the engine now 
 It costs nothing against the conformance target today -- all 314 COLLATE clauses in the Appello schema are _ci, which the engine honours -- but a schema using a _bin collation cannot be created at all.
 
 Closing this means honouring a per-column collation, which is #0129. When that lands, the refusal should become an answer and a corpus case should replace it.
+
+## Notes
+
+### 2026-09-01T07:46:39Z — Christopher Vachon (user)
+
+Widened by 294e19c: the refusal now covers the TABLE-level clause as well as the column-level one, through a single shared reader. Review found the first cut refused only the column form while the table form was still parsed and dropped -- and this repo's example migrations write it that way on all five tables, so the wrong answer was reachable by writing the clause one line higher.
+
+The boundary is now measured rather than suffix-matched: 286 collation names read off 8.3, embedded sorted. A name outside that set is 1273 as MySQL writes it. A real MySQL collation this engine cannot compare in -- utf8mb4_bin, latin1_swedish_ci, binary -- is the unsupported refusal, which is what this issue tracks. The first cut conflated the two and answered 1273 for utf8mb4_bin, a false claim about a name MySQL has.
+
+So closing this issue means honouring those collations (#0129), and when it lands the refusal becomes an answer at both levels and the corpus can carry cases for them.
