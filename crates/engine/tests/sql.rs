@@ -872,6 +872,11 @@ fn a_malformed_escape_is_refused_even_where_no_row_evaluates_it() {
         "SELECT 1 FROM LE GROUP BY s HAVING MAX(s) LIKE 'a' ESCAPE '!!'",
         "SELECT s, COUNT(*) FROM LE GROUP BY s HAVING s LIKE 'a' ESCAPE '!!'",
         "SELECT COUNT(*) FROM LE GROUP BY s LIKE 'a' ESCAPE '!!'",
+        // No aggregate and no GROUP BY, so this one is not grouped at all —
+        // the clause is settled per row on the projection path, and over an
+        // empty table there is no row to settle it. It reaches a different
+        // guard from the two above and needs a case of its own.
+        "SELECT s FROM LE HAVING s LIKE 'a' ESCAPE '!!'",
         // A join produces no pair of rows when either side is empty, so an ON
         // clause is settled for no row at all.
         "SELECT a.id FROM LE a JOIN LF b ON a.s LIKE b.s ESCAPE '!!'",
@@ -879,6 +884,10 @@ fn a_malformed_escape_is_refused_even_where_no_row_evaluates_it() {
         // One row, and the LIKE still never evaluated.
         "SELECT CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE '!!') ELSE 9 END",
         "SELECT 0 AND ('a' LIKE 'b' ESCAPE '!!')",
+        // A FROM-less HAVING, where the one implicit row would otherwise
+        // settle the clause — so the branch nothing takes is what makes this
+        // reach the guard rather than the evaluation.
+        "SELECT 1 HAVING CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE '!!') ELSE 9 END > 0",
     ] {
         // Matched rather than unwrapped, so a statement that succeeds names
         // itself. Half of these differ from their neighbours by one clause,
@@ -2377,6 +2386,429 @@ fn a_having_without_an_aggregate_is_applied() {
         "SELECT region FROM Sale GROUP BY region HAVING region = 'north'",
     );
     assert_eq!(filtered, vec![vec!["north"]]);
+}
+
+/// The table the HAVING tests below read, and one with nothing in it.
+fn having_rows(engine: &Engine, session: &mut Session) {
+    run(
+        engine,
+        session,
+        "CREATE TABLE H (id INT NOT NULL, b INT NULL, s VARCHAR(10) NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        engine,
+        session,
+        "INSERT INTO H VALUES (1,1,'x'),(2,2,'y'),(3,3,'z'),(4,NULL,'w')",
+    );
+    run(
+        engine,
+        session,
+        "CREATE TABLE HE (id INT NOT NULL, b INT NULL, PRIMARY KEY (id))",
+    );
+}
+
+/// A HAVING with no aggregate does not group the query.
+///
+/// Measured on 8.3: `SELECT b FROM H HAVING b > 1` answers the two rows where
+/// `b` is greater than 1, and describes the column exactly as `SELECT b FROM
+/// H` does — same type, same width, same flags, same origin table. The clause
+/// is a second filter there, not a grouping.
+///
+/// This engine read the presence of the clause as making the query grouped, so
+/// an ordinary column became a nonaggregated reference and ONLY_FULL_GROUP_BY
+/// refused every statement here. Refusing what MySQL answers is the direction
+/// that breaks working queries rather than merely disagreeing with them.
+#[test]
+fn a_having_without_an_aggregate_does_not_group_the_query() {
+    let (engine, mut session) = engine();
+    having_rows(&engine, &mut session);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT b FROM H HAVING b > 1 ORDER BY b"
+        ),
+        vec![vec!["2"], vec!["3"]]
+    );
+    // Every column stays available, which is the part grouping would have
+    // taken away: `SELECT *` is not even a legal select item in a grouped
+    // query here.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT * FROM H HAVING b > 1 ORDER BY id"
+        ),
+        vec![vec!["2", "2", "y"], vec!["3", "3", "z"]]
+    );
+    // The clause is settled per row and after the projection, so it can name
+    // an output alias and still filter row by row.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT b + 1 AS bp FROM H HAVING bp > 2 ORDER BY bp"
+        ),
+        vec![vec!["3"], vec!["4"]]
+    );
+    // Ahead of DISTINCT, behind WHERE, and ahead of ORDER BY and LIMIT.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT DISTINCT s FROM H WHERE id < 4 HAVING s > 'w' ORDER BY s LIMIT 2"
+        ),
+        vec![vec!["x"], vec!["y"]]
+    );
+    // An aggregate inside a subquery belongs to that subquery. Grouping the
+    // outer query for it would collapse four rows into one.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT b FROM H HAVING b > (SELECT MIN(b) FROM H) ORDER BY b"
+        ),
+        vec![vec!["2"], vec!["3"]]
+    );
+    // Over no rows it produces no rows, where the same clause with an
+    // aggregate in it settles over one implicit group. Both measured on 8.3.
+    assert!(rows(&engine, &mut session, "SELECT b FROM HE HAVING b > 1").is_empty());
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM HE HAVING COUNT(*) >= 0"
+        ),
+        vec![vec!["0"]]
+    );
+}
+
+/// A window function is computed over the rows the HAVING kept.
+///
+/// MySQL evaluates a window *after* HAVING, so the clause decides what the
+/// window even sees. Measured on 8.3 over H(1,2,3,NULL): `HAVING b > 1` leaves
+/// two rows, `ROW_NUMBER()` numbers them 1 and 2, `COUNT(*) OVER ()` answers 2
+/// and `SUM(id) OVER ()` answers 5 — not 2 and 3, 4, and 10.
+///
+/// The first arrangement of this fix filtered the projected rows, which meant
+/// `project` had already computed every window over every row the WHERE kept.
+/// The row *set* was right and the window values were wrong, which is the
+/// worse failure: these statements were refused with 1055 before the clause
+/// stopped grouping, so a refusal had become a wrong answer.
+///
+/// There is no circularity to worry about. A HAVING can never name a window,
+/// directly or through an alias — that is 3593 and 3594 — so nothing the
+/// clause reads depends on a value that is not yet computed.
+#[test]
+fn a_window_is_computed_after_an_ungrouped_having() {
+    let (engine, mut session) = engine();
+    having_rows(&engine, &mut session);
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT b, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM H HAVING b > 1 ORDER BY b"
+        ),
+        vec![vec!["2", "1"], vec!["3", "2"]]
+    );
+    // The row set is the same under either order and only the window value
+    // tells them apart, which is why this asserts the value: 2 is the count of
+    // what survived and 4 is the count of what the WHERE left.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT b, COUNT(*) OVER () AS c FROM H HAVING b > 1 ORDER BY b"
+        ),
+        vec![vec!["2", "2"], vec!["3", "2"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT b, SUM(id) OVER () AS t FROM H HAVING b > 1 ORDER BY b"
+        ),
+        vec![vec!["2", "5"], vec!["3", "5"]]
+    );
+    // Partitions are drawn over the survivors too, not merely renumbered.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT b, ROW_NUMBER() OVER (PARTITION BY b > 2 ORDER BY id) AS rn FROM H \
+             HAVING b IS NOT NULL ORDER BY b"
+        ),
+        vec![vec!["1", "1"], vec!["2", "2"], vec!["3", "1"]]
+    );
+    // LIMIT and DISTINCT come after the window, so neither narrows it.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT b, COUNT(*) OVER () AS c FROM H HAVING b > 1 ORDER BY b LIMIT 1"
+        ),
+        vec![vec!["2", "2"]]
+    );
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT b, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM H HAVING 0"
+    )
+    .is_empty());
+}
+
+/// An aggregate written in the HAVING and nowhere else still groups the query.
+///
+/// The other side of the boundary above, and the reason the routing asks what
+/// the clause *contains* rather than whether it is there: `SELECT b FROM H
+/// HAVING COUNT(*) > 0` is one implicit group covering every row on 8.3, so
+/// `b` is a nonaggregated column in an aggregated query and the statement is
+/// refused rather than answered.
+#[test]
+fn an_aggregate_in_the_having_groups_the_query() {
+    let (engine, mut session) = engine();
+    having_rows(&engine, &mut session);
+    assert!(session.sql_mode().only_full_group_by);
+
+    for sql in [
+        "SELECT b FROM H HAVING COUNT(*) > 0",
+        "SELECT b FROM H HAVING b > 1 AND COUNT(*) > 0",
+        "SELECT b FROM H HAVING SUM(id) > 1",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1140, "{sql} -> {err}");
+    }
+
+    // And one that groups legally answers the single row the group produces.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM H HAVING COUNT(*) > 0"
+        ),
+        vec![vec!["4"]]
+    );
+}
+
+/// An aggregated query with no GROUP BY is 1140, not 1055.
+///
+/// Two different complaints on 8.3: 1055 is a column missing from a GROUP BY
+/// that exists, and ER_MIX_OF_GROUP_FUNC_AND_FIELDS_V2 at 1140 is one in a
+/// query that has no GROUP BY to be missing from. This engine sent 1055 for
+/// both, so a client branching on the code was told the wrong rule.
+#[test]
+fn an_aggregated_query_without_a_group_by_is_1140() {
+    let (engine, mut session) = engine();
+    having_rows(&engine, &mut session);
+
+    let err = engine
+        .execute(&mut session, "SELECT COUNT(*), b FROM H", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1140, "{err}");
+    assert!(
+        err.message.contains("without GROUP BY"),
+        "expected 8.3's wording, got: {err}"
+    );
+
+    // With a GROUP BY it stays 1055.
+    let err = engine
+        .execute(&mut session, "SELECT id, COUNT(*) FROM H GROUP BY b", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1055, "{err}");
+}
+
+/// HAVING reads the select list and the grouping, not the FROM clause.
+///
+/// Measured on 8.3, and with ONLY_FULL_GROUP_BY off as well as on: a name in a
+/// HAVING resolves against the select list, the GROUP BY columns and any
+/// enclosing query — nothing else. `SELECT b FROM H HAVING id > 1` is 1054
+/// "in 'having clause'" there with `id` sitting in `H`.
+///
+/// It is what keeps the per-row HAVING honest. That path makes every column of
+/// the relation reachable from the clause, so without this `SELECT b FROM H
+/// HAVING id > 1` would have become an answer — and `SELECT COUNT(*) FROM H
+/// HAVING b > 1`, which this engine answered as an empty set because the
+/// group's first row happened not to pass, would have stayed one.
+#[test]
+fn a_having_does_not_read_the_from_clause() {
+    let (engine, mut session) = engine();
+    having_rows(&engine, &mut session);
+
+    for sql in [
+        "SELECT b FROM H HAVING id > 1",
+        "SELECT COUNT(*) FROM H HAVING b > 1",
+        "SELECT b FROM H GROUP BY b HAVING id > 1",
+        // The item's *name* is what a name can match, and `b + 1` is not `b`.
+        "SELECT b + 1 FROM H HAVING b + 1 > 2",
+        "SELECT UPPER(s) FROM H HAVING s > 'w'",
+        // An aggregate's argument does read the relation, so this one is a
+        // name nothing in the statement answers to at all.
+        "SELECT SUM(id) FROM H HAVING SUM(nope) > 1",
+        // Ahead of the ESCAPE guard, because 8.3 resolves a clause's names
+        // before its arguments.
+        "SELECT b FROM H HAVING nope LIKE 'a' ESCAPE '!!'",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1054, "{sql} -> {err}");
+        assert!(
+            err.message.contains("having clause"),
+            "{sql} -> {err}: expected the clause to be named"
+        );
+    }
+
+    // The field list is resolved first, which is the order 8.3 answers in and
+    // is only true while that pass runs ahead of the filter.
+    let err = engine
+        .execute(&mut session, "SELECT nope FROM H HAVING zz > 1", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1054, "{err}");
+    assert!(err.message.contains("field list"), "{err}");
+    let err = engine
+        .execute(&mut session, "SELECT a.* FROM H HAVING zz > 1", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1051, "{err}");
+    // And the HAVING before the ORDER BY, also measured.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT b FROM H HAVING nope > 1 ORDER BY alsonope",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1054, "{err}");
+    assert!(err.message.contains("having clause"), "{err}");
+
+    for sql in [
+        // By identity rather than by spelling: neither name on this column is
+        // the one the clause wrote.
+        "SELECT b AS zzz FROM H HAVING b > 1",
+        "SELECT b FROM H HAVING H.b > 1",
+        // A column the query groups by, whether or not it is also selected.
+        "SELECT COUNT(*) FROM H GROUP BY s HAVING s > 'w'",
+        // An aggregate's argument reads the whole relation.
+        "SELECT SUM(id) FROM H HAVING SUM(id) > 1",
+        // An enclosing query's column: 8.3 resolves a HAVING name outwards.
+        "SELECT id FROM H WHERE (SELECT MAX(x.b) FROM H x HAVING H.id > 0) IS NOT NULL",
+    ] {
+        run(&engine, &mut session, sql);
+    }
+}
+
+/// A HAVING name that could mean two different things is 1052.
+///
+/// The per-row path would otherwise have answered with whichever the
+/// substitution reached first, which is a value chosen by this engine's
+/// internals: `SELECT id AS b, t.b FROM t HAVING b > 1` is
+/// ER_NON_UNIQ_ERROR on 8.3. The same column written twice is *not* ambiguous
+/// there, which is why the check compares what the names resolve to.
+#[test]
+fn a_having_name_meaning_two_things_is_refused() {
+    let (engine, mut session) = engine();
+    having_rows(&engine, &mut session);
+
+    for sql in [
+        "SELECT id AS b, H.b FROM H HAVING b > 1",
+        "SELECT b, id AS b FROM H HAVING b > 1",
+        // Through a `*`, where the select list never wrote either name: a
+        // self-join projects two columns called `id`, and resolving to the
+        // first is an answer chosen by which side of the join came first.
+        "SELECT * FROM H a JOIN H c ON a.id = c.id HAVING id > 1",
+        "SELECT a.*, c.b FROM H a JOIN H c ON a.id = c.id HAVING b > 1",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1052, "{sql} -> {err}");
+    }
+
+    // Twice over is one thing, and answers. So is a qualified `*`, which
+    // projects one of the two.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT H.b, b FROM H HAVING b > 1 ORDER BY 1"
+        ),
+        vec![vec!["2", "2"], vec!["3", "3"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT a.id FROM H a JOIN H c ON a.id = c.id HAVING id > 1 ORDER BY 1"
+        ),
+        vec![vec!["2"], vec!["3"], vec!["4"]]
+    );
+}
+
+/// A window function cannot be read from a HAVING, directly or through an
+/// alias.
+///
+/// A window is computed over the finished result, so a clause deciding what
+/// the result contains cannot use one: 8.3 answers 3593 for the function and
+/// 3594 for an alias of an expression containing one. The alias half is the
+/// one the per-row path would have got wrong rather than merely miscoded — the
+/// projected row holds a real row number, so the clause would have filtered on
+/// it and answered.
+#[test]
+fn a_window_function_in_a_having_is_refused() {
+    let (engine, mut session) = engine();
+    having_rows(&engine, &mut session);
+
+    for sql in [
+        "SELECT b FROM H HAVING ROW_NUMBER() OVER (ORDER BY id) > 1",
+        "SELECT b FROM H GROUP BY b HAVING ROW_NUMBER() OVER () > 1",
+        // Left to right through the clause, which is the order 8.3 refuses in.
+        "SELECT b FROM H HAVING ROW_NUMBER() OVER () > 1 AND nope > 1",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 3593, "{sql} -> {err}");
+    }
+
+    for sql in [
+        "SELECT b, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM H HAVING rn > 2",
+        "SELECT b, ROW_NUMBER() OVER (ORDER BY b) AS rn FROM H GROUP BY b HAVING rn > 1",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 3594, "{sql} -> {err}");
+    }
+
+    // The name beside it still wins when it comes first.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT b FROM H HAVING nope > 1 AND ROW_NUMBER() OVER () > 1",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1054, "{err}");
+}
+
+/// A FROM-less SELECT has a HAVING too, and this engine dropped it.
+///
+/// `SELECT 1 HAVING 0` is an empty result on 8.3 and was a row here, and
+/// `SELECT 1 HAVING nope > 0` is 1054 there and was a row here as well. The
+/// one implicit row is the group, so an aggregate in the clause folds over it
+/// exactly as one in the select list already does.
+#[test]
+fn a_from_less_select_applies_its_having() {
+    let (engine, mut session) = engine();
+
+    assert!(rows(&engine, &mut session, "SELECT 1 HAVING 0").is_empty());
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 1 AS x HAVING x > 0"),
+        vec![vec!["1"]]
+    );
+    assert!(rows(&engine, &mut session, "SELECT COUNT(*) HAVING COUNT(*) > 5").is_empty());
+
+    // The clause is named as well as the code, because the per-row evaluation
+    // this path already did raises the same 1054 under 'field list' — so a
+    // test reading only the code passes with the resolve-time check removed.
+    let err = engine
+        .execute(&mut session, "SELECT 1 HAVING nope > 0", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1054, "{err}");
+    assert!(err.message.contains("having clause"), "{err}");
 }
 
 /// Under ONLY_FULL_GROUP_BY, selecting a column that is neither grouped nor

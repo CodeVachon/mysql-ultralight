@@ -34,6 +34,50 @@ impl EngineError {
         )
     }
 
+    /// ER_NON_UNIQ_ERROR.
+    ///
+    /// The clause is spelled into the message without quotes, which is how
+    /// MySQL prints this one: `Column 'b' in having clause is ambiguous`,
+    /// beside 1054's `Unknown column 'b' in 'having clause'`.
+    pub fn ambiguous(name: &str, context: &str) -> Self {
+        Self::new(
+            1052,
+            "23000",
+            format!("Column '{name}' in {context} is ambiguous"),
+        )
+    }
+
+    /// ER_WINDOW_INVALID_WINDOW_FUNC_USE.
+    ///
+    /// A window function is computed over the result, so a clause that decides
+    /// what the result *is* cannot call one. 8.3 names the function in lower
+    /// case whatever the statement wrote.
+    pub fn window_function_misplaced(name: &str) -> Self {
+        Self::new(
+            3593,
+            "HY000",
+            format!(
+                "You cannot use the window function '{}' in this context.",
+                name.to_ascii_lowercase()
+            ),
+        )
+    }
+
+    /// ER_WINDOW_INVALID_WINDOW_FUNC_ALIAS_USE.
+    ///
+    /// The same refusal reached through a select-list alias, which MySQL
+    /// distinguishes because the clause never wrote the function itself.
+    pub fn window_alias_misplaced(name: &str) -> Self {
+        Self::new(
+            3594,
+            "HY000",
+            format!(
+                "You cannot use the alias '{name}' of an expression containing a window \
+                 function in this context."
+            ),
+        )
+    }
+
     /// ER_BAD_TABLE_ERROR.
     ///
     /// Distinct from `no_such_table`: 1146 is a table the catalog does not

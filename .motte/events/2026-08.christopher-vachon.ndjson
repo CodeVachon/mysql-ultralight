@@ -263,3 +263,5 @@
 {"at":"2026-08-31T20:28:05Z","id":141,"by":"Christopher Vachon","as":"user","type":"created","title":"A hex or bit literal is not read as a number","state":"Todo"}
 {"at":"2026-08-31T20:28:22Z","id":142,"by":"Christopher Vachon","as":"user","type":"created","title":"A computed string column's type code does not widen with its argument","state":"Todo"}
 {"at":"2026-08-31T20:28:22Z","id":143,"by":"Christopher Vachon","as":"user","type":"created","title":"Binariness does not survive an aggregate","state":"Todo"}
+{"at":"2026-08-31T21:18:30Z","id":130,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-08-31T23:25:21Z","id":103,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}

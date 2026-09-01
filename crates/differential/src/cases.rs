@@ -287,6 +287,128 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // What makes a query grouped, and what a HAVING can see. Nothing here
+        // asks about aggregation itself; the point is the boundary either side
+        // of the clause, which is where #0103 sat.
+        name: "having",
+        setup: &[
+            "CREATE TABLE Hv (id INT NOT NULL, b INT NULL, s VARCHAR(10) NOT NULL, \
+             PRIMARY KEY (id))",
+            "INSERT INTO Hv VALUES (1,1,'x'),(2,2,'y'),(3,3,'z'),(4,NULL,'w')",
+            "CREATE TABLE HvE (id INT NOT NULL, b VARCHAR(10) NULL, PRIMARY KEY (id))",
+        ],
+        cases: &[
+            // A HAVING with no aggregate does not group the query: every
+            // column stays available and the clause filters rows. This engine
+            // read the clause as grouping and refused all of these with 1055.
+            same("SELECT b FROM Hv HAVING b > 1 ORDER BY b"),
+            same("SELECT * FROM Hv HAVING b > 1 ORDER BY id"),
+            same("SELECT b FROM Hv HAVING b IS NULL"),
+            same("SELECT b FROM Hv HAVING 1 ORDER BY b"),
+            same("SELECT b FROM Hv HAVING 0"),
+            same("SELECT b FROM Hv HAVING NULL"),
+            // Settled after the projection, so it reads an output alias, and
+            // before DISTINCT, ORDER BY and LIMIT.
+            same("SELECT b + 1 AS bp FROM Hv HAVING bp > 2 ORDER BY bp"),
+            same("SELECT DISTINCT s FROM Hv WHERE id < 4 HAVING s > 'w' ORDER BY s"),
+            same("SELECT b FROM Hv HAVING b > 1 ORDER BY b LIMIT 1"),
+            // An aggregate inside a subquery belongs to that subquery, so the
+            // outer query is still per-row.
+            same("SELECT b FROM Hv HAVING b > (SELECT MIN(b) FROM Hv) ORDER BY b"),
+            same(
+                "SELECT b FROM Hv HAVING (SELECT COUNT(*) FROM HvE WHERE HvE.id = Hv.id) = 0 \
+                 ORDER BY b",
+            ),
+            // The clause resolves a name by what it is rather than by how it
+            // is spelled, and an alias beats a column.
+            same("SELECT b AS zzz FROM Hv HAVING b > 1 ORDER BY zzz"),
+            same("SELECT b FROM Hv HAVING Hv.b > 1 ORDER BY b"),
+            // Ordered by position rather than by the alias, which is a
+            // different rule and a divergence of its own: `SELECT id AS b FROM
+            // Hv ORDER BY b` sorts by the alias on 8.3 and by the column `b`
+            // here, with no HAVING anywhere near it.
+            same("SELECT id AS b FROM Hv HAVING b > 1 ORDER BY 1"),
+            same("SELECT Hv.b, b FROM Hv HAVING b > 1 ORDER BY 1"),
+            same("SELECT id, b AS bb FROM Hv HAVING bb > 1 ORDER BY id"),
+            same("SELECT x.b FROM Hv AS x HAVING x.b > 1 ORDER BY 1"),
+            // An enclosing query's column is in scope; this query's own FROM
+            // is not.
+            // The subquery sits in the WHERE rather than the select list,
+            // because a scalar subquery *projected* is declared VAR_STRING by
+            // this engine and LONGLONG by 8.3 — a divergence with nothing to
+            // do with HAVING, which would drown this case's question.
+            same(
+                "SELECT id FROM Hv WHERE (SELECT MAX(x.b) FROM Hv x HAVING Hv.id > 2) \
+                 IS NOT NULL ORDER BY id",
+            ),
+            same("SELECT b FROM Hv HAVING id > 1"),
+            same("SELECT COUNT(*) FROM Hv HAVING b > 1"),
+            same("SELECT b FROM Hv GROUP BY b HAVING id > 1"),
+            same("SELECT b + 1 FROM Hv HAVING b + 1 > 2"),
+            same("SELECT UPPER(s) FROM Hv HAVING s > 'w'"),
+            same("SELECT SUM(id) FROM Hv HAVING SUM(nope) > 1"),
+            same("SELECT SUM(id) FROM Hv HAVING SUM(id) > 1"),
+            same("SELECT s, COUNT(*) FROM Hv GROUP BY s HAVING s > 'w' ORDER BY s"),
+            // Two things one name could mean.
+            same("SELECT id AS b, Hv.b FROM Hv HAVING b > 1"),
+            same("SELECT * FROM Hv a JOIN Hv c ON a.id = c.id HAVING id > 1"),
+            same("SELECT a.*, c.b FROM Hv a JOIN Hv c ON a.id = c.id HAVING b > 1"),
+            same("SELECT a.id FROM Hv a JOIN Hv c ON a.id = c.id HAVING id > 1 ORDER BY 1"),
+            same("SELECT * FROM Hv HAVING nope > 1"),
+            // An aggregate written in the HAVING and nowhere else *does* group
+            // the query, which is 1140 and not 1055 -- a different complaint
+            // from a column missing from a GROUP BY that exists.
+            same("SELECT b FROM Hv HAVING COUNT(*) > 0"),
+            same("SELECT b FROM Hv HAVING b > 1 AND COUNT(*) > 0"),
+            same("SELECT b FROM Hv HAVING SUM(id) > 1"),
+            same("SELECT COUNT(*), b FROM Hv"),
+            same("SELECT id, COUNT(*) FROM Hv GROUP BY b"),
+            same("SELECT COUNT(*) FROM Hv HAVING COUNT(*) > 0"),
+            same("SELECT b FROM Hv GROUP BY b HAVING COUNT(*) > 0 AND b > 1 ORDER BY b"),
+            // A window is computed over the finished result, so the clause
+            // deciding what the result holds cannot read one -- and the alias
+            // is the half that would otherwise have been answered from the
+            // projected row.
+            same("SELECT b FROM Hv HAVING ROW_NUMBER() OVER (ORDER BY id) > 1"),
+            same("SELECT b, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM Hv HAVING rn > 2"),
+            // A window is computed over the rows the HAVING kept, not over the
+            // rows the WHERE kept. The row set is the same either way and only
+            // the window value says which order was used, which is why these
+            // are here at all -- nothing else in this group composes the two.
+            same("SELECT b, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM Hv HAVING b > 1 ORDER BY b"),
+            same("SELECT b, COUNT(*) OVER () AS c FROM Hv HAVING b > 1 ORDER BY b"),
+            same("SELECT b, SUM(id) OVER () AS t FROM Hv HAVING b > 1 ORDER BY b"),
+            same(
+                "SELECT b, ROW_NUMBER() OVER (PARTITION BY b > 2 ORDER BY id) AS rn FROM Hv \
+                 HAVING b IS NOT NULL ORDER BY b",
+            ),
+            same("SELECT b, COUNT(*) OVER () AS c FROM Hv WHERE id < 4 HAVING b > 1 ORDER BY b"),
+            same("SELECT DISTINCT b, COUNT(*) OVER () AS c FROM Hv HAVING b > 1 ORDER BY b"),
+            same("SELECT b, COUNT(*) OVER () AS c FROM Hv HAVING b > 1 ORDER BY b LIMIT 1"),
+            same("SELECT b, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM Hv HAVING 0"),
+            same("SELECT b, COUNT(*) OVER () AS c FROM Hv HAVING c > 1"),
+            // The clause order either side of the HAVING, each measured.
+            same("SELECT nope FROM Hv HAVING zz > 1"),
+            same("SELECT a.* FROM Hv HAVING zz > 1"),
+            same("SELECT b FROM Hv HAVING nope > 1 ORDER BY alsonope"),
+            same("SELECT b + 1 AS b FROM Hv HAVING b > 2 ORDER BY 1"),
+            // Names before arguments: an unknown one is 1054 where a malformed
+            // ESCAPE beside it would be 1210.
+            same("SELECT b FROM Hv HAVING nope LIKE 'a' ESCAPE '!!'"),
+            same("SELECT b FROM Hv HAVING b LIKE 'a' ESCAPE '!!'"),
+            // Over an empty table, where nothing per row settles the clause.
+            same("SELECT b FROM HvE HAVING b > 1"),
+            same("SELECT COUNT(*) FROM HvE HAVING COUNT(*) >= 0"),
+            same("SELECT b FROM HvE HAVING b LIKE 'a' ESCAPE '!!'"),
+            // A FROM-less SELECT has one too, and this engine dropped it.
+            same("SELECT 1 HAVING 0"),
+            same("SELECT 1 AS x HAVING x > 0"),
+            same("SELECT 1 HAVING nope > 0"),
+            same("SELECT COUNT(*) HAVING COUNT(*) > 5"),
+            same("SELECT 1 HAVING CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE '!!') ELSE 9 END > 0"),
+        ],
+    },
+    Group {
         // Everything here is about what the *binary* protocol sends, which the
         // harness could not see until it started asking both ways. Each case
         // is one where a declared type code narrower than the value it carries

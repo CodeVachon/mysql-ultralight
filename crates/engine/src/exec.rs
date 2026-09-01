@@ -1489,11 +1489,25 @@ impl Engine {
         // with no GROUP BY is one group covering every row.
         // An aggregate anywhere in a select item groups the query, not just a
         // bare one: `SELECT SUM(a) / COUNT(*)` and `SELECT IFNULL(SUM(v), 0)`
-        // are aggregate queries. HAVING alone groups it too, since MySQL
-        // treats the whole result as one group in that case.
+        // are aggregate queries. So does one written in the HAVING and nowhere
+        // else — `SELECT b FROM t HAVING COUNT(*) > 0` is 1140 on 8.3, the
+        // complaint of an aggregated query with an ungrouped column in it.
+        //
+        // The *clause* does not group anything, which this read as meaning it
+        // did: `SELECT b FROM t HAVING b > 1` answers the rows where b is
+        // greater than 1 on 8.3, describing them exactly as `SELECT b FROM t`
+        // does, and came back 1055 here — a working query refused. Without an
+        // aggregate a HAVING is a second filter, settled per row after the
+        // projection so it can name an output alias.
+        //
+        // An aggregate inside a *subquery* belongs to that subquery, which is
+        // why this asks `contains_aggregate` — it does not descend into one —
+        // rather than looking for the word: `HAVING b > (SELECT MIN(b) FROM t)`
+        // is per-row on 8.3, and grouping it would collapse the answer to one
+        // row.
         let aggregating = !group_exprs.is_empty()
-            || select.having.is_some()
-            || select.projection.iter().any(select_item_aggregates);
+            || select.projection.iter().any(select_item_aggregates)
+            || select.having.as_ref().is_some_and(contains_aggregate);
 
         if aggregating {
             let mut grouped = self.grouped(
@@ -1511,6 +1525,34 @@ impl Engine {
             return Ok(Ordered::sorted(grouped));
         }
 
+        // Before the HAVING, because that is the order 8.3 resolves in:
+        // `SELECT nope FROM t HAVING zz > 1` is 1054 for `nope` in the field
+        // list, and `SELECT a.* FROM t HAVING zz > 1` is 1051. `project` runs
+        // the same pass again when it gets there; it is pure, and one
+        // definition means a mutation to it neuters both.
+        resolve_field_list(&select.projection, &refs, &relation)?;
+
+        // A HAVING that groups nothing filters rows here, before anything is
+        // projected — because a window function is computed over the rows the
+        // HAVING kept, not over the rows the WHERE kept. Measured on 8.3:
+        // `SELECT b, ROW_NUMBER() OVER (ORDER BY id) rn FROM Hv HAVING b > 1`
+        // numbers the two surviving rows 1 and 2, and `COUNT(*) OVER ()`
+        // beside it answers 2 rather than 4. Filtering after the projection
+        // answered 2 and 3, and 4 — the window had already seen the rows the
+        // clause was about to drop.
+        //
+        // Ahead of the sort too, which is also where 8.3 puts it: `SELECT b
+        // FROM t HAVING nope > 1 ORDER BY alsonope` is 1054 for `nope` under
+        // the HAVING, not for `alsonope`.
+        self.filter_having(
+            session,
+            select,
+            &group_exprs,
+            &refs,
+            relation.columns.len(),
+            &mut matching,
+        )?;
+
         // Sorting happens before projection so ORDER BY can reference a column
         // the SELECT list does not return, which MySQL allows.
         let pending_order = match order {
@@ -1524,6 +1566,65 @@ impl Engine {
             result: projected,
             pending_order,
         })
+    }
+
+    /// Applies a HAVING that groups nothing, dropping the rows it rejects.
+    ///
+    /// The ungrouped counterpart of the HAVING inside `grouped`, and it runs
+    /// on the source rows rather than on projected ones so that everything
+    /// downstream — the window functions above all — sees only what survived.
+    ///
+    /// An alias is reached by substituting the *expression* the select list
+    /// wrote for it, where the grouped path binds the value it already
+    /// computed. The two differ because nothing has been computed yet here,
+    /// and it is sound for the same reason the grouped path is not: an alias a
+    /// HAVING can name is never a window, since naming one is 3594, so the
+    /// expression behind it is settled by this row alone.
+    ///
+    /// No aggregate can reach this — one written in the HAVING sends the
+    /// statement down the grouped path instead.
+    fn filter_having(
+        &self,
+        session: &Session,
+        select: &Select,
+        group_exprs: &[Expr],
+        refs: &[ColumnRef],
+        own: usize,
+        matching: &mut Vec<&Vec<Value>>,
+    ) -> EngineResult<()> {
+        let Some(having) = &select.having else {
+            return Ok(());
+        };
+        // After the field list, which the caller resolved. Before the ESCAPE
+        // guard below, because 8.3 resolves a clause's names before its
+        // arguments: `SELECT b FROM t HAVING zz LIKE 'a' ESCAPE '!!'` is 1054
+        // there, not 1210.
+        //
+        // `group_exprs` is empty here by construction — a GROUP BY routes the
+        // statement to `grouped` — and is passed rather than assumed so the
+        // check has one contract wherever it is called from.
+        check_having_scope(having, &select.projection, group_exprs, refs, own)?;
+        refuse_malformed_escape([having])?;
+
+        let resolved = substitute_item_exprs(having, &select.projection);
+        let mut keep = Vec::with_capacity(matching.len());
+        for row in matching.iter() {
+            let ctx = Context {
+                row: Some(Row {
+                    schema: refs,
+                    values: row,
+                }),
+                session,
+                executor: Some(self),
+            };
+            keep.push(expr::eval(&resolved, &ctx)?.truthy() == Some(true));
+        }
+        *matching = std::mem::take(matching)
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(row, keep)| keep.then_some(row))
+            .collect();
+        Ok(())
     }
 
     /// Sorts source rows in place. Returns false when an ORDER BY expression
@@ -2156,10 +2257,32 @@ impl Engine {
             row.push(value);
         }
 
-        Ok(ResultSet {
-            columns,
-            rows: vec![row],
-        })
+        // A FROM-less SELECT still has a HAVING, and this path used to drop
+        // the clause on the floor: `SELECT 1 HAVING 0` answered a row on this
+        // engine and answers none on 8.3, and `SELECT 1 HAVING zz > 0`
+        // answered a row where 8.3 is 1054. The one implicit row is the group,
+        // so an aggregate written in the clause folds over it exactly as one
+        // in the select list already does — `SELECT COUNT(*) HAVING COUNT(*) >
+        // 5` is empty on both.
+        let mut rows = vec![row];
+        if let Some(having) = &select.having {
+            check_having_scope(having, &select.projection, &[], &implicit_schema, 0)?;
+            refuse_malformed_escape([having])?;
+            let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+            let resolved = substitute_aliases(having, &names);
+            let value = self.eval_over_group(
+                &resolved,
+                &implicit_row,
+                &implicit_schema,
+                session,
+                &rows[0],
+            )?;
+            if value.truthy() != Some(true) {
+                rows.clear();
+            }
+        }
+
+        Ok(ResultSet { columns, rows })
     }
 
     fn project(
@@ -2191,60 +2314,21 @@ impl Engine {
                 }
             };
 
+        // Every name and every ESCAPE in the list, before any of it is read for
+        // anything else. Hoisted out of the loop below so the HAVING can be
+        // settled between this and the window computation, which is where 8.3
+        // settles it — see `filter_having`.
+        resolve_field_list(&select.projection, refs, relation)?;
+
         for item in &select.projection {
             match item {
                 SelectItem::Wildcard(_) => push_all(&mut columns, &mut plan, None),
                 SelectItem::QualifiedWildcard(kind, _) => {
-                    // Read off the identifiers rather than the rendered
-                    // text. Display keeps an identifier's quotes, so a
-                    // back-quoted qualifier came back with the quotes still
-                    // on it — which matches no table, and once the check
-                    // below existed refused a statement MySQL answers.
-                    // `object_name` is the same unquoting `using_condition`
-                    // already does for a USING list.
-                    let qualifier = match kind {
-                        sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => {
-                            object_name(name)
-                        }
-                        // `expr.*`, which only BigQuery and Snowflake parse —
-                        // `supports_select_expr_star` is false for MySQL, so
-                        // this arm is unreachable here and renders rather
-                        // than inventing a name for something that is not a
-                        // table qualifier at all.
-                        other => other.to_string().trim_end_matches(".*").to_owned(),
-                    };
-                    let table = qualifier.rsplit('.').next().unwrap_or("");
-                    // A qualifier this query's own FROM clause does not
-                    // provide is 1051, not an empty column list: `SELECT a.*
-                    // FROM J2` and `SELECT J2.* FROM J2 x` both raise it on
-                    // 8.3, and this engine used to return a result set with
-                    // no columns in it at all.
-                    //
-                    // Asked of the relation and not of `refs`, because a `*`
-                    // does not see the enclosing query the way a named column
-                    // does: `SELECT id FROM A WHERE 1 IN (SELECT A.* FROM B)`
-                    // is `Unknown table 'A'` on 8.3 even though `A` is right
-                    // there in the outer FROM. The one place an out-of-scope
-                    // qualifier is legal is inside EXISTS, where the select
-                    // list is discarded before any `*` in it is expanded —
-                    // handled where that happens, in `expr::eval`.
-                    let own_from = &relation.columns;
-                    if !own_from.iter().any(|c| c.table.eq_ignore_ascii_case(table)) {
-                        return Err(EngineError::bad_table(&qualifier));
-                    }
+                    let table = wildcard_qualifier(kind);
+                    let table = table.rsplit('.').next().unwrap_or("");
                     push_all(&mut columns, &mut plan, Some(table));
                 }
                 SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                    // Ahead of every other reading of the item, because the
-                    // expression path only resolves a name when it evaluates
-                    // one, and it evaluates one per row. With no rows -- an
-                    // empty table, a filter nothing survived, or a statement
-                    // being described -- `SELECT a.b FROM J2` declared a
-                    // column called `b` and returned successfully.
-                    if let Some(name) = unresolved_column(e, refs) {
-                        return Err(EngineError::unknown_column(&name, "field list"));
-                    }
-                    refuse_malformed_escape([e])?;
                     let alias = match item {
                         SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
                         _ => None,
@@ -2671,6 +2755,7 @@ impl Engine {
         }
 
         let items = projected_items(&select.projection)?;
+        let names: Vec<String> = items.iter().map(|(alias, _)| alias.clone()).collect();
 
         // Before the grouping rules, because MySQL resolves names first:
         // `SELECT a.b, COUNT(*) FROM J2 GROUP BY b` is 1054 there and would
@@ -2694,7 +2779,23 @@ impl Engine {
         // Ahead of `check_full_group_by` because 8.3 answers 1210 before 1055:
         // `SELECT s FROM LE GROUP BY id HAVING s LIKE 'a' ESCAPE '!!'` is 1210
         // there, not the grouping complaint.
-        refuse_malformed_escape(group_exprs.iter().chain(select.having.as_ref()))?;
+        //
+        // Split across the HAVING's own name check rather than kept as one
+        // call, because 8.3 settles the GROUP BY clause before the HAVING and
+        // a clause's names before its arguments: `GROUP BY s LIKE 'a' ESCAPE
+        // '!!' HAVING zz > 1` is 1210 there and `HAVING zz LIKE 'a' ESCAPE
+        // '!!'` is 1054. One helper still, so a mutation to it neuters both.
+        refuse_malformed_escape(group_exprs.iter())?;
+        if let Some(having) = &select.having {
+            check_having_scope(
+                having,
+                &select.projection,
+                &group_exprs,
+                refs,
+                input_columns.len(),
+            )?;
+        }
+        refuse_malformed_escape(select.having.as_ref())?;
 
         // Under ONLY_FULL_GROUP_BY a selected column must be grouped by or
         // aggregated. Silently evaluating it against the group's first row
@@ -2758,7 +2859,7 @@ impl Engine {
             // HAVING is evaluated after the projection so it can reference an
             // output alias, which MySQL allows and reporting queries rely on.
             if let Some(having) = &select.having {
-                let resolved = substitute_aliases(having, &items);
+                let resolved = substitute_aliases(having, &names);
                 if self
                     .eval_over_group(&resolved, group, refs, session, &out)?
                     .truthy()
@@ -2777,7 +2878,7 @@ impl Engine {
                     key.push(match by_position {
                         Some(value) => value,
                         None => {
-                            let resolved = substitute_aliases(&item.expr, &items);
+                            let resolved = substitute_aliases(&item.expr, &names);
                             self.eval_over_group(&resolved, group, refs, session, &out)?
                         }
                     });
@@ -5799,19 +5900,53 @@ fn resolve_ordinal(e: &Expr, projection: &[SelectItem]) -> Option<Expr> {
 ///
 /// A hidden column and not a rendered literal, for the reason `alias_name`
 /// gives: the value goes through unchanged, tag and all.
-fn substitute_aliases(e: &Expr, items: &[(String, Expr)]) -> Expr {
+fn substitute_aliases(e: &Expr, names: &[String]) -> Expr {
     use sqlparser::ast::Ident;
 
-    if let Expr::Identifier(ident) = e {
-        if let Some(position) = items
+    substitute_names(e, &|written| {
+        names
             .iter()
-            .position(|(alias, _)| alias.eq_ignore_ascii_case(&ident.value))
-        {
-            return Expr::Identifier(Ident::new(alias_name(position)));
+            .position(|name| name.eq_ignore_ascii_case(written))
+            .map(|position| Expr::Identifier(Ident::new(alias_name(position))))
+    })
+}
+
+/// Rewrites a reference to a select-list item into the expression written for
+/// it, for the path where nothing has been computed to bind instead.
+///
+/// One level and no further, which is what 8.3 does: `SELECT b + 1 AS b FROM t
+/// HAVING b > 2` filters on `b + 1 > 2` there with the inner `b` the column,
+/// and answers 3 and 4 rather than re-reading its own alias.
+fn substitute_item_exprs(e: &Expr, projection: &[SelectItem]) -> Expr {
+    substitute_names(e, &|written| {
+        projection.iter().find_map(|item| match item {
+            SelectItem::ExprWithAlias { expr, alias } => alias
+                .value
+                .eq_ignore_ascii_case(written)
+                .then(|| expr.clone()),
+            SelectItem::UnnamedExpr(inner) => render_expr(inner)
+                .eq_ignore_ascii_case(written)
+                .then(|| inner.clone()),
+            // A `*` writes no name of its own: what it projects are columns,
+            // which the row answers to directly.
+            _ => None,
+        })
+    })
+}
+
+/// The walk both substitutions share.
+///
+/// One recursion rather than two, because a variant missing from it is a place
+/// an alias silently fails to resolve — and the two callers would have had to
+/// drift apart one variant at a time to find out.
+fn substitute_names(e: &Expr, of: &dyn Fn(&str) -> Option<Expr>) -> Expr {
+    if let Expr::Identifier(ident) = e {
+        if let Some(replacement) = of(&ident.value) {
+            return replacement;
         }
     }
 
-    let recur = |inner: &Expr| Box::new(substitute_aliases(inner, items));
+    let recur = |inner: &Expr| Box::new(substitute_names(inner, of));
     match e {
         Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
             left: recur(left),
@@ -7352,20 +7487,28 @@ fn equality_conjuncts(e: &Expr) -> Vec<(Expr, Expr)> {
 /// Where a column reference lands in the relation, so `sectionId` and
 /// `esa.sectionId` are recognised as the same column.
 fn column_slot(refs: &[ColumnRef], e: &Expr) -> Option<usize> {
-    let (table, name) = match e {
-        Expr::Identifier(i) => (None, i.value.as_str()),
-        Expr::CompoundIdentifier(parts) => (
+    let (table, name) = column_parts(e)?;
+    refs.iter().position(|c| {
+        c.name.eq_ignore_ascii_case(name) && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+    })
+}
+
+/// The qualifier and the name a column reference is written with.
+///
+/// Split out of `column_slot` because that one stops at the first column a
+/// name could mean, and a name that could mean two is a question of its own.
+fn column_parts(e: &Expr) -> Option<(Option<&str>, &str)> {
+    match e {
+        Expr::Identifier(i) => Some((None, i.value.as_str())),
+        Expr::CompoundIdentifier(parts) => Some((
             parts
                 .get(parts.len().wrapping_sub(2))
                 .map(|p| p.value.as_str()),
             parts.last()?.value.as_str(),
-        ),
-        Expr::Nested(inner) => return column_slot(refs, inner),
-        _ => return None,
-    };
-    refs.iter().position(|c| {
-        c.name.eq_ignore_ascii_case(name) && table.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
-    })
+        )),
+        Expr::Nested(inner) => column_parts(inner),
+        _ => None,
+    }
 }
 
 /// Whether a failed probe is the statement's fault rather than the probe's.
@@ -7522,6 +7665,287 @@ fn refuse_malformed_escape<'a>(clauses: impl IntoIterator<Item = &'a Expr>) -> E
     }
 }
 
+/// The table a `tbl.*` names, unquoted.
+///
+/// Read off the identifiers rather than the rendered text. Display keeps an
+/// identifier's quotes, so a back-quoted qualifier came back with the quotes
+/// still on it — which matches no table, and once the check in
+/// `resolve_field_list` existed refused a statement MySQL answers.
+/// `object_name` is the same unquoting `using_condition` already does for a
+/// USING list.
+fn wildcard_qualifier(kind: &sqlparser::ast::SelectItemQualifiedWildcardKind) -> String {
+    match kind {
+        sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => object_name(name),
+        // `expr.*`, which only BigQuery and Snowflake parse —
+        // `supports_select_expr_star` is false for MySQL, so this arm is
+        // unreachable here and renders rather than inventing a name for
+        // something that is not a table qualifier at all.
+        other => other.to_string().trim_end_matches(".*").to_owned(),
+    }
+}
+
+/// Resolves every name and every ESCAPE in a select list.
+///
+/// Its own pass rather than a line inside the projection loop, because the
+/// order matters and something now runs between the two: 8.3 settles the field
+/// list, then the HAVING, then computes the windows, and the HAVING decides
+/// which rows a window even sees. `SELECT nope FROM t HAVING zz > 1` is 1054
+/// for `nope` there, so this has to happen before `filter_having` and the
+/// projection has to happen after it.
+///
+/// Called from `project` too, where these checks used to live, so a statement
+/// that never reaches the HAVING is resolved exactly as it was.
+fn resolve_field_list(
+    projection: &[SelectItem],
+    refs: &[ColumnRef],
+    relation: &Relation,
+) -> EngineResult<()> {
+    for item in projection {
+        match item {
+            SelectItem::Wildcard(_) => {}
+            SelectItem::QualifiedWildcard(kind, _) => {
+                let qualifier = wildcard_qualifier(kind);
+                let table = qualifier.rsplit('.').next().unwrap_or("");
+                // A qualifier this query's own FROM clause does not provide is
+                // 1051, not an empty column list: `SELECT a.* FROM J2` and
+                // `SELECT J2.* FROM J2 x` both raise it on 8.3, and this
+                // engine used to return a result set with no columns in it at
+                // all.
+                //
+                // Asked of the relation and not of `refs`, because a `*` does
+                // not see the enclosing query the way a named column does:
+                // `SELECT id FROM A WHERE 1 IN (SELECT A.* FROM B)` is
+                // `Unknown table 'A'` on 8.3 even though `A` is right there in
+                // the outer FROM. The one place an out-of-scope qualifier is
+                // legal is inside EXISTS, where the select list is discarded
+                // before any `*` in it is expanded — handled where that
+                // happens, in `expr::eval`.
+                if !relation
+                    .columns
+                    .iter()
+                    .any(|c| c.table.eq_ignore_ascii_case(table))
+                {
+                    return Err(EngineError::bad_table(&qualifier));
+                }
+            }
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                // Ahead of every other reading of the item, because the
+                // expression path only resolves a name when it evaluates one,
+                // and it evaluates one per row. With no rows -- an empty
+                // table, a filter nothing survived, or a statement being
+                // described -- `SELECT a.b FROM J2` declared a column called
+                // `b` and returned successfully.
+                if let Some(name) = unresolved_column(e, refs) {
+                    return Err(EngineError::unknown_column(&name, "field list"));
+                }
+                refuse_malformed_escape([e])?;
+            }
+            // Refused where the projection is built, because that is a gap in
+            // this engine rather than a question about the statement.
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a HAVING that names something the clause cannot see.
+///
+/// HAVING does not read the FROM clause. Measured on 8.3: a name in it
+/// resolves against the select list, the GROUP BY columns and any enclosing
+/// query — and nothing else, whether or not ONLY_FULL_GROUP_BY is on. `SELECT
+/// b FROM t HAVING id > 1` is 1054 "in 'having clause'" there with `id` in
+/// plain sight in `t`, and so is `SELECT COUNT(*) FROM t HAVING b > 1`, which
+/// this engine answered as an empty set — the group's first row happened not
+/// to pass. Only an aggregate's argument, and a subquery, read the relation.
+///
+/// It is what keeps the routing change honest. Sending a HAVING with no
+/// aggregate down the per-row path makes every column of the relation reachable
+/// from the clause, so without this the two statements above would have become
+/// answers rather than better errors.
+fn check_having_scope(
+    having: &Expr,
+    projection: &[SelectItem],
+    group_exprs: &[Expr],
+    refs: &[ColumnRef],
+    own: usize,
+) -> EngineResult<()> {
+    let recur = |e: &Expr| check_having_scope(e, projection, group_exprs, refs, own);
+    match having {
+        // Ahead of everything else in the walk, and the walk is left to right,
+        // because that is the order 8.3 answers in: `HAVING ROW_NUMBER() OVER
+        // () > 1 AND zz > 1` is 3593 and `HAVING zz > 1 AND ROW_NUMBER() OVER
+        // () > 1` is 1054.
+        Expr::Function(f) if f.over.is_some() => {
+            Err(EngineError::window_function_misplaced(&f.name.to_string()))
+        }
+        // An aggregate's argument *is* read against the relation: `SELECT b
+        // FROM t HAVING SUM(id) > 1` resolves `id` on 8.3 and refuses on the
+        // select list instead. One that resolves against nothing at all is
+        // still 1054, under this clause's name.
+        Expr::Function(f) if is_aggregate(&f.name.to_string()) => value_arguments(f)
+            .iter()
+            .find_map(|a| unresolved_column(a, refs))
+            .map_or(Ok(()), |name| {
+                Err(EngineError::unknown_column(&name, "having clause"))
+            }),
+        // Variables, not columns — the same two spellings `unresolved_column`
+        // has to let through.
+        Expr::Identifier(i) if i.value.starts_with('@') => Ok(()),
+        Expr::CompoundIdentifier(parts)
+            if parts.first().is_some_and(|p| p.value.starts_with('@')) =>
+        {
+            Ok(())
+        }
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            resolve_having_name(having, projection, group_exprs, refs, own)
+        }
+        Expr::Function(f) => value_arguments(f).iter().try_for_each(recur),
+        // `subexpressions` does not descend into a subquery, which is what
+        // makes the correlated case right: a subquery resolves its own names
+        // in its own scope, and the outer columns it reaches are checked when
+        // that query is run.
+        other => subexpressions(other).into_iter().try_for_each(recur),
+    }
+}
+
+/// Where one name written in a HAVING resolves, or why it does not.
+///
+/// Resolution is by identity rather than by spelling, which is what 8.3 does:
+/// `SELECT b AS zzz FROM t HAVING b > 1` answers there — the clause found the
+/// column the select list projects, under neither of the names on it — and so
+/// does `SELECT b FROM t HAVING t.b > 1`. A select-list alias wins over a
+/// column, so `SELECT id AS b FROM t HAVING b > 1` filters on `id`.
+fn resolve_having_name(
+    e: &Expr,
+    projection: &[SelectItem],
+    group_exprs: &[Expr],
+    refs: &[ColumnRef],
+    own: usize,
+) -> EngineResult<()> {
+    let slot = column_slot(refs, e);
+    // Only an unqualified name can name an alias: `SELECT id AS b FROM t
+    // HAVING t.b > 1` is 1054 on 8.3, because `t.b` asks for a column of `t`
+    // and the alias is not one.
+    let bare = match e {
+        Expr::Identifier(i) => Some(i.value.as_str()),
+        _ => None,
+    };
+
+    // Every own column a `*` could have projected under this name, not just
+    // the first one `column_slot` finds: `SELECT * FROM t a JOIN t c ON a.id =
+    // c.id HAVING id > 1` puts two columns called `id` in the select list and
+    // is 1052 on 8.3, and resolving to either of them would have answered it.
+    let projected_slots = |from: Option<&str>| -> Vec<usize> {
+        let Some((qualifier, name)) = column_parts(e) else {
+            return Vec::new();
+        };
+        refs.iter()
+            .take(own)
+            .enumerate()
+            .filter(|(_, c)| {
+                c.name.eq_ignore_ascii_case(name)
+                    && qualifier.is_none_or(|q| c.table.eq_ignore_ascii_case(q))
+                    && from.is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    };
+
+    // What the name could resolve to, one entry per candidate, each carrying
+    // whether the expression behind it is a window.
+    let mut found: Vec<(String, bool)> = Vec::new();
+    for item in projection {
+        match item {
+            // A `*` projects every column of this query's own relation, so a
+            // name that lands in one of them is in the select list without any
+            // item having been written for it.
+            SelectItem::Wildcard(_) => {
+                for slot in projected_slots(None) {
+                    found.push((format!("#{slot}"), false));
+                }
+            }
+            SelectItem::QualifiedWildcard(kind, _) => {
+                let qualifier = match kind {
+                    sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => {
+                        object_name(name)
+                    }
+                    other => other.to_string().trim_end_matches(".*").to_owned(),
+                };
+                let table = qualifier.rsplit('.').next().unwrap_or("").to_owned();
+                for slot in projected_slots(Some(&table)) {
+                    found.push((format!("#{slot}"), false));
+                }
+            }
+            SelectItem::UnnamedExpr(inner) | SelectItem::ExprWithAlias { expr: inner, .. } => {
+                let name = match item {
+                    SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                    _ => render_expr(inner),
+                };
+                let inner_slot = column_slot(refs, inner);
+                let by_name = bare.is_some_and(|n| name.eq_ignore_ascii_case(n));
+                let by_column = slot.is_some() && inner_slot == slot;
+                if by_name || by_column {
+                    let identity = inner_slot
+                        .map(|s| format!("#{s}"))
+                        .unwrap_or_else(|| render_expr(inner));
+                    found.push((identity, contains_window(inner)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Two candidates that are the same thing are not ambiguous, which is why
+    // this compares identities rather than counting matches: `SELECT t.b, b
+    // FROM t HAVING b > 1` answers on 8.3 and `SELECT id AS b, t.b FROM t
+    // HAVING b > 1` is 1052.
+    if found.len() > 1 && found.iter().any(|(id, _)| *id != found[0].0) {
+        return Err(EngineError::ambiguous(&written_name(e), "having clause"));
+    }
+    if let Some((_, windowed)) = found.first() {
+        // A window function is computed over the finished result, so a clause
+        // that decides what the result contains cannot read one even at second
+        // hand: `SELECT b, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM t HAVING
+        // rn > 2` is 3594 on 8.3. The value is right there in the projected
+        // row, so without this the alias would have been answered with it.
+        if *windowed {
+            return Err(EngineError::window_alias_misplaced(&written_name(e)));
+        }
+        return Ok(());
+    }
+
+    // A column the query groups by, whether or not the select list also
+    // returns it: `SELECT COUNT(*) FROM t GROUP BY s HAVING s > 'w'` answers
+    // on 8.3.
+    let rendered = e.to_string();
+    if group_exprs.iter().any(|g| g.to_string() == rendered)
+        || slot.is_some_and(|s| group_exprs.iter().any(|g| column_slot(refs, g) == Some(s)))
+    {
+        return Ok(());
+    }
+
+    // An enclosing query's column, which `refs` carries after this query's
+    // own: MySQL resolves a HAVING name against outer queries as well, and
+    // `SELECT MAX(x.b) FROM t x HAVING t.id > 0` inside a correlated subquery
+    // answers on 8.3.
+    if slot.is_some_and(|s| s >= own) {
+        return Ok(());
+    }
+
+    Err(EngineError::unknown_column(
+        &written_name(e),
+        "having clause",
+    ))
+}
+
+/// True when an expression calls a window function anywhere inside it.
+fn contains_window(e: &Expr) -> bool {
+    match e {
+        Expr::Function(f) => f.over.is_some() || function_arguments(f).iter().any(contains_window),
+        other => subexpressions(other).into_iter().any(contains_window),
+    }
+}
+
 /// Rejects a selected expression that is neither aggregated nor grouped by.
 ///
 /// Without this the engine evaluates it against the group's first row and
@@ -7576,6 +8000,24 @@ fn check_full_group_by(
     // The whole select item rather than the part of it that failed: the walk
     // descends to a leaf, and naming that leaf would report `x` for
     // `SUBSTRING(x, 1, 1)` — less than it knew before it started recursing.
+    //
+    // Two codes, not one. 8.3 answers 1055 only where there is a GROUP BY to
+    // be absent from; an aggregated query with no GROUP BY at all is 1140,
+    // ER_MIX_OF_GROUP_FUNC_AND_FIELDS_V2, and this engine sent 1055 for both.
+    // `SELECT COUNT(*), b FROM t` and `SELECT b FROM t HAVING COUNT(*) > 0`
+    // are the shapes that reach it, and a client branching on the code was
+    // told the wrong thing about which rule it broke.
+    if group_exprs.is_empty() {
+        return Err(EngineError::new(
+            1140,
+            "42000",
+            format!(
+                "In aggregated query without GROUP BY, expression '{top}' contains a \
+                 nonaggregated column; this is incompatible with \
+                 sql_mode=only_full_group_by"
+            ),
+        ));
+    }
     Err(EngineError::new(
         1055,
         "42000",

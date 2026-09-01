@@ -1,0 +1,3 @@
+{"at":"2026-09-01T02:16:08Z","id":144,"by":"Christopher Vachon","as":"user","type":"created","title":"ORDER BY resolves a shadowed column before a select-list alias","state":"Todo"}
+{"at":"2026-09-01T02:16:09Z","id":145,"by":"Christopher Vachon","as":"user","type":"created","title":"A string function mangles non-UTF-8 bytes through a lossy decode","state":"Todo"}
+{"at":"2026-09-01T02:16:09Z","id":146,"by":"Christopher Vachon","as":"user","type":"created","title":"BIN over a stored binary column refuses where MySQL answers","state":"Todo"}

@@ -1,11 +1,11 @@
 ---
 id: 103
 title: HAVING without an aggregate is treated as a grouped query
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-08-25T14:48:58Z
-updated: 2026-08-25T14:48:58Z
+updated: 2026-08-31T23:25:21Z
 ---
 
 ## Description
