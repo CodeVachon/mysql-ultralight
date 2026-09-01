@@ -693,24 +693,13 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             Ok(bool_value((matched.truthy() == Some(true)) != *negated))
         }
 
-        // `x COLLATE c` compares x under a different collation. Comparison
-        // here is case-insensitive, so a `_ci` collation is honoured by doing
-        // nothing; `_bin` and `_cs` would compare differently and are refused
-        // rather than ignored.
-        //
-        // One gap is knowingly left open: comparison here is accent-*sensitive*,
-        // so the accent-insensitive collations — `utf8mb4_unicode_ci`,
-        // `utf8mb4_0900_ai_ci` — fold `café` and `cafe` together in MySQL and
-        // not here. That is a property of every comparison the engine makes,
-        // including the server's default collation, rather than something this
-        // expression introduces, so refusing it here would reject the schema
-        // while leaving the same difference everywhere else.
+        // `x COLLATE c` compares x under a different collation. Which
+        // collations exist, which this engine can honour, and why the rest are
+        // refused rather than ignored, is `collation` — the column-level and
+        // table-level clauses read the same one, so the three cannot drift
+        // apart again.
         Expr::Collate { expr, collation } => {
-            let name = collation.to_string().to_ascii_lowercase();
-            let name = name.trim_matches('`');
-            if !name.ends_with("_ci") {
-                return Err(unsupported(format!("the `{name}` collation")));
-            }
+            crate::collation::read(collation)?;
             eval(expr, ctx)
         }
 

@@ -364,6 +364,45 @@ fn specified(table: &str, column: &str) -> Option<(SqlType, bool)> {
     Some((spec_type(spelling)?, *not_null))
 }
 
+/// `COLLATION_NAME`, which only a column that holds *characters* has.
+///
+/// NULL otherwise, and that is not a detail: MySQL reports NULL for an INT, a
+/// DATE, a DECIMAL, a JSON — and for a BLOB, a BINARY and a VARBINARY, which
+/// hold bytes and carry no character set at all. Measured on 8.3 across all
+/// twelve; only `char`/`varchar`/`text`, `enum` and `set` report one. This
+/// reported the database's collation for every column of every type, so an
+/// `INT` claimed `utf8mb4_0900_ai_ci`.
+///
+/// The binary collation comes first, because it is the one collation this
+/// engine actually *models*: `SqlType::binary_collation` puts the BINARY flag
+/// on the wire definition, and reporting the database's collation beside it
+/// made one column describe itself two ways. The reachable case is
+/// `CREATE TABLE c AS SELECT COLUMN_TYPE FROM information_schema.COLUMNS`,
+/// whose copy 8.3 declares `utf8mb3_bin` — and `tests/image.rs` already exists
+/// to protect that flag on exactly this column.
+///
+/// Then the three declarations, narrowest first, which is 8.3's own order: a
+/// column's own `COLLATE` wins over its table's, and the table's over the
+/// database's. All three measured — a table-level clause shows up on every
+/// character column of the table, and a database-level one on every character
+/// column of every table that declares nothing.
+fn collation_name(
+    ty: &SqlType,
+    declared: Option<&str>,
+    table: Option<&str>,
+    database: &str,
+) -> Value {
+    match ty.kind {
+        TypeKind::Text | TypeKind::Enum | TypeKind::Set => {
+            if ty.binary_collation {
+                return text(crate::collation::BINARY);
+            }
+            text(declared.or(table).unwrap_or(database))
+        }
+        _ => Value::Null,
+    }
+}
+
 /// A declared type from the spelling the spec writes it as.
 ///
 /// The same spellings a `CREATE TABLE` would use, so `SqlType` reports them the
@@ -606,11 +645,11 @@ fn columns(catalog: &Catalog) -> Table {
                     } else {
                         ""
                     }),
-                    text(
-                        column
-                            .collation
-                            .clone()
-                            .unwrap_or_else(|| db.collation.clone()),
+                    collation_name(
+                        &column.ty,
+                        column.collation.as_deref(),
+                        table.collation.as_deref(),
+                        &db.collation,
                     ),
                     text(column.comment.clone().unwrap_or_default()),
                 ]);
@@ -645,7 +684,7 @@ fn columns(catalog: &Catalog) -> Table {
                     text(&column.ty.declared),
                     text(""),
                     text(""),
-                    text(&db.collation),
+                    collation_name(&column.ty, column.collation.as_deref(), None, &db.collation),
                     text(""),
                 ]);
             }
@@ -1068,6 +1107,13 @@ fn engines() -> Table {
     )
 }
 
+/// `information_schema.COLLATIONS`, built from the list a `COLLATE` clause is
+/// checked against.
+///
+/// Built from it rather than written out beside it: this table saying a
+/// collation exists and the clause refusing it — or the reverse — is a server
+/// contradicting itself about its own capabilities, and the two were separate
+/// lists until `collation::KNOWN` became the single one.
 fn collations() -> Table {
     build(
         "COLLATIONS",
@@ -1079,40 +1125,21 @@ fn collations() -> Table {
             "IS_COMPILED",
             "SORTLEN",
         ],
-        vec![
-            vec![
-                text("utf8mb4_0900_ai_ci"),
-                text("utf8mb4"),
-                Value::Int(255),
-                text("Yes"),
-                text("Yes"),
-                Value::Int(0),
-            ],
-            vec![
-                text("utf8mb4_general_ci"),
-                text("utf8mb4"),
-                Value::Int(45),
-                text(""),
-                text("Yes"),
-                Value::Int(1),
-            ],
-            vec![
-                text("utf8mb4_unicode_ci"),
-                text("utf8mb4"),
-                Value::Int(224),
-                text(""),
-                text("Yes"),
-                Value::Int(8),
-            ],
-            vec![
-                text("binary"),
-                text("binary"),
-                Value::Int(63),
-                text("Yes"),
-                text("Yes"),
-                Value::Int(1),
-            ],
-        ],
+        crate::collation::KNOWN
+            .iter()
+            .map(|c| {
+                vec![
+                    text(c.name),
+                    text(c.charset),
+                    Value::Int(c.id),
+                    text(if c.is_default { "Yes" } else { "" }),
+                    // Every collation this engine has is built in; there is no
+                    // dynamic loading for the column to distinguish.
+                    text("Yes"),
+                    Value::Int(c.sortlen),
+                ]
+            })
+            .collect(),
     )
 }
 

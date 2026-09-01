@@ -1058,9 +1058,10 @@ fn a_document_holding_serde_s_number_key_still_reloads() {
 
 /// A binary-collated column keeps its collation across a save and a reload.
 ///
-/// Nothing in the DDL declares one — `COLLATE` is not a clause this engine
-/// accepts — but `CREATE TABLE ... AS SELECT` off `information_schema` copies
-/// one into a user table, which is exactly what 8.3 does: the copy of
+/// No DDL `COLLATE` clause can declare one — only a `_ci` collation is
+/// accepted — so the column that carries one here comes from
+/// `CREATE TABLE ... AS SELECT` off `information_schema`, which is exactly
+/// what 8.3 does: the copy of
 /// `COLUMN_TYPE` is `utf8mb3_bin` there too. The collation is the only thing
 /// that puts the BINARY flag on a text column's wire definition, so an image
 /// that dropped it would make the same table describe itself one way before a
@@ -1095,4 +1096,57 @@ fn a_binary_collation_survives_a_reload() {
     let mut session = Session::new(ServerConfig::default(), 1);
     session.current_database = Some("testdb".to_owned());
     assert_eq!(binary_flags(&restored, &session), before);
+}
+
+/// A name is written to the image as it was written in the DDL.
+///
+/// The image is the one place a wrong name becomes *permanent*: the format is
+/// append-only, so an image baked with `` `we``ird` `` stored as ``we``ird``
+/// and `` COLLATE `utf8mb4_general_ci` `` stored as `` `utf8mb4_general_ci` ``
+/// carries both into every process that boots from it. Nothing on load can undo either —
+/// a table genuinely named ``we``ird`` is legal — so the only place to be
+/// right is where the name is read out of the statement.
+#[test]
+fn a_quoted_name_survives_a_reload_as_it_was_written() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE `we``ird` (`c``ol` INT)",
+    );
+    run(&engine, &mut session, "CREATE TABLE `my.table` (a INT)");
+    run(&engine, &mut session, "INSERT INTO `my.table` VALUES (1)");
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C (a VARCHAR(10) COLLATE `utf8mb4_general_ci`)",
+    );
+
+    let encoded = image::encode(&engine.catalog_snapshot().unwrap());
+    let decoded = image::decode(&encoded).expect("the image loads");
+    let restored = Engine::from_catalog(decoded, ServerConfig::default()).unwrap();
+    let mut session = Session::new(ServerConfig::default(), 1);
+    session.current_database = Some("testdb".to_owned());
+
+    assert_eq!(
+        rows(
+            &restored,
+            &mut session,
+            "SELECT TABLE_NAME, COLUMN_NAME, COLLATION_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'testdb' ORDER BY TABLE_NAME, COLUMN_NAME",
+        ),
+        // NULL on the two INT columns, because only a column of characters
+        // has a collation — which is what 8.3 reports for an INT too.
+        vec![
+            vec!["C", "a", "utf8mb4_general_ci"],
+            vec!["my.table", "a", "NULL"],
+            vec!["we`ird", "c`ol", "NULL"],
+        ]
+    );
+    // The reloaded name is one a statement can still address, which is the
+    // half a metadata assertion alone would miss.
+    assert_eq!(
+        rows(&restored, &mut session, "SELECT a FROM `my.table`"),
+        vec![vec!["1"]]
+    );
 }

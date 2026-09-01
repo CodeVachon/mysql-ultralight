@@ -1,11 +1,11 @@
 ---
 id: 138
 title: An identifier's rendering leaks into the names the engine reports
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-08-31T13:35:09Z
-updated: 2026-08-31T13:35:09Z
+updated: 2026-09-01T03:03:41Z
 ---
 
 ## Description

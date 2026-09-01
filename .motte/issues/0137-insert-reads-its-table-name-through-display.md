@@ -1,11 +1,11 @@
 ---
 id: 137
 title: INSERT reads its table name through Display
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-08-31T13:35:08Z
-updated: 2026-08-31T13:35:08Z
+updated: 2026-09-01T03:03:41Z
 ---
 
 ## Description

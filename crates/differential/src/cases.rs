@@ -3363,4 +3363,177 @@ pub const GROUPS: &[Group] = &[
             same("SELECT HEX(FROM_BASE64(TO_BASE64(b))) FROM Byt"),
         ],
     },
+    Group {
+        // A name is what was written between the quotes, and nothing here may
+        // report the *rendering* of it back. Two ways that went wrong, both
+        // measured on 8.3 and both silent:
+        //
+        // `Display` doubles an embedded backtick, so a reader that rendered a
+        // name and trimmed the outer pair off reported ``we``ird`` where 8.3
+        // reports ``we`ird``; and a reader that split the rendering on `.`
+        // could not tell a qualifier from a dot inside a name, so
+        // `INSERT INTO \`my.table\`` was 1049 `Unknown database 'my'` against a
+        // table `CREATE TABLE` and `SELECT` had both accepted. #0137, #0138.
+        //
+        // The names 8.3 refuses are refused for the name and not for the
+        // quoting — a trailing space is 1103 on a table and 1166 on a column,
+        // and so is an empty one — so there is nothing to compare there that
+        // the parser does not already settle.
+        name: "names as they were written",
+        setup: &[
+            "CREATE TABLE `we``ird` (`c``ol` INT NOT NULL, `oth er` INT NULL)",
+            "CREATE TABLE `oth``er` (`c``ol` INT NULL)",
+            "CREATE TABLE `my.table` (a INT NULL)",
+            "CREATE TABLE `select` (`from` INT NULL)",
+            "CREATE TABLE `tabké` (`colé` INT NULL)",
+            // The clause spelled four ways. All four are
+            // `utf8mb4_general_ci` on 8.3: the backquoted one was stored with
+            // its backticks, and the upper-case one was stored shouting,
+            // because 8.3 lowercases the name it records.
+            "CREATE TABLE Coll (a VARCHAR(10) COLLATE `utf8mb4_general_ci` NULL, \
+             b VARCHAR(10) COLLATE utf8mb4_general_ci NULL, \
+             c VARCHAR(10) COLLATE 'utf8mb4_general_ci' NULL, \
+             d VARCHAR(10) COLLATE UTF8MB4_GENERAL_CI NULL)",
+            // Every type, for the one question this table can answer about
+            // them: which of them has a collation at all.
+            //
+            // Named in lower case on purpose, as `ins` below is. 8.3 declares
+            // `information_schema` `TABLE_NAME` `utf8mb3_bin`, so both `ORDER
+            // BY` and `=` over it are case-*sensitive* there — `Bee` sorts
+            // before `apple` and `= 'bee'` matches nothing. This engine
+            // compares every string case-insensitively and has no collation to
+            // follow, so a group mixing the cases would diverge on the row
+            // order of the listing above and report that gap rather than this
+            // one. Lower case throughout is the same answer on both.
+            "CREATE TABLE ty (i INT NULL, d DATE NULL, dt DATETIME(3) NULL, f DOUBLE NULL, \
+             n DECIMAL(10,2) NULL, t TEXT NULL, v VARCHAR(10) NULL, b BLOB NULL, \
+             vb VARBINARY(10) NULL, e ENUM('x','y') NULL, st SET('p','q') NULL, j JSON NULL)",
+            "CREATE TABLE ins (a INT NULL, b INT NULL)",
+            "CREATE INDEX `ix``x` ON `we``ird` (`c``ol`)",
+            "INSERT INTO `we``ird` VALUES (7, 1)",
+            "INSERT INTO `oth``er` VALUES (7)",
+            "INSERT INTO `my.table` VALUES (1)",
+            "INSERT INTO `select` VALUES (3)",
+            "INSERT INTO `tabké` VALUES (5)",
+            // Setup rather than a case, because every case runs twice — once
+            // per protocol — and an index created twice is 1061 on the second.
+            "CREATE INDEX ixa ON `my.table` (a)",
+            // Here for the same reason, and it is a claim of its own: an
+            // assignment target reads its column name by a path nothing below
+            // reaches, so if it still read a rendering this fails as 1054 and
+            // takes the whole run with it.
+            "UPDATE `we``ird` SET `oth er` = 4",
+        ],
+        cases: &[
+            // Where a name is *reported*, which is the only place the
+            // difference between a name and its rendering shows.
+            same("SELECT TABLE_NAME FROM information_schema.tables \
+                  WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME"),
+            same("SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME, ORDINAL_POSITION"),
+            same("SELECT INDEX_NAME, COLUMN_NAME, TABLE_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() ORDER BY INDEX_NAME"),
+            same("SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Coll' \
+                  ORDER BY ORDINAL_POSITION"),
+            // Only a column of characters has one. This reported the
+            // database's collation for every column of every type, so an INT
+            // claimed `utf8mb4_0900_ai_ci`; nothing asked until this line.
+            same("SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ty' \
+                  ORDER BY ORDINAL_POSITION"),
+            // And on the wire, where a column's name is what the client reads
+            // the value back by.
+            same("SELECT `c``ol` AS `al``ias` FROM `we``ird`"),
+            same("SELECT `colé` FROM `tabké`"),
+            same("SELECT `from` FROM `select`"),
+
+            // The dotted name, statement by statement. `CREATE` and `SELECT`
+            // agreed with 8.3 while the three writes beside them did not.
+            same("SELECT a FROM `my.table` ORDER BY a"),
+            same("INSERT INTO `my.table` (a) VALUES (2)"),
+            same("UPDATE `my.table` SET a = 3 WHERE a = 2"),
+            same("DELETE FROM `my.table` WHERE a = 3"),
+            // Recognised outside the parser, and it took its table name out of
+            // the statement's text rather than out of a tree.
+            same("ALTER TABLE `my.table` RENAME INDEX ixa TO ixb"),
+            same("SELECT INDEX_NAME, TABLE_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() ORDER BY INDEX_NAME, TABLE_NAME"),
+
+            // A USING list reads its column name by a path of its own, and
+            // the `oth er` beside it is the value the setup's UPDATE wrote.
+            same("SELECT o.`c``ol`, w.`oth er` FROM `we``ird` w JOIN `oth``er` o USING (`c``ol`)"),
+            same("DROP INDEX `ix``x` ON `we``ird`"),
+
+            // A qualifier on a column in an INSERT's list names the table it
+            // is in, and the column is still the last part. Matching on the
+            // whole join looked for a column called `Ins.a`.
+            same("INSERT INTO ins (ins.a, ins.b) VALUES (1, 2)"),
+            same("SELECT a, b FROM ins ORDER BY a"),
+
+            // Deliberately not here: `PREPARE s FROM 'SELECT ''x'' AS c'`,
+            // which is the same defect over a literal — trimming the quotes off
+            // the ends ate the doubling and prepared the unparseable
+            // `SELECT ''x`. 8.3 answers 1295 to a PREPARE sent *through* the
+            // prepared-statement protocol, and every case here is asked through
+            // both, so the case would report that gap rather than this one. It
+            // is covered by a test instead.
+        ],
+    },
+    Group {
+        // A collation reaches a client by three routes that have to agree:
+        // `information_schema.COLLATIONS` says which exist, `COLLATION_NAME`
+        // says which a column has, and a `COLLATE` clause is checked against
+        // the first. They were three separate readers, and each pair
+        // disagreed. #0138.
+        //
+        // What this group deliberately cannot ask: `COLLATE utf8mb4_bin`, and
+        // every other collation 8.3 has and this engine cannot compare in. 8.3
+        // accepts those and this engine refuses them — a refusal rather than a
+        // wrong answer, on the ground that recording one and then comparing the
+        // column the way every other one is compared answers the wrong
+        // question. That is a deliberate divergence, so a case for it would be
+        // a baseline line rather than a green run. The refusal is covered by a
+        // test.
+        //
+        // Named in lower case for the reason the group above is: 8.3 declares
+        // `information_schema` `TABLE_NAME` `utf8mb3_bin`, so ordering over it
+        // is case-sensitive there and is not here.
+        name: "collations as MySQL records them",
+        setup: &[
+            // The table-level clause, which was parsed and dropped. It sets
+            // `TABLE_COLLATION` and reaches every character column that
+            // declares none of its own.
+            "CREATE TABLE tcoll (a VARCHAR(10) NULL, b INT NULL, \
+             c TEXT COLLATE utf8mb4_general_ci NULL) \
+             DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+            // The column-level clause spelled four ways, all one collation.
+            "CREATE TABLE ccoll (a VARCHAR(10) COLLATE `utf8mb4_unicode_ci` NULL, \
+             b VARCHAR(10) COLLATE utf8mb4_unicode_ci NULL, \
+             c VARCHAR(10) COLLATE 'utf8mb4_unicode_ci' NULL, \
+             d VARCHAR(10) COLLATE UTF8MB4_UNICODE_CI NULL)",
+            // A view reports the collation of the column behind it.
+            "CREATE TABLE vbase (a VARCHAR(10) COLLATE utf8mb4_general_ci NULL, n INT NULL)",
+            "CREATE VIEW vcoll AS SELECT a, n FROM vbase",
+        ],
+        cases: &[
+            same("SELECT TABLE_NAME, TABLE_COLLATION FROM information_schema.tables \
+                  WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME"),
+            same("SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tcoll' \
+                  ORDER BY ORDINAL_POSITION"),
+            same("SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ccoll' \
+                  ORDER BY ORDINAL_POSITION"),
+            same("SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'vcoll' \
+                  ORDER BY ORDINAL_POSITION"),
+            // A name that is not a collation at all. Both servers refuse it,
+            // with the same code, which is what makes it askable here where
+            // the collations this engine cannot honour are not.
+            same("CREATE TABLE bogus1 (a VARCHAR(10) COLLATE bogus_ci)"),
+            same("CREATE TABLE bogus2 (a VARCHAR(10)) COLLATE=bogus_ci"),
+            same("SELECT 'a' COLLATE bogus_ci"),
+        ],
+    },
 ];

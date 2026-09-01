@@ -1,3 +1,10 @@
 {"at":"2026-09-01T02:16:08Z","id":144,"by":"Christopher Vachon","as":"user","type":"created","title":"ORDER BY resolves a shadowed column before a select-list alias","state":"Todo"}
 {"at":"2026-09-01T02:16:09Z","id":145,"by":"Christopher Vachon","as":"user","type":"created","title":"A string function mangles non-UTF-8 bytes through a lossy decode","state":"Todo"}
 {"at":"2026-09-01T02:16:09Z","id":146,"by":"Christopher Vachon","as":"user","type":"created","title":"BIN over a stored binary column refuses where MySQL answers","state":"Todo"}
+{"at":"2026-09-01T03:03:30Z","id":103,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-01T03:03:30Z","id":147,"by":"Christopher Vachon","as":"user","type":"created","title":"A window function on the grouped path refuses","state":"Todo"}
+{"at":"2026-09-01T03:03:41Z","id":137,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-01T03:03:41Z","id":138,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-01T06:09:08Z","id":148,"by":"Christopher Vachon","as":"user","type":"created","title":"information_schema names compare case-sensitively in MySQL","state":"Todo"}
+{"at":"2026-09-01T06:09:09Z","id":149,"by":"Christopher Vachon","as":"user","type":"created","title":"A DDL COLLATE the engine cannot honour is now refused","state":"Todo"}
+{"at":"2026-09-01T06:09:09Z","id":150,"by":"Christopher Vachon","as":"user","type":"created","title":"A duplicate CREATE INDEX is accepted","state":"Todo"}

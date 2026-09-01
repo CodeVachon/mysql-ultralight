@@ -4,6 +4,7 @@
 //! parameters and returns rows. The wire protocol lives in sibling crates.
 
 pub mod catalog;
+pub mod collation;
 pub mod ddl;
 pub mod decimal;
 pub mod dialect;
@@ -15,6 +16,7 @@ pub mod functions;
 pub mod image;
 pub mod info_schema;
 pub mod json;
+pub(crate) mod name;
 pub mod params;
 pub mod relation;
 pub mod result;

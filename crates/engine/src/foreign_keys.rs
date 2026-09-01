@@ -9,6 +9,7 @@ use std::collections::HashSet;
 
 use crate::catalog::{Database, ForeignKey, Table};
 use crate::error::{EngineError, EngineResult};
+use crate::name;
 use crate::value::Value;
 
 /// The parent keys a child table's foreign key can point at, captured before
@@ -80,11 +81,12 @@ impl ParentKeys {
             "23000",
             format!(
                 "Cannot add or update a child row: a foreign key constraint fails \
-                 (`{child_table}`, CONSTRAINT `{}` FOREIGN KEY (`{}`) REFERENCES `{}` (`{}`))",
-                self.constraint.name,
-                self.constraint.columns.join("`, `"),
-                self.constraint.referenced_table,
-                self.constraint.referenced_columns.join("`, `"),
+                 ({}, CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({}))",
+                name::quote(child_table),
+                name::quote(&self.constraint.name),
+                quoted_list(&self.constraint.columns),
+                name::quote(&self.constraint.referenced_table),
+                quoted_list(&self.constraint.referenced_columns),
             ),
         )
     }
@@ -252,12 +254,29 @@ pub fn restrict_violation(
         "23000",
         format!(
             "Cannot delete or update a parent row: a foreign key constraint fails \
-             (`{child_table}`, CONSTRAINT `{}` FOREIGN KEY (`{}`) REFERENCES `{parent_table}` (`{}`))",
-            constraint.name,
-            constraint.columns.join("`, `"),
-            constraint.referenced_columns.join("`, `"),
+             ({}, CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({}))",
+            name::quote(child_table),
+            name::quote(&constraint.name),
+            quoted_list(&constraint.columns),
+            name::quote(parent_table),
+            quoted_list(&constraint.referenced_columns),
         ),
     )
+}
+
+/// A column list as one of these messages writes it: each name quoted as SQL,
+/// separated by commas.
+///
+/// Every name here goes through `name::quote` rather than being joined with a
+/// literal `` `, ` ``, which is what these messages did — correct only while
+/// the names reaching them still carried their own doubling. 8.3 writes
+/// ``FOREIGN KEY (`pi``d`)`` for a column named ``pi`d``.
+fn quoted_list(columns: &[String]) -> String {
+    columns
+        .iter()
+        .map(|c| name::quote(c))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]

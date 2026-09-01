@@ -30,10 +30,14 @@ pub struct SqlType {
     /// sending the text in the connection's character set. It is the only way
     /// a `MYSQL_TYPE_BLOB` carrying characters can carry that flag.
     ///
-    /// Nothing in the DDL sets it yet, because `COLLATE` is not a clause this
-    /// engine accepts. `information_schema` does: MySQL declares
-    /// `COLUMN_TYPE`, `COLUMN_DEFAULT` and their neighbours `utf8mb3_bin`, and
-    /// a client reading those columns is told they are binary.
+    /// A DDL `COLLATE` clause does not set it, and cannot: `collation::named`
+    /// takes only a `_ci` collation and refuses the rest, rather than
+    /// recording a name and then comparing the column the way it compares
+    /// every other one. `collation::BINARY` is the name that goes with this
+    /// flag.
+    /// `information_schema` sets it: MySQL declares `COLUMN_TYPE`,
+    /// `COLUMN_DEFAULT` and their neighbours `utf8mb3_bin`, and a client
+    /// reading those columns is told they are binary.
     pub binary_collation: bool,
 }
 

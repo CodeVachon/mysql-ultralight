@@ -24,7 +24,9 @@ pub enum Intercepted {
     Deallocate { name: String },
     /// `ALTER TABLE t RENAME INDEX old TO new`.
     RenameIndex {
-        table: String,
+        /// The table's name, part by part. Not joined: a part may hold a dot
+        /// of its own, and nothing downstream could split it back out.
+        table: Vec<String>,
         old: String,
         new: String,
     },
@@ -86,7 +88,7 @@ pub fn intercept(sql: &str) -> Option<Intercepted> {
                 && words.len() == 8 =>
         {
             Some(Intercepted::RenameIndex {
-                table: unquote(&words[2]),
+                table: unquote_parts(&words[2]),
                 old: unquote(&words[5]),
                 new: unquote(&words[7]),
             })
@@ -871,18 +873,82 @@ fn words_of(sql: &str) -> Vec<String> {
     out
 }
 
-/// Strips surrounding quotes or backticks from a single identifier.
+/// The parts of a qualified identifier, each with its quoting undone.
 ///
-/// Applied per dotted part, because `"db"."t"` trimmed as a whole leaves the
-/// inner quotes behind and produces a database named `db"`.
+/// Two things trimming the quotes off cannot do, and both were wrong here.
+/// A quote inside a quoted identifier is *doubled* rather than escaped, so
+/// ``ALTER TABLE `we``ird` RENAME INDEX`` addressed a table ``we``ird`` no
+/// catalog holds; and only a dot *outside* the quotes separates one part from
+/// the next, so splitting the text on `.` first made ``ALTER TABLE `my.table` ``
+/// a table `table` in a database `my`.
+///
+/// The parts come back as a list rather than joined for that second reason:
+/// rejoining them with a dot is the step nothing downstream can undo.
+fn unquote_parts(word: &str) -> Vec<String> {
+    let bytes = word.as_bytes();
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // `classify` is the one place that knows where a quoted run ends,
+        // including that a doubled quote does not end it.
+        if let Some((Segment::Quoted, end)) = classify(bytes, i) {
+            current.push_str(&quoted_value(&word[i..end]));
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'.' {
+            parts.push(std::mem::take(&mut current));
+            i += 1;
+            continue;
+        }
+        // A char at a time rather than a byte, so a non-ASCII identifier
+        // survives: `tabké` is a name MySQL accepts.
+        let ch = word[i..].chars().next().expect("i is a char boundary");
+        current.push(ch);
+        i += ch.len_utf8();
+    }
+
+    parts.push(current);
+    parts
+}
+
+/// A single identifier, for the names that carry no qualifier.
 fn unquote(word: &str) -> String {
-    word.split('.')
-        .map(|part| {
-            part.trim_matches(|c| c == '`' || c == '"' || c == '\'')
-                .to_owned()
-        })
-        .collect::<Vec<_>>()
-        .join(".")
+    unquote_parts(word).join(".")
+}
+
+/// The value of one quoted run, `text` beginning at its opening quote.
+///
+/// A doubled quote reads as one, which is the escaping MySQL's own renderers
+/// apply. A backslash escape is left as written: undoing those is
+/// `NO_BACKSLASH_ESCAPES` territory, and that mode is not modelled here at all.
+fn quoted_value(text: &str) -> String {
+    let quote = &text[..1];
+    let inner = text
+        .strip_prefix(quote)
+        // An unterminated run has no closing quote to strip, and everything
+        // after the opening one is its value.
+        .and_then(|t| t.strip_suffix(quote))
+        .unwrap_or(&text[1..]);
+    inner.replace(&format!("{quote}{quote}"), quote)
+}
+
+/// The text of a `PREPARE ... FROM '<sql>'` literal, as written.
+///
+/// Its own entry point rather than `unquote`, because a statement is not an
+/// identifier: a dot in it separates nothing. Trimming the quotes off the
+/// ends — which is what this was — turned a doubled quote at the end of the
+/// statement into part of the closing run, so `PREPARE s FROM 'SELECT ''x'''`
+/// prepared the unparseable `SELECT ''x`.
+pub(crate) fn unquote_literal(text: &str) -> String {
+    match classify(text.as_bytes(), 0) {
+        // The whole of it, or it is not a literal: `@v` is a variable and
+        // `'a' 'b'` is two runs, neither of which this may take apart.
+        Some((Segment::Quoted, end)) if end == text.len() => quoted_value(text),
+        _ => text.to_owned(),
+    }
 }
 
 /// Replaces every occurrence in code, leaving literals and comments alone.
@@ -1243,7 +1309,7 @@ mod tests {
         assert_eq!(
             intercept("ALTER TABLE `T` RENAME INDEX `old` TO `new`"),
             Some(Intercepted::RenameIndex {
-                table: "T".into(),
+                table: vec!["T".into()],
                 old: "old".into(),
                 new: "new".into(),
             })
@@ -1552,9 +1618,46 @@ mod review_regressions {
     /// `"db"."t"` trimmed as a whole leaves the inner quotes behind.
     #[test]
     fn a_qualified_name_is_unquoted_per_part() {
-        assert_eq!(unquote(r#""db"."t""#), "db.t");
-        assert_eq!(unquote("`db`.`t`"), "db.t");
-        assert_eq!(unquote("plain"), "plain");
+        assert_eq!(unquote_parts(r#""db"."t""#), vec!["db", "t"]);
+        assert_eq!(unquote_parts("`db`.`t`"), vec!["db", "t"]);
+        assert_eq!(unquote_parts("plain"), vec!["plain"]);
+    }
+
+    /// The two things trimming cannot do, on the statement that reaches them.
+    #[test]
+    fn a_quoted_name_keeps_its_dots_and_undoubles_its_quotes() {
+        // One part, not two: the dot is inside the name.
+        assert_eq!(unquote_parts("`my.table`"), vec!["my.table"]);
+        assert_eq!(
+            unquote_parts("`my.db`.`my.table`"),
+            vec!["my.db", "my.table"]
+        );
+        // One backtick, not the two the name was written with.
+        assert_eq!(unquote_parts("`we``ird`"), vec!["we`ird"]);
+        assert_eq!(unquote_parts(r#""we""ird""#), vec![r#"we"ird"#]);
+        assert_eq!(unquote_parts("`tabké`"), vec!["tabké"]);
+    }
+
+    #[test]
+    fn the_rename_index_table_keeps_its_dot() {
+        assert_eq!(
+            intercept("ALTER TABLE `my.table` RENAME INDEX a TO b"),
+            Some(Intercepted::RenameIndex {
+                table: vec!["my.table".into()],
+                old: "a".into(),
+                new: "b".into(),
+            })
+        );
+    }
+
+    /// A doubled quote inside a prepared statement's source is one quote.
+    #[test]
+    fn a_prepared_source_undoubles_its_quotes() {
+        let doubled = "'SELECT ''x'' AS c'";
+        assert_eq!(unquote_literal(doubled), "SELECT 'x' AS c");
+        // A variable is not a literal and must reach the caller untouched,
+        // because that is how the caller tells the two apart.
+        assert_eq!(unquote_literal("@sql"), "@sql");
     }
 }
 

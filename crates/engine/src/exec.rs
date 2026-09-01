@@ -20,6 +20,7 @@ use crate::expr::{self, ColumnRef, Context, OuterRow, Row};
 use crate::foreign_keys::{self, Action};
 use crate::image;
 use crate::info_schema;
+use crate::name;
 use crate::params;
 use crate::relation::Relation;
 use crate::result::{OutColumn, Outcome, ResultSet};
@@ -171,10 +172,14 @@ impl Engine {
             let Outcome::Rows(rows) = resolved else {
                 continue;
             };
-            refreshed.push((
-                view.name.clone(),
-                Self::view_shape(&rows.columns, &view.columns),
-            ));
+            // The guard is taken and dropped per view rather than held across
+            // the loop: the `execute` above runs a query, which locks the
+            // catalog itself.
+            let shape = {
+                let catalog = self.catalog()?;
+                Self::view_shape(&catalog, &rows.columns, &view.columns)
+            };
+            refreshed.push((view.name.clone(), shape));
         }
 
         let mut catalog = self.catalog_mut()?;
@@ -190,7 +195,23 @@ impl Engine {
     }
 
     /// The stored shape of a view, from the columns its definition produced.
-    fn view_shape(columns: &[OutColumn], explicit: &[String]) -> Vec<crate::catalog::Column> {
+    ///
+    /// The catalog is read for one thing the projection does not carry: the
+    /// collation the base column was declared with. 8.3 reports a view's
+    /// column with the collation of the column behind it, and building the
+    /// shape without it made a view over a `COLLATE utf8mb4_general_ci` column
+    /// report the database default instead. The surrounding code copies `ty`
+    /// and `nullable` across for the same reason.
+    ///
+    /// Only for a column that *is* a stored column: a computed one has no
+    /// collation to inherit, and the grouped projection knows the column but
+    /// not the table it came from — see `OutColumn::origin_table` — so it takes
+    /// no collation rather than guessing at one.
+    fn view_shape(
+        catalog: &Catalog,
+        columns: &[OutColumn],
+        explicit: &[String],
+    ) -> Vec<crate::catalog::Column> {
         columns
             .iter()
             .enumerate()
@@ -201,6 +222,7 @@ impl Engine {
                 );
                 column.position = i + 1;
                 column.nullable = c.nullable;
+                column.collation = base_collation(catalog, c);
                 column
             })
             .collect()
@@ -574,7 +596,7 @@ impl Engine {
                         }
                         value.as_text()
                     }
-                    None => source.trim_matches('\'').to_owned(),
+                    None => rewrite::unquote_literal(&source),
                 };
                 session.prepared.insert(name.to_ascii_lowercase(), text);
                 Ok(Outcome::ok())
@@ -607,7 +629,7 @@ impl Engine {
             }
 
             Intercepted::RenameIndex { table, old, new } => {
-                let (db, table_name) = self.split_parts(session, &table)?;
+                let (db, table_name) = self.qualify(session, table)?;
                 let mut catalog = self.catalog_mut()?;
                 let database = catalog
                     .database_mut(&db)
@@ -693,7 +715,12 @@ impl Engine {
                 let mut scoped = session.clone();
                 scoped.current_database = Some(db.clone());
                 let resolved = self.query(&scoped, &create.query)?;
-                let shape = Self::view_shape(&resolved.columns, &explicit);
+                // Before the write guard below, which this would deadlock
+                // against.
+                let shape = {
+                    let catalog = self.catalog()?;
+                    Self::view_shape(&catalog, &resolved.columns, &explicit)
+                };
 
                 let view = crate::catalog::View {
                     name: name.clone(),
@@ -741,7 +768,7 @@ impl Engine {
                 ..
             } => {
                 self.catalog_mut()?
-                    .create_database(&object_name(db_name), *if_not_exists)?;
+                    .create_database(&name::dotted(db_name), *if_not_exists)?;
                 Ok(Outcome::ok())
             }
             Statement::Drop {
@@ -768,10 +795,22 @@ impl Engine {
             }
 
             Statement::Use(use_stmt) => {
-                let name = format!("{use_stmt}")
-                    .trim_start_matches("USE ")
-                    .trim_matches('`')
-                    .to_owned();
+                // The name out of the tree, rather than out of
+                // `format!("{use_stmt}")` with the `USE ` this statement had
+                // just been rendered with stripped back off the front — which
+                // put a quoted name into the session under its rendering, so
+                // ``USE `db``x` `` selected a database called ``db``x``.
+                //
+                // The other `Use` variants are `USE CATALOG`, `USE WAREHOUSE`
+                // and the rest, which only Databricks and Snowflake parse:
+                // MySQL's dialect reads no keyword after `USE` at all, so
+                // every one of these is `Object` and the arm below cannot be
+                // reached. It refuses rather than guessing a database name out
+                // of the rendering, which is what the old reading did.
+                let sqlparser::ast::Use::Object(object) = use_stmt else {
+                    return Err(unsupported(format!("{use_stmt}")));
+                };
+                let name = name::dotted(object);
                 // information_schema is served virtually rather than stored,
                 // so it is absent from the catalog while still being listed by
                 // SHOW DATABASES and queryable when qualified.
@@ -794,7 +833,7 @@ impl Engine {
                     .show_in
                     .as_ref()
                     .and_then(|s| s.parent_name.as_ref())
-                    .map(object_name)
+                    .map(name::dotted)
                     .unwrap_or_default();
                 self.show_columns(session, &table).map(Outcome::Rows)
             }
@@ -2060,7 +2099,7 @@ impl Engine {
                 // A CTE shadows a table of the same name, and is looked up
                 // before the catalog for exactly that reason. Innermost wins.
                 let unqualified = name.0.len() == 1;
-                let plain = object_name(name);
+                let plain = name::dotted(name);
                 if unqualified {
                     if let Some((_, cte)) = session
                         .ctes
@@ -3320,8 +3359,16 @@ impl Engine {
     // ---------------------------------------------------------------- writes
 
     fn insert(&self, session: &mut Session, insert: &Insert) -> EngineResult<Outcome> {
-        let rendered = insert.table.to_string();
-        let (db, table_name) = self.split_parts(session, &rendered)?;
+        // Through `split_name`, like every other statement, rather than by
+        // splitting the rendering of `insert.table` on `.`. That could not
+        // tell a qualifier from a dot inside a name, so an INSERT into a table
+        // spelled ``my.table`` was 1049 `Unknown database 'my'` — against a
+        // table `CREATE TABLE` and `SELECT` had both accepted, so the engine
+        // disagreed with itself about one name.
+        let sqlparser::ast::TableObject::TableName(table_name_ast) = &insert.table else {
+            return Err(unsupported(format!("INSERT INTO {}", insert.table)));
+        };
+        let (db, table_name) = self.split_name(session, table_name_ast)?;
         let ignore = insert.ignore;
 
         let duplicate_key_update = match &insert.on {
@@ -3382,7 +3429,12 @@ impl Engine {
                 .columns
                 .iter()
                 .map(|c| {
-                    let name = c.to_string().trim_matches('`').to_owned();
+                    // The column, not the whole qualified name: MySQL takes
+                    // `INSERT INTO q (q.a, q.b) VALUES (1, 2)` — measured on
+                    // 8.3, and `INSERT INTO db.q (db.q.a)` with it — where
+                    // matching on the join of every part is 1054 for a column
+                    // called `q.a` that no table has.
+                    let name = name::tail(c);
                     let index = table
                         .column_index(&name)
                         .ok_or_else(|| EngineError::unknown_column(&name, "field list"))?;
@@ -3986,11 +4038,7 @@ impl Engine {
         // `DELETE t1 FROM t1, t2 WHERE t1.id = t2.id` — the commoner spelling
         // of a multi-table delete — takes the same path as the JOIN form.
         if from.len() > 1 || !from[0].joins.is_empty() || !delete.tables.is_empty() {
-            let targets = delete
-                .tables
-                .iter()
-                .map(object_name_tail)
-                .collect::<Vec<_>>();
+            let targets = delete.tables.iter().map(name::tail).collect::<Vec<_>>();
             return self.delete_joined(session, delete, from, &targets);
         }
         let TableFactor::Table { name, alias, .. } = &from[0].relation else {
@@ -4244,7 +4292,7 @@ impl Engine {
             ObjectType::Database | ObjectType::Schema => {
                 for name in names {
                     self.catalog_mut()?
-                        .drop_database(&object_name(name), if_exists)?;
+                        .drop_database(&name::dotted(name), if_exists)?;
                 }
             }
             ObjectType::View => {
@@ -4314,7 +4362,7 @@ impl Engine {
                     .ok_or_else(|| EngineError::no_such_table(&table_name))?;
 
                 for name in names {
-                    let index = object_name(name);
+                    let index = name::dotted(name);
                     let before = table.indexes.len();
                     table
                         .indexes
@@ -4340,7 +4388,7 @@ impl Engine {
             S::SingleAssignment {
                 variable, values, ..
             } => {
-                let name = object_name(variable);
+                let name = name::dotted(variable);
                 let ctx = Context::rowless(session).with_executor(self);
                 // An expression that cannot be evaluated must not become a
                 // silent NULL: the variable would then carry a wrong answer
@@ -4354,7 +4402,7 @@ impl Engine {
             }
             S::MultipleAssignments { assignments } => {
                 for assignment in assignments {
-                    let name = object_name(&assignment.name);
+                    let name = name::dotted(&assignment.name);
                     let ctx = Context::rowless(session).with_executor(self);
                     let value = expr::eval(&assignment.value, &ctx)?;
                     self.assign(session, &name, value)?;
@@ -4809,48 +4857,52 @@ impl Engine {
         Ok(row)
     }
 
-    /// Splits a rendered `db.table` string, for the paths where the AST hands
-    /// back a name already stringified.
-    fn split_parts(&self, session: &Session, rendered: &str) -> EngineResult<(String, String)> {
-        let parts: Vec<String> = rendered
-            .split('.')
-            // Under ANSI_QUOTES the parts arrive double-quoted, so trimming
-            // only backticks leaves a database named `testdb"`.
-            .map(|p| p.trim_matches(|c| c == '`' || c == '"').to_owned())
-            .collect();
-        match parts.len() {
-            1 => {
-                let db = session
-                    .current_database
-                    .clone()
-                    .ok_or_else(EngineError::no_database)?;
-                Ok((db, parts[0].clone()))
-            }
-            2 => Ok((parts[0].clone(), parts[1].clone())),
-            _ => Err(unsupported(format!("qualified name `{rendered}`"))),
-        }
-    }
-
     /// Splits `db.table` into parts, falling back to the session's database.
     fn split_name(&self, session: &Session, name: &ObjectName) -> EngineResult<(String, String)> {
-        let parts: Vec<String> = name
-            .0
-            .iter()
-            .map(|p| p.to_string().trim_matches('`').to_owned())
-            .collect();
+        self.qualify(session, name::parts(name))
+    }
 
+    /// Resolves an already-read name against the session's current database.
+    ///
+    /// Takes the parts rather than a `db.table` string, because a part may
+    /// hold a dot of its own and nothing can split one back apart. The joined
+    /// spelling is built only in the arm that reports it: every table factor
+    /// in every query comes through here, and rendering a message for the
+    /// statements that are fine cost a second walk and a third allocation on
+    /// the hottest path in the engine.
+    fn qualify(&self, session: &Session, mut parts: Vec<String>) -> EngineResult<(String, String)> {
         match parts.len() {
             1 => {
                 let db = session
                     .current_database
                     .clone()
                     .ok_or_else(EngineError::no_database)?;
-                Ok((db, parts[0].clone()))
+                Ok((db, parts.remove(0)))
             }
-            2 => Ok((parts[0].clone(), parts[1].clone())),
-            _ => Err(unsupported(format!("qualified name `{name}`"))),
+            2 => {
+                let table = parts.remove(1);
+                Ok((parts.remove(0), table))
+            }
+            _ => Err(unsupported(format!("qualified name `{}`", parts.join(".")))),
         }
     }
+}
+
+/// The collation the stored column behind a projected one was declared with.
+///
+/// `None` unless the projection names a real column of a real table, which is
+/// what `origin` and `origin_table` record.
+fn base_collation(catalog: &Catalog, column: &OutColumn) -> Option<String> {
+    let table = column.origin_table.as_deref()?;
+    let name = column.origin.as_deref()?;
+    catalog
+        .database(&column.schema)?
+        .table(table)?
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(name))?
+        .collation
+        .clone()
 }
 
 /// Builds the equality condition a `USING (a, b)` join clause implies.
@@ -4863,7 +4915,7 @@ fn using_condition(
 
     let mut condition: Option<Expr> = None;
     for name in names {
-        let column = name.to_string().trim_matches('`').to_owned();
+        let column = name::dotted(name);
         let (Some(l), Some(r)) = (left.index_of(None, &column), right.index_of(None, &column))
         else {
             return Err(EngineError::unknown_column(&column, "from clause"));
@@ -5155,14 +5207,6 @@ fn restore_tables(catalog: &mut Catalog, snapshot: &Catalog, tables: &[(String, 
     }
 }
 
-/// The last part of a qualified name, as a delete target is addressed.
-fn object_name_tail(name: &ObjectName) -> String {
-    name.0
-        .last()
-        .map(|p| p.to_string().trim_matches('`').to_owned())
-        .unwrap_or_default()
-}
-
 /// The name a `DELETE FROM a, b USING ...` target is addressed by.
 ///
 /// An alias wins over the table name, because that is what the USING clause
@@ -5181,7 +5225,7 @@ fn target_name(item: &TableWithJoins) -> EngineResult<String> {
     Ok(alias
         .as_ref()
         .map(|a| a.name.value.clone())
-        .unwrap_or_else(|| object_name_tail(name)))
+        .unwrap_or_else(|| name::tail(name)))
 }
 
 /// The narrowest type that can hold what either branch of a set operation
@@ -7435,7 +7479,7 @@ fn factor_name(factor: &TableFactor) -> Option<String> {
             alias
                 .as_ref()
                 .map(|a| a.name.value.clone())
-                .unwrap_or_else(|| object_name(name)),
+                .unwrap_or_else(|| name::dotted(name)),
         ),
         TableFactor::Derived { alias, .. } | TableFactor::JsonTable { alias, .. } => {
             alias.as_ref().map(|a| a.name.value.clone())
@@ -7675,7 +7719,7 @@ fn refuse_malformed_escape<'a>(clauses: impl IntoIterator<Item = &'a Expr>) -> E
 /// USING list.
 fn wildcard_qualifier(kind: &sqlparser::ast::SelectItemQualifiedWildcardKind) -> String {
     match kind {
-        sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => object_name(name),
+        sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => name::dotted(name),
         // `expr.*`, which only BigQuery and Snowflake parse —
         // `supports_select_expr_star` is false for MySQL, so this arm is
         // unreachable here and renders rather than inventing a name for
@@ -7867,7 +7911,7 @@ fn resolve_having_name(
             SelectItem::QualifiedWildcard(kind, _) => {
                 let qualifier = match kind {
                     sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name) => {
-                        object_name(name)
+                        name::dotted(name)
                     }
                     other => other.to_string().trim_end_matches(".*").to_owned(),
                 };
@@ -8240,31 +8284,14 @@ fn assignment_qualifier(target: &AssignmentTarget) -> Option<String> {
     let AssignmentTarget::ColumnName(name) = target else {
         return None;
     };
-    (name.0.len() >= 2).then(|| {
-        name.0[name.0.len() - 2]
-            .to_string()
-            .trim_matches('`')
-            .to_owned()
-    })
+    (name.0.len() >= 2).then(|| name::part(&name.0[name.0.len() - 2]))
 }
 
 fn assignment_column(target: &AssignmentTarget) -> EngineResult<String> {
     match target {
-        AssignmentTarget::ColumnName(name) => Ok(name
-            .0
-            .last()
-            .map(|p| p.to_string().trim_matches('`').to_owned())
-            .unwrap_or_default()),
+        AssignmentTarget::ColumnName(column) => Ok(name::tail(column)),
         other => Err(unsupported(format!("assignment target `{other}`"))),
     }
-}
-
-fn object_name(name: &ObjectName) -> String {
-    name.0
-        .iter()
-        .map(|p| p.to_string().trim_matches('`').to_owned())
-        .collect::<Vec<_>>()
-        .join(".")
 }
 
 /// The name MySQL gives an unaliased select item.

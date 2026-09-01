@@ -17607,3 +17607,659 @@ fn unhex_and_from_base64_describe_their_answers_as_bytes() {
         vec![vec!["FF"]]
     );
 }
+
+// ---------------------------------------------------------------- names
+
+/// A name is what was written between the quotes, not the rendering of it.
+///
+/// Read through `Display` and trimmed back, an identifier loses two different
+/// things, and the engine lost both. `Display` *doubles* an embedded backtick
+/// and trimming the outer pair cannot undo it; and a caller that splits the
+/// rendering on `.` cannot tell a qualifier from a dot inside the name.
+///
+/// Measured on 8.3, which accepts every one of these and reports the value:
+///
+/// | written | 8.3 `information_schema` | 8.3 `SHOW CREATE TABLE` |
+/// |---|---|---|
+/// | `` `we``ird` `` | ``we`ird`` | `` CREATE TABLE `we``ird` `` |
+/// | `` `my.table` `` | `my.table` | `` CREATE TABLE `my.table` `` |
+/// | `` `select` `` | `select` | `` CREATE TABLE `select` `` |
+/// | `` `tabké` `` | `tabké` | `` CREATE TABLE `tabké` `` |
+///
+/// The ones it refuses are refused for the name and not the quoting: a
+/// trailing space is 1103/1166 and so is an empty one, whatever they are
+/// wrapped in.
+#[test]
+fn a_quoted_name_keeps_the_value_it_was_written_with() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE `we``ird` (`c``ol` INT)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE INDEX `ix``x` ON `we``ird` (`c``ol`)",
+    );
+    run(&engine, &mut session, "INSERT INTO `we``ird` VALUES (7)");
+
+    // One backtick in every reported name, not the two the DDL was written
+    // with. The column was already right, which is what makes the table name
+    // beside it evidence rather than a constant.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'testdb' ORDER BY COLUMN_NAME",
+        ),
+        vec![vec!["we`ird", "c`ol"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'testdb'",
+        ),
+        vec![vec!["we`ird"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = 'testdb'",
+        ),
+        vec![vec!["ix`x", "c`ol"]]
+    );
+    // And on the wire, where an alias is the name the client reads back.
+    assert_eq!(
+        engine
+            .describe(&session, "SELECT `c``ol` AS `al``ias` FROM `we``ird`", 0)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["al`ias"]
+    );
+
+    // An assignment target and a USING list read a name through paths of their
+    // own, and each one that still went through `Display` would find no such
+    // column — the metadata above cannot reach either.
+    assert_eq!(
+        affected(&engine, &mut session, "UPDATE `we``ird` SET `c``ol` = 8"),
+        1
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT `c``ol` FROM `we``ird`"),
+        vec![vec!["8"]]
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE `oth``er` (`c``ol` INT)",
+    );
+    run(&engine, &mut session, "INSERT INTO `oth``er` VALUES (8)");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT o.`c``ol` FROM `we``ird` w JOIN `oth``er` o USING (`c``ol`)",
+        ),
+        vec![vec!["8"]]
+    );
+    run(&engine, &mut session, "DROP INDEX `ix``x` ON `we``ird`");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = 'testdb'",
+        ),
+        vec![vec!["0"]]
+    );
+
+    // A name only a keyword, and a non-ASCII one: both are values like any
+    // other and neither may be transformed on the way to being reported.
+    run(&engine, &mut session, "CREATE TABLE `select` (`from` INT)");
+    run(&engine, &mut session, "CREATE TABLE `tabké` (`colé` INT)");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME IN ('select', 'tabké') \
+             ORDER BY TABLE_NAME",
+        ),
+        vec![vec!["select", "from"], vec!["tabké", "colé"]]
+    );
+}
+
+/// Every statement addresses one dotted name the same way.
+///
+/// `INSERT` read its table through `insert.table.to_string()` and split the
+/// rendering on `.`, where every other path reads the name part by part. So
+/// `CREATE TABLE` and `SELECT` were happy with `` `my.table` `` and the
+/// `INSERT` beside them was 1049 `Unknown database 'my'` — the engine
+/// disagreeing with itself about one name, against an 8.3 that inserts the
+/// row.
+#[test]
+fn a_dotted_name_is_one_table_to_every_statement() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE `my.table` (a INT)");
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "INSERT INTO `my.table` (a) VALUES (1)"
+        ),
+        1
+    );
+    assert_eq!(
+        affected(&engine, &mut session, "INSERT INTO `my.table` VALUES (2)"),
+        1
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a FROM `my.table` ORDER BY a"),
+        vec![vec!["1"], vec!["2"]]
+    );
+    // The writes, which is where the split lived, and the DDL that renames an
+    // index — the one other path that took a name as a rendered string.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE `my.table` SET a = 3 WHERE a = 1"
+        ),
+        1
+    );
+    assert_eq!(
+        affected(&engine, &mut session, "DELETE FROM `my.table` WHERE a = 3"),
+        1
+    );
+    run(&engine, &mut session, "CREATE INDEX ixa ON `my.table` (a)");
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE `my.table` RENAME INDEX ixa TO ixb",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME, INDEX_NAME FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = 'testdb'",
+        ),
+        vec![vec!["my.table", "ixb"]]
+    );
+    // A real qualifier still qualifies, so the fix did not simply stop
+    // splitting: this one names the database and 8.3 reads it the same way.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a FROM testdb.`my.table`"),
+        vec![vec!["2"]]
+    );
+    // And the arm that refuses a deeper name still names it. The joined
+    // spelling is now built only here — every other call skips it — so a
+    // regression would be a message with nothing in it rather than a failure.
+    let err = engine
+        .execute(&mut session, "SELECT a FROM a.b.c", &[])
+        .unwrap_err();
+    assert!(err.to_string().contains("qualified name `a.b.c`"), "{err}");
+}
+
+/// `COLLATE` reports the collation, not the spelling of the collation.
+///
+/// The DDL stored `ColumnOption::Collation` through `to_string()` on an
+/// `ObjectName`, so `` COLLATE `utf8mb4_general_ci` `` reached
+/// `information_schema.COLUMNS.COLLATION_NAME` — and the state image — with
+/// its backticks still on. 8.3 reports `utf8mb4_general_ci` for every spelling
+/// below, the upper-case one included: it lowercases the name it records.
+#[test]
+fn a_collation_is_named_the_same_however_it_is_written() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C (a VARCHAR(10) COLLATE `utf8mb4_general_ci`, \
+                         b VARCHAR(10) COLLATE utf8mb4_general_ci, \
+                         c VARCHAR(10) COLLATE 'utf8mb4_general_ci', \
+                         d VARCHAR(10) COLLATE UTF8MB4_GENERAL_CI)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'C' ORDER BY COLUMN_NAME",
+        ),
+        vec![
+            vec!["a", "utf8mb4_general_ci"],
+            vec!["b", "utf8mb4_general_ci"],
+            vec!["c", "utf8mb4_general_ci"],
+            vec!["d", "utf8mb4_general_ci"],
+        ]
+    );
+
+    // The expression form reads the same name through the same reader, so a
+    // quoted `_ci` collation is honoured there too.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 'a' COLLATE `utf8mb4_general_ci`"
+        ),
+        vec![vec!["a"]]
+    );
+}
+
+/// A collation this engine cannot honour is refused, in the DDL as well as in
+/// an expression.
+///
+/// The DDL recorded any collation at all and then compared the column the way
+/// it compares every other one, which is a wrong answer in two directions.
+/// Both measured on 8.3, against `VARCHAR(10) COLLATE utf8mb4_bin` under a
+/// UNIQUE key: it stores `'a'` and `'A'` side by side where this engine
+/// answered 1062, and `WHERE a = 'A'` returns `A` there and returned `a` here.
+///
+/// So the two paths now share one reader. Refusing is the direction that
+/// cannot be silently wrong, and it turns nothing real away — the conformance
+/// target spells all 314 of its `COLLATE` clauses `_ci`.
+#[test]
+fn a_collation_the_engine_cannot_honour_is_refused() {
+    let (engine, mut session) = engine();
+    for sql in [
+        "CREATE TABLE B (a VARCHAR(10) COLLATE utf8mb4_bin)",
+        "CREATE TABLE B (a VARCHAR(10) COLLATE `utf8mb4_bin`)",
+        "CREATE TABLE B (a VARCHAR(10) COLLATE utf8mb4_0900_as_cs)",
+        "CREATE TABLE B (a VARCHAR(10)) COLLATE=utf8mb4_bin",
+        "CREATE TABLE B (a VARCHAR(10)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+        "SELECT 'a' COLLATE utf8mb4_bin",
+        "SELECT 'a' COLLATE `utf8mb4_bin`",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        // Never 1273: these are collations 8.3 has, so calling them unknown
+        // would be a false claim about the name rather than a report of this
+        // engine's gap.
+        assert_ne!(err.code, 1273, "{sql} -> {err}");
+        // Named without its backticks, whichever path refused it: the message
+        // has to name the collation, not the rendering it was written with.
+        assert!(
+            err.to_string().contains("`utf8mb4_bin` collation")
+                || err.to_string().contains("`utf8mb4_0900_as_cs` collation"),
+            "{sql} -> {err}"
+        );
+    }
+    // Refused, not half-applied: no table is left behind.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'testdb'",
+        ),
+        vec![vec!["0"]]
+    );
+}
+
+/// A name that is not a collation at all is 1273, as 8.3 answers it.
+///
+/// The suffix check alone blessed anything ending `_ci`, so `COLLATE bogus_ci`
+/// succeeded — and was lowercased, written into the append-only state image
+/// and reported to whatever introspected the schema afterwards. Measured: 8.3
+/// answers `ERROR 1273 (HY000): Unknown collation: 'bogus_ci'`, at the column
+/// level and at the table level alike.
+#[test]
+fn a_name_that_is_not_a_collation_is_unknown() {
+    let (engine, mut session) = engine();
+    for sql in [
+        "CREATE TABLE B (a VARCHAR(10) COLLATE bogus_ci)",
+        "CREATE TABLE B (a VARCHAR(10) COLLATE `bogus_ci`)",
+        "CREATE TABLE B (a VARCHAR(10)) COLLATE=bogus_ci",
+        "SELECT 'a' COLLATE bogus_ci",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1273, "{sql} -> {err}");
+        assert_eq!(err.sql_state, "HY000", "{sql} -> {err}");
+        assert!(
+            err.to_string().contains("Unknown collation: \'bogus_ci\'"),
+            "{sql} -> {err}"
+        );
+    }
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'testdb'",
+        ),
+        vec![vec!["0"]]
+    );
+}
+
+/// What `information_schema.COLLATIONS` lists and what a `COLLATE` clause
+/// accepts are one list.
+///
+/// A server that advertises a collation and then refuses it — or refuses one
+/// it advertises as unknown — is contradicting itself about its own
+/// capabilities, and these were two hand-written lists. The clause was checked
+/// for a `_ci` suffix alone, so it accepted names the table did not list at
+/// all.
+#[test]
+fn the_collations_table_and_the_collate_clause_agree() {
+    let (engine, mut session) = engine();
+    let listed = rows(
+        &engine,
+        &mut session,
+        "SELECT COLLATION_NAME FROM information_schema.COLLATIONS ORDER BY COLLATION_NAME",
+    );
+    assert!(!listed.is_empty(), "the table should list something");
+
+    for row in &listed {
+        let name = &row[0];
+        let sql = format!("SELECT 'a' COLLATE `{name}`");
+        match engine.execute(&mut session, &sql, &[]) {
+            // Advertised and honoured.
+            Ok(_) => {}
+            // Advertised and not honourable is allowed — `binary` is — but it
+            // may never come back as *unknown*, which is what the table would
+            // be contradicting.
+            Err(e) => assert_ne!(e.code, 1273, "{sql} -> {e}"),
+        }
+    }
+
+    // And the other direction: a name the table does not list is unknown,
+    // rather than being waved through on the strength of its suffix.
+    let absent = "definitely_not_a_collation_ci";
+    assert!(
+        !listed.iter().any(|r| r[0] == absent),
+        "the fixture name must not be listed"
+    );
+    let err = engine
+        .execute(&mut session, &format!("SELECT 'a' COLLATE `{absent}`"), &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1273, "{err}");
+}
+
+/// A table-level `COLLATE` is the clause the column-level one was refused for,
+/// written one line higher.
+///
+/// It was parsed and dropped — `create.table_options` was never read — so the
+/// table reported the database's collation and compared its columns the way
+/// every other one is compared. Measured on 8.3: the clause sets
+/// `TABLE_COLLATION` and shows up on every *character* column of the table,
+/// and on none of the others.
+#[test]
+fn a_table_level_collation_reaches_the_columns_it_covers() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (a VARCHAR(10), b INT, c TEXT COLLATE utf8mb4_general_ci) \
+         DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_COLLATION FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'T'",
+        ),
+        vec![vec!["utf8mb4_unicode_ci"]]
+    );
+    // The table's collation on the character columns that declare none, the
+    // column's own where it declares one, and NULL on the INT.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'T' ORDER BY ORDINAL_POSITION",
+        ),
+        vec![
+            vec!["a", "utf8mb4_unicode_ci"],
+            vec!["b", "NULL"],
+            vec!["c", "utf8mb4_general_ci"],
+        ]
+    );
+}
+
+/// A view's column carries the collation of the column behind it.
+///
+/// The shape was built with no collation at all, so a view over a column with
+/// an explicit `COLLATE` reported the database default. 8.3 reports the base
+/// column's, and NULL for a column that holds no characters.
+#[test]
+fn a_view_reports_the_collation_of_the_column_behind_it() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Base (a VARCHAR(10) COLLATE utf8mb4_general_ci, n INT)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW V AS SELECT a, n FROM Base",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'V' ORDER BY ORDINAL_POSITION",
+        ),
+        vec![vec!["a", "utf8mb4_general_ci"], vec!["n", "NULL"]]
+    );
+}
+
+/// One column may not describe itself two ways.
+///
+/// `CREATE TABLE ... AS SELECT COLUMN_TYPE FROM information_schema.COLUMNS`
+/// copies a column this engine marks `binary_collation`, which is what puts
+/// the BINARY flag on its wire definition — and `COLLATION_NAME` beside it
+/// reported the database's `utf8mb4_0900_ai_ci`. 8.3 reports `utf8mb3_bin`,
+/// which is the collation the flag stands for.
+#[test]
+fn a_binary_collated_column_reports_the_collation_its_wire_flag_means() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Copied AS SELECT COLUMN_TYPE, COLUMN_NAME \
+         FROM information_schema.columns WHERE TABLE_NAME = 'Copied'",
+    );
+    let binary_flags: Vec<bool> = engine
+        .describe(&session, "SELECT * FROM Copied", 0)
+        .unwrap()
+        .unwrap()
+        .iter()
+        .map(|c| c.to_wire().flags & mysql_ultralight_protocol::column::flags::BINARY != 0)
+        .collect();
+    // The pair is the claim: the first column carries the flag and the second
+    // does not, and what `information_schema` says has to agree with both.
+    assert_eq!(binary_flags, vec![true, false]);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Copied' ORDER BY ORDINAL_POSITION",
+        ),
+        vec![
+            vec!["COLUMN_TYPE", "utf8mb3_bin"],
+            vec!["COLUMN_NAME", "utf8mb4_0900_ai_ci"],
+        ]
+    );
+}
+
+/// Only a column that holds characters has a collation.
+///
+/// Every column of every type reported the database's collation, so an `INT`
+/// claimed `utf8mb4_0900_ai_ci`. Measured on 8.3 across all twelve types
+/// below: `char`/`varchar`/`text`, `enum` and `set` report one and the rest —
+/// the numbers, the temporals, `json`, and the byte types `blob`, `binary`
+/// and `varbinary` — report NULL.
+#[test]
+fn only_a_character_column_reports_a_collation() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Ty (i INT, d DATE, dt DATETIME(3), f DOUBLE, n DECIMAL(10,2), \
+                          t TEXT, v VARCHAR(10), b BLOB, vb VARBINARY(10), \
+                          e ENUM('x','y'), st SET('p','q'), j JSON)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Ty' ORDER BY ORDINAL_POSITION",
+        ),
+        vec![
+            vec!["i", "NULL"],
+            vec!["d", "NULL"],
+            vec!["dt", "NULL"],
+            vec!["f", "NULL"],
+            vec!["n", "NULL"],
+            vec!["t", "utf8mb4_0900_ai_ci"],
+            vec!["v", "utf8mb4_0900_ai_ci"],
+            vec!["b", "NULL"],
+            vec!["vb", "NULL"],
+            vec!["e", "utf8mb4_0900_ai_ci"],
+            vec!["st", "utf8mb4_0900_ai_ci"],
+            vec!["j", "NULL"],
+        ]
+    );
+}
+
+/// A foreign key's error message quotes its names back as SQL.
+///
+/// The message is not reporting names, it is quoting SQL — 8.3 writes
+/// ``REFERENCES `pa``rent` `` with the backtick doubled, exactly as
+/// `SHOW CREATE TABLE` does. These sites wrapped each name in backticks
+/// without escaping it, which was right only for as long as the name reaching
+/// them still carried its own doubling; reading the value correctly broke
+/// them, so the re-quoting is now explicit and `name::quote` is the one place
+/// it happens.
+///
+/// The whole message is asserted rather than a fragment: the constraint, the
+/// child column and the parent table each go through it separately, and an
+/// assertion on one would pass while the other two were unescaped.
+#[test]
+fn a_foreign_key_violation_quotes_every_name_it_writes() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE `pa``rent` (id INT NOT NULL PRIMARY KEY)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE `ch``ild` (id INT NOT NULL PRIMARY KEY, `pi``d` INT NULL, \
+         CONSTRAINT `fk``x` FOREIGN KEY (`pi``d`) REFERENCES `pa``rent` (id))",
+    );
+
+    let err = engine
+        .execute(&mut session, "INSERT INTO `ch``ild` VALUES (1, 99)", &[])
+        .unwrap_err();
+    // 8.3, character for character, but for the child table: it writes
+    // ``  `testdb`.`ch``ild`  `` and this engine does not schema-qualify it,
+    // which is a gap of its own and not this one.
+    assert_eq!(
+        err.to_string(),
+        "ERROR 1452 (23000): Cannot add or update a child row: a foreign key constraint \
+         fails (`ch``ild`, CONSTRAINT `fk``x` FOREIGN KEY (`pi``d`) \
+         REFERENCES `pa``rent` (`id`))"
+    );
+
+    // The 1451 half is a separate format string and was wrong the same way.
+    run(&engine, &mut session, "INSERT INTO `pa``rent` VALUES (1)");
+    run(&engine, &mut session, "INSERT INTO `ch``ild` VALUES (2, 1)");
+    let err = engine
+        .execute(&mut session, "DELETE FROM `pa``rent` WHERE id = 1", &[])
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "ERROR 1451 (23000): Cannot delete or update a parent row: a foreign key constraint \
+         fails (`ch``ild`, CONSTRAINT `fk``x` FOREIGN KEY (`pi``d`) \
+         REFERENCES `pa``rent` (`id`))"
+    );
+}
+
+/// A qualified column name in an INSERT's column list names the column.
+///
+/// `INSERT INTO q (q.a, q.b) VALUES (1, 2)` is legal on 8.3 — measured, and
+/// `INSERT INTO db.q (db.q.a)` with it. Matching on every part joined looks
+/// for a column called `q.a`, which no table has, so this was 1054.
+#[test]
+fn an_insert_column_list_takes_the_column_out_of_a_qualified_name() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE q (a INT, b INT)");
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "INSERT INTO q (q.a, q.b) VALUES (1, 2)"
+        ),
+        1
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "INSERT INTO testdb.q (testdb.q.a) VALUES (5)"
+        ),
+        1
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a, b FROM q ORDER BY a"),
+        vec![vec!["1", "2"], vec!["5", "NULL"]]
+    );
+}
+
+/// A prepared statement's source is the literal's value, not the text between
+/// the first and last quote of it.
+///
+/// `trim_matches('\'')` eats the doubling at the end of the statement as if it
+/// were part of the closing quote, so this prepared `SELECT ''x` and failed to
+/// parse. 8.3 answers `x`.
+#[test]
+fn a_prepared_statement_undoubles_the_quotes_in_its_source() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "PREPARE s FROM 'SELECT ''x'' AS c'");
+    assert_eq!(rows(&engine, &mut session, "EXECUTE s"), vec![vec!["x"]]);
+}
+
+/// `USE` takes the database's name out of the tree.
+///
+/// It was read out of `format!("{use_stmt}")` with the rendered `USE ` stripped
+/// back off the front, which put a quoted name into the session under its
+/// rendering. 8.3 accepts both of these and `DATABASE()` reports the value.
+#[test]
+fn use_selects_the_database_it_names() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE DATABASE `db``x`");
+    run(&engine, &mut session, "CREATE DATABASE `my.db`");
+
+    run(&engine, &mut session, "USE `db``x`");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT DATABASE()"),
+        vec![vec!["db`x"]]
+    );
+    run(&engine, &mut session, "CREATE TABLE t (a INT)");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_SCHEMA FROM information_schema.TABLES WHERE TABLE_NAME = 't'",
+        ),
+        vec![vec!["db`x"]]
+    );
+
+    run(&engine, &mut session, "USE `my.db`");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT DATABASE()"),
+        vec![vec!["my.db"]]
+    );
+}

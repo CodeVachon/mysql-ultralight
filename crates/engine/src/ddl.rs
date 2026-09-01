@@ -2,13 +2,14 @@
 
 use sqlparser::ast::{
     AlterTableOperation, ColumnDef, ColumnOption, CreateIndex, CreateTable, CreateTableLikeKind,
-    ObjectName, RenameTableNameKind, TableConstraint,
+    CreateTableOptions, ObjectName, RenameTableNameKind, SqlOption, TableConstraint,
 };
 
 use crate::catalog::{Catalog, Column, ForeignKey, Index, Table};
 use crate::error::{unsupported, EngineError, EngineResult};
 use crate::exec::Engine;
 use crate::expr;
+use crate::name;
 use crate::result::{OutColumn, Outcome, ResultSet};
 use crate::session::Session;
 use crate::types::SqlType;
@@ -34,6 +35,15 @@ pub fn create_table(
     };
 
     let mut table = Table::new(&name);
+    // Through the same reader the column-level clause and the expression use.
+    // This one was parsed and dropped: `create.table_options` was never read
+    // and `Table::collation` never assigned, so
+    // `CREATE TABLE t (a VARCHAR(10)) COLLATE=utf8mb4_bin` succeeded, reported
+    // the database's collation, and compared `a` case-insensitively — the
+    // exact wrong answer the column-level refusal exists to prevent, reachable
+    // by writing the clause one line higher. This repo's own example
+    // migrations use the table-level form on every table.
+    table.collation = table_collation(&create.table_options)?;
 
     let mut inline_checks = Vec::new();
     for (position, def) in create.columns.iter().enumerate() {
@@ -479,7 +489,14 @@ fn build_column_with_checks(
                 });
             }
             ColumnOption::Comment(c) => column.comment = Some(c.clone()),
-            ColumnOption::Collation(c) => column.collation = Some(c.to_string()),
+            // Through the one reader, which reads the name rather than its
+            // rendering and lowercases it the way 8.3 does. This stored the
+            // rendering, so `COLLATE `utf8mb4_general_ci`` reached
+            // `information_schema.COLUMNS.COLLATION_NAME` — and the state
+            // image — with its backticks still on; and it accepted any name at
+            // all, which `collation::named` now checks for the reasons written
+            // there.
+            ColumnOption::Collation(c) => column.collation = Some(crate::collation::read(c)?),
             ColumnOption::OnUpdate(e) => {
                 // Only CURRENT_TIMESTAMP is meaningful here; anything else
                 // would be a value this engine would have to invent.
@@ -629,7 +646,7 @@ fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineRe
             table.foreign_keys.push(ForeignKey {
                 name: constraint_name,
                 columns: key_columns,
-                referenced_table: object_name(foreign_table),
+                referenced_table: name::dotted(foreign_table),
                 referenced_columns: referred_columns.iter().map(|c| c.value.clone()).collect(),
                 on_delete: on_delete
                     .as_ref()
@@ -656,10 +673,45 @@ fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineRe
     Ok(())
 }
 
+/// The `COLLATE` a table option carries, where it carries one.
+///
+/// `DEFAULT CHARSET` beside it is not read: this engine has one character set,
+/// and a `CHARACTER SET` clause that named another would have to be refused on
+/// its own terms rather than through the collation. That is its own gap.
+fn table_collation(options: &CreateTableOptions) -> EngineResult<Option<String>> {
+    let list = match options {
+        CreateTableOptions::Plain(list)
+        | CreateTableOptions::With(list)
+        | CreateTableOptions::Options(list)
+        | CreateTableOptions::TableProperties(list) => list,
+        CreateTableOptions::None => return Ok(None),
+    };
+    for option in list {
+        // `COLLATE=x` and `COLLATE x` both arrive as this, with the `=` gone.
+        if let SqlOption::KeyValue { key, value } = option {
+            if key.value.eq_ignore_ascii_case("COLLATE") {
+                return crate::collation::read_option(value).map(Some);
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn index_column_names(columns: &[sqlparser::ast::IndexColumn]) -> Vec<String> {
     columns
         .iter()
-        .map(|c| c.column.expr.to_string().trim_matches('`').to_owned())
+        .map(|c| match &c.column.expr {
+            sqlparser::ast::Expr::Identifier(ident) => ident.value.clone(),
+            sqlparser::ast::Expr::CompoundIdentifier(parts) => {
+                parts.last().map(|p| p.value.clone()).unwrap_or_default()
+            }
+            // A functional index — `KEY ((a + 1))` — indexes an expression and
+            // not a column, and this engine matches an index's columns by
+            // name. Rendered, it matches no column and the index does nothing,
+            // which is what it did before; naming it after some column inside
+            // the expression would make it silently index the wrong thing.
+            other => other.to_string(),
+        })
         .collect()
 }
 
@@ -794,7 +846,7 @@ pub fn alter_table(
                 let target = match new_name {
                     RenameTableNameKind::To(name) | RenameTableNameKind::As(name) => name,
                 };
-                let new_name = object_name(target);
+                let new_name = name::dotted(target);
                 // From the copy, so any operation earlier in the same
                 // statement travels with it rather than being dropped on the
                 // floor with the original.
@@ -937,7 +989,7 @@ pub fn create_index(
     let name = create
         .name
         .as_ref()
-        .map(object_name)
+        .map(name::dotted)
         .unwrap_or_else(|| format!("{table_name}_idx"));
 
     if create.if_not_exists && table.indexes.iter().any(|i| i.name == name) {
@@ -966,12 +1018,4 @@ pub fn create_index(
 
     table.indexes.push(index);
     Ok(Outcome::ok())
-}
-
-fn object_name(name: &ObjectName) -> String {
-    name.0
-        .iter()
-        .map(|p| p.to_string().trim_matches('`').to_owned())
-        .collect::<Vec<_>>()
-        .join(".")
 }
