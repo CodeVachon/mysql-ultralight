@@ -47,6 +47,69 @@ fn fresh_engine() -> (std::sync::Arc<Engine>, Session) {
     engine()
 }
 
+/// A directory under the system temp directory that belongs to one test.
+///
+/// These tests used fixed names (`mu-image-describe.mus`), which two runs of
+/// the suite at once shared: one run's snapshot was the other run's file to
+/// delete, and the test that reported it was whichever one next read a file
+/// somebody else had removed. That failure names a snapshot or a describe
+/// behaviour rather than the collision, and running the named test on its own
+/// passes, so it costs a whole debugging session to place.
+///
+/// Built from std rather than a temp-dir crate on purpose: `cargo audit` and
+/// `cargo machete` carry every dependency in this workspace forever, and a
+/// directory name and a `remove_dir_all` do not need one.
+struct Scratch {
+    root: std::path::PathBuf,
+}
+
+impl Scratch {
+    fn new() -> Self {
+        // The process id separates concurrent runs and the counter separates
+        // the tests inside one; the clock is what separates this run from a
+        // directory left by a killed process whose id has since been handed
+        // out again, which the other two cannot do.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let ordinal = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let root =
+            std::env::temp_dir().join(format!("mu-image-{}-{now:x}-{ordinal}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Self { root }
+    }
+
+    fn path(&self, name: &str) -> std::path::PathBuf {
+        self.root.join(name)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // A panicking test unwinds through this, so the failure path leaves no
+        // more behind than the passing one. Files left in a shared directory
+        // by a failing run are the same bug at a smaller size.
+        std::fs::remove_dir_all(&self.root).ok();
+    }
+}
+
+#[test]
+fn two_scratch_directories_are_never_the_same_directory() {
+    // The property the fixed names did not have. Only the within-process half
+    // is checkable here — that two runs of the binary differ is the process
+    // id, which one process cannot observe.
+    let one = Scratch::new();
+    let two = Scratch::new();
+    assert_ne!(one.root, two.root);
+    assert!(one.root.is_dir() && two.root.is_dir());
+
+    let root = one.root.clone();
+    std::fs::write(root.join("left-behind.mus"), b"x").unwrap();
+    drop(one);
+    assert!(!root.exists(), "scratch outlived the test that made it");
+}
+
 /// A schema exercising every field the image has to carry.
 fn populate(engine: &Engine, session: &mut Session) {
     run(
@@ -109,7 +172,8 @@ fn an_image_round_trips_the_whole_catalog() {
         "SELECT id, label, score, kind, payload, shout FROM Parent ORDER BY id",
     );
 
-    let path = std::env::temp_dir().join("mu-image-round-trip.mus");
+    let scratch = Scratch::new();
+    let path = scratch.path("round-trip.mus");
     engine.save_image(&path).unwrap();
 
     // A fresh engine that has never seen the DDL.
@@ -176,8 +240,6 @@ fn an_image_round_trips_the_whole_catalog() {
         .len(),
         4
     );
-
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -187,7 +249,8 @@ fn a_cascade_still_works_after_a_reload() {
     let (engine, mut session) = engine();
     populate(&engine, &mut session);
 
-    let path = std::env::temp_dir().join("mu-image-cascade.mus");
+    let scratch = Scratch::new();
+    let path = scratch.path("cascade.mus");
     engine.save_image(&path).unwrap();
 
     let restored = Engine::new(ServerConfig::default());
@@ -200,8 +263,6 @@ fn a_cascade_still_works_after_a_reload() {
         rows(&restored, &mut session, "SELECT id FROM Child ORDER BY id"),
         vec![vec!["11"]]
     );
-
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -210,7 +271,8 @@ fn restoring_replaces_a_running_catalog() {
     let (engine, mut session) = engine();
     populate(&engine, &mut session);
 
-    let path = std::env::temp_dir().join("mu-image-restore.mus");
+    let scratch = Scratch::new();
+    let path = scratch.path("restore.mus");
     run(
         &engine,
         &mut session,
@@ -235,8 +297,6 @@ fn restoring_replaces_a_running_catalog() {
         3
     );
     assert_eq!(rows(&engine, &mut session, "SELECT id FROM Child").len(), 2);
-
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -416,18 +476,23 @@ fn a_snapshot_is_written_whole_or_not_at_all() {
     let (engine, mut session) = engine();
     populate(&engine, &mut session);
 
-    let path = std::env::temp_dir().join("mu-image-atomic.mus");
+    let scratch = Scratch::new();
+    let path = scratch.path("atomic.mus");
     std::fs::write(&path, b"stale contents").unwrap();
     engine.save_image(&path).unwrap();
 
     let bytes = std::fs::read(&path).unwrap();
     assert!(image::decode(&bytes).is_ok());
-    assert!(
-        !path.with_extension("tmp").exists(),
-        "temporary left behind"
-    );
-
-    std::fs::remove_file(&path).ok();
+    // Every file in the directory, not `atomic.tmp`: the temporary carries the
+    // writing process's id, so naming one guessed spelling asserted about a
+    // file that could never have existed under any behaviour.
+    let left: Vec<_> = std::fs::read_dir(&scratch.root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "atomic.mus")
+        .collect();
+    assert!(left.is_empty(), "temporary left behind: {left:?}");
 }
 
 #[test]
@@ -458,7 +523,8 @@ fn a_snapshot_inside_a_write_is_refused_rather_than_hanging() {
     // connection would wedge behind it too.
     let (engine, mut session) = engine();
     populate(&engine, &mut session);
-    let path = std::env::temp_dir().join("mu-image-nested.mus");
+    let scratch = Scratch::new();
+    let path = scratch.path("nested.mus");
 
     for sql in [
         format!(
@@ -485,8 +551,6 @@ fn a_snapshot_inside_a_write_is_refused_rather_than_hanging() {
         "INSERT INTO Child (id, parentId) VALUES (12, 1)",
     );
     assert_eq!(rows(&engine, &mut session, "SELECT id FROM Child").len(), 3);
-
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -497,7 +561,8 @@ fn a_snapshot_or_restore_inside_a_transaction_is_refused() {
     let (engine, mut session) = engine();
     populate(&engine, &mut session);
 
-    let path = std::env::temp_dir().join("mu-image-txn.mus");
+    let scratch = Scratch::new();
+    let path = scratch.path("txn.mus");
     run(
         &engine,
         &mut session,
@@ -527,8 +592,6 @@ fn a_snapshot_or_restore_inside_a_transaction_is_refused() {
         rows(&engine, &mut session, "SELECT id FROM Child ORDER BY id").len(),
         2
     );
-
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -539,7 +602,8 @@ fn describing_never_snapshots_restores_or_takes_a_lock() {
     let (engine, mut session) = engine();
     populate(&engine, &mut session);
 
-    let path = std::env::temp_dir().join("mu-image-describe.mus");
+    let scratch = Scratch::new();
+    let path = scratch.path("describe.mus");
     run(
         &engine,
         &mut session,
@@ -554,8 +618,7 @@ fn describing_never_snapshots_restores_or_takes_a_lock() {
     );
     let live = rows(&engine, &mut session, "SELECT id FROM Parent ORDER BY id");
 
-    let written = std::env::temp_dir().join("mu-image-describe-never.mus");
-    std::fs::remove_file(&written).ok();
+    let written = scratch.path("describe-never.mus");
 
     // Where the call is on the path to a column's shape, it is reached and
     // refused, and the statement describes as nothing.
@@ -618,8 +681,6 @@ fn describing_never_snapshots_restores_or_takes_a_lock() {
         rows(&engine, &mut session, "SELECT id FROM Parent").len(),
         3
     );
-
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -650,26 +711,29 @@ fn a_failed_snapshot_leaves_nothing_behind() {
     let (engine, mut session) = engine();
     populate(&engine, &mut session);
 
-    let directory = std::env::temp_dir().join("mu-image-dir");
+    let scratch = Scratch::new();
+    // A snapshot onto a directory: the write cannot succeed, and the question
+    // is what it leaves behind when it does not.
+    let directory = scratch.path("as-a-directory.mus");
     std::fs::create_dir_all(&directory).unwrap();
 
     let err = engine.save_image(&directory).unwrap_err();
     // The error names the file that was asked for, not a temporary the caller
     // has never heard of.
     assert!(
-        err.message.contains("mu-image-dir") && !err.message.contains(".tmp"),
+        err.message.contains("as-a-directory.mus") && !err.message.contains(".tmp"),
         "{}",
         err.message
     );
-    let leftovers: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+    // Only this test's own directory is searched. Scanning the shared temp
+    // directory would report another run's temporary as this run's leak.
+    let leftovers: Vec<_> = std::fs::read_dir(&scratch.root)
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("mu-image-dir") && n.ends_with(".tmp"))
+        .filter(|n| n.ends_with(".tmp"))
         .collect();
     assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
-
-    std::fs::remove_dir_all(&directory).ok();
 }
 
 #[test]
@@ -679,8 +743,8 @@ fn describing_refuses_consequences_hidden_inside_a_view() {
     let (engine, mut session) = engine();
     populate(&engine, &mut session);
 
-    let written = std::env::temp_dir().join("mu-image-via-view.mus");
-    std::fs::remove_file(&written).ok();
+    let scratch = Scratch::new();
+    let written = scratch.path("via-view.mus");
     run(
         &engine,
         &mut session,
@@ -707,7 +771,6 @@ fn describing_refuses_consequences_hidden_inside_a_view() {
     // Selecting from it still works: only the probe is restricted.
     run(&engine, &mut session, "SELECT taken FROM Sneaky");
     assert!(written.exists());
-    std::fs::remove_file(&written).ok();
 }
 
 #[test]
