@@ -10374,6 +10374,396 @@ fn a_literal_column_is_named_by_its_contents() {
     }
 }
 
+/// A column reference under unary plus *is* the column, in every field of the
+/// definition and not only in its name.
+///
+/// MySQL's parser discards unary plus and parentheses rather than building a
+/// node for either, so nothing downstream of the parse can see they were
+/// written. Measured on 8.3 over `DECIMAL(10,2) NOT NULL`: `SELECT +a`,
+/// `SELECT + a`, `SELECT +(a)`, `SELECT (a)` and `SELECT ((+((a))))` each come
+/// back named `a`, typed NEWDECIMAL of width 12 with 2 decimals, flagged
+/// NOT_NULL, and reporting the table they were read from — the same packet
+/// `SELECT a` sends. `CREATE TABLE ... AS SELECT +a` copies
+/// `decimal(10,2) NOT NULL` too.
+///
+/// Asserted against the plain reference rather than against a written-out
+/// expectation, because the claim is that the two are indistinguishable: an
+/// engine-wide gap in what a column reports — the decimals byte is 0 for every
+/// column here — must not be able to make this test pass by moving.
+#[test]
+fn a_column_under_unary_plus_is_the_column() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE P (a DECIMAL(10,2) NOT NULL, b INT NULL, s VARCHAR(20) NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO P VALUES (1.50, 7, 'hi')",
+    );
+
+    // The definition as it goes out on the wire — name, schema, table, type,
+    // width and flags — from both paths a client can ask down. Asserting only
+    // one of them would leave the other free to drift, and a prepared
+    // statement reads its metadata from `describe`.
+    let wire = |session: &mut Session, sql: &str| -> (String, String) {
+        let described = engine
+            .describe(session, sql, 0)
+            .unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
+            .unwrap_or_else(|| panic!("described nothing: {sql}"));
+        let Outcome::Rows(executed) = run(&engine, session, sql) else {
+            panic!("expected rows from: {sql}");
+        };
+        (
+            format!("{:?}", described[0].to_wire()),
+            format!("{:?}", executed.columns[0].to_wire()),
+        )
+    };
+
+    // Every one of these is `SELECT a FROM P` on 8.3, down to the last flag.
+    let plain = wire(&mut session, "SELECT a FROM P");
+    for sql in [
+        "SELECT +a FROM P",
+        "SELECT + a FROM P",
+        "SELECT +(a) FROM P",
+        "SELECT (+a) FROM P",
+        "SELECT + +a FROM P",
+        "SELECT ++a FROM P",
+        "SELECT (a) FROM P",
+        "SELECT ((a)) FROM P",
+        "SELECT ((+((a)))) FROM P",
+        "SELECT + (a) FROM P",
+        // A qualifier is part of the reference, not of the wrapper.
+        "SELECT +P.a FROM P",
+        "SELECT +(P.a) FROM P",
+        "SELECT +testdb.P.a FROM P",
+    ] {
+        assert_eq!(wire(&mut session, sql), plain, "{sql}");
+    }
+
+    // The peel chooses which item this is and never what it is named, so
+    // anything but a column reference underneath keeps the whole written text
+    // — including the plus. `origin` is what a direct projection carries and
+    // a computed column does not, which is the part the name alone would not
+    // catch: `SELECT -a` and `SELECT +ABS(a)` are named after their text on
+    // 8.3 *and* report no table.
+    for (sql, expected) in [
+        ("SELECT -a FROM P", "-a"),
+        ("SELECT - a FROM P", "- a"),
+        ("SELECT -(a) FROM P", "-(a)"),
+        ("SELECT +-a FROM P", "+-a"),
+        ("SELECT -+a FROM P", "-+a"),
+        ("SELECT +a+1 FROM P", "+a+1"),
+        ("SELECT +(a+1) FROM P", "+(a+1)"),
+        ("SELECT +ABS(a) FROM P", "+ABS(a)"),
+        ("SELECT +(SELECT 1) FROM P", "+(SELECT 1)"),
+        // A variable parses as an identifier and is not a column reference:
+        // it carries no parse-time name either, so 8.3 names these after
+        // their text, plus and parentheses included.
+        ("SELECT +@v FROM P", "+@v"),
+        ("SELECT (@v) FROM P", "(@v)"),
+        ("SELECT +@@sql_mode FROM P", "+@@sql_mode"),
+    ] {
+        let described = engine.describe(&session, sql, 0).unwrap().unwrap();
+        assert_eq!(described[0].name, expected, "describing {sql}");
+        let Outcome::Rows(executed) = run(&engine, &mut session, sql) else {
+            panic!("expected rows from: {sql}");
+        };
+        assert_eq!(executed.columns[0].name, expected, "running {sql}");
+        assert!(
+            executed.columns[0].origin.is_none(),
+            "{sql} reported a stored column behind it"
+        );
+    }
+
+    // Which is why the variable check reads the quoting rather than the
+    // leading `@`: a backtick-quoted `@v` is a column of that name, and 8.3
+    // answers it — 5 here, where the unquoted spelling is an unset variable.
+    run(&engine, &mut session, "CREATE TABLE Q (`@v` INT)");
+    run(&engine, &mut session, "INSERT INTO Q VALUES (5)");
+    let Outcome::Rows(quoted) = run(&engine, &mut session, "SELECT +`@v` FROM Q") else {
+        panic!("expected rows");
+    };
+    assert_eq!(quoted.columns[0].name, "@v");
+    assert_eq!(quoted.columns[0].origin.as_deref(), Some("@v"));
+    assert_eq!(quoted.rows[0][0].as_text(), "5");
+
+    // An explicit alias still wins the name, and the rest of the definition is
+    // still the column's: `SELECT +a AS x` is `a`'s shape under `x`'s name on
+    // 8.3, which is why the alias is on both sides of this one.
+    assert_eq!(
+        wire(&mut session, "SELECT +a AS x FROM P"),
+        wire(&mut session, "SELECT a AS x FROM P"),
+    );
+
+    // The other four paths a column definition is built on. Each is compared
+    // against the same shape written without the plus, because each derives
+    // the definition differently — the grouped projection has the columns but
+    // not the relation behind them, and a view materialises its own.
+    for (plussed, bare) in [
+        ("SELECT +a FROM P GROUP BY a", "SELECT a FROM P GROUP BY a"),
+        (
+            "SELECT * FROM (SELECT +a FROM P) d",
+            "SELECT * FROM (SELECT a FROM P) d",
+        ),
+        (
+            "WITH c AS (SELECT +(a) FROM P) SELECT * FROM c",
+            "WITH c AS (SELECT a FROM P) SELECT * FROM c",
+        ),
+        (
+            "SELECT +a FROM P UNION SELECT +a FROM P",
+            "SELECT a FROM P UNION SELECT a FROM P",
+        ),
+    ] {
+        assert_eq!(
+            wire(&mut session, plussed),
+            wire(&mut session, bare),
+            "{plussed}"
+        );
+    }
+
+    // A view stores its definition as text and re-derives everything from it,
+    // so the plus has to survive that round trip too: 8.3 stores this one with
+    // the plus gone, as ``select `P`.`a` AS `a` ``, and materialises the column
+    // as `decimal(10,2) NOT NULL`.
+    run(&engine, &mut session, "CREATE VIEW VP AS SELECT +a FROM P");
+    run(&engine, &mut session, "CREATE VIEW VB AS SELECT a FROM P");
+    let renamed = |(described, executed): (String, String), view: &str| {
+        (described.replace(view, "V"), executed.replace(view, "V"))
+    };
+    assert_eq!(
+        renamed(wire(&mut session, "SELECT * FROM VP"), "VP"),
+        renamed(wire(&mut session, "SELECT * FROM VB"), "VB"),
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE FROM information_schema.COLUMNS
+             WHERE TABLE_NAME = 'VP'"
+        ),
+        vec![vec!["a", "decimal(10,2)", "NO"]]
+    );
+
+    // A reference the plus does not make resolvable, and the message names the
+    // reference rather than the item: 1054 `zz` on 8.3, not `+zz`.
+    let err = engine
+        .execute(&mut session, "SELECT +zz FROM P", &[])
+        .unwrap_err();
+    assert_eq!(
+        (err.code, err.message.as_str()),
+        (1054, "Unknown column 'zz' in 'field list'")
+    );
+
+    // And the values are the column's own, which is the half of this that was
+    // already right: a plus over a string is the string on 8.3, not a number
+    // coerced out of it.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT +a, +b, +s FROM P"),
+        vec![vec!["1.50", "7", "hi"]]
+    );
+
+    // The clauses that resolve a reference of their own. `GROUP BY +b` groups
+    // by the column on 8.3 rather than by an expression over it, so the select
+    // list's `b` is a grouped column and not a nonaggregated one.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT b FROM P GROUP BY +b"),
+        vec![vec!["7"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT +b FROM P GROUP BY b"),
+        vec![vec!["7"]]
+    );
+}
+
+/// Inside a larger expression a unary plus types as its operand, where a unary
+/// minus computes.
+///
+/// The two shared an arm for as long as both were called signs, which handed a
+/// plus every coercion a minus makes. Measured on 8.3, `+x` is
+/// indistinguishable from `x` in the type and in the UNSIGNED flag, while `-x`
+/// widens: `NULLIF(+f, 1)` over a `FLOAT` is a FLOAT and `NULLIF(-f, 1)` is a
+/// DOUBLE; `NULLIF(+b, 1)` over a `TINYINT` is a TINY and the minus is a
+/// LONGLONG; `CASE WHEN 1 THEN +u END` keeps UNSIGNED and the minus drops it.
+///
+/// Not reachable from a select item on its own — a plus over a column
+/// reference *is* that column and never reaches this walk — which is why it
+/// took a wrapper to see. A binary client decodes by the declared type, so a
+/// dropped UNSIGNED arrives as a negative number.
+#[test]
+fn a_plus_inside_an_expression_types_as_its_operand() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE E (f FLOAT NULL, b TINYINT NULL, u INT UNSIGNED NULL, d DATE NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO E VALUES (1.5, 3, 7, '2024-01-05')",
+    );
+
+    // Everything the definition carries except the name, which is the one
+    // field these two are *meant* to differ in.
+    let shape = |session: &mut Session, sql: &str| -> String {
+        let Outcome::Rows(executed) = run(&engine, session, sql) else {
+            panic!("expected rows from: {sql}");
+        };
+        let mut column = executed.columns[0].clone();
+        column.name = String::new();
+        format!("{column:?}")
+    };
+
+    for (plussed, bare) in [
+        ("SELECT NULLIF(+f, 1) FROM E", "SELECT NULLIF(f, 1) FROM E"),
+        ("SELECT NULLIF(+b, 1) FROM E", "SELECT NULLIF(b, 1) FROM E"),
+        ("SELECT NULLIF(+u, 1) FROM E", "SELECT NULLIF(u, 1) FROM E"),
+        ("SELECT NULLIF(+d, 1) FROM E", "SELECT NULLIF(d, 1) FROM E"),
+        (
+            "SELECT NULLIF(+(f), 1) FROM E",
+            "SELECT NULLIF(f, 1) FROM E",
+        ),
+        (
+            "SELECT NULLIF(+ +f, 1) FROM E",
+            "SELECT NULLIF(f, 1) FROM E",
+        ),
+        (
+            "SELECT CASE WHEN 1 THEN +u END FROM E",
+            "SELECT CASE WHEN 1 THEN u END FROM E",
+        ),
+        ("SELECT +u + 1 FROM E", "SELECT u + 1 FROM E"),
+        (
+            "SELECT IF(1, +u, NULL) FROM E",
+            "SELECT IF(1, u, NULL) FROM E",
+        ),
+    ] {
+        assert_eq!(
+            shape(&mut session, plussed),
+            shape(&mut session, bare),
+            "{plussed}"
+        );
+    }
+
+    // The boundary, and the reason the two cannot share an arm: a minus over
+    // the same operands answers something else on 8.3, so a test that only
+    // compared plus against plain would pass with the plus still coercing.
+    for (sql, ty, unsigned) in [
+        ("SELECT NULLIF(-f, 1) FROM E", "Double", false),
+        ("SELECT NULLIF(-b, 1) FROM E", "LongLong", false),
+        ("SELECT NULLIF(-d, 1) FROM E", "Double", false),
+        ("SELECT CASE WHEN 1 THEN -u END FROM E", "LongLong", false),
+    ] {
+        let Outcome::Rows(executed) = run(&engine, &mut session, sql) else {
+            panic!("expected rows from: {sql}");
+        };
+        assert_eq!(format!("{:?}", executed.columns[0].ty), ty, "{sql}");
+        assert_eq!(executed.columns[0].unsigned, unsigned, "{sql}");
+    }
+}
+
+/// A position is read through a unary plus, and not through a minus.
+///
+/// `ORDER BY +1` and `GROUP BY +1` name the first output column on 8.3, the
+/// same as `ORDER BY 1` and `ORDER BY (1)`, because the plus is discarded
+/// before anything looks at the number. `ORDER BY -1` is a constant there and
+/// sorts nothing, so this is the peel and not "any sign" — and a position out
+/// of range is reported by its digits, `Unknown column '2'` rather than `+2`.
+///
+/// Wrong row order rather than an error, which is the kind of divergence a
+/// test suite trips over last: the plussed position was read as a constant and
+/// left the rows in the order they arrived.
+#[test]
+fn a_position_is_read_through_a_unary_plus() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE O (a INT NOT NULL)");
+    run(&engine, &mut session, "INSERT INTO O VALUES (2), (1)");
+
+    let sorted = vec![vec!["1"], vec!["2"]];
+    let written = vec![vec!["2"], vec!["1"]];
+    for (sql, expected) in [
+        ("SELECT a FROM O ORDER BY 1", &sorted),
+        ("SELECT a FROM O ORDER BY (1)", &sorted),
+        ("SELECT a FROM O ORDER BY +1", &sorted),
+        ("SELECT a FROM O ORDER BY + 1", &sorted),
+        ("SELECT a FROM O ORDER BY + +1", &sorted),
+        ("SELECT a FROM O ORDER BY +(1)", &sorted),
+        // A minus is an operator MySQL records, so this one is a constant and
+        // orders nothing.
+        ("SELECT a FROM O ORDER BY -1", &written),
+        // A grouped query counts positions over the same list.
+        ("SELECT a FROM O GROUP BY +1 ORDER BY +1", &sorted),
+    ] {
+        assert_eq!(&rows(&engine, &mut session, sql), expected, "{sql}");
+    }
+
+    // An alias is reached through the same peel, and the case that settles it
+    // is an alias *shadowing* a real column: a bare name takes the select list
+    // and the same name inside a larger expression takes the relation, so
+    // which side `+b` falls on says whether the plus was peeled at all. All
+    // four rows measured on 8.3 over `Sh(id, b)` holding (1,30), (2,20),
+    // (3,10) — `ORDER BY +b` sorts by the alias `id` and `ORDER BY b + 0` by
+    // the column `b`, which are opposite orders.
+    run(&engine, &mut session, "CREATE TABLE Sh (id INT, b INT)");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Sh VALUES (1, 30), (2, 20), (3, 10)",
+    );
+    let by_alias = vec![vec!["1"], vec!["2"], vec!["3"]];
+    let by_column = vec![vec!["3"], vec!["2"], vec!["1"]];
+    for (sql, expected) in [
+        ("SELECT id AS b FROM Sh ORDER BY b", &by_alias),
+        ("SELECT id AS b FROM Sh ORDER BY +b", &by_alias),
+        ("SELECT id AS b FROM Sh ORDER BY (b)", &by_alias),
+        ("SELECT id AS b FROM Sh ORDER BY b + 0", &by_column),
+        // The boundary again, and it is not the same answer: a minus is an
+        // expression, so the relation wins and this sorts by `b` descending —
+        // which over these rows is the alias's own order by coincidence, so
+        // it is asserted for what it is rather than as evidence.
+        ("SELECT id AS b FROM Sh ORDER BY -b", &by_alias),
+        // A DISTINCT holds the ORDER BY to what the query returns. `+b` is a
+        // select-list name there and answers on 8.3; `-b` reaches the column
+        // and is 3065, asserted below.
+        ("SELECT DISTINCT id AS b FROM Sh ORDER BY +b", &by_alias),
+        (
+            "SELECT id AS b, COUNT(*) FROM Sh GROUP BY id ORDER BY +b",
+            &by_alias,
+        ),
+    ] {
+        let got: Vec<Vec<String>> = rows(&engine, &mut session, sql)
+            .into_iter()
+            .map(|row| row.into_iter().take(1).collect())
+            .collect();
+        assert_eq!(&got, expected, "{sql}");
+    }
+
+    // The refusals the peel must not paper over: with the plus gone from the
+    // reference, a minus still reaches a column the query does not return.
+    for (sql, code) in [
+        ("SELECT DISTINCT id AS b FROM Sh ORDER BY -b", 3065),
+        (
+            "SELECT id AS b, COUNT(*) FROM Sh GROUP BY id ORDER BY -b",
+            1055,
+        ),
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, code, "{sql}");
+    }
+
+    // Out of range is 1054 over the digits, with the plus left out of the
+    // message the way 8.3 leaves it out.
+    let err = engine
+        .execute(&mut session, "SELECT a FROM O ORDER BY +2", &[])
+        .unwrap_err();
+    assert_eq!(
+        (err.code, err.message.as_str()),
+        (1054, "Unknown column '2' in 'order clause'")
+    );
+}
+
 /// A view is the fourth path a name has to survive, and the only one where it
 /// used to be re-derived from text the engine wrote rather than text the
 /// client did.

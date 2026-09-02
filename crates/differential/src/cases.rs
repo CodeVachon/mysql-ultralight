@@ -1552,6 +1552,123 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // The other half of the rule above. A literal carries a parse-time
+        // name and so does a column reference, and unary plus and parentheses
+        // are handed straight back by MySQL's parser rather than recorded — so
+        // `SELECT +a` is the column `a`, in the name and in everything else
+        // the definition carries. #0117.
+        //
+        // Measured on 8.3 over `DECIMAL(10,2) NOT NULL`: `+a`, `+(a)`, `+ a`,
+        // `(a)` and `+ +a` each come back named `a`, 12 wide, NOT NULL and
+        // reporting the table they were read from — the same packet `SELECT a`
+        // sends. Unary minus builds a node MySQL records and is named after
+        // its text, `- a` keeping the space.
+        //
+        // The plus is invisible everywhere else the parse is read, too: inside
+        // a larger expression it types as its operand where a minus computes,
+        // and a position or a select-list name is resolved through it. Both
+        // are here, because both were wrong for the same reason.
+        name: "unary plus, which the parser discards",
+        setup: &[
+            "CREATE TABLE Pl (id INT NOT NULL, a DECIMAL(10,2) NOT NULL, n INT NULL, \
+             s VARCHAR(20) NULL, f FLOAT NULL, tn TINYINT NULL, u INT UNSIGNED NULL, \
+             PRIMARY KEY (id))",
+            "INSERT INTO Pl VALUES (1, 1.50, 7, 'hi', 1.5, 3, 7), \
+             (2, -2.25, NULL, NULL, 0.5, 1, 2)",
+            // An alias that shadows a real column of the same table, which is
+            // what makes a peeled `ORDER BY +b` visible: a bare name takes the
+            // select list and the same name inside an expression takes the
+            // relation, and those are opposite orders over these rows.
+            "CREATE TABLE Sh (id INT NULL, b INT NULL)",
+            "INSERT INTO Sh VALUES (1, 30), (2, 20), (3, 10)",
+            // A view is stored as text and re-run on read, and a CTAS declares
+            // a table from the definition: two paths that re-derive the column
+            // rather than copy the packet, and both have to lose the plus. 8.3
+            // stores the view as ``select `Pl`.`a` AS `a` `` and declares the
+            // copy `decimal(10,2) NOT NULL`.
+            "CREATE VIEW PlV AS SELECT +a FROM Pl",
+            "CREATE TABLE PlCopy AS SELECT +a FROM Pl",
+        ],
+        cases: &[
+            // The shapes from the issue, beside the reference they are.
+            same("SELECT a, +a, +(a), + a, (a), + +a, ((+((a)))) FROM Pl ORDER BY id"),
+            same("SELECT +Pl.a, +(Pl.a) FROM Pl ORDER BY id"),
+            same("SELECT +id, +n, +s FROM Pl ORDER BY id"),
+            // An alias wins the name and the rest of the definition is still
+            // the column's.
+            same("SELECT +a AS x FROM Pl ORDER BY id"),
+            // The boundary: unary minus is not peeled, and neither is a plus
+            // over anything that is not a reference.
+            same("SELECT -a, - a, -(a), +-a, -+a FROM Pl ORDER BY id"),
+            same("SELECT +a+1, +(a+1), +ABS(a) FROM Pl ORDER BY id"),
+            // The clauses that resolve a reference of their own. `GROUP BY +n`
+            // groups by the column on 8.3, so the select list's `n` is a
+            // grouped column there rather than a nonaggregated one.
+            same("SELECT +a FROM Pl GROUP BY a ORDER BY 1"),
+            same("SELECT n FROM Pl GROUP BY +n ORDER BY 1"),
+            same("SELECT +a FROM Pl ORDER BY +a"),
+            // The paths that build a definition rather than copy one.
+            same("SELECT * FROM (SELECT +a FROM Pl) d ORDER BY 1"),
+            same("WITH c AS (SELECT +(a) FROM Pl) SELECT * FROM c ORDER BY 1"),
+            same("SELECT +a FROM Pl UNION SELECT +a FROM Pl ORDER BY 1"),
+            same("SELECT * FROM PlV ORDER BY 1"),
+            same(
+                "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE FROM information_schema.columns \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('PlV', 'PlCopy') \
+                 ORDER BY TABLE_NAME",
+            ),
+            // A plus makes nothing resolvable, and 1054 names the reference
+            // rather than the item it was written in.
+            same("SELECT +zz FROM Pl"),
+            same("SELECT +Pl.zz FROM Pl"),
+            // Inside a larger expression the plus types as its operand and
+            // the minus computes: over a FLOAT the plus stays a FLOAT and the
+            // minus is a DOUBLE, over a TINYINT the plus stays a TINY and the
+            // minus widens, and over an `INT UNSIGNED` the plus keeps the
+            // flag the minus drops. A dropped UNSIGNED reaches a binary
+            // client as a negative number.
+            same("SELECT NULLIF(+f, 1), NULLIF(f, 1), NULLIF(-f, 1) FROM Pl ORDER BY id"),
+            same("SELECT NULLIF(+tn, 1), NULLIF(tn, 1), NULLIF(-tn, 1) FROM Pl ORDER BY id"),
+            same(
+                "SELECT CASE WHEN 1 THEN +u END, CASE WHEN 1 THEN u END, \
+                 CASE WHEN 1 THEN -u END FROM Pl ORDER BY id",
+            ),
+            same("SELECT +u + 1, u + 1, IF(1, +u, NULL), IF(1, u, NULL) FROM Pl ORDER BY id"),
+            // A position is read through the plus and not through a minus,
+            // which is a wrong row order rather than an error: `ORDER BY -1`
+            // is a constant on 8.3 and sorts nothing.
+            //
+            // The minus is asked with a second key behind it, because a case
+            // whose rows are not totally ordered can differ on the plan rather
+            // than on the answer. `id` settles it and the discrimination
+            // survives: read as a position, `-1` would sort on `a` and put
+            // -2.25 first, and read as the constant it is, `id` decides and
+            // 1.50 comes first.
+            same("SELECT a FROM Pl ORDER BY +1"),
+            same("SELECT a FROM Pl ORDER BY -1, id"),
+            same("SELECT a FROM Pl GROUP BY +1 ORDER BY + +1"),
+            same("SELECT a FROM Pl ORDER BY +2"),
+            // And a select-list name, against an alias shadowing a column:
+            // `+b` is the alias on 8.3 and `b + 0` is the column.
+            same("SELECT id AS b FROM Sh ORDER BY +b"),
+            same("SELECT id AS b FROM Sh ORDER BY b + 0"),
+            same("SELECT DISTINCT id AS b FROM Sh ORDER BY +b"),
+            same("SELECT DISTINCT id AS b FROM Sh ORDER BY -b"),
+            same("SELECT id AS b, COUNT(*) FROM Sh GROUP BY id ORDER BY +b"),
+            // A variable belongs beside these and is not here: it parses as an
+            // identifier, is not peeled — 8.3 names `SELECT +@v` after its
+            // text — and its column is described binary there where this
+            // engine has no collation to carry, which is #0128 rather than
+            // this. Covered by name in `crates/engine/tests/sql.rs`.
+            //
+            // So is the grouped `ORDER BY -b`, which both servers refuse with
+            // 1055 and describe differently — this engine names the
+            // expression where 8.3 names the column. The refusal is asserted
+            // by code in `crates/engine/tests/sql.rs`; the message is its own
+            // gap and does not belong in a group about the plus.
+        ],
+    },
+    Group {
         name: "bitwise operators",
         setup: &[
             "CREATE TABLE B (id INT NOT NULL, n INT NULL, neg INT NULL, u BIGINT UNSIGNED NULL, \
@@ -1738,16 +1855,11 @@ pub const GROUPS: &[Group] = &[
             same("SELECT y, y + 0, y * 1, -y FROM Tm ORDER BY id"),
             // The same number under every arithmetic operator. Unary minus is
             // a DOUBLE in MySQL where `d + 0` is a LONGLONG, and unary plus
-            // is the identity and stays a DATE.
-            // `+d` is aliased because MySQL names that column `d` and this
-            // engine names it `+d`, which is a naming gap and not this one.
-            // Widths not asked, for `+d` alone: MySQL's unary plus hands the
-            // field back untouched, so that column is `d` itself and 10 wide,
-            // where this engine computes a new column and has no width for
-            // one. The type, which is the thing this case is about, is
-            // compared.
-            same(
-                "SELECT d - 0, d * 1, d MOD 7, d DIV 1, -d, +d AS plus_d FROM Tm ORDER BY id").without_widths(),
+            // hands the field straight back — so `+d` is `d` itself, named
+            // `d`, typed DATE and 10 wide. It carried an alias and had its
+            // widths excused for as long as this engine computed a new column
+            // for it; #0117 is why neither is needed now.
+            same("SELECT d - 0, d * 1, d MOD 7, d DIV 1, -d, +d FROM Tm ORDER BY id"),
             same("SELECT -dt, -tm, dt * 1, tm * 1, ts - 0 FROM Tm ORDER BY id"),
             // A comparison against a number is numeric — the packed value —
             // and against a string is not.
@@ -3175,6 +3287,11 @@ pub const GROUPS: &[Group] = &[
             same("SELECT two + 1, 1 + two, two * 2, 2 * two, two + 0.5, 0.5 + two \
                   FROM Dm ORDER BY id"),
             same("SELECT -two, -three, -whole, -wide FROM Dm ORDER BY id"),
+            // Unary plus is not a sign at all — MySQL's parser discards it —
+            // so these are the four columns themselves, each keeping the
+            // width and the scale it was declared with. #0117; before it, this
+            // engine computed a new column for each and could not be asked.
+            same("SELECT +two, +three, +whole, +wide FROM Dm ORDER BY id"),
             same("SELECT ABS(-1.50), ABS(two), ABS(three), ABS(-0.00) FROM Dm ORDER BY id"),
             // `%` and `MOD` are one operator spelled two ways and take the
             // wider scale, padding to it: `10.5 MOD 3.00` is 1.50.

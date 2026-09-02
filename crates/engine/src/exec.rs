@@ -2777,16 +2777,15 @@ impl Engine {
         // other table's `id`, and neither must `nodb.J2.b`. Leaving it
         // unresolved sends it down the expression path, which reports 1054.
         //
-        // Matched on the two identifier forms rather than through
-        // `column_parts`, which also unwraps `Nested`: `SELECT (b)` is a
-        // computed item on 8.3 and takes its metadata from the expression,
-        // not from the column inside the parentheses.
-        let direct = match e {
-            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-                column_parts(e).and_then(|written| relation.index_of(&written))
-            }
-            _ => None,
-        };
+        // Through `column_reference`, so the wrappers MySQL's parser discards
+        // are discarded here too: `SELECT +b`, `SELECT (b)` and `SELECT +(b)`
+        // are all the column `b` on 8.3, down to the width and the flags, and
+        // a `SELECT +b` sent through `CREATE TABLE ... AS` copies `b`'s
+        // declaration. A variable is not a column reference even though it
+        // parses as one, which is why this is not `column_parts`.
+        let direct = column_reference(e)
+            .and_then(column_parts)
+            .and_then(|written| relation.index_of(&written));
 
         if let Some(i) = direct {
             let column = &relation.columns[i];
@@ -6168,12 +6167,18 @@ fn ordinal_of(e: &Expr) -> Option<usize> {
 /// nothing answers to it. The digits go back because the message quotes them
 /// rather than the parsed value.
 ///
-/// Only a literal, and only an integer one. Parentheses are stripped because
-/// 8.3 strips them — `ORDER BY (2)` is the second output column there — and
-/// arithmetic is not a position: `ORDER BY 1 + 1` and `ORDER BY 1.0` are
-/// constants on 8.3 and leave the rows in the order they arrived.
+/// Only a literal, and only an integer one. Parentheses and unary plus are
+/// peeled because 8.3 peels them: `ORDER BY (2)`, `ORDER BY +2` and the doubled
+/// `ORDER BY + +2` all name the second output column there. Arithmetic is not a
+/// position — `ORDER BY 1 + 1` and `ORDER BY 1.0` are constants on 8.3 and
+/// leave the rows in the order they arrived — and neither is a *minus*:
+/// `ORDER BY -1` is a constant there and sorts nothing, which is why this peels
+/// with `peeled` rather than with anything that would take a sign.
+///
+/// The digits go back without the wrapper, which is also 8.3: a position out of
+/// range under a plus is `Unknown column '2' in 'order clause'`.
 fn written_position(e: &Expr) -> Option<(usize, &str)> {
-    match strip_parens(e) {
+    match peeled(e) {
         Expr::Value(v) => match &v.value {
             sqlparser::ast::Value::Number(n, _) if n.bytes().all(|b| b.is_ascii_digit()) => {
                 // A run of digits too long for a `usize` is still a position,
@@ -6185,14 +6190,6 @@ fn written_position(e: &Expr) -> Option<(usize, &str)> {
             _ => None,
         },
         _ => None,
-    }
-}
-
-/// An expression with any wrapping parentheses removed.
-fn strip_parens(e: &Expr) -> &Expr {
-    match e {
-        Expr::Nested(inner) => strip_parens(inner),
-        other => other,
     }
 }
 
@@ -6451,7 +6448,7 @@ fn resolve_order_expr(
         return Ok(bind(position - 1));
     }
 
-    if let Expr::Identifier(ident) = strip_parens(e) {
+    if let Expr::Identifier(ident) = peeled(e) {
         if let Some(index) = select_list_slot(&ident.value, items)? {
             return Ok(bind(index));
         }
@@ -6579,7 +6576,7 @@ fn check_distinct_order(
         if written_position(&item.expr).is_some() {
             continue;
         }
-        if let Expr::Identifier(ident) = strip_parens(&item.expr) {
+        if let Expr::Identifier(ident) = peeled(&item.expr) {
             if select_list_slot(&ident.value, items)?.is_some() {
                 continue;
             }
@@ -6995,9 +6992,18 @@ fn unsigned_answer(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelCo
         // `~x` is a BIGINT UNSIGNED like the binary bitwise operators. A sign
         // is not — MySQL reports `-(7 ^ 3)` signed — which is what the
         // fall-through leaves.
+        //
+        // Unary plus is not a sign: it is discarded by the parser, so the
+        // operand answers for it. `NULLIF(+u, 1)` over an `INT UNSIGNED` is
+        // UNSIGNED on 8.3 where `NULLIF(-u, 1)` is signed, and a flag dropped
+        // here reaches a binary client as a negative number.
         Expr::UnaryOp { op, expr } => match crate::expr::reassociated_unary(op, expr) {
             Some(fixed) => recur(&fixed),
-            None => matches!(op, sqlparser::ast::UnaryOperator::BitwiseNot),
+            None => match op {
+                sqlparser::ast::UnaryOperator::BitwiseNot => true,
+                sqlparser::ast::UnaryOperator::Plus => recur(expr),
+                _ => false,
+            },
         },
         // `CEIL` and `FLOOR` arrive as their own nodes rather than as calls.
         Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => recur(expr),
@@ -7693,13 +7699,8 @@ fn direct_column<'a>(
     refs: &[ColumnRef],
     input: &'a [crate::relation::RelColumn],
 ) -> Option<&'a crate::relation::RelColumn> {
-    match e {
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-            column_slot(refs, e).and_then(|slot| input.get(slot))
-        }
-        Expr::Nested(inner) => direct_column(inner, refs, input),
-        _ => None,
-    }
+    let written = column_reference(e)?;
+    column_slot(refs, written).and_then(|slot| input.get(slot))
 }
 
 /// The type to declare for an expression, before any row has been evaluated.
@@ -8019,14 +8020,24 @@ fn computed_column_type(
             }
             match op {
                 U::Not | U::BitwiseNot => ColumnType::LongLong,
-                // Unary plus is the identity — `+d` is still a DATE — where
-                // unary minus computes, and MySQL answers a DOUBLE for the
+                // Unary plus is not an operator at all — MySQL's parser hands
+                // its operand straight back — so the operand's type is the
+                // answer, untouched. It shared the arm below for as long as
+                // both were called signs, which gave a plus every coercion a
+                // minus makes: measured on 8.3, `NULLIF(+f, 1)` over a FLOAT
+                // is a FLOAT where `NULLIF(-f, 1)` is a DOUBLE, and
+                // `NULLIF(+b, 1)` over a TINYINT is a TINY where the minus
+                // widens to LONGLONG. Only reachable from inside another
+                // expression, since a plus over a column reference on its own
+                // is that column and never comes here.
+                U::Plus => computed_column_type(expr, refs, input),
+                // Unary minus computes, and MySQL answers a DOUBLE for the
                 // negation of a temporal even though `d + 0` is a LONGLONG.
                 // Measured, not derived: `-d` is DOUBLE -20240105 on 8.3.
                 U::Minus if is_temporal(computed_column_type(expr, refs, input)) => {
                     ColumnType::Double
                 }
-                U::Minus | U::Plus => match computed_column_type(expr, refs, input) {
+                U::Minus => match computed_column_type(expr, refs, input) {
                     t if is_integer(t) => ColumnType::LongLong,
                     // As with `ABS`: computing with a float widens it, and
                     // MySQL says so in the type as well as in the digits.
@@ -8320,11 +8331,15 @@ fn column_slot(refs: &[ColumnRef], e: &Expr) -> Option<usize> {
 /// `name::column_parts` does the splitting, which is where the database part
 /// stopped being dropped: this used to read `parts[len - 2]` as the table and
 /// nothing before it, so `nodb.J2.b` resolved to `J2`.`b`.
+///
+/// Parentheses and unary plus are peeled, because neither is written into the
+/// reference MySQL resolves: `SELECT b FROM t GROUP BY +b` groups by the column
+/// on 8.3, and `SELECT +b FROM t GROUP BY b` answers rather than reporting a
+/// nonaggregated column.
 fn column_parts(e: &Expr) -> Option<name::ColumnParts<'_>> {
-    match e {
+    match peeled(e) {
         Expr::Identifier(i) => Some(name::ColumnParts::bare(i.value.as_str())),
         Expr::CompoundIdentifier(parts) => name::column_parts(parts),
-        Expr::Nested(inner) => column_parts(inner),
         _ => None,
     }
 }
@@ -9082,19 +9097,26 @@ fn assignment_parts(target: &AssignmentTarget) -> EngineResult<Vec<String>> {
 /// `doc ->> '$.b'` are one `LongArrow`. A client keys a row by this name, so a
 /// test reading the column back finds nothing.
 ///
-/// A literal is the exception, and `literal_name` is where that lives.
+/// A literal is the exception, and `literal_name` is where that lives. A column
+/// reference is the other one, and `column_reference` is: both carry a name
+/// from the moment they are parsed, so the text that spelled them — including
+/// any parentheses and unary pluses around them — is never asked for.
 fn render_expr(e: &Expr) -> String {
-    match e {
-        Expr::Identifier(i) => i.value.clone(),
-        Expr::CompoundIdentifier(parts) => {
+    match column_reference(e) {
+        Some(Expr::Identifier(i)) => i.value.clone(),
+        Some(Expr::CompoundIdentifier(parts)) => {
             parts.last().map(|p| p.value.clone()).unwrap_or_default()
         }
         // Capped only here. A column reference carries the name the catalog
         // holds, which is a different limit on a different path.
-        other => capped(
-            literal_name(other)
-                .or_else(|| source_text(other))
-                .unwrap_or_else(|| other.to_string()),
+        //
+        // Over the item as it was written rather than over the peeled one:
+        // what is left of `+ABS(a)` after the peel is `ABS(a)`, and 8.3 names
+        // that column `+ABS(a)`.
+        _ => capped(
+            literal_name(e)
+                .or_else(|| source_text(e))
+                .unwrap_or_else(|| e.to_string()),
         ),
     }
 }
@@ -9308,6 +9330,64 @@ fn capped(mut name: String) -> String {
     name
 }
 
+/// What is left of an item once the two constructs that hand their operand
+/// straight back are discarded: parentheses and unary plus.
+///
+/// MySQL's parser really does drop them rather than build a node for them —
+/// `'+' simple_expr` is its operand — which is why they are invisible in
+/// everything downstream of the parse, from the name to the width to the table
+/// the column reports. Unary minus builds a node and is not peeled here.
+fn peeled(e: &Expr) -> &Expr {
+    let mut inner = e;
+    loop {
+        inner = match inner {
+            Expr::Nested(nested) => nested,
+            Expr::UnaryOp {
+                op: sqlparser::ast::UnaryOperator::Plus,
+                expr,
+            } => expr,
+            _ => return inner,
+        };
+    }
+}
+
+/// The column reference an item is, seen through parentheses and unary plus.
+///
+/// `SELECT +a`, `SELECT (a)`, `SELECT +(a)` and `SELECT + +a` are the column
+/// `a` on 8.3 in *every* field of the definition — name, type, width, decimals,
+/// flags, and the schema and table it reports — and not a computed column that
+/// happens to answer the same value. `CREATE TABLE c AS SELECT +a FROM t` copies
+/// `decimal(10,2) NOT NULL` the same way `SELECT a` does, and a view over it is
+/// stored as ``select `t`.`a` AS `a` `` with the plus gone.
+///
+/// The peel chooses which item this is, never what it is named: with anything
+/// else underneath the item is the whole written text again, so `SELECT +ABS(a)`
+/// is `+ABS(a)` and `SELECT -a` is `-a`, both computed.
+///
+/// A variable parses as an identifier and is not one of these, measured both
+/// ways on 8.3: `SELECT +@v` is named `+@v` and `SELECT (@@sql_mode)` keeps its
+/// parentheses, because a variable carries no parse-time name for the peel to
+/// find. Quoting is what separates the two, and it has to be read: a plus in
+/// front of a backtick-quoted `@v` is a column of that name, and 8.3 names that
+/// one `@v`.
+fn column_reference(e: &Expr) -> Option<&Expr> {
+    let inner = peeled(e);
+    let variable = match inner {
+        Expr::Identifier(i) => is_variable(i),
+        Expr::CompoundIdentifier(parts) => parts.first().is_some_and(is_variable),
+        _ => return None,
+    };
+    (!variable).then_some(inner)
+}
+
+/// Whether an identifier names a variable rather than a column.
+///
+/// The quoting is half the answer: `@v` is a user variable and `` `@v` `` is a
+/// column that happens to be called that, and MySQL reads the two differently.
+fn is_variable(i: &sqlparser::ast::Ident) -> bool {
+    i.quote_style.is_none() && i.value.starts_with('@')
+}
+
 /// The name MySQL's parser attaches to a literal, if this item is one.
 ///
 /// MySQL names most unaliased items after their source text, but a literal is
@@ -9327,18 +9407,7 @@ fn capped(mut name: String) -> String {
 /// Unary minus is not peeled, and is not an oversight: `SELECT -1` is `-1` but
 /// `SELECT - 1` is `- 1`, which is the source text and not the literal.
 fn literal_name(e: &Expr) -> Option<String> {
-    let mut inner = e;
-    loop {
-        inner = match inner {
-            Expr::Nested(nested) => nested,
-            Expr::UnaryOp {
-                op: sqlparser::ast::UnaryOperator::Plus,
-                expr,
-            } => expr,
-            _ => break,
-        };
-    }
-    let Expr::Value(value) = inner else {
+    let Expr::Value(value) = peeled(e) else {
         return None;
     };
     use sqlparser::ast::Value as V;
