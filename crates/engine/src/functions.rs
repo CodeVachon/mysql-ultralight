@@ -1346,9 +1346,15 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         // reading both sides as integers answered 1 for `MOD(1.500, 2)` under
         // a column described NEWDECIMAL, which promises the fraction it had
         // just thrown away.
-        "mod" => {
-            crate::expr::arithmetic(&sqlparser::ast::BinaryOperator::Modulo, &arg(0), &arg(1))?
-        }
+        // The increment is handed over rather than looked up because the
+        // operator takes one, and `%` does not read it: measured on 8.3, `MOD`
+        // and `DIV` answer the same at every `div_precision_increment`.
+        "mod" => crate::expr::arithmetic(
+            &sqlparser::ast::BinaryOperator::Modulo,
+            &arg(0),
+            &arg(1),
+            session.div_precision_increment(),
+        )?,
         // Dispatched on the argument rather than reading it as text: MySQL's
         // letter test comes from the argument's charset, and the binary one
         // admits only ASCII where a utf8mb4 one admits every codepoint from

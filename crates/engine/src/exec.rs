@@ -3368,17 +3368,33 @@ impl Engine {
                 if present.is_empty() {
                     Value::Null
                 } else if let Some((total, scale)) = exact_total(&present) {
-                    // An average gains four digits over what it averaged,
-                    // which is MySQL's `div_precision_increment`: `AVG` of an
-                    // integer column is a `DECIMAL(_,4)` and of a
-                    // `DECIMAL(_,2)` a `DECIMAL(_,6)`.
-                    let scale = scale + crate::decimal::AVERAGE_EXTRA_SCALE;
-                    let widened = 10i128.pow(crate::decimal::AVERAGE_EXTRA_SCALE as u32);
-                    match total
-                        .checked_mul(widened)
-                        .and_then(|n| crate::decimal::divide_units(n, present.len() as i128))
-                    {
-                        Some(mean) => Value::Decimal(crate::decimal::render(mean, scale)),
+                    // Through the same division `/` uses, because MySQL's
+                    // average *is* that division: the total over the row
+                    // count at `div_precision_increment` extra places, so
+                    // `AVG` of an integer column is a `DECIMAL(_,4)` and of a
+                    // `DECIMAL(_,2)` a `DECIMAL(_,6)` at the stock 4, and both
+                    // move with the variable.
+                    //
+                    // Not a widened total divided at the answer's own scale,
+                    // which is what was here and which rounds the true
+                    // quotient. MySQL truncates at a nine-digit word boundary
+                    // first, and the two disagree wherever the result's scale
+                    // lands on one: `AVG` over a `DECIMAL(10,5)` totalling
+                    // 1.00001 across three rows is 0.333336666 on 8.3, for the
+                    // 0.333336667 that rounding gives. At an increment of 0
+                    // there is no word at all, so `AVG` of 1 and 2 is 1 there
+                    // rather than 2.
+                    let sum = crate::decimal::render(total, scale);
+                    // `present` is non-empty here, so the divisor cannot be
+                    // the zero that is the only thing `divide` refuses a pair
+                    // of decimals for; the float is what the inexact branch
+                    // below would have answered.
+                    match crate::decimal::divide(
+                        &sum,
+                        &present.len().to_string(),
+                        session.div_precision_increment(),
+                    ) {
+                        Some(mean) => Value::Decimal(mean),
                         None => Value::Float(approximate_total(&present) / present.len() as f64),
                     }
                 } else {

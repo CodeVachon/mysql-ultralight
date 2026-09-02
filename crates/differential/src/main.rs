@@ -347,6 +347,11 @@ fn reset(conn: &mut Conn, group: &str) {
         // setting it — and a group after one that did would otherwise be
         // counting weeks under somebody else's mode.
         "SET SESSION default_week_format = 0".to_owned(),
+        // The third, and the one with the widest blast radius: every quotient
+        // and every average in every group is scaled by it, so a group that
+        // ran after one which set it would be comparing arithmetic under
+        // somebody else's precision. 4 is the stock 8.3 default.
+        "SET SESSION div_precision_increment = 4".to_owned(),
         format!("DROP DATABASE IF EXISTS `{DATABASE}`"),
         format!("CREATE DATABASE `{DATABASE}`"),
         format!("USE `{DATABASE}`"),

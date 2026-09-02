@@ -176,43 +176,29 @@ impl Session {
     /// Applies a `SET` of a system variable.
     ///
     /// Nearly all of these are stored and handed straight back, so the value's
-    /// text is kept as written and nothing checks it. `default_week_format` is
-    /// the exception, because it is the one variable the engine *reads*:
-    /// `EXTRACT(WEEK FROM x)` answers a different question under each of its
-    /// eight values, so a value taken unchecked is a wrong answer rather than
-    /// an unread string.
-    ///
-    /// Measured on 8.3. Out of range is clamped rather than refused — 9 becomes
-    /// 7 and -1 becomes 0, each with warning 1292 — and masking to three bits
-    /// instead answers week 1 where MySQL answers week 52. A value that is not
-    /// an integer is refused with 1232, a *string* included: `'3'`, `3.7`,
-    /// `b'11'` and NULL are all errors there, while `TRUE` and `1 + 1` are
-    /// taken as the numbers they are.
+    /// text is kept as written and nothing checks it. The exceptions are the
+    /// variables the engine *reads*, where a value taken unchecked is a wrong
+    /// answer rather than an unread string: `EXTRACT(WEEK FROM x)` answers a
+    /// different question under each of `default_week_format`'s eight values,
+    /// and every quotient and every average moves with
+    /// `div_precision_increment`.
     ///
     /// Every other variable is still stored unvalidated, which MySQL would
-    /// refuse for most of them. That gap is about `SET` rather than about the
-    /// week, and nothing here reads those values back into an answer.
+    /// refuse for most of them. That gap is about `SET` in general — #0095 —
+    /// rather than about either of these, and nothing here reads those values
+    /// back into an answer.
     pub fn set_system_variable(&mut self, name: &str, value: &Value) -> EngineResult<()> {
         let name = normalize_scope(name);
         let text = match name.as_str() {
-            "default_week_format" => match value {
-                Value::Int(_) | Value::Unsigned(_) | Value::Bool(_) => {
-                    // `as_exact_int`, not `as_int`: the latter wraps a `u64`
-                    // above `i64::MAX` to a negative on purpose, so
-                    // `SET default_week_format = 18446744073709551615` clamped
-                    // *down* to 0 and answered week 1 for a date MySQL puts in
-                    // week 52. A literal that large really does arrive here as
-                    // `Value::Unsigned`. `i128` holds both ranges exactly.
-                    value.as_exact_int().unwrap_or(0).clamp(0, 7).to_string()
-                }
-                _ => {
-                    return Err(EngineError::new(
-                        1232,
-                        "42000",
-                        format!("Incorrect argument type to variable '{name}'"),
-                    ))
-                }
-            },
+            // Masking to three bits instead of clamping answers week 1 where
+            // MySQL answers week 52, which is what the range is here to stop.
+            "default_week_format" => clamped_integer(&name, value, 7)?,
+            // 30 here and `MAX_SCALE` being 30 as well is a coincidence of
+            // value: this is the range MySQL documents and clamps the variable
+            // to, not the scale a product or a quotient is capped at.
+            "div_precision_increment" => {
+                clamped_integer(&name, value, crate::decimal::MAX_DIV_PRECISION_INCREMENT)?
+            }
             _ => value.as_text(),
         };
         if name == "sql_mode" {
@@ -240,6 +226,26 @@ impl Session {
             .get("default_week_format")
             .and_then(|stored| stored.parse().ok())
             .unwrap_or(0)
+    }
+
+    /// The extra decimal places a quotient and an average gain, which MySQL
+    /// spells `div_precision_increment`.
+    ///
+    /// Read straight off the override for the same reason as the week format
+    /// above: this is asked once per arithmetic node and once per aggregate,
+    /// and the normalised name and the cloned value `system_variable` builds
+    /// would both be paid for something that cannot change while the statement
+    /// runs.
+    ///
+    /// The parse cannot fail for anything this engine stored:
+    /// `set_system_variable` refuses a non-integer and clamps the rest into
+    /// 0..=30 before it gets here. The default for an absent override is
+    /// MySQL's documented 4.
+    pub fn div_precision_increment(&self) -> usize {
+        self.overrides
+            .get("div_precision_increment")
+            .and_then(|stored| stored.parse().ok())
+            .unwrap_or(crate::decimal::DEFAULT_DIV_PRECISION_INCREMENT)
     }
 
     /// Resolves a system variable.
@@ -303,6 +309,15 @@ impl Session {
             // argument, so the session has to be able to answer it and to
             // carry a `SET` of it. 0 is the stock 8.3 default, measured.
             "default_week_format" => int(0),
+            // Read by `/` and by `AVG`, so the session has to be able to
+            // answer it and to carry a `SET` of it. Listed rather than left to
+            // materialise on the first write: a variable that exists only once
+            // somebody has set it is worse than one that is absent, because a
+            // client reading before it writes is told the variable does not
+            // exist and the same client reading after is told it does.
+            "div_precision_increment" => {
+                int(crate::decimal::DEFAULT_DIV_PRECISION_INCREMENT as i64)
+            }
             "max_execution_time" => int(0),
             "default_storage_engine" => text("InnoDB"),
             "init_connect" => text(""),
@@ -327,6 +342,7 @@ impl Session {
             "collation_server",
             "default_storage_engine",
             "default_week_format",
+            "div_precision_increment",
             "foreign_key_checks",
             "group_concat_max_len",
             "have_ssl",
@@ -402,6 +418,40 @@ pub struct Transaction {
     /// work another connection had already committed, since the catalog is
     /// shared — turning a rollback into data loss for someone else.
     pub modified: Vec<(String, String)>,
+}
+
+/// An integer system variable's stored text, clamped to `0..=high`.
+///
+/// Measured on 8.3 for both variables that use it, which behave identically
+/// and differ only in their upper bound. Out of range is clamped rather than
+/// refused — `default_week_format = 9` is stored as 7 and
+/// `div_precision_increment = 31` as 30, and -1 is 0 for either, each with
+/// warning 1292 that this engine has nowhere to put. A value that is not an
+/// integer is refused with 1232, a *string* spelling one included: `'3'`,
+/// `3.7`, `b'11'` and NULL are all errors, while `TRUE` and `1 + 1` are taken
+/// as the numbers they are.
+///
+/// Shared between those two because both were measured, and not offered as a
+/// general rule: MySQL's integer variables are not uniform in what they refuse
+/// and what they clamp, so a third one belongs here only once it has been
+/// measured too. #0095 is the general question.
+fn clamped_integer(name: &str, value: &Value, high: i128) -> EngineResult<String> {
+    match value {
+        Value::Int(_) | Value::Unsigned(_) | Value::Bool(_) => {
+            // `as_exact_int`, not `as_int`: the latter wraps a `u64` above
+            // `i64::MAX` to a negative on purpose, so
+            // `SET default_week_format = 18446744073709551615` clamped *down*
+            // to 0 and answered week 1 for a date MySQL puts in week 52. A
+            // literal that large really does arrive here as `Value::Unsigned`.
+            // `i128` holds both ranges exactly.
+            Ok(value.as_exact_int().unwrap_or(0).clamp(0, high).to_string())
+        }
+        _ => Err(EngineError::new(
+            1232,
+            "42000",
+            format!("Incorrect argument type to variable '{name}'"),
+        )),
+    }
 }
 
 /// Strips a `GLOBAL.` / `SESSION.` / `LOCAL.` prefix and lowercases the rest.

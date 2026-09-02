@@ -72,7 +72,7 @@ Two things fail a run:
 
 So the file only ever shrinks, and it shrinks by fixing things.
 
-**It is empty.** All 2514 statements answer exactly as MySQL 8.3 answers them,
+**It is empty.** All 2568 statements answer exactly as MySQL 8.3 answers them,
 in both protocols — the rows, and every part of the column definition listed
 under "What a column is compared on" below. It started at 108 divergences
 across 66 statements.
@@ -216,18 +216,37 @@ A setup statement that fails is a failed run, and refuses to be blessed: if
 setup fails on *both* servers every case in the group then fails identically,
 compares equal, and reports a group that tested nothing as a group that agreed.
 
+A third rule, which the harness cannot enforce: **two groups that set the same
+session variable must not share a statement's text.** The client caches a
+prepared statement by its text for the life of the connection, and MySQL reads
+`div_precision_increment` when a statement is *prepared*, fixing the quotient's
+and the average's scale then — a later `SET` does not re-fix an already-prepared
+statement. So the second group's binary pass asks MySQL a question about the
+first group's setting, and the divergence it reports is the corpus's, not the
+engine's. Measured on 8.3: prepared at 4 and re-executed after
+`SET SESSION div_precision_increment = 0`,
+`SELECT @@div_precision_increment, 1/3, AVG(i) FROM Quot` answers 0, 0.3333,
+1.6667 through the binary protocol against 0, 0, 1 through the text one. It bites
+only for a statement over literals; one that names a table is re-prepared when
+`reset` replaces the database under it. Give each group's statements an alias of
+their own.
+
 A group may change `sql_mode` in its setup and leave it changed for its cases —
 `REAL_AS_FLOAT` does. The two connections outlive every group, so the mode is
 restored to the server's default before each one rather than trusted to be it;
 add to the mode in force rather than replacing it, or the group silently runs
 without `STRICT_TRANS_TABLES` as well.
 
-`default_week_format` is the other variable a group may leave changed, and is
+`default_week_format` is the second variable a group may leave changed, and is
 restored the same way. `EXTRACT(WEEK FROM x)` takes no mode argument and reads
 that variable instead, so the only way to ask MySQL the other seven week
 questions is to set it — and a group that ran after one which did would
-otherwise be counting weeks under somebody else's mode. Any further variable a
-group sets needs the same line in `reset`, for the same reason.
+otherwise be counting weeks under somebody else's mode.
+
+`div_precision_increment` is the third, restored to 4. It scales every quotient
+and every average, so a group left running under somebody else's increment
+would not be asking about arithmetic at all. Any further variable a group sets
+needs the same line in `reset`, for the same reason.
 
 ## The corpus
 

@@ -3090,6 +3090,148 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // #0113. `div_precision_increment` decides two things: a quotient's
+        // scale, which is its left operand's plus the increment, and an
+        // average's, which is the scale it averaged plus the same. 0 is the
+        // setting that separates the two steps MySQL takes — it computes to a
+        // whole number of nine-digit words and truncates there before rounding
+        // to the answer's scale, and at 0 over two integers there is no word
+        // at all, so `7/2` is 3 rather than 4 and `AVG(i)` over 1, 2 and 2 is
+        // 1 rather than 2.
+        //
+        // No `SELECT @@div_precision_increment` case in any of these groups:
+        // an *overridden* system variable comes back from this engine as a
+        // string where MySQL sends an UNSIGNED LONGLONG, which is true of
+        // every variable a session sets — #0095 — and `reset` sets this one on
+        // every connection, so there is no group where it is not overridden.
+        //
+        // Every statement in these three groups is aliased to a name of its
+        // own, and that is load-bearing rather than decoration. MySQL reads
+        // `div_precision_increment` when a statement is *prepared* and fixes
+        // the quotient's and the average's scale then; a later `SET` does not
+        // re-fix an already-prepared statement, and the client caches a
+        // prepared statement by its text across groups. Measured on 8.3 over
+        // one connection: prepared at 4 and re-executed after
+        // `SET SESSION div_precision_increment = 0`,
+        // `SELECT @@div_precision_increment, 1/3, AVG(i) FROM Quot` answers
+        // 0, 0.3333, 1.6667 through the binary protocol — the variable current
+        // and the arithmetic frozen — against 0, 0, 1 through the text one.
+        //
+        // Two of these groups sharing one statement's text would therefore ask
+        // MySQL about *the first group's* increment. It is
+        // only visible for a statement over literals: one that names a table
+        // is re-prepared when `reset` replaces the database under it, which is
+        // why the `AVG` cases agreed while the literal quotient did not.
+        //
+        // This engine re-parses from the statement text on every execution and
+        // so always answers at the increment in force, which is the divergence
+        // — and modelling MySQL's prepare-time fixing for this one variable
+        // while `sql_mode` and everything else still re-derive would make the
+        // gap depend on which variable was changed. Distinct text per group is
+        // what these groups mean to ask: each one's statements are prepared
+        // under its own increment.
+        name: "div_precision_increment: 0",
+        setup: &[
+            "CREATE TABLE Quot (
+                 id INT NOT NULL,
+                 i INT NOT NULL,
+                 d DECIMAL(10,2) NOT NULL,
+                 w DECIMAL(10,5) NOT NULL,
+                 PRIMARY KEY (id)
+             )",
+            "INSERT INTO Quot (id, i, d, w) VALUES
+                 (1, 1, 1.50, 1.00001), (2, 2, 2.50, 0.00000), (3, 2, 3.00, 0.00000)",
+            "SET SESSION div_precision_increment = 0",
+        ],
+        cases: &[
+            same("SELECT 1/3 AS zero, 1.5/1.5, 7/2, 1.00001/3"),
+            same("SELECT AVG(i) AS zero, AVG(d), AVG(w) FROM Quot"),
+            // Unaffected at every setting, measured, which is why they ride
+            // along in each group rather than being asked once at the default.
+            same("SELECT 7 DIV 2 AS zero, 10.5 MOD 3, MOD(10.5, 3), i DIV 2, d MOD 2 \
+                  FROM Quot ORDER BY id"),
+            same("SELECT d / i AS zero, w / i, i / d FROM Quot ORDER BY id"),
+        ],
+    },
+    Group {
+        // 6 and 30, the second being the top of the range and the one place
+        // the 30-place cap on a quotient's scale bites: 1.5 has a place of its
+        // own, so 1 + 30 would be 31 and MySQL answers 30.
+        name: "div_precision_increment: 6 and 30",
+        setup: &[
+            "CREATE TABLE Quot (
+                 id INT NOT NULL,
+                 i INT NOT NULL,
+                 d DECIMAL(10,2) NOT NULL,
+                 w DECIMAL(10,5) NOT NULL,
+                 PRIMARY KEY (id)
+             )",
+            "INSERT INTO Quot (id, i, d, w) VALUES
+                 (1, 1, 1.50, 1.00001), (2, 2, 2.50, 0.00000), (3, 2, 3.00, 0.00000)",
+            "SET SESSION div_precision_increment = 6",
+        ],
+        cases: &[
+            same("SELECT 1/3 AS six, 1.5/1.5, 7/2, 1.00001/3"),
+            same("SELECT AVG(i) AS six, AVG(d), AVG(w) FROM Quot"),
+            same("SELECT 7 DIV 2 AS six, 10.5 MOD 3, MOD(10.5, 3), i DIV 2, d MOD 2 \
+                  FROM Quot ORDER BY id"),
+            // A case rather than setup, so the group's own increment survives
+            // it and both settings are asked in one group.
+            same("SET SESSION div_precision_increment = 30"),
+            same("SELECT 1/3 AS wide, 1.5/1.5, 7/2, 1.00001/3"),
+            same("SELECT AVG(i) AS wide, AVG(d), AVG(w) FROM Quot"),
+            same("SELECT 7 DIV 2 AS wide, 10.5 MOD 3, MOD(10.5, 3), i DIV 2, d MOD 2 \
+                  FROM Quot ORDER BY id"),
+        ],
+    },
+    Group {
+        // The default and the range. The increment is left at what `reset`
+        // puts it back to, which is MySQL's documented 4, so the first two
+        // cases are the stock answer — and `AVG(w)` is where the truncation to
+        // a nine-digit word shows at that default, because the answer's own
+        // scale is 9 and nothing rounds the interim down: 0.333336666, not the
+        // 0.333336667 that rounding the true quotient gives.
+        name: "div_precision_increment: the default and the range",
+        setup: &[
+            "CREATE TABLE Quot (
+                 id INT NOT NULL,
+                 i INT NOT NULL,
+                 d DECIMAL(10,2) NOT NULL,
+                 w DECIMAL(10,5) NOT NULL,
+                 PRIMARY KEY (id)
+             )",
+            "INSERT INTO Quot (id, i, d, w) VALUES
+                 (1, 1, 1.50, 1.00001), (2, 2, 2.50, 0.00000), (3, 2, 3.00, 0.00000)",
+        ],
+        cases: &[
+            same("SELECT 1/3 AS four, 1.5/1.5, 7/2, 1.00001/3"),
+            same("SELECT AVG(i) AS four, AVG(d), AVG(w) FROM Quot"),
+            // Out of range is clamped rather than refused, at both ends.
+            same("SET SESSION div_precision_increment = 31"),
+            same("SELECT 1/3 AS above, AVG(w) FROM Quot"),
+            same("SET SESSION div_precision_increment = -1"),
+            same("SELECT 1/3 AS below, AVG(w) FROM Quot"),
+            // Above `i64::MAX`, which is a literal anyone can write and which
+            // arrives as an unsigned value. Read through a signed `i64` it
+            // wraps to -1 and clamps to 0, the far end of the range from the
+            // 30 MySQL stores.
+            same("SET SESSION div_precision_increment = 18446744073709551615"),
+            same("SELECT 1/3 AS huge, AVG(w) FROM Quot"),
+            // A value that is not an integer is 1232 on both, a string
+            // spelling one included.
+            same("SET SESSION div_precision_increment = 'abc'"),
+            same("SET SESSION div_precision_increment = '3'"),
+            same("SET SESSION div_precision_increment = 3.7"),
+            same("SET SESSION div_precision_increment = NULL"),
+            // And an integer-valued expression, and a keyword, are taken as
+            // the numbers they are.
+            same("SET SESSION div_precision_increment = 1 + 1"),
+            same("SELECT 1/3 AS computed, AVG(w) FROM Quot"),
+            same("SET SESSION div_precision_increment = TRUE"),
+            same("SELECT 1/3 AS keyword, AVG(w) FROM Quot"),
+        ],
+    },
+    Group {
         // #0058. `SELECT nope.k FROM S`, where nothing named `nope` is in
         // scope, is refused by MySQL when the statement is *prepared*; this
         // engine described it as one column called `k` and failed only when

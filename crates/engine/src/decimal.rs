@@ -181,20 +181,27 @@ fn padded(digits: &[u8], scale: usize) -> Vec<u8> {
 /// full under a column still described `decimal(65,0)`.
 pub const MAX_SCALE: usize = 30;
 
-/// The extra decimal places MySQL gives a quotient over its left operand.
+/// The extra decimal places a quotient gains over its left operand, for a
+/// session that has not said otherwise.
 ///
-/// `div_precision_increment`, whose documented default is 4. It is a session
-/// variable there and a constant here: this engine does not know the variable
-/// at all, so `SET div_precision_increment` is 1193 rather than a quiet change
-/// of answer, which is the honest half of the gap.
-pub const DIV_PRECISION_INCREMENT: usize = 4;
+/// `div_precision_increment`'s documented default, measured as 4 on 8.3. A
+/// session can set it anywhere in 0..=30, so every caller here takes the
+/// increment as an argument and only [`Session::div_precision_increment`]
+/// falls back to this.
+///
+/// An average takes the same number over the scale it averaged, which is why
+/// there is one constant and not two: `AVG` of a `DECIMAL(10,2)` is a
+/// `DECIMAL(_,6)` and `AVG` of an integer is a `DECIMAL(_,4)`, both moving
+/// with the variable.
+///
+/// [`Session::div_precision_increment`]: crate::session::Session::div_precision_increment
+pub const DEFAULT_DIV_PRECISION_INCREMENT: usize = 4;
 
-/// The extra digits MySQL gives an average over the scale it averaged.
+/// The largest `div_precision_increment` MySQL will hold.
 ///
-/// The same `div_precision_increment`, which is why it is that constant rather
-/// than a second 4: `AVG` of a `DECIMAL(10,2)` is a `DECIMAL(_,6)` and `AVG`
-/// of an integer is a `DECIMAL(_,4)`.
-pub const AVERAGE_EXTRA_SCALE: usize = DIV_PRECISION_INCREMENT;
+/// Measured on 8.3: 31 is stored as 30 and -1 as 0, each with warning 1292,
+/// so the range is 0..=30 and out of range is clamped rather than refused.
+pub const MAX_DIV_PRECISION_INCREMENT: i128 = 30;
 
 /// A decimal with the point taken out: its sign, its digits, and how many of
 /// them fall after the point.
@@ -468,16 +475,22 @@ pub fn multiply(a: &str, b: &str) -> Option<String> {
     ))
 }
 
-/// `a / b`, at the left operand's scale plus [`DIV_PRECISION_INCREMENT`].
+/// `a / b`, at the left operand's scale plus `increment`.
+///
+/// The increment is the session's `div_precision_increment` rather than a
+/// constant, because MySQL's is: at 6, `1/3` is 0.333333 and `1.5/1.5` is
+/// 1.0000000, and at 0 `1/3` is 0 — all measured on 8.3.
 ///
 /// The rounding is not simply "round the true quotient", and the difference is
 /// measurable. MySQL computes the quotient to a whole number of nine-digit
 /// words — `frac1 + frac2 + div_precision_increment` rounded up to a multiple
-/// of nine — truncating there, and rounds *that* to the result's scale. Where
-/// the two coincide the truncation is what shows: `1.00001 / 3` is 0.333336666
-/// on 8.3, at nine places, where rounding the true quotient gives
-/// 0.333336667. `1 / 7` is 0.1429 because the nine-digit intermediate does get
-/// rounded down to four.
+/// of nine — truncating there, and rounds *that* to the result's scale. At an
+/// increment of 0 there are no words at all over two integers, which is why
+/// `7/2` is 3 there and not 4: the truncation happens before any rounding
+/// could. Where the two coincide the truncation is what shows: `1.00001 / 3`
+/// is 0.333336666 on 8.3, at nine places, where rounding the true quotient
+/// gives 0.333336667. `1 / 7` is 0.1429 because the nine-digit intermediate
+/// does get rounded down to four.
 ///
 /// What comes back is the quotient at the scale MySQL *displays*, which is not
 /// quite the number MySQL holds. Measured on 8.3, `JSON_ARRAY(1/3)` is
@@ -492,20 +505,20 @@ pub fn multiply(a: &str, b: &str) -> Option<String> {
 ///
 /// `None` for an operand that is not a decimal. A zero divisor is the caller's
 /// to test with [`is_zero`], because its answer is NULL rather than a number.
-pub fn divide(a: &str, b: &str) -> Option<String> {
+pub fn divide(a: &str, b: &str, increment: usize) -> Option<String> {
     let (a, b) = (parts(a)?, parts(b)?);
     if b.is_zero() {
         return None;
     }
-    let interim = (a.scale + b.scale + DIV_PRECISION_INCREMENT).div_ceil(9) * 9;
+    let interim = (a.scale + b.scale + increment).div_ceil(9) * 9;
     // `a`'s digits carry a factor of 10^-a.scale and `b`'s a factor of
     // 10^-b.scale, so the shift that leaves the quotient at `interim` places
     // is `interim + b.scale - a.scale` — never negative, since `interim` is at
-    // least `a.scale + b.scale + 4`.
+    // least `a.scale + b.scale + increment` rounded up.
     let mut numerator = a.digits.clone();
     numerator.resize(numerator.len() + interim + b.scale - a.scale, 0);
     let (quotient, _) = divmod_magnitude(&numerator, &b.digits);
-    let scale = (a.scale + DIV_PRECISION_INCREMENT).min(MAX_SCALE);
+    let scale = (a.scale + increment).min(MAX_SCALE);
     Some(rounded(a.negative != b.negative, &quotient, interim, scale))
 }
 
@@ -634,31 +647,6 @@ pub fn rescale(text: &str, scale: usize) -> Option<String> {
     units(text, scale).map(|units| render(units, scale))
 }
 
-/// `numerator / denominator` over two counts of units, rounded half away from
-/// zero.
-///
-/// The division an average is, which is why it is counted rather than spelled
-/// out like [`divide`]: MySQL rounds the result at its own scale rather than
-/// truncating, so 2.99 over three rows is 0.996667 and not 0.996666, and the
-/// fold that reaches here already holds its total as units.
-pub fn divide_units(numerator: i128, denominator: i128) -> Option<i128> {
-    if denominator == 0 {
-        return None;
-    }
-    let (n, d) = (numerator, denominator);
-    let quotient = n / d;
-    // Unsigned magnitudes, so neither the doubling nor the absolute value can
-    // overflow — `i128::MIN.abs()` panics, and this is a public helper that
-    // does not get to assume its caller passed a row count.
-    let remainder = (n % d).unsigned_abs();
-    if remainder.saturating_mul(2) >= d.unsigned_abs() {
-        let away = if (n < 0) != (d < 0) { -1 } else { 1 };
-        quotient.checked_add(away)
-    } else {
-        Some(quotient)
-    }
-}
-
 /// A float written at `scale` digits, for the values that are not decimals at
 /// all.
 ///
@@ -738,8 +726,14 @@ mod tests {
         assert_eq!(subtract("1.500", "1.50").as_deref(), Some("0.000"));
         assert_eq!(multiply("1.50", "1.500").as_deref(), Some("2.25000"));
         assert_eq!(multiply("1.500", "1.50").as_deref(), Some("2.25000"));
-        assert_eq!(divide("1.50", "1.500").as_deref(), Some("1.000000"));
-        assert_eq!(divide("1.500", "1.50").as_deref(), Some("1.0000000"));
+        assert_eq!(
+            divide("1.50", "1.500", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
+            Some("1.000000")
+        );
+        assert_eq!(
+            divide("1.500", "1.50", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
+            Some("1.0000000")
+        );
         assert_eq!(remainder("1.50", "1.500").as_deref(), Some("0.000"));
         assert_eq!(integer_divide("1.50", "1.500").as_deref(), Some("1"));
         // And against an integer, whose scale is zero.
@@ -777,22 +771,45 @@ mod tests {
     #[test]
     fn division_truncates_at_nine_digit_words_before_it_rounds() {
         // 0.33333666666… truncated at nine places, not rounded to …667.
-        assert_eq!(divide("1.00001", "3").as_deref(), Some("0.333336666"));
+        assert_eq!(
+            divide("1.00001", "3", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
+            Some("0.333336666")
+        );
         // And where there are digits to spare it does round: 1/7 at nine
         // places is 0.142857142, rounded to four.
-        assert_eq!(divide("1", "7").as_deref(), Some("0.1429"));
-        assert_eq!(divide("2", "3").as_deref(), Some("0.6667"));
-        assert_eq!(divide("-2", "3").as_deref(), Some("-0.6667"));
+        assert_eq!(
+            divide("1", "7", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
+            Some("0.1429")
+        );
+        assert_eq!(
+            divide("2", "3", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
+            Some("0.6667")
+        );
+        assert_eq!(
+            divide("-2", "3", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
+            Some("-0.6667")
+        );
         // 25 places on the left asks for 29 and computes 36, which is where
         // the rounding at the far end is visible.
         assert_eq!(
-            divide("1.0000000000000000000000000", "7").as_deref(),
+            divide(
+                "1.0000000000000000000000000",
+                "7",
+                DEFAULT_DIV_PRECISION_INCREMENT
+            )
+            .as_deref(),
             Some("0.14285714285714285714285714286")
         );
-        assert_eq!(divide("1", "3").as_deref(), Some("0.3333"));
-        assert_eq!(divide("10", "3").as_deref(), Some("3.3333"));
+        assert_eq!(
+            divide("1", "3", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
+            Some("0.3333")
+        );
+        assert_eq!(
+            divide("10", "3", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
+            Some("3.3333")
+        );
         // A zero divisor has no answer here; NULL is the caller's to give.
-        assert_eq!(divide("1", "0"), None);
+        assert_eq!(divide("1", "0", DEFAULT_DIV_PRECISION_INCREMENT), None);
         assert_eq!(remainder("1", "0.00"), None);
         assert_eq!(integer_divide("1", "0"), None);
         assert!(is_zero("0.00") && is_zero("-0") && !is_zero("0.01"));
@@ -852,7 +869,7 @@ mod tests {
             Some("1.500000000000000000000000000000")
         );
         assert_eq!(
-            divide(long, "1").as_deref(),
+            divide(long, "1", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
             Some("1.500000000000000000000000000000")
         );
     }
@@ -936,7 +953,7 @@ mod tests {
         // Text that is not a decimal is not this path's to answer.
         assert_eq!(add("1e3", "1"), None);
         assert_eq!(multiply("abc", "1"), None);
-        assert_eq!(divide("1", "-"), None);
+        assert_eq!(divide("1", "-", DEFAULT_DIV_PRECISION_INCREMENT), None);
     }
 
     /// Comparison against the counted reference, and past where the counted

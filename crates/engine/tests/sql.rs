@@ -16816,6 +16816,198 @@ fn default_week_format_is_bounded_the_way_mysql_bounds_it() {
     assert_eq!(listed(&engine, &mut session), vec!["1".to_owned()]);
 }
 
+#[test]
+fn div_precision_increment_defaults_to_four_and_is_a_variable_before_it_is_set() {
+    // MySQL's documented default, measured on 8.3 along with the scopes: the
+    // bare name, `@@SESSION.` and `@@GLOBAL.` all answer 4 on a stock server.
+    // This engine has one session and no server-wide configuration for a
+    // global to differ from, so the three resolve to the same variable here.
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT @@div_precision_increment, @@SESSION.div_precision_increment, \
+             @@GLOBAL.div_precision_increment"
+        ),
+        vec![vec!["4", "4", "4"]]
+    );
+    // And it is in SHOW VARIABLES on a session that has never written one.
+    // The gap this closes is not only that `SELECT @@div_precision_increment`
+    // was 1193: `SET` stored any name at all, so the variable materialised on
+    // the first write and a client that read before writing was told it did
+    // not exist while the same client reading after was told it did.
+    //
+    // Found by looking for the row rather than by a `LIKE`, which this
+    // engine's SHOW VARIABLES ignores.
+    let listed = |engine: &Engine, session: &mut Session| -> Vec<String> {
+        rows(engine, session, "SHOW VARIABLES")
+            .into_iter()
+            .filter(|row| row[0] == "div_precision_increment")
+            .map(|row| row[1].clone())
+            .collect()
+    };
+    assert_eq!(listed(&engine, &mut session), vec!["4".to_owned()]);
+    run(
+        &engine,
+        &mut session,
+        "SET SESSION div_precision_increment = 6",
+    );
+    assert_eq!(listed(&engine, &mut session), vec!["6".to_owned()]);
+}
+
+#[test]
+fn div_precision_increment_moves_every_quotient_and_every_average() {
+    // The two things the variable decides, in one test because they are one
+    // number: a quotient's scale is its left operand's plus the increment, and
+    // an average's is the scale it averaged plus the same. Every row below was
+    // read off 8.3 with the variable set to the value in the first column.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Quot (
+            i INT NOT NULL,
+            d DECIMAL(10,2) NOT NULL,
+            w DECIMAL(10,5) NOT NULL
+        )",
+    );
+    // `w` totals 1.00001 over three rows, which is the one shape where MySQL's
+    // truncation to a whole nine-digit word is visible in an average: at the
+    // stock 4 the answer's own scale is 9, so the interim is not rounded down
+    // to anything and 0.333336666 survives where rounding the true quotient
+    // would give 0.333336667.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Quot (i, d, w) VALUES
+            (1, 1.50, 1.00001), (2, 2.50, 0.00000), (2, 3.00, 0.00000)",
+    );
+    let quotients = "SELECT 1/3, 1.5/1.5, 7/2, 1.00001/3";
+    let averages = "SELECT AVG(i), AVG(d), AVG(w) FROM Quot";
+    // `DIV` and `MOD` are unaffected at every setting, measured, so they ride
+    // along on each pass rather than getting a test that only tries one.
+    let untouched = "SELECT 7 DIV 2, 10.5 MOD 3, MOD(10.5, 3)";
+    let thirty = "0.333333333333333333333333333333";
+    for (increment, quotient_row, average_row) in [
+        // 0 is the setting that shows MySQL computes to a whole number of
+        // nine-digit words and truncates there: `7/2` is 3 and not 4 because
+        // at an increment of 0 over two integers there is no word at all, and
+        // `AVG(i)` is 1 for the same reason where 5/3 rounds to 2.
+        (
+            "0",
+            vec!["0", "1.0", "3", "0.33334"],
+            vec!["1", "2.33", "0.33334"],
+        ),
+        // The default, set explicitly: a session that says 4 has to answer
+        // exactly as one that never said anything.
+        (
+            "4",
+            vec!["0.3333", "1.00000", "3.5000", "0.333336666"],
+            vec!["1.6667", "2.333333", "0.333336666"],
+        ),
+        (
+            "6",
+            vec!["0.333333", "1.0000000", "3.500000", "0.33333666667"],
+            vec!["1.666667", "2.33333333", "0.33333666667"],
+        ),
+        // The top of the range, where the 30-place cap on a quotient's scale
+        // starts biting: 1.5 has a place of its own, so 1 + 30 would be 31 and
+        // MySQL answers 30.
+        (
+            "30",
+            vec![
+                thirty,
+                "1.000000000000000000000000000000",
+                "3.500000000000000000000000000000",
+                "0.333336666666666666666666666667",
+            ],
+            vec![
+                "1.666666666666666666666666666667",
+                "2.333333333333333333333333333333",
+                "0.333336666666666666666666666667",
+            ],
+        ),
+    ] {
+        run(
+            &engine,
+            &mut session,
+            &format!("SET SESSION div_precision_increment = {increment}"),
+        );
+        assert_eq!(
+            rows(&engine, &mut session, quotients),
+            vec![quotient_row],
+            "quotients at {increment}"
+        );
+        assert_eq!(
+            rows(&engine, &mut session, averages),
+            vec![average_row],
+            "averages at {increment}"
+        );
+        assert_eq!(
+            rows(&engine, &mut session, untouched),
+            vec![vec!["3", "1.5", "1.5"]],
+            "DIV and MOD at {increment}"
+        );
+    }
+}
+
+#[test]
+fn div_precision_increment_is_bounded_the_way_mysql_bounds_it() {
+    // The same rule `default_week_format` follows, measured separately because
+    // MySQL's integer variables are not uniform in it: out of range is clamped
+    // with warning 1292 rather than refused, and the range is 0..=30 rather
+    // than that variable's 0..=7.
+    let (engine, mut session) = engine();
+    for (set, stored, third) in [
+        ("31", "30", "0.333333333333333333333333333333"),
+        ("30", "30", "0.333333333333333333333333333333"),
+        // Above `i64::MAX`, which arrives as a `Value::Unsigned`. Read through
+        // a signed `i64` it wraps to -1 and clamps to 0, which is the far end
+        // of the range from the 30 MySQL stores.
+        (
+            "18446744073709551615",
+            "30",
+            "0.333333333333333333333333333333",
+        ),
+        ("-1", "0", "0"),
+        ("0", "0", "0"),
+        ("4", "4", "0.3333"),
+        // An expression and a keyword, both taken as the numbers they are.
+        ("1 + 1", "2", "0.33"),
+        ("TRUE", "1", "0.3"),
+    ] {
+        run(
+            &engine,
+            &mut session,
+            &format!("SET SESSION div_precision_increment = {set}"),
+        );
+        assert_eq!(
+            rows(
+                &engine,
+                &mut session,
+                "SELECT @@div_precision_increment, 1/3"
+            ),
+            vec![vec![stored, third]],
+            "{set}"
+        );
+    }
+    // A value that is not an integer is refused rather than taken, a string
+    // spelling one included. `b'11'` is deliberately absent for the same
+    // reason as in the week-format test: this engine has no bit literal, so it
+    // answers 1235 for the literal rather than 1232 for the variable.
+    for set in ["'abc'", "'3'", "3.7", "NULL"] {
+        let err = engine
+            .execute(
+                &mut session,
+                &format!("SET SESSION div_precision_increment = {set}"),
+                &[],
+            )
+            .unwrap_err();
+        assert_eq!(err.code, 1232, "expected 1232 for: {set}");
+    }
+}
+
 /// The source table the `CREATE TABLE ... AS SELECT` tests below build from,
 /// declared so that every attribute MySQL drops on the way through has
 /// something to drop: an AUTO_INCREMENT primary key, a unique key, a NOT NULL

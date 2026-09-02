@@ -1176,7 +1176,7 @@ fn binary(
         },
 
         B::Plus | B::Minus | B::Multiply | B::Divide | B::Modulo | B::MyIntegerDivide => {
-            arithmetic(op, &left, &right)?
+            arithmetic(op, &left, &right, ctx.session.div_precision_increment())?
         }
 
         // The tokenizer always produces StringConcat for `||`, but what it
@@ -2085,7 +2085,18 @@ fn unsigned_case(
 /// `pub(crate)` because `MOD` is the `%` operator spelled as a call and has to
 /// answer the same thing: typed alike and evaluated apart, `MOD(1.500, 2)`
 /// promised a decimal and handed back the integer 1.
-pub(crate) fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> EngineResult<Value> {
+///
+/// `increment` is the session's `div_precision_increment`, and only `/` reads
+/// it — `DIV` and `MOD` are unaffected at every setting, measured on 8.3. It
+/// arrives as a number rather than as a `Context` because that is the whole of
+/// what this needs from the session, and a `Context` here would be one every
+/// caller had to have.
+pub(crate) fn arithmetic(
+    op: &BinaryOperator,
+    left: &Value,
+    right: &Value,
+    increment: usize,
+) -> EngineResult<Value> {
     use BinaryOperator as B;
 
     if left.is_null() || right.is_null() {
@@ -2146,7 +2157,7 @@ pub(crate) fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> En
     // Exact where both sides are exact, which a fractional temporal makes
     // reachable: a DATETIME(3) packs to a decimal, and `dt3 + 0` through an
     // `f64` renders 20240105060708.5 where MySQL says 20240105060708.500.
-    if let Some(exact) = exact_arithmetic(op, left, right) {
+    if let Some(exact) = exact_arithmetic(op, left, right, increment) {
         return exact;
     }
 
@@ -2196,7 +2207,7 @@ pub(crate) fn arithmetic(op: &BinaryOperator, left: &Value, right: &Value) -> En
 /// |---|---|---|
 /// | `+`, `-` | the wider of the two | 3.000, 0.000 |
 /// | `*` | the two added | 2.25000 |
-/// | `/` | the left one plus `div_precision_increment` | 1.000000 |
+/// | `/` | the left one plus `increment` | 1.000000 |
 /// | `%`, `MOD` | the wider of the two | 0.000 |
 /// | `DIV` | none — a BIGINT whatever it divided | 1 |
 ///
@@ -2213,6 +2224,7 @@ fn exact_arithmetic(
     op: &BinaryOperator,
     left: &Value,
     right: &Value,
+    increment: usize,
 ) -> Option<EngineResult<Value>> {
     use BinaryOperator as B;
     // An unsigned operand is exact too, and it is not range-checked here: a
@@ -2227,7 +2239,7 @@ fn exact_arithmetic(
         B::Plus => crate::decimal::add(&a, &b),
         B::Minus => crate::decimal::subtract(&a, &b),
         B::Multiply => crate::decimal::multiply(&a, &b),
-        B::Divide => crate::decimal::divide(&a, &b),
+        B::Divide => crate::decimal::divide(&a, &b, increment),
         B::Modulo => crate::decimal::remainder(&a, &b),
         B::MyIntegerDivide => {
             let quotient = crate::decimal::integer_divide(&a, &b)?;
