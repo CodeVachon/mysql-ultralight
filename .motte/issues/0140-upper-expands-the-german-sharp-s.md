@@ -1,11 +1,11 @@
 ---
 id: 140
 title: UPPER expands the German sharp s
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-08-31T20:28:05Z
-updated: 2026-08-31T20:28:05Z
+updated: 2026-09-02T14:02:43Z
 ---
 
 ## Description

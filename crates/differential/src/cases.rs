@@ -3700,6 +3700,113 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // MySQL's case folding is a per-character table: one character in,
+        // exactly one character or itself out, never a sequence. Rust's
+        // `to_uppercase` is Unicode's *full* mapping, which expands -- so
+        // `UPPER('stra\u{df}e')` was `STRASSE` here and is `STRA\u{df}E` on
+        // 8.3, a wrong answer whose `LENGTH` and `CHAR_LENGTH` are wrong with
+        // it. #0140.
+        //
+        // Asked through `HEX` because nothing else can see most of it: a
+        // ligature and the character it expands to print differently, but a
+        // combining mark does not.
+        //
+        // **Which table is a property of the collation.** 8.3 has two for
+        // utf8mb4 and they disagree on 616 characters upward and 608 downward.
+        // A column declared without a `COLLATE` clause gets
+        // `utf8mb4_0900_ai_ci`, which is what this engine encodes; a *literal*
+        // takes the connection's, and the client here negotiates 45,
+        // `utf8mb4_general_ci`. Where the two disagree, this engine can only
+        // match one of them, and #0129 is what would let it match both.
+        //
+        // So which form a character is asked in here is decided per character
+        // and by measuring, not by a rule: the ~1200 disagreements are
+        // scattered through the BMP and only 193 are above it, so no range
+        // describes them. Two classes needed the column form, and they are the
+        // only two in this group:
+        //
+        //   - a character above the BMP, which `general_ci` never folds
+        //   - `\u{1e9e}`, whose lowercase is `\u{df}` under one collation and
+        //     itself under the other
+        //
+        // Everything else below was checked against both collations and
+        // answers the same under each, so a literal asks what it looks like it
+        // asks. Adding a case means running that check, not consulting the
+        // classes above.
+        name: "case folding is a table, not Unicode",
+        setup: &[
+            "CREATE TABLE Cf (id INT NOT NULL, t VARCHAR(30) NULL, PRIMARY KEY (id))",
+            "INSERT INTO Cf VALUES (1,'stra\u{df}e'),(2,'\u{1f0}\u{fb01}'),(3,'\u{130}'),\
+             (4,'\u{10d0}'),(5,'\u{1f80}'),(6,'\u{10428}'),(7,'\u{1e9e}')",
+        ],
+        cases: &[
+            // The issue as filed, and the length that goes with it.
+            same("SELECT HEX(UPPER('stra\u{df}e')), LENGTH(UPPER('stra\u{df}e')), \
+                  CHAR_LENGTH(UPPER('stra\u{df}e'))"),
+            // The rest of the class: a ligature, and the four whose full
+            // mapping is a base plus one or two combining marks.
+            same("SELECT HEX(UPPER('\u{fb01}')), HEX(UPPER('\u{1f0}')), \
+                  HEX(UPPER('\u{149}')), HEX(LOWER('\u{130}'))"),
+            same("SELECT HEX(UPPER('\u{1e96}')), HEX(UPPER('\u{390}')), \
+                  HEX(UPPER('\u{587}'))"),
+            // The opposite exception, and the reason "leave a sequence alone"
+            // is not the whole rule: Unicode uppercases the Greek
+            // iota-subscript forms to two characters and 8.3 answers the
+            // precomposed one.
+            same("SELECT HEX(UPPER('\u{1f80}')), HEX(UPPER('\u{1f90}')), \
+                  HEX(UPPER('\u{1fa0}'))"),
+            same("SELECT HEX(UPPER('\u{1fb3}')), HEX(UPPER('\u{1fc3}')), \
+                  HEX(UPPER('\u{1ff3}'))"),
+            // Case pairs 8.3's tables do not have, so both halves stay put
+            // where Unicode maps them: Georgian's Mtavruli capitals are
+            // Unicode 11 and these tables are Unicode 9.
+            same("SELECT HEX(UPPER('\u{10d0}')), HEX(LOWER('\u{1c90}')), \
+                  HEX(UPPER('\u{a7b9}')), HEX(LOWER('\u{a7b8}'))"),
+            // Two tables and not one: neither composition is the identity, so
+            // neither direction may be derived from the other.
+            same("SELECT HEX(UPPER('\u{b5}')), HEX(LOWER(UPPER('\u{b5}'))), \
+                  HEX(LOWER('\u{b5}'))"),
+            same("SELECT HEX(UPPER('\u{130}')), HEX(UPPER(LOWER('\u{130}'))), \
+                  HEX(LOWER('\u{17f}')), HEX(LOWER(UPPER('\u{17f}')))"),
+            same("SELECT HEX(LOWER('\u{212a}')), HEX(UPPER(LOWER('\u{212a}'))), \
+                  HEX(LOWER('\u{2126}')), HEX(UPPER(LOWER('\u{2126}')))"),
+            // A run of the table whose members are every other character: the
+            // capital of each pair must not move under `UPPER`, nor the small
+            // one under `LOWER`.
+            same("SELECT HEX(UPPER('\u{101}')), HEX(UPPER('\u{100}')), \
+                  HEX(LOWER('\u{100}')), HEX(LOWER('\u{101}'))"),
+            // The ordinary case, which the table must not have broken.
+            same("SELECT HEX(UPPER('ab\u{e9}')), HEX(LOWER('AB\u{c9}')), \
+                  HEX(UPPER('\u{ff41}')), HEX(LOWER('\u{ff21}'))"),
+            // And once without `HEX`, so the rows a client would actually see
+            // are compared too, with `UCASE` and `LCASE` along the same path.
+            same("SELECT UPPER('stra\u{df}e'), LOWER('STRA\u{df}E'), UCASE('\u{1f0}'), \
+                  LCASE('\u{130}')"),
+            // The nineteen characters whose fold is wider in UTF-8 than they
+            // are. 8.3 folds into a buffer the size of the argument and
+            // truncates when one of them overflows it, so over a *column*
+            // `UPPER('a\u{23f}b')` there is `A\u{2c7e}` with the `b` gone.
+            // This engine declines the fold instead, which is what
+            // `general_ci` answers and therefore what 8.3 answers here -- so
+            // these are literals, and the column form is the one that
+            // diverges. #0154.
+            same("SELECT HEX(UPPER('\u{23f}')), HEX(UPPER('a\u{23f}b')), \
+                  HEX(UPPER('\u{23f}aa')), HEX(LOWER('\u{23a}'))"),
+            same("SELECT HEX(UPPER('\u{23f}\u{23f}a')), HEX(UPPER('aa\u{23f}a')), \
+                  LENGTH(UPPER('a\u{23f}b')), CHAR_LENGTH(UPPER('\u{23f}'))"),
+            same("SELECT HEX(LOWER('\u{23e}')), HEX(LOWER('\u{130}\u{23a}')), \
+                  HEX(UPPER('\u{2c7e}'))"),
+            // Through a column, where 8.3 folds by `utf8mb4_0900_ai_ci` --
+            // the position the two classes named at the top of this group can
+            // only be asked in. Row 6 is a character above the BMP and row 7
+            // the `\u{1e9e}` whose lowercase is `\u{df}` under this collation
+            // and itself under the other.
+            same("SELECT id, HEX(UPPER(t)), HEX(LOWER(t)), LENGTH(UPPER(t)), \
+                  CHAR_LENGTH(UPPER(t)) FROM Cf ORDER BY id"),
+            same("SELECT id, UPPER(t), LOWER(t) FROM Cf ORDER BY id"),
+        ],
+    },
+    Group {
         // A name is what was written between the quotes, and nothing here may
         // report the *rendering* of it back. Two ways that went wrong, both
         // measured on 8.3 and both silent:

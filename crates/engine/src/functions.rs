@@ -1195,8 +1195,27 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         }
         "length" | "octet_length" => Value::Int(text(0).len() as i64),
         "char_length" | "character_length" => Value::Int(text(0).chars().count() as i64),
-        "upper" | "ucase" => Value::Text(text(0).to_uppercase()),
-        "lower" | "lcase" => Value::Text(text(0).to_lowercase()),
+        // `crate::casefold` rather than Rust's, which performs Unicode's full
+        // mapping and expands: `UPPER('stra\u{df}e')` was `STRASSE` where 8.3
+        // answers `STRA\u{df}E`. MySQL's is a per-character table, and *which*
+        // table is a property of the collation rather than of the character
+        // set -- see that module.
+        //
+        // A fold that would be wider in UTF-8 than the character it replaces
+        // is declined rather than applied, which is where this engine parts
+        // company with 8.3 over a *column*: 8.3 folds into a buffer the size
+        // of the argument and truncates, so `UPPER('a\u{23f}b')` there is
+        // `A\u{2c7e}` with the `b` gone. Nineteen characters, #0154, and the
+        // measurement behind choosing not to lose bytes is in `casefold`.
+        //
+        // Both still fold a binary string, which 8.3 does not touch at all:
+        // `UPPER(CAST('str' AS BINARY))` is `str` there. That is #0128 and
+        // this does not reach it, because the argument arrives here already
+        // decoded and nothing left says it was bytes. It does narrow the gap
+        // by accident -- a `\u{df}` in a VARBINARY now survives, where the
+        // full mapping used to turn it into `SS`.
+        "upper" | "ucase" => Value::Text(crate::casefold::upper(&text(0))),
+        "lower" | "lcase" => Value::Text(crate::casefold::lower(&text(0))),
         "trim" => Value::Text(text(0).trim().to_owned()),
         "ltrim" => Value::Text(text(0).trim_start().to_owned()),
         "rtrim" => Value::Text(text(0).trim_end().to_owned()),

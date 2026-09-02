@@ -1,11 +1,11 @@
 ---
 id: 117
 title: Unary plus is not peeled from a column's name
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-08-25T23:13:29Z
-updated: 2026-08-25T23:13:29Z
+updated: 2026-09-02T14:25:12Z
 ---
 
 ## Description

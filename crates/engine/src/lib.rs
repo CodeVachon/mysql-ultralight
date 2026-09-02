@@ -3,6 +3,7 @@
 //! Knows nothing about sockets or packets: it takes SQL text and bound
 //! parameters and returns rows. The wire protocol lives in sibling crates.
 
+pub mod casefold;
 pub mod catalog;
 pub mod collation;
 pub mod ddl;

@@ -8157,6 +8157,177 @@ fn soundex_answers_what_mysql_answers() {
 }
 
 #[test]
+fn case_folding_is_a_table_rather_than_unicodes_full_mapping() {
+    // Rust's `to_uppercase` is Unicode's *full* mapping and expands, so
+    // `UPPER('stra\u{df}e')` was `STRASSE` where 8.3 answers `STRA\u{df}E`.
+    // MySQL's is a per-character table: one character in, exactly one
+    // character or itself out.
+    //
+    // Every expectation here is `HEX()` of an answer read off 8.3 under
+    // `utf8mb4_0900_ai_ci`, which is the collation of a column declared
+    // without a `COLLATE` clause and the one `crates/engine/src/casefold.rs`
+    // encodes. `HEX` rather than the characters because most of this is
+    // invisible otherwise: `\u{1f0}` and the `J` plus combining caron Unicode
+    // expands it to render the same way.
+    let (engine, mut session) = engine();
+
+    for (sql, expected) in [
+        // The characters #0140 was measured on.
+        ("SELECT HEX(UPPER('stra\u{df}e'))", "53545241C39F45"),
+        ("SELECT HEX(UPPER('\u{fb01}'))", "EFAC81"),
+        ("SELECT HEX(UPPER('\u{1f0}'))", "C7B0"),
+        ("SELECT HEX(LOWER('\u{130}'))", "69"),
+        // And the length that went wrong with the answer, which is what a
+        // caller sees without asking for the bytes.
+        ("SELECT LENGTH(UPPER('stra\u{df}e'))", "7"),
+        ("SELECT CHAR_LENGTH(UPPER('stra\u{df}e'))", "6"),
+        // The rest of the expanding class: a base plus a combining mark, a
+        // modifier letter plus a capital, and one that expands to three.
+        ("SELECT HEX(UPPER('\u{149}'))", "C589"),
+        ("SELECT HEX(UPPER('\u{1e96}'))", "E1BA96"),
+        ("SELECT HEX(UPPER('\u{390}'))", "CE90"),
+        ("SELECT HEX(UPPER('\u{587}'))", "D687"),
+        // The opposite exception, and why "leave a sequence alone" is not the
+        // whole rule: Unicode uppercases the Greek iota-subscript forms to two
+        // characters, and 8.3 answers the precomposed one.
+        ("SELECT HEX(UPPER('\u{1f80}'))", "E1BE88"),
+        ("SELECT HEX(UPPER('\u{1f90}'))", "E1BE98"),
+        ("SELECT HEX(UPPER('\u{1fa0}'))", "E1BEA8"),
+        ("SELECT HEX(UPPER('\u{1fb3}'))", "E1BEBC"),
+        ("SELECT HEX(UPPER('\u{1fc3}'))", "E1BF8C"),
+        ("SELECT HEX(UPPER('\u{1ff3}'))", "E1BFBC"),
+        // Case pairs 8.3's tables stop short of. They are Unicode 9.0, and
+        // Georgian's Mtavruli capitals are Unicode 11.
+        ("SELECT HEX(UPPER('\u{10d0}'))", "E18390"),
+        ("SELECT HEX(LOWER('\u{1c90}'))", "E1B290"),
+        ("SELECT HEX(UPPER('\u{a7b9}'))", "EA9EB9"),
+        ("SELECT HEX(LOWER('\u{a7b8}'))", "EA9EB8"),
+        // Two tables and not one. Neither composition is the identity, so
+        // neither direction may be derived from the other.
+        ("SELECT HEX(UPPER('\u{b5}'))", "CE9C"),
+        ("SELECT HEX(LOWER(UPPER('\u{b5}')))", "CEBC"),
+        ("SELECT HEX(LOWER('\u{b5}'))", "C2B5"),
+        ("SELECT HEX(UPPER('\u{130}'))", "C4B0"),
+        ("SELECT HEX(UPPER(LOWER('\u{130}')))", "49"),
+        ("SELECT HEX(LOWER('\u{212a}'))", "6B"),
+        ("SELECT HEX(UPPER(LOWER('\u{212a}')))", "4B"),
+        ("SELECT HEX(LOWER('\u{17f}'))", "C5BF"),
+        ("SELECT HEX(LOWER(UPPER('\u{17f}')))", "73"),
+        ("SELECT HEX(LOWER('\u{2126}'))", "CF89"),
+        ("SELECT HEX(UPPER(LOWER('\u{2126}')))", "CEA9"),
+        // `\u{df}` uppercases to itself and `\u{1e9e}` lowercases to it, so
+        // the pair is one-way.
+        ("SELECT HEX(UPPER('\u{df}'))", "C39F"),
+        ("SELECT HEX(LOWER('\u{1e9e}'))", "C39F"),
+        ("SELECT HEX(UPPER('\u{1e9e}'))", "E1BA9E"),
+        // A run whose members are every other character. The capital of each
+        // pair must not move under `UPPER`, nor the small one under `LOWER`.
+        ("SELECT HEX(UPPER('\u{101}'))", "C480"),
+        ("SELECT HEX(UPPER('\u{100}'))", "C480"),
+        ("SELECT HEX(LOWER('\u{100}'))", "C481"),
+        ("SELECT HEX(LOWER('\u{101}'))", "C481"),
+        // Above the BMP, where the fold is four bytes either way.
+        ("SELECT HEX(UPPER('\u{10428}'))", "F0909080"),
+        ("SELECT HEX(LOWER('\u{10400}'))", "F09090A8"),
+        ("SELECT HEX(UPPER('\u{1e922}'))", "F09EA480"),
+        // The ordinary case, which the table must not have broken.
+        ("SELECT HEX(UPPER('ab\u{e9}'))", "4142C389"),
+        ("SELECT HEX(LOWER('AB\u{c9}'))", "6162C3A9"),
+        ("SELECT HEX(UPPER('\u{ff41}'))", "EFBCA1"),
+        ("SELECT HEX(LOWER('\u{ff21}'))", "EFBD81"),
+        ("SELECT UPPER('stra\u{df}e')", "STRA\u{df}E"),
+        ("SELECT UCASE('stra\u{df}e')", "STRA\u{df}E"),
+        ("SELECT LCASE('STRA\u{df}E')", "stra\u{df}e"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn a_fold_that_would_grow_is_declined_rather_than_truncated() {
+    // 8.3 folds in place: `Item_str_conv::val_str` hands the charset's fold
+    // the *same* buffer as source and destination, sized to the argument,
+    // because for utf8mb4 the multiplier that would widen it is 1. A character
+    // whose fold is longer in UTF-8 than the source writes over bytes it has
+    // not read yet, the next read lands mid-character, and the scan stops — so
+    // over a column 8.3 answers a truncated string: `UPPER('a\u{23f}b')` is
+    // `A\u{2c7e}`, the `b` gone.
+    //
+    // Nineteen characters do it, and this engine declines the fold instead of
+    // reproducing the truncation. That is `utf8mb4_general_ci`'s answer, which
+    // is 8.3's own for a literal, and every expectation below is measured
+    // there. Over a column it is a wrong answer and #0154; it was chosen
+    // because the two are equally wrong — 152 of 304 measured strings each —
+    // and only one of them deletes characters. `casefold.rs` has the
+    // measurement.
+    let (engine, mut session) = engine();
+
+    for (sql, expected) in [
+        // The fold is declined and nothing else about the string changes.
+        ("SELECT HEX(UPPER('\u{23f}'))", "C8BF"),
+        ("SELECT CHAR_LENGTH(UPPER('\u{23f}'))", "1"),
+        ("SELECT HEX(LOWER('\u{23a}'))", "C8BA"),
+        ("SELECT HEX(LOWER('\u{23e}'))", "C8BE"),
+        // The neighbours survive, which is the whole point.
+        ("SELECT HEX(UPPER('a\u{23f}b'))", "41C8BF42"),
+        ("SELECT LENGTH(UPPER('a\u{23f}b'))", "4"),
+        ("SELECT HEX(UPPER('\u{23f}aa'))", "C8BF4141"),
+        ("SELECT HEX(UPPER('\u{23f}\u{23f}a'))", "C8BFC8BF41"),
+        ("SELECT HEX(UPPER('aa\u{23f}a'))", "4141C8BF41"),
+        ("SELECT HEX(LOWER('\u{130}\u{23a}'))", "69C8BA"),
+        // The character the declined fold would have produced is not itself
+        // affected: the rule is about the fold's width, not a hole in the
+        // table. `LOWER('\u{2c7e}')` is the exception on this list — it is
+        // `C8BF` under `0900_ai_ci` and `E2B1BE` under `general_ci`, both
+        // measured, and this engine follows the first.
+        ("SELECT HEX(UPPER('\u{2c7e}'))", "E2B1BE"),
+        ("SELECT HEX(LOWER('\u{2c7e}'))", "C8BF"),
+        (
+            "SELECT CHAR_LENGTH(UPPER('\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}'))",
+            "8",
+        ),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // The same folds through a column rather than a literal, which this engine
+    // reaches by a different projection. Rows 1, 2 and 4 are 8.3's answers
+    // either way; row 3 is where #0154 lives — 8.3 over a column answers the
+    // empty string and a length of 0.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Cf (id INT NOT NULL, t VARCHAR(30) NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Cf VALUES (1,'stra\u{df}e'),(2,'\u{130}'),(3,'\u{23f}'),(4,'\u{1f80}')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, HEX(UPPER(t)), HEX(LOWER(t)), LENGTH(UPPER(t)) FROM Cf ORDER BY id"
+        ),
+        vec![
+            vec!["1", "53545241C39F45", "73747261C39F65", "7"],
+            vec!["2", "C4B0", "69", "2"],
+            vec!["3", "C8BF", "C8BF", "2"],
+            vec!["4", "E1BE88", "E1BE80", "3"],
+        ]
+    );
+}
+
+#[test]
 fn a_json_double_is_written_the_way_mysql_writes_one() {
     // Three formatters disagree here and only one is MySQL's. serde switches
     // to exponent form earlier than MySQL and writes the sign — `1e+30` where

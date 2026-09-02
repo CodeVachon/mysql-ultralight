@@ -15,3 +15,15 @@
 {"at":"2026-09-01T20:08:23Z","id":90,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-09-01T20:08:23Z","id":144,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-09-01T20:36:01Z","id":98,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-01T23:47:05Z","id":98,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-01T23:47:05Z","id":151,"by":"Christopher Vachon","as":"user","type":"created","title":"Identifier comparison is case-insensitive where the reference server is not","state":"Todo"}
+{"at":"2026-09-02T13:48:25Z","id":129,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-02T14:02:23Z","id":152,"by":"Christopher Vachon","as":"user","type":"created","title":"The engine's default collation is not utf8mb4_0900_ai_ci","state":"Todo"}
+{"at":"2026-09-02T14:02:43Z","id":129,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Todo"}
+{"at":"2026-09-02T14:02:43Z","id":140,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-02T14:25:12Z","id":108,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-02T14:25:12Z","id":117,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-02T14:25:12Z","id":113,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-02T14:59:43Z","id":153,"by":"Christopher Vachon","as":"user","type":"created","title":"Multi-table DELETE drops the database qualifier","state":"Todo"}
+{"at":"2026-09-02T17:25:27Z","id":154,"by":"Christopher Vachon","as":"user","type":"created","title":"A literal's case fold uses the wrong collation","state":"Todo"}
+{"at":"2026-09-02T17:25:27Z","id":155,"by":"Christopher Vachon","as":"user","type":"created","title":"A supplementary character survives in a generated column name","state":"Todo"}

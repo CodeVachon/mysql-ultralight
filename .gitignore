@@ -1,1 +1,4 @@
 /target
+
+# Agent worktrees, not part of the project
+.claude/worktrees/

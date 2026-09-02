@@ -1,11 +1,11 @@
 ---
 id: 113
 title: div_precision_increment is not a system variable
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-08-25T23:13:03Z
-updated: 2026-08-25T23:13:03Z
+updated: 2026-09-02T14:25:12Z
 ---
 
 ## Description
