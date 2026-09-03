@@ -31,6 +31,80 @@
 
 use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
 
+use crate::error::{EngineError, EngineResult};
+
+/// The longest identifier MySQL will accept, in **characters**.
+///
+/// Characters and not bytes, measured on 8.3: 64 two-byte `é` and 64
+/// four-byte characters are both accepted as a column name and 65 of either is
+/// refused, so a name may be 256 bytes long. The engine's other name limit —
+/// the 255-byte cut on a *generated* column name in `exec.rs` — counts bytes,
+/// which is why this one is written out rather than shared.
+///
+/// One number covers every kind measured: a column, a table, a database, an
+/// index, a constraint, a view. A savepoint is *not* one of them — 8.3 takes a
+/// 1000-character savepoint name and rolls back to it — and neither is a table
+/// alias or a CTE's column name, both of which 8.3 accepts at 300 characters
+/// and resolves references against in full.
+pub(crate) const MAX_IDENTIFIER: usize = 64;
+
+/// 1059 where a name is longer than MySQL will take.
+///
+/// For the paths that *name an object*: `CREATE TABLE`'s table and columns,
+/// `CREATE DATABASE`, an index or constraint name, a view's name, and the
+/// `ALTER TABLE` operations that introduce any of those.
+///
+/// Refusing is the point. A migration that creates a 65-character column here
+/// and fails against a real server has been tested against the wrong thing,
+/// which is the one outcome this engine exists to prevent.
+pub(crate) fn check_identifier(value: &str) -> EngineResult<()> {
+    match value.chars().count() > MAX_IDENTIFIER {
+        true => Err(EngineError::identifier_too_long(value)),
+        false => Ok(()),
+    }
+}
+
+/// The same limit, answered 1166, for the paths where a column name is
+/// *derived* rather than defined.
+///
+/// See `EngineError::incorrect_column_name` for which those are and why the
+/// code differs.
+pub(crate) fn check_column_name(value: &str) -> EngineResult<()> {
+    match value.chars().count() > MAX_IDENTIFIER {
+        true => Err(EngineError::incorrect_column_name(value)),
+        false => Ok(()),
+    }
+}
+
+/// The longest alias MySQL will report, in **bytes**.
+///
+/// A third limit on a third path, and the reason the two above are not enough:
+/// `SELECT 1 AS <300 characters>` is not refused at all, it comes back named
+/// with the first 256 bytes and a 1466 warning. Bytes rather than characters —
+/// 129 two-byte `é` come back as 128 — and cut on a character boundary with
+/// nothing appended: 254 `a` and a three-byte `€` come back as the 254 `a`
+/// alone, at 254 bytes rather than padded out to 256.
+const MAX_ALIAS_BYTES: usize = 256;
+
+/// A select item's alias as MySQL reports it.
+///
+/// Every reader of an alias goes through here, because the cut is not only
+/// what the client is told: MySQL cuts the alias when it stores it, so `SELECT
+/// 1 AS <300> ORDER BY <300>` is 1054 there and `ORDER BY <the first 256>`
+/// resolves. Cutting at the reporting site alone would report one name and
+/// resolve another.
+pub(crate) fn alias(ident: &Ident) -> String {
+    let value = &ident.value;
+    if value.len() <= MAX_ALIAS_BYTES {
+        return value.clone();
+    }
+    let mut at = MAX_ALIAS_BYTES;
+    while !value.is_char_boundary(at) {
+        at -= 1;
+    }
+    value[..at].to_owned()
+}
+
 /// One part of a name, as it was written.
 ///
 /// `ObjectNamePart::Function` is Snowflake's `db.IDENTIFIER('t').c` and no

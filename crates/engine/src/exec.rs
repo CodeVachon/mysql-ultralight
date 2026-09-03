@@ -704,6 +704,18 @@ impl Engine {
 
             Statement::CreateTable(create) => ddl::create_table(self, session, create),
             Statement::CreateView(create) => {
+                // The view's own name is an identifier like any other, and its
+                // columns are not: 8.3 answers a 65-character view name with
+                // 1059 and a 65-character column — written in the column list
+                // or as an alias anywhere in the definition — with 1166.
+                for part in name::parts(&create.name) {
+                    name::check_identifier(&part)?;
+                }
+                for column in &create.columns {
+                    name::check_column_name(&column.name.value)?;
+                }
+                check_aliases_in_query(&create.query)?;
+
                 let (db, name) = self.split_name(session, &create.name)?;
                 let explicit: Vec<String> = create
                     .columns
@@ -769,6 +781,10 @@ impl Engine {
                 if_not_exists,
                 ..
             } => {
+                // 8.3 refuses this before `IF NOT EXISTS` can excuse it.
+                for part in name::parts(db_name) {
+                    name::check_identifier(&part)?;
+                }
                 self.catalog_mut()?
                     .create_database(&name::dotted(db_name), *if_not_exists)?;
                 Ok(Outcome::ok())
@@ -2415,7 +2431,7 @@ impl Engine {
             .iter()
             .map(|item| match item {
                 SelectItem::UnnamedExpr(e) => Ok((render_expr(e), e)),
-                SelectItem::ExprWithAlias { expr, alias } => Ok((alias.value.clone(), expr)),
+                SelectItem::ExprWithAlias { expr, alias } => Ok((name::alias(alias), expr)),
                 other => Err(unsupported(format!("select item `{other}`"))),
             })
             .collect::<EngineResult<_>>()?;
@@ -2660,7 +2676,7 @@ impl Engine {
                 }
                 SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
                     let alias = match item {
-                        SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+                        SelectItem::ExprWithAlias { alias, .. } => Some(name::alias(alias)),
                         _ => None,
                     };
 
@@ -6767,7 +6783,7 @@ fn projected_items(projection: &[SelectItem]) -> EngineResult<Vec<(String, Expr)
         .iter()
         .map(|item| match item {
             SelectItem::UnnamedExpr(e) => Ok((render_expr(e), e.clone())),
-            SelectItem::ExprWithAlias { expr, alias } => Ok((alias.value.clone(), expr.clone())),
+            SelectItem::ExprWithAlias { expr, alias } => Ok((name::alias(alias), expr.clone())),
             other => Err(unsupported(format!(
                 "select item `{other}` in a grouped query"
             ))),
@@ -6902,7 +6918,7 @@ fn output_items(
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 out.push(OutItem {
-                    name: alias.value.clone(),
+                    name: name::alias(alias),
                     expr: expr.clone(),
                     slot: column_slot(refs, expr),
                 });
@@ -7360,8 +7376,7 @@ fn substitute_aliases(e: &Expr, names: &[String]) -> Expr {
 fn substitute_item_exprs(e: &Expr, projection: &[SelectItem]) -> Expr {
     substitute_names(e, &|written| {
         projection.iter().find_map(|item| match item {
-            SelectItem::ExprWithAlias { expr, alias } => alias
-                .value
+            SelectItem::ExprWithAlias { expr, alias } => name::alias(alias)
                 .eq_ignore_ascii_case(written)
                 .then(|| expr.clone()),
             SelectItem::UnnamedExpr(inner) => render_expr(inner)
@@ -10061,7 +10076,7 @@ fn resolve_having_name(
             }
             SelectItem::UnnamedExpr(inner) | SelectItem::ExprWithAlias { expr: inner, .. } => {
                 let name = match item {
-                    SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                    SelectItem::ExprWithAlias { alias, .. } => name::alias(alias),
                     _ => render_expr(inner),
                 };
                 let inner_slot = column_slot(refs, inner);
@@ -10619,6 +10634,132 @@ fn render_expr(e: &Expr) -> String {
                 .or_else(|| source_text(e))
                 .unwrap_or_else(|| e.to_string()),
         ),
+    }
+}
+
+/// Refuses a view whose definition writes an alias longer than a column name
+/// may be.
+///
+/// A view turns its aliases into stored column names, so the limit that
+/// applies to a column applies to them — and 8.3 applies it to *every* alias
+/// in the definition, not only to the ones that become the view's own columns.
+/// Measured there: `CREATE VIEW v AS SELECT 1 AS x UNION SELECT 2 AS
+/// <65 chars>` is 1166, and so is `... AS SELECT * FROM (SELECT 1 AS
+/// <65 chars>) d`, where a plain `SELECT` over either answers.
+///
+/// The walk is its own rather than `collect_names`, because that one
+/// follows the *leftmost* branch of a set operation, because pinning a name
+/// into the others would rename nothing. Refusing has no such reason to stop.
+///
+/// A generated name is deliberately not checked. 8.3 does not refuse those —
+/// it renames them, storing `SELECT 1+1+...` past 64 characters as
+/// `Name_exp_1` — and refusing where it renames would be a new wrong answer in
+/// place of the old one. That rename is not implemented here; see the note on
+/// the empty name in `pin_in_body`, which is the same gap.
+fn check_aliases_in_query(query: &Query) -> EngineResult<()> {
+    if let Some(with) = query.with.as_ref() {
+        for cte in &with.cte_tables {
+            check_aliases_in_query(&cte.query)?;
+        }
+    }
+    check_aliases_in_body(&query.body)
+}
+
+fn check_aliases_in_body(body: &SetExpr) -> EngineResult<()> {
+    match body {
+        SetExpr::Select(select) => {
+            for item in &select.projection {
+                if let SelectItem::ExprWithAlias { alias, expr } = item {
+                    name::check_column_name(&alias.value)?;
+                    check_aliases_in_expr(expr)?;
+                } else if let SelectItem::UnnamedExpr(expr) = item {
+                    check_aliases_in_expr(expr)?;
+                }
+            }
+            for e in select.selection.iter().chain(select.having.iter()) {
+                check_aliases_in_expr(e)?;
+            }
+            for table in &select.from {
+                check_aliases_in_table(&table.relation)?;
+                for join in &table.joins {
+                    check_aliases_in_table(&join.relation)?;
+                }
+            }
+            Ok(())
+        }
+        SetExpr::Query(inner) => check_aliases_in_query(inner),
+        SetExpr::SetOperation { left, right, .. } => {
+            check_aliases_in_body(left)?;
+            check_aliases_in_body(right)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Refuses an over-long alias written inside an expression's subquery.
+///
+/// `subexpressions` deliberately stops at a subquery and at a function's
+/// arguments, because the walks that *resolve* names must: a subquery's
+/// columns are resolved in its own scope, not the enclosing one. Refusing is
+/// the opposite case. 8.3 applies the limit to every alias anywhere in a
+/// view's definition, however deeply it is buried, so this walk descends where
+/// that one stops. Measured there, all 1166, and all accepted here before:
+///
+/// ```text
+/// CREATE VIEW v AS SELECT COALESCE((SELECT 1 AS <65>), 1) AS y
+/// CREATE VIEW v AS SELECT 1 AS y FROM t WHERE i IN (SELECT 1 AS <65>)
+/// CREATE VIEW v AS SELECT 1 AS y FROM t WHERE EXISTS (SELECT 1 AS <65>)
+/// CREATE VIEW v AS SELECT 1 AS y FROM t HAVING MAX(i) = (SELECT 1 AS <65>)
+/// CREATE VIEW v AS SELECT 1 AS y FROM t WHERE i > ALL (SELECT 1 AS <65>)
+/// ```
+///
+/// while every one of those answers without the `CREATE VIEW`, which is what
+/// makes this the view path's business and not the executor's.
+///
+/// `AnyOp` and `AllOp` are matched here rather than left to `subexpressions`
+/// because that function does not carry them and ends in a catch-all, so the
+/// `ALL` line above would walk into nothing. That catch-all is the same shape
+/// the note on `subexpressions` records drifting before, and it is the
+/// residual risk here too: a query-bearing variant this match does not name is
+/// not refused rather than being a compile error.
+fn check_aliases_in_expr(e: &Expr) -> EngineResult<()> {
+    match e {
+        Expr::Subquery(query) => check_aliases_in_query(query)?,
+        Expr::InSubquery { subquery, .. } => check_aliases_in_query(subquery)?,
+        Expr::Exists { subquery, .. } => check_aliases_in_query(subquery)?,
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            check_aliases_in_expr(left)?;
+            check_aliases_in_expr(right)?;
+        }
+        // A function's arguments, which `subexpressions` omits because the
+        // resolving walks disagree about what an aggregate's arguments mean.
+        // Nothing here reads the argument, only what it may hide.
+        Expr::Function(f) => {
+            for arg in function_arguments(f) {
+                check_aliases_in_expr(&arg)?;
+            }
+        }
+        _ => {}
+    }
+    for sub in subexpressions(e) {
+        check_aliases_in_expr(sub)?;
+    }
+    Ok(())
+}
+
+fn check_aliases_in_table(factor: &TableFactor) -> EngineResult<()> {
+    match factor {
+        TableFactor::Derived { subquery, .. } => check_aliases_in_query(subquery),
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            check_aliases_in_table(&table_with_joins.relation)?;
+            for join in &table_with_joins.joins {
+                check_aliases_in_table(&join.relation)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 

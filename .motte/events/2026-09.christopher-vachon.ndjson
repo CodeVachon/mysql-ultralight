@@ -69,3 +69,8 @@
 {"at":"2026-09-03T08:26:13Z","id":106,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
 {"at":"2026-09-03T08:27:05Z","id":107,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
 {"at":"2026-09-03T09:05:54Z","id":167,"by":"Christopher Vachon","as":"user","type":"created","title":"UNSIGNED survives a UNION for a decimal or a float","state":"Todo"}
+{"at":"2026-09-03T09:22:20Z","id":105,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T09:22:20Z","id":106,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T09:52:21Z","id":150,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T10:09:34Z","id":168,"by":"Christopher Vachon","as":"user","type":"created","title":"A cut alias raises no warning, and no statement ever does","state":"Todo"}
+{"at":"2026-09-03T10:30:29Z","id":169,"by":"Christopher Vachon","as":"user","type":"created","title":"A table reference longer than 64 characters is 1146, not 1059","state":"Todo"}

@@ -20,6 +20,20 @@ pub fn create_table(
     session: &mut Session,
     create: &CreateTable,
 ) -> EngineResult<Outcome> {
+    // Before the name is split and before anything is looked up: 8.3 settles
+    // an identifier's length while it parses, so it wins over every other
+    // refusal the statement could raise. Measured there — `CREATE TABLE
+    // <65 chars> AS SELECT * FROM nosuch` is 1059 and not 1146, `CREATE TABLE
+    // IF NOT EXISTS <existing> (<65 chars> INT)` is 1059 and not silence, and
+    // `(b INT, b INT, <65 chars> INT)` is 1059 and not 1060.
+    //
+    // Both parts, because the database is an identifier too: `CREATE TABLE
+    // <65 chars>.t` is 1059 on 8.3 rather than the 1049 an unknown database
+    // would give.
+    for part in name::parts(&create.name) {
+        name::check_identifier(&part)?;
+    }
+
     let (db, name) = engine.split_name_public(session, &create.name)?;
 
     if let Some(like) = &create.like {
@@ -54,6 +68,21 @@ pub fn create_table(
         )?);
     }
     table.checks.append(&mut inline_checks);
+
+    // The names the query hands over are checked too, and answered 1166 where
+    // the definition's own columns are answered 1059 — measured on 8.3, both
+    // for an explicit alias and for the name an unaliased expression generates
+    // (`AS SELECT i+1+1+...` past 64 characters is 1166 there).
+    //
+    // Over the result's *columns* and not its rows, which is the shape #0009's
+    // note is about: `... AS SELECT i AS <65 chars> FROM Empty WHERE 1 = 0`
+    // still refuses, because a name is settled when it is resolved rather than
+    // when a row is evaluated.
+    if let Some(result) = &selected {
+        for column in &result.columns {
+            name::check_column_name(&column.name)?;
+        }
+    }
 
     // A table with no columns is not a table MySQL can make — `CREATE TABLE t
     // ()` is a syntax error there — and it is not one this engine can *answer*
@@ -448,6 +477,11 @@ fn build_column_with_checks(
     position: usize,
     inline_checks: &mut Vec<crate::catalog::Check>,
 ) -> EngineResult<Column> {
+    // Before the type, because 8.3 settles the name while it parses. This is
+    // the check `CREATE TABLE`, `ALTER TABLE ADD COLUMN` and `ALTER TABLE
+    // CHANGE COLUMN` all reach — the three spellings that *define* a column,
+    // and the three 8.3 answers 1059 for.
+    name::check_identifier(&def.name.value)?;
     let declared = SqlType::from_ast(&def.data_type)?;
     declared.check_declaration_limits(&def.name.value)?;
     let mut column = Column::new(def.name.value.clone(), declared);
@@ -457,6 +491,17 @@ fn build_column_with_checks(
     column.nullable = true;
 
     for option in &def.options {
+        // `CONSTRAINT <name> CHECK (...)` written against the column instead of
+        // against the table. It is the same constraint under the same limit,
+        // and `constraint_names` never sees it because that reads a
+        // `TableConstraint` and this is a `ColumnOptionDef` -- so the spelling
+        // one line lower was refused while this one was stored, over-long name
+        // and all, into the catalog and the state image. Measured on 8.3, both
+        // 1059: `CREATE TABLE c (i INT CONSTRAINT <65> CHECK (i > 0))` and
+        // `ALTER TABLE t ADD COLUMN k INT CONSTRAINT <65> CHECK (k > 0)`.
+        if let Some(name) = &option.name {
+            name::check_identifier(&name.value)?;
+        }
         // A declaration's expressions are stored as text here and evaluated
         // per row later, so anything 8.3 settles while it *resolves* has to be
         // settled by the CREATE or it is never settled at all — the zero-rows
@@ -565,6 +610,9 @@ fn build_column_with_checks(
 }
 
 fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineResult<()> {
+    for written in constraint_names(constraint) {
+        name::check_identifier(&written.value)?;
+    }
     match constraint {
         TableConstraint::PrimaryKey(pk) => {
             let (columns, name) = (&pk.columns, &pk.name);
@@ -692,6 +740,66 @@ fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineRe
     Ok(())
 }
 
+/// Refuses an `ALTER TABLE` operation that introduces a name MySQL will not
+/// take.
+///
+/// Only the operations that *introduce* a name. One that names something the
+/// table is supposed to already hold — `DROP COLUMN`, `MODIFY`, `DROP INDEX`,
+/// the old half of a rename — is left to fail its lookup, which is a refusal
+/// either way and is what this engine already answered.
+///
+/// `RENAME COLUMN` is the odd one and is measured, not assumed: 8.3 answers it
+/// 1166 where `ADD COLUMN` and `CHANGE COLUMN` in the same statement position
+/// are 1059.
+fn check_operation_names(operation: &AlterTableOperation) -> EngineResult<()> {
+    match operation {
+        AlterTableOperation::AddColumn { column_def, .. } => {
+            name::check_identifier(&column_def.name.value)
+        }
+        AlterTableOperation::ChangeColumn { new_name, .. } => {
+            name::check_identifier(&new_name.value)
+        }
+        AlterTableOperation::RenameColumn {
+            new_column_name, ..
+        } => name::check_column_name(&new_column_name.value),
+        AlterTableOperation::RenameTable { table_name } => {
+            let (RenameTableNameKind::To(target) | RenameTableNameKind::As(target)) = table_name;
+            name::parts(target)
+                .iter()
+                .try_for_each(|part| name::check_identifier(part))
+        }
+        AlterTableOperation::AddConstraint { constraint, .. } => constraint_names(constraint)
+            .into_iter()
+            .try_for_each(|written| name::check_identifier(&written.value)),
+        AlterTableOperation::RenameConstraint { new_name, .. } => {
+            name::check_identifier(&new_name.value)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Every name a constraint *writes* for itself, whichever clause carried it.
+///
+/// Only the written ones. The names this module invents where a constraint has
+/// none — `PRIMARY`, `<table>_ibfk_1`, `<table>_chk_1`, the columns joined by
+/// underscores — are not identifiers the statement asked for, and 8.3 does not
+/// refuse a table for the length of a name it made up itself.
+///
+/// `UNIQUE` yields two: `CONSTRAINT c UNIQUE (...)` puts the name in `name`
+/// and `UNIQUE INDEX c (...)` — the spelling Prisma generates — puts it in
+/// `index_name`, and reading only one of them would leave the other unchecked.
+fn constraint_names(constraint: &TableConstraint) -> Vec<&sqlparser::ast::Ident> {
+    let carried: [Option<&sqlparser::ast::Ident>; 2] = match constraint {
+        TableConstraint::PrimaryKey(pk) => [pk.name.as_ref(), pk.index_name.as_ref()],
+        TableConstraint::Unique(unique) => [unique.name.as_ref(), unique.index_name.as_ref()],
+        TableConstraint::Index(index) => [index.name.as_ref(), None],
+        TableConstraint::ForeignKey(fk) => [fk.name.as_ref(), fk.index_name.as_ref()],
+        TableConstraint::Check(check) => [check.name.as_ref(), None],
+        _ => [None, None],
+    };
+    carried.into_iter().flatten().collect()
+}
+
 /// The `COLLATE` a table option carries, where it carries one.
 ///
 /// `DEFAULT CHARSET` beside it is not read: this engine has one character set,
@@ -741,6 +849,15 @@ pub fn alter_table(
     operations: &[AlterTableOperation],
     if_exists: bool,
 ) -> EngineResult<Outcome> {
+    // Before the table is looked up: 8.3 answers `ALTER TABLE nosuch ADD
+    // COLUMN <65 chars> INT` with 1059 rather than 1146, so the length is
+    // settled while the statement is read and not while it is applied. Every
+    // operation is checked before any is applied for the same reason the loop
+    // below works on a copy — one statement either happens or does not.
+    for operation in operations {
+        check_operation_names(operation)?;
+    }
+
     let (db, table_name) = engine.split_name_public(session, name)?;
     engine.mark_modified_public(session, &db, &table_name);
     let mut catalog = engine.catalog_mut_public()?;
@@ -1004,6 +1121,17 @@ pub fn create_index(
     let table = database
         .table_mut(&table_name)
         .ok_or_else(|| EngineError::no_such_table(&table_name))?;
+
+    // After the table is found and not before, which is where 8.3 puts it:
+    // `CREATE INDEX <65 chars> ON nosuch (i)` is 1146 there, where the same
+    // over-long name reached through `ALTER TABLE nosuch ADD INDEX` is 1059.
+    // The two paths really do disagree, so neither one is a guess about the
+    // other.
+    if let Some(written) = create.name.as_ref() {
+        for part in name::parts(written) {
+            name::check_identifier(&part)?;
+        }
+    }
 
     let name = create
         .name

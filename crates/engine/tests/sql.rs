@@ -13075,8 +13075,10 @@ fn a_generated_column_name_stops_at_255_bytes() {
         (format!("SELECT '{long}'"), "a".repeat(255)),
         (format!("SELECT {call}"), call[..255].to_owned()),
         (format!("SELECT '{wide}'"), "é".repeat(127)),
-        // An alias is an identifier and is not this path: it is not cut here.
-        (format!("SELECT 1 AS {long}"), long.clone()),
+        // An alias is an identifier and is cut on its own terms: 256 bytes
+        // rather than 255, which is why the two limits are separate constants
+        // and this line reads 256. See `an_alias_is_reported_cut_at_256_bytes`.
+        (format!("SELECT 1 AS {long}"), "a".repeat(256)),
     ] {
         let described = engine.describe(&session, &sql, 0).unwrap().unwrap();
         assert_eq!(described[0].name, expected, "describing {sql}");
@@ -24147,5 +24149,502 @@ fn unary_minus_over_a_string_is_a_double() {
     ] {
         let described = engine.describe(&session, sql, 0).unwrap().unwrap();
         assert_eq!(format!("{:?}", described[0].ty), "Double", "{sql}");
+    }
+}
+/// The cut is what the alias *is*, not only what is reported.
+///
+/// MySQL cuts the alias when it stores it, so a later clause resolves against
+/// the cut name and not the written one. Measured on 8.3: ``SELECT 1 AS
+/// `<300>` ORDER BY `<300>` `` is 1054 there, and ordering by the first 256
+/// answers.
+#[test]
+fn a_clause_resolves_an_alias_by_its_cut_name() {
+    let (engine, mut session) = engine();
+    let written = "a".repeat(300);
+    let cut = "a".repeat(256);
+    run(&engine, &mut session, "CREATE TABLE Src (i INT)");
+    run(&engine, &mut session, "INSERT INTO Src VALUES (1)");
+
+    for sql in [
+        format!("SELECT 1 AS `{written}` ORDER BY `{cut}`"),
+        format!("SELECT 1 AS `{written}` HAVING `{cut}` = 1"),
+        // A HAVING over a real relation, which is the path that rewrites the
+        // name into the expression behind it rather than only resolving it.
+        // Both halves have to agree on which name that is, or a statement that
+        // resolves goes on to evaluate an identifier nothing answers to.
+        format!("SELECT i + 1 AS `{written}` FROM Src HAVING `{cut}` = 2"),
+        // ORDER BY over a real relation resolves its key against the select
+        // list's names, which is a third reader again.
+        format!("SELECT i AS `{written}` FROM Src ORDER BY `{cut}`"),
+    ] {
+        let Outcome::Rows(executed) = run(&engine, &mut session, &sql) else {
+            panic!("expected rows from {sql}");
+        };
+        assert_eq!(executed.columns[0].name, cut, "{sql}");
+        assert_eq!(executed.rows.len(), 1, "{sql}");
+    }
+
+    for sql in [
+        format!("SELECT 1 AS `{written}` ORDER BY `{written}`"),
+        format!("SELECT 1 AS `{written}` HAVING `{written}` = 1"),
+    ] {
+        let err = engine.execute(&mut session, &sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1054, "{sql} -> {err}");
+    }
+}
+
+/// MySQL takes an identifier of at most 64 characters and refuses a longer one
+/// with 1059, on every path that *names* something.
+///
+/// Measured on 8.3 rather than remembered, one statement per row below. The
+/// point of the refusal is the DDL: a migration that creates a 65-character
+/// column here and fails against a real server has been tested against the
+/// wrong thing, which is the one outcome this engine exists to prevent.
+#[test]
+fn a_ddl_identifier_past_64_characters_is_refused() {
+    let (engine, mut session) = engine();
+    let ok = "a".repeat(64);
+    let long = "a".repeat(65);
+    run(&engine, &mut session, "CREATE TABLE Anchor (i INT)");
+
+    for sql in [
+        // A column being defined, in all three spellings that define one.
+        format!("CREATE TABLE T1 (`{long}` INT)"),
+        format!("ALTER TABLE Anchor ADD COLUMN `{long}` INT"),
+        format!("ALTER TABLE Anchor CHANGE COLUMN i `{long}` INT"),
+        // A table, written plain and with a database in front of it.
+        format!("CREATE TABLE `{long}` (i INT)"),
+        format!("CREATE TABLE testdb.`{long}` (i INT)"),
+        format!("CREATE TABLE `{long}`.t (i INT)"),
+        format!("ALTER TABLE Anchor RENAME TO `{long}`"),
+        // A database.
+        format!("CREATE DATABASE `{long}`"),
+        format!("CREATE DATABASE IF NOT EXISTS `{long}`"),
+        // An index or a key, inline and through both ALTER spellings.
+        format!("CREATE TABLE T2 (i INT, KEY `{long}` (i))"),
+        // The spelling Prisma generates, which carries its name in
+        // `index_name` where `CONSTRAINT c UNIQUE` carries it in `name`.
+        // Reading only one of the two would leave this accepted.
+        format!("CREATE TABLE T8 (i INT, UNIQUE KEY `{long}` (i))"),
+        format!("CREATE INDEX `{long}` ON Anchor (i)"),
+        format!("ALTER TABLE Anchor ADD INDEX `{long}` (i)"),
+        // A constraint, of each kind that carries a name.
+        format!("CREATE TABLE T3 (i INT, CONSTRAINT `{long}` PRIMARY KEY (i))"),
+        format!("CREATE TABLE T4 (i INT, CONSTRAINT `{long}` UNIQUE (i))"),
+        format!("CREATE TABLE T5 (i INT, CONSTRAINT `{long}` CHECK (i > 0))"),
+        format!("ALTER TABLE Anchor ADD CONSTRAINT `{long}` CHECK (i > 0)"),
+        format!(
+            "CREATE TABLE T6 (i INT, CONSTRAINT `{long}` FOREIGN KEY (i) REFERENCES Anchor (i))"
+        ),
+        // A view's own name, which is an identifier where its columns are not.
+        format!("CREATE VIEW `{long}` AS SELECT 1"),
+        // The same constraint written against the column rather than the
+        // table. `constraint_names` reads a `TableConstraint` and never sees
+        // this one, so T5 above was refused while this was stored.
+        format!("CREATE TABLE T7 (i INT CONSTRAINT `{long}` CHECK (i > 0))"),
+        format!("ALTER TABLE Anchor ADD COLUMN k INT CONSTRAINT `{long}` CHECK (k > 0)"),
+    ] {
+        let err = engine.execute(&mut session, &sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1059, "{sql} -> {err}");
+        assert_eq!(err.sql_state, "42000", "{sql}");
+        assert_eq!(
+            err.message,
+            format!("Identifier name '{long}' is too long"),
+            "{sql}"
+        );
+    }
+
+    // Nothing was created by any of them, and the anchor is untouched: the
+    // refusal has to leave the catalog where it found it, or a failed
+    // migration would be half applied.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = 'testdb' ORDER BY TABLE_NAME"
+        ),
+        vec![vec!["Anchor"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Anchor'"
+        ),
+        vec![vec!["i"]]
+    );
+
+    // One character shorter is a name MySQL takes, and information_schema
+    // reports all 64 of it rather than a cut.
+    run(
+        &engine,
+        &mut session,
+        &format!("CREATE TABLE `{ok}` (i INT)"),
+    );
+    run(
+        &engine,
+        &mut session,
+        &format!("ALTER TABLE Anchor ADD COLUMN `{ok}` INT"),
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            &format!(
+                "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+                 WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = '{ok}'"
+            )
+        ),
+        vec![vec!["i"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            &format!(
+                "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+                 WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Anchor' \
+                 AND COLUMN_NAME = '{ok}'"
+            )
+        ),
+        vec![vec![ok.as_str()]]
+    );
+}
+
+/// A column name MySQL *derives* rather than defines is the same limit
+/// answered 1166.
+///
+/// The two codes are not interchangeable and both were measured on 8.3:
+/// ``CREATE TABLE t (`<65>` INT)`` is 1059 there and ``CREATE TABLE t AS
+/// SELECT 1 AS `<65>` `` is 1166, in the same server, one statement apart.
+#[test]
+fn a_derived_column_name_past_64_characters_is_refused_as_1166() {
+    let (engine, mut session) = engine();
+    let long = "a".repeat(65);
+    run(&engine, &mut session, "CREATE TABLE Src (i INT)");
+    run(&engine, &mut session, "INSERT INTO Src VALUES (1)");
+
+    for sql in [
+        // The names `CREATE TABLE ... AS SELECT` takes from its query, whether
+        // written as an alias or generated from the expression's text.
+        format!("CREATE TABLE C1 AS SELECT 1 AS `{long}`"),
+        // Over an empty relation, which is the shape #0009's note is about: a
+        // check that lives in the row loop disappears here.
+        format!("CREATE TABLE C3 AS SELECT i AS `{long}` FROM Src WHERE 1 = 0"),
+        format!("CREATE TABLE C4 AS SELECT i AS `{long}` FROM Src LIMIT 0"),
+        // A view's columns, written in its column list or as an alias
+        // anywhere in its definition — including a branch of a union and a
+        // derived table, neither of which names the view's own columns.
+        format!("CREATE VIEW V1 (`{long}`) AS SELECT 1"),
+        format!("CREATE VIEW V2 AS SELECT 1 AS `{long}`"),
+        format!("CREATE VIEW V3 AS SELECT 1 AS x UNION SELECT 2 AS `{long}`"),
+        format!("CREATE VIEW V4 AS SELECT * FROM (SELECT 1 AS `{long}`) d"),
+        format!("CREATE VIEW V5 AS WITH c AS (SELECT 1 AS `{long}`) SELECT * FROM c"),
+        // An alias inside a subquery written in an *expression* rather than in
+        // the FROM. The walk stopped at these, so each was accepted while V4's
+        // derived table -- the same alias one level of nesting away -- was
+        // refused. Each is 1166 on 8.3 and answers without the CREATE VIEW.
+        format!("CREATE VIEW V6 AS SELECT COALESCE((SELECT 1 AS `{long}`), 1) AS y"),
+        format!("CREATE VIEW V7 AS SELECT 1 AS y FROM Src WHERE i IN (SELECT 1 AS `{long}`)"),
+        format!("CREATE VIEW V8 AS SELECT 1 AS y FROM Src WHERE EXISTS (SELECT 1 AS `{long}`)"),
+        format!("CREATE VIEW V9 AS SELECT 1 AS y FROM Src HAVING MAX(i) = (SELECT 1 AS `{long}`)"),
+        format!("CREATE VIEW VA AS SELECT 1 AS y FROM Src WHERE i > ALL (SELECT 1 AS `{long}`)"),
+        // And the rename, which is the one ALTER operation 8.3 answers 1166
+        // for where its neighbours are 1059.
+        format!("ALTER TABLE Src RENAME COLUMN i TO `{long}`"),
+    ] {
+        let err = engine.execute(&mut session, &sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1166, "{sql} -> {err}");
+        assert_eq!(err.sql_state, "42000", "{sql}");
+        assert_eq!(
+            err.message,
+            format!("Incorrect column name '{long}'"),
+            "{sql}"
+        );
+    }
+
+    // A name generated from the expression's text rather than written as an
+    // alias, which is the same refusal reporting a different name. Measured on
+    // 8.3, where `CREATE TABLE t AS SELECT i+1+1+...` past 64 characters is
+    // 1166 quoting the expression.
+    let generated = format!("i{}", "+1".repeat(40));
+    let sql = format!("CREATE TABLE C2 AS SELECT {generated} FROM Src");
+    let err = engine.execute(&mut session, &sql, &[]).unwrap_err();
+    assert_eq!(err.code, 1166, "{sql} -> {err}");
+    assert_eq!(err.message, format!("Incorrect column name '{generated}'"));
+
+    // None of them left anything behind, and `Src` still has its column under
+    // the name it was made with.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = 'testdb' ORDER BY TABLE_NAME"
+        ),
+        vec![vec!["Src"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT i FROM Src"),
+        vec![vec!["1"]]
+    );
+
+    // The same shapes one character shorter all answer, so the refusal is
+    // about the length and not about the shape.
+    let ok = "a".repeat(64);
+    run(
+        &engine,
+        &mut session,
+        &format!("CREATE TABLE C5 AS SELECT 1 AS `{ok}`"),
+    );
+    run(
+        &engine,
+        &mut session,
+        &format!("CREATE VIEW V6 AS SELECT 1 AS `{ok}`"),
+    );
+    run(
+        &engine,
+        &mut session,
+        &format!("ALTER TABLE Src RENAME COLUMN i TO `{ok}`"),
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT * FROM V6"),
+        vec![vec!["1"]]
+    );
+}
+
+/// The kinds MySQL does *not* limit, kept here so the check is not widened
+/// into them by someone who assumed 64 was universal.
+///
+/// All measured on 8.3 at 300 characters, and all of them answer: a table
+/// alias, a CTE's *column* names, and a savepoint, which takes a
+/// 1000-character name and rolls back to it.
+///
+/// A CTE's own name belongs on this list too, which is not what an earlier
+/// draft of this comment said. Defining one is not limited — `WITH <65> AS
+/// (SELECT 1 AS x) SELECT 1` answers on 8.3, and an unreferenced CTE is not
+/// even evaluated there. What is limited is *referencing* an over-long name:
+/// `SELECT * FROM <65>` is 1059, which is where the 1059 for `WITH <65> AS
+/// (...) SELECT * FROM <65>` actually comes from. That limit is on the table
+/// reference and is not implemented here — this engine answers 1146. See
+/// #0169.
+#[test]
+fn a_table_alias_a_cte_column_and_a_savepoint_carry_no_length_limit() {
+    let (engine, mut session) = engine();
+    let long = "a".repeat(300);
+
+    let Outcome::Rows(executed) = run(
+        &engine,
+        &mut session,
+        &format!("SELECT `{long}`.x FROM (SELECT 1 AS x) AS `{long}`"),
+    ) else {
+        panic!("expected rows through a long table alias");
+    };
+    assert_eq!(executed.rows.len(), 1);
+
+    let Outcome::Rows(executed) = run(
+        &engine,
+        &mut session,
+        &format!("WITH c (`{long}`) AS (SELECT 1) SELECT * FROM c"),
+    ) else {
+        panic!("expected rows through a long CTE column name");
+    };
+    assert_eq!(executed.columns[0].name, long);
+
+    run(&engine, &mut session, "BEGIN");
+    run(
+        &engine,
+        &mut session,
+        &format!("SAVEPOINT `{}`", "a".repeat(1000)),
+    );
+    run(
+        &engine,
+        &mut session,
+        &format!("ROLLBACK TO `{}`", "a".repeat(1000)),
+    );
+    run(&engine, &mut session, "COMMIT");
+}
+
+/// An alias is not refused at all: MySQL reports the first 256 bytes of it.
+///
+/// The third limit and the third path — 64 characters for an identifier, 255
+/// bytes for a generated name, 256 bytes for an alias — all measured on 8.3.
+/// The cut is on a character boundary with nothing appended, so 254 `a` and a
+/// three-byte `€` come back as the 254 `a` at 254 bytes rather than padded.
+#[test]
+fn an_alias_is_reported_cut_at_256_bytes() {
+    let (engine, mut session) = engine();
+
+    for (alias, expected) in [
+        ("a".repeat(255), "a".repeat(255)),
+        ("a".repeat(256), "a".repeat(256)),
+        ("a".repeat(257), "a".repeat(256)),
+        ("a".repeat(300), "a".repeat(256)),
+        // Bytes, not characters: 129 two-byte characters overrun 256 by two.
+        ("é".repeat(128), "é".repeat(128)),
+        ("é".repeat(129), "é".repeat(128)),
+        ("é".repeat(300), "é".repeat(128)),
+        // The boundary, and the reason it is a boundary cut: 254 bytes rather
+        // than 256 with a question mark on the end.
+        ("a".repeat(254) + "€€€€€", "a".repeat(254)),
+        ("a".repeat(253) + "€€€€€", "a".repeat(253) + "€"),
+    ] {
+        let sql = format!("SELECT 1 AS `{alias}`");
+        let Outcome::Rows(executed) = run(&engine, &mut session, &sql) else {
+            panic!("expected rows from an aliased select");
+        };
+        assert_eq!(
+            executed.columns[0].name,
+            expected,
+            "running an alias of {} bytes",
+            alias.len()
+        );
+        assert!(executed.columns[0].name.len() <= 256);
+        // Describing has to agree, or a prepared client reads one name and an
+        // executing one another.
+        let described = engine.describe(&session, &sql, 0).unwrap().unwrap();
+        assert_eq!(
+            described[0].name,
+            expected,
+            "describing {} bytes",
+            alias.len()
+        );
+    }
+
+    // The grouped plan and the window plan each build their own list of
+    // names, and both have to cut the same way — a column name that depends
+    // on which plan the statement took is a column a client cannot key a row
+    // by.
+    run(&engine, &mut session, "CREATE TABLE Src (i INT)");
+    run(&engine, &mut session, "INSERT INTO Src VALUES (1)");
+    let written = "a".repeat(300);
+    for sql in [
+        format!("SELECT COUNT(*) AS `{written}` FROM Src GROUP BY i"),
+        format!("SELECT ROW_NUMBER() OVER () AS `{written}` FROM Src"),
+        // And the shapes that carry a name out of an inner query: a derived
+        // table, a CTE and a union all take theirs from an item one level
+        // down, so the cut has to have happened before it is carried.
+        format!("SELECT * FROM (SELECT 1 AS `{written}`) d"),
+        format!("WITH c AS (SELECT 1 AS `{written}`) SELECT * FROM c"),
+        format!("SELECT 1 AS `{written}` UNION SELECT 2 AS `{written}`"),
+    ] {
+        let Outcome::Rows(executed) = run(&engine, &mut session, &sql) else {
+            panic!("expected rows from {sql}");
+        };
+        assert_eq!(executed.columns[0].name, "a".repeat(256), "{sql}");
+    }
+}
+
+/// The name quoted in 1059 and 1166 is cut at 100 bytes, and a character
+/// straddling the cut becomes one `?` per byte it would have taken.
+///
+/// Measured on 8.3, which is the only way to know it: the cut is a `%-.100s`
+/// and the padding is not a character-boundary trim like the ones elsewhere in
+/// this engine. 98 `a` and a three-byte `€` come back with *two* question
+/// marks, 99 `a` and the same `€` with one, and 97 `a` and the `€` — exactly
+/// 100 bytes — come back whole.
+#[test]
+fn an_over_long_name_is_quoted_into_the_message_cut_at_100_bytes() {
+    let (engine, mut session) = engine();
+
+    for (name, expected) in [
+        ("a".repeat(300), "a".repeat(100)),
+        ("a".repeat(97) + "€€€€€", "a".repeat(97) + "€"),
+        ("a".repeat(98) + "€€€€€", "a".repeat(98) + "??"),
+        ("a".repeat(99) + "€€€€€", "a".repeat(99) + "?"),
+        // Two-byte characters: 50 of them are exactly 100 bytes, so this one
+        // comes back whole as well.
+        ("é".repeat(70), "é".repeat(50)),
+        (
+            "a".to_owned() + &"é".repeat(70),
+            "a".to_owned() + &"é".repeat(49) + "?",
+        ),
+    ] {
+        let sql = format!("CREATE TABLE T (`{name}` INT)");
+        let err = engine.execute(&mut session, &sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1059, "{sql}");
+        assert_eq!(
+            err.message,
+            format!("Identifier name '{expected}' is too long"),
+            "quoting {} characters",
+            name.chars().count()
+        );
+        // Every truncated one is exactly 100 bytes, which is what the padding
+        // is for.
+        assert_eq!(expected.len(), 100, "{expected}");
+    }
+}
+
+/// The length is settled while the statement is read, so 1059 beats the
+/// refusals a later stage would have raised.
+///
+/// Each of these is a statement with two things wrong with it, and 8.3 reports
+/// the length. `CREATE INDEX` is the measured exception and is here to keep it
+/// from being tidied into agreement with the others.
+#[test]
+fn the_identifier_length_is_settled_before_anything_is_looked_up() {
+    let (engine, mut session) = engine();
+    let long = "a".repeat(65);
+    run(&engine, &mut session, "CREATE TABLE Anchor (i INT)");
+
+    for sql in [
+        // The table does not exist: 1059 rather than 1146.
+        format!("ALTER TABLE Nope ADD COLUMN `{long}` INT"),
+        // The table already exists, with and without the clause that would
+        // otherwise excuse it: 1059 rather than 1050 or silence.
+        format!("CREATE TABLE Anchor (`{long}` INT)"),
+        format!("CREATE TABLE IF NOT EXISTS Anchor (`{long}` INT)"),
+        // The query names a table that is not there: 1059 rather than 1146.
+        format!("CREATE TABLE `{long}` AS SELECT * FROM Nope"),
+        // Two columns of one name as well: 1059 rather than 1060.
+        format!("CREATE TABLE T7 (b INT, b INT, `{long}` INT)"),
+    ] {
+        let err = engine.execute(&mut session, &sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1059, "{sql} -> {err}");
+    }
+
+    // The exception, measured: `CREATE INDEX` finds its table first, so an
+    // over-long index name on a table that is not there is 1146 — where the
+    // same name through `ALTER TABLE Nope ADD INDEX` is 1059 above.
+    let sql = format!("CREATE INDEX `{long}` ON Nope (i)");
+    let err = engine.execute(&mut session, &sql, &[]).unwrap_err();
+    assert_eq!(err.code, 1146, "{sql} -> {err}");
+
+    // An ALTER is one statement however many operations it lists, so the
+    // operations before the over-long one do not survive it.
+    let sql = format!("ALTER TABLE Anchor ADD COLUMN j INT, ADD COLUMN `{long}` INT");
+    let err = engine.execute(&mut session, &sql, &[]).unwrap_err();
+    assert_eq!(err.code, 1059, "{sql} -> {err}");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Anchor'"
+        ),
+        vec![vec!["i"]]
+    );
+}
+
+/// The 64 are characters, not bytes.
+///
+/// Measured on 8.3, and worth measuring because the other name limit this
+/// engine implements — the 255-byte cut on a generated column name — counts
+/// bytes. A column named with 64 two-byte characters is 128 bytes long and is
+/// accepted; 64 four-byte ones are 256 bytes and are accepted too.
+#[test]
+fn the_identifier_limit_counts_characters_and_not_bytes() {
+    let (engine, mut session) = engine();
+
+    for (wide, label) in [("é", "two_byte"), ("𝄞", "four_byte")] {
+        let ok = wide.repeat(64);
+        let long = wide.repeat(65);
+        let sql = format!("CREATE TABLE T{label}ok (`{ok}` INT)");
+        run(&engine, &mut session, &sql);
+        let sql = format!("CREATE TABLE T{label}long (`{long}` INT)");
+        let err = engine.execute(&mut session, &sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1059, "{label}: {sql}");
     }
 }

@@ -1,11 +1,11 @@
 ---
 id: 150
 title: A duplicate CREATE INDEX is accepted
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-09-01T06:09:09Z
-updated: 2026-09-01T06:09:09Z
+updated: 2026-09-03T09:52:21Z
 ---
 
 ## Description
