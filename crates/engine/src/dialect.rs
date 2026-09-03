@@ -37,10 +37,19 @@ pub struct SqlMode {
     pub real_as_float: bool,
     /// Writes that would truncate or lose data are errors, not warnings.
     ///
-    /// Parsed and not yet read by anything: the engine refuses an
-    /// out-of-range write under every mode, so its behaviour does not turn on
-    /// this. Kept rather than deleted only because the flag it comes from is
-    /// real; it needs implementing or removing, like `real_as_float` did.
+    /// Read at write time, through the statement scope `crate::exec`
+    /// publishes, for the same reason `real_as_float` above is: a value is
+    /// written into a column several calls below the only place that holds the
+    /// session. Without it a string wider than the column declares is cut to
+    /// the width and an out-of-range number is clamped to the end of the
+    /// range, which is what 8.3 does — 300 into a TINYINT is 127 there under
+    /// `sql_mode=''`, and 1264 under the default mode.
+    ///
+    /// Two things it does *not* yet reach, both of which stay errors under
+    /// every mode: a value that is not a number at all going into a numeric
+    /// column, which 8.3 stores as 0 with warning 1366, and a FLOAT whose
+    /// declared `(M,D)` cannot hold it. Each is a wrong stored value rather
+    /// than a missing one, so refusing is the safer of the two gaps.
     pub strict: bool,
     /// A grouped query may only select columns it grouped by, or aggregates.
     pub only_full_group_by: bool,
@@ -76,12 +85,6 @@ impl SqlMode {
                 // setting it rather than taken from the manual. The list was
                 // short by two — `REAL_AS_FLOAT` and `ONLY_FULL_GROUP_BY` —
                 // which was invisible only while the first of those was inert.
-                //
-                // `TRADITIONAL` is deliberately absent: 8.3 expands it to the
-                // STRICT pair and the NO_ZERO/division flags, and this struct
-                // has no live field for any of them. `strict` is set by the
-                // arm above and read by nothing, so an arm here would add a
-                // second lie rather than remove one. See the note on `strict`.
                 "ANSI" => {
                     out.real_as_float = true;
                     out.pipes_as_concat = true;
@@ -89,6 +92,17 @@ impl SqlMode {
                     out.ignore_space = true;
                     out.only_full_group_by = true;
                 }
+                // The other compound mode, and the one that turns strictness
+                // on. 8.3 reads `SET sql_mode='TRADITIONAL'` back as
+                // `STRICT_TRANS_TABLES,STRICT_ALL_TABLES,NO_ZERO_IN_DATE,
+                // NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,TRADITIONAL,
+                // NO_ENGINE_SUBSTITUTION` — measured, not taken from the
+                // manual — and `strict` is the only one of those seven this
+                // struct has a field for. The four it does not are a gap of
+                // their own; leaving the whole arm out was only defensible
+                // while `strict` was inert, and under it `'abcdef'` into a
+                // `VARCHAR(3)` stored `abc` where 8.3 answers 1406.
+                "TRADITIONAL" => out.strict = true,
                 _ => {}
             }
         }

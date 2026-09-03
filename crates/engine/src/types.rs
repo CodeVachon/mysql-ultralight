@@ -698,6 +698,89 @@ impl SqlType {
         }
     }
 
+    /// `n` under the column's own signedness.
+    ///
+    /// Tagged here because this is the last place the column's declaration and
+    /// the value are both in hand — the same argument the ENUM ordinal makes.
+    /// An operand being subtracted from something has no column left to ask,
+    /// and whether `iu - 100` is 1690 or -93 is entirely the column's answer.
+    /// See #0069.
+    fn tagged_int(&self, n: i128) -> Value {
+        if self.unsigned {
+            Value::Unsigned(n as u64)
+        } else {
+            Value::Int(n as i64)
+        }
+    }
+
+    /// The most a value of this column may be, and in what unit.
+    ///
+    /// The unit is not a detail: a `VARCHAR(3)` counts three *characters*, so
+    /// `'ééé'` is six bytes and taken while `'éééé'` is 1406; a `TINYTEXT`
+    /// counts 255 *bytes*, so 127 of the same character fit and 128 do not.
+    /// Both measured on 8.3. The byte widths are the ones the spelling
+    /// implies, because a TEXT column has a maximum whether or not the DDL
+    /// wrote one.
+    fn capacity(&self) -> Option<Capacity> {
+        match self.kind {
+            TypeKind::Text => Some(match self.base_name().as_str() {
+                "tinytext" => Capacity::Bytes(255),
+                "text" => Capacity::Bytes(65_535),
+                "mediumtext" => Capacity::Bytes(16_777_215),
+                "longtext" => Capacity::Bytes(4_294_967_295),
+                // A bare `CHAR` is `CHAR(1)`, which is what MySQL reports for
+                // one and what it holds. It is its own variant because the
+                // padding is part of the type rather than of the width.
+                "char" => Capacity::Padded(self.length.unwrap_or(1)),
+                // A `VARCHAR` with no length is not a MySQL type at all — 8.3
+                // answers 1064 for the declaration — but sqlparser accepts one
+                // and this engine has always built a column from it. Reading
+                // the missing length as 1 would make that column hold a single
+                // character, which is a width nobody wrote; no width is the
+                // honest answer for a declaration MySQL would not have taken.
+                _ => Capacity::Chars(self.length?),
+            }),
+            TypeKind::Blob => Some(match self.base_name().as_str() {
+                "tinyblob" => Capacity::Bytes(255),
+                "blob" => Capacity::Bytes(65_535),
+                "mediumblob" => Capacity::Bytes(16_777_215),
+                "longblob" => Capacity::Bytes(4_294_967_295),
+                // A bare `BINARY` is `BINARY(1)` and carries its length from
+                // `from_ast`; a `VARBINARY` with none is the same non-type as
+                // the `VARCHAR` above, and gets the same answer.
+                _ => Capacity::Bytes(self.length?),
+            }),
+            _ => None,
+        }
+    }
+
+    /// [`Self::coerce`], and then what the column *declares* it can hold.
+    ///
+    /// Separate from `coerce` because not every caller is a write. A derived
+    /// table, a CTE and a `CREATE TABLE ... AS SELECT` all rebuild their
+    /// columns from an `SqlType`, and this engine has no width arithmetic for
+    /// a computed column — [`Self::from_column_type`] declares `varchar(512)`
+    /// for every one of them. Holding a value to *that* number would cut a
+    /// computed string at 512 characters, turning a width that was only ever
+    /// cosmetic into lost data. So only a column some DDL declared is held to
+    /// its width, and the write paths are the ones that call this.
+    pub fn store(&self, value: Value, column: &str) -> EngineResult<Value> {
+        let value = self.coerce(value, column)?;
+        let Some(capacity) = self.capacity() else {
+            return Ok(value);
+        };
+        match value {
+            Value::Text(text, _) => Ok(Value::collated(
+                fitted_text(text, capacity, column)?,
+                self.collation,
+            )),
+            Value::Bytes(bytes) => Ok(Value::Bytes(fitted_bytes(bytes, capacity, column)?)),
+            // NULL, and nothing else `coerce` answers for a column that
+            // declares a width.
+            other => Ok(other),
+        }
+    }
+
     pub fn coerce(&self, value: Value, column: &str) -> EngineResult<Value> {
         if value.is_null() {
             return Ok(Value::Null);
@@ -715,32 +798,44 @@ impl SqlType {
             )
         };
 
+        // The row is a running count of what the statement has written, for
+        // the same reason `too_long` carries one: 8.3 names row 2 when the
+        // second row of a three-row INSERT is the one out of range, and this
+        // said row 1 for every row of every statement.
         let out_of_range = || {
             EngineError::new(
                 1264,
                 "22003",
-                format!("Out of range value for column '{column}' at row 1"),
+                format!(
+                    "Out of range value for column '{column}' at row {}",
+                    WRITE.with(|w| w.get().row)
+                ),
             )
         };
 
         Ok(match self.kind {
             TypeKind::Bool | TypeKind::Int => {
-                let n = value.as_exact_int().ok_or_else(mismatch)?;
+                // Rounded, not truncated. A `VALUES (1.5)` into an INT is 2 on
+                // 8.3 and was 1 here — wrong stored data on an ordinary
+                // insert, and through a recursive CTE a `+0.5` step that never
+                // advanced. See #0195.
+                let n = stored_int(&value).ok_or_else(mismatch)?;
                 let (low, high) = self.integer_range();
-                if n < low || n > high {
-                    return Err(out_of_range());
+                // The sign of an *exact* value is read before the rounding,
+                // which is the one place the two disagree: -0.4 into an
+                // UNSIGNED column is 1264 on 8.3, where the string `'-0.4'`
+                // and the double `-0.4e0` both round to zero and are taken.
+                let under = n < low || (self.unsigned && negative_decimal(&value));
+                if under || n > high {
+                    if !lenient() {
+                        return Err(out_of_range());
+                    }
+                    // Non-strict clamps to the end of the range it overran and
+                    // carries a warning: 300 into a TINYINT is 127 there, -300
+                    // is -128, and -1 into an UNSIGNED column is 0.
+                    return Ok(self.tagged_int(if under { low } else { high }));
                 }
-                // Tagged here because this is the last place the column's own
-                // signedness and the value are both in hand — the same
-                // argument the ENUM ordinal below makes. An operand being
-                // subtracted from something has no column left to ask, and
-                // whether `iu - 100` is 1690 or -93 is entirely the column's
-                // answer. See #0069.
-                if self.unsigned {
-                    Value::Unsigned(n as u64)
-                } else {
-                    Value::Int(n as i64)
-                }
+                self.tagged_int(n)
             }
             // A YEAR is two bytes on the wire, and MySQL's range for it is
             // 1901 to 2155 with zero for "none". Left unchecked it was the one
@@ -989,8 +1084,248 @@ impl SqlType {
             // An operand in a `WHERE` has no column left to ask, and whether
             // `name = 'cafe'` finds `café` is entirely the column's answer.
             // See #0129, #0134, #0152.
+            //
+            // The declared *width* is not applied here but in
+            // [`Self::store`], which every write goes through: see the note
+            // there on why a computed column's width cannot be enforced.
             _ => Value::collated(value.as_text(), self.collation),
         })
+    }
+}
+
+/// The most a string column can hold, and in which unit it counts.
+#[derive(Debug, Clone, Copy)]
+enum Capacity {
+    /// A `VARCHAR(n)`, which counts characters.
+    Chars(u64),
+    /// A `CHAR(n)`, which counts characters and keeps none of the trailing
+    /// spaces MySQL pads it out with.
+    Padded(u64),
+    /// A TEXT, a BLOB or a `VARBINARY(n)`, which count bytes.
+    Bytes(u64),
+}
+
+/// 1406, which MySQL raises for a value wider than the column declares.
+///
+/// The row it names is a running count of what the statement has written,
+/// which `WriteScope` publishes: a three-row INSERT whose second row is too
+/// wide says `at row 2` on 8.3, and so does an UPDATE that reaches its second
+/// row.
+fn too_long(column: &str) -> EngineError {
+    EngineError::new(
+        1406,
+        "22001",
+        format!(
+            "Data too long for column '{column}' at row {}",
+            WRITE.with(|w| w.get().row)
+        ),
+    )
+}
+
+/// `text`, cut to what the column declares.
+///
+/// Trailing spaces are the exception MySQL makes and the reason this is
+/// not a plain length check: a value whose *non-space* content fits is
+/// truncated to the width and taken, with warning 1265 rather than the
+/// 1406 anything else gets. `'ab   '` into a `VARCHAR(3)` is stored as
+/// `'ab '` on 8.3 and `'abcd '` is refused — measured, both of them.
+///
+/// A CHAR gives up its trailing spaces entirely, which is not a truncation
+/// but what the type is: MySQL pads a CHAR to its width on the way in and
+/// strips the padding on the way out, so a `CHAR(5)` given `'ab  '` reads
+/// back `'ab'` and one given five spaces reads back empty. Stripping here
+/// rather than at every read keeps one stored form per value.
+fn fitted_text(mut text: String, capacity: Capacity, column: &str) -> EngineResult<String> {
+    // Before anything counts them, so `CHAR(3)` given `'ab   '` is two
+    // characters rather than a truncation of five.
+    if matches!(capacity, Capacity::Padded(_)) {
+        text.truncate(text.trim_end_matches(' ').len());
+    }
+    // The byte offset the column's width ends at, or nothing at all when
+    // the whole value is within it.
+    let limit = match capacity {
+        Capacity::Chars(n) | Capacity::Padded(n) => match text.char_indices().nth(n as usize) {
+            Some((offset, _)) => offset,
+            None => return Ok(text),
+        },
+        Capacity::Bytes(n) => {
+            if text.len() as u64 <= n {
+                return Ok(text);
+            }
+            // Back to a character boundary, so a column measured in bytes
+            // cannot be left holding half of one.
+            let mut limit = n as usize;
+            while !text.is_char_boundary(limit) {
+                limit -= 1;
+            }
+            limit
+        }
+    };
+    // Everything past the width is a space, so nothing the column would
+    // have held is being dropped.
+    if text[limit..].chars().all(|c| c == ' ') || lenient() {
+        text.truncate(limit);
+        return Ok(text);
+    }
+    Err(too_long(column))
+}
+
+/// `bytes`, cut to what the column declares.
+///
+/// No space exemption and no character boundary to respect: a binary
+/// column holds bytes, and `VARBINARY(3)` given `'abc '` is 1406 on 8.3
+/// where a `VARCHAR(3)` given the same value is taken.
+fn fitted_bytes(mut bytes: Vec<u8>, capacity: Capacity, column: &str) -> EngineResult<Vec<u8>> {
+    // Always the byte arm — `capacity` counts characters only for a CHAR
+    // or a VARCHAR, and `coerce` never hands one of those back as bytes.
+    let Capacity::Bytes(limit) = capacity else {
+        return Ok(bytes);
+    };
+    if bytes.len() as u64 <= limit {
+        return Ok(bytes);
+    }
+    if !lenient() {
+        return Err(too_long(column));
+    }
+    bytes.truncate(limit as usize);
+    Ok(bytes)
+}
+
+/// The integer a value is stored as, rounded the way MySQL rounds it.
+///
+/// Two rules, and which one applies is decided by the *value's* type rather
+/// than the column's. An exact value — a decimal literal, a string of digits,
+/// the result of decimal arithmetic — rounds half away from zero, so 2.5 into
+/// an INT is 3 and -2.5 is -3. An approximate one — a DOUBLE or a FLOAT —
+/// rounds half to even, so `2.5e0` is 2 and `3.5e0` is 4. Both measured on
+/// 8.3, and the pair is why #0195 warns against conflating this with the
+/// shortest-form double rule #0124 records: they are different mechanisms.
+///
+/// `None` for anything MySQL does not read as a number at all, which is what
+/// raises 1366 at the caller.
+fn stored_int(value: &Value) -> Option<i128> {
+    match value {
+        Value::Float(_) | Value::Float32(_) => {
+            // Saturating rather than wrapping, which is what puts a double
+            // past the column's range instead of somewhere inside it.
+            Some(value.as_float()?.round_ties_even() as i128)
+        }
+        // A JSON scalar and a binary string are read as text here for the same
+        // reason `as_exact_int` reads them that way: MySQL reads both in a
+        // numeric context exactly as it reads a string.
+        Value::Text(text, _) | Value::Json(text) | Value::Decimal(text) => {
+            rounded_digits(text).or_else(|| value.as_exact_int())
+        }
+        Value::Bytes(bytes) => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(rounded_digits)
+            .or_else(|| value.as_exact_int()),
+        other => other.as_exact_int(),
+    }
+}
+
+/// `text` as a whole number, rounded half away from zero.
+///
+/// Through the same rescaling a DECIMAL column stores its values with, so one
+/// rule covers `'2.5'`, `'1e3'` and a decimal wider than an `i128`. `None`
+/// where the digits do not fit an `i128` — the caller then falls back to the
+/// float reading, which saturates and so is refused by the range check rather
+/// than wrapping into it.
+fn rounded_digits(text: &str) -> Option<i128> {
+    let text = text.trim();
+    // Only what MySQL reads as a number at all: `decimal_digits` answers 0 for
+    // a name, and a column must raise 1366 for one rather than store a zero.
+    //
+    // `'inf'` and `'NaN'` parse as floats and are not decimals, so they are
+    // left to the reading below this one — which saturates `'inf'` past every
+    // column's range and refuses it, where rescaling would have stored a 0
+    // nobody wrote.
+    if !text.parse::<f64>().ok()?.is_finite() {
+        return None;
+    }
+    decimal_digits(text, 0).parse::<i128>().ok()
+}
+
+/// Whether `value` is an exact decimal below zero.
+///
+/// The one place the sign is read before the rounding is: -0.4 into an
+/// UNSIGNED column is 1264 on 8.3, where the string `'-0.4'` and the double
+/// `-0.4e0` both round to zero and are taken. Measured; nothing else here
+/// would predict it.
+fn negative_decimal(value: &Value) -> bool {
+    match value {
+        Value::Decimal(text) => {
+            let text = text.trim_start();
+            text.starts_with('-') && text.bytes().any(|b| b.is_ascii_digit() && b != b'0')
+        }
+        _ => false,
+    }
+}
+
+/// Whether a value the column cannot hold is cut down to fit rather than
+/// refused.
+///
+/// Two things say so, and MySQL treats them the same way. Without
+/// `STRICT_TRANS_TABLES` or `STRICT_ALL_TABLES` a write that would lose data
+/// truncates or clamps and carries a warning; `INSERT IGNORE` does the same
+/// under either mode, which is measured — `INSERT IGNORE` of `'abcdef'` into a
+/// `VARCHAR(3)` stores `abc` on 8.3 with warning 1265.
+///
+/// The warning itself is not carried: this engine has no diagnostics area, so
+/// `SHOW WARNINGS` is unsupported and a truncation here is silent where MySQL
+/// notes it. What is stored matches; what is reported about it does not.
+fn lenient() -> bool {
+    WRITE.with(|w| w.get().ignoring) || !crate::exec::strict()
+}
+
+/// What a write is doing when a value does not fit the column.
+#[derive(Clone, Copy)]
+struct Write {
+    /// The row the statement is on, counting from one.
+    row: usize,
+    /// Whether the statement said IGNORE.
+    ignoring: bool,
+}
+
+thread_local! {
+    /// One row and not ignoring, which is what a caller that publishes nothing
+    /// — a DDL default, a generated column, an `AUTO_INCREMENT` — is doing.
+    static WRITE: std::cell::Cell<Write> = const {
+        std::cell::Cell::new(Write { row: 1, ignoring: false })
+    };
+}
+
+/// Publishes what a write is doing for the length of a scope.
+///
+/// Read by `coerce` and `store`, which are several calls below the loop that
+/// knows the row number — the same argument `exec::real_as_float` makes for
+/// reading the mode this way rather than threading it through every signature
+/// in between. Restored through a guard rather than a trailing assignment, so
+/// a statement that fails halfway cannot leave the next one counting from
+/// where it stopped.
+pub(crate) struct WriteScope(Write);
+
+impl WriteScope {
+    /// The statement is writing its `n`th row, counting from one.
+    pub(crate) fn row(n: usize) -> Self {
+        Self(WRITE.with(|w| w.replace(Write { row: n, ..w.get() })))
+    }
+
+    /// The statement said IGNORE, so nothing it writes is refused for not
+    /// fitting.
+    pub(crate) fn ignoring() -> Self {
+        Self(WRITE.with(|w| {
+            w.replace(Write {
+                ignoring: true,
+                ..w.get()
+            })
+        }))
+    }
+}
+
+impl Drop for WriteScope {
+    fn drop(&mut self) {
+        WRITE.with(|w| w.set(self.0));
     }
 }
 

@@ -645,8 +645,31 @@ fn build_column_with_checks(
             // in the shape the column holds and checked once against it: a
             // `JSON DEFAULT ('{')` is refused by the CREATE that declares it
             // rather than by the first read of a row that took it.
+            //
+            // Through `store` and not `coerce`, so a default the column cannot
+            // hold is caught here too — and reported as 1067 rather than as
+            // the 1406 or 1264 a write would get, which is what 8.3 answers:
+            // `CREATE TABLE t (s VARCHAR(3) DEFAULT 'abcdef')` is `Invalid
+            // default value for 's'` there, with the 1406 left behind in the
+            // warning list.
             ColumnOption::Default(e) => match expr::literal_of(e) {
-                Some(v) => column.default = Some(column.ty.coerce(v, &column.name)?),
+                Some(v) => {
+                    let stored = column.ty.store(v, &column.name).map_err(|refused| {
+                        // Only the two a *width* raises. Everything else the
+                        // column can refuse — a document that is not JSON, a
+                        // value that is not an ENUM member — keeps the code it
+                        // came with, which is the code 8.3 answers for it.
+                        if !matches!(refused.code, 1406 | 1264) {
+                            return refused;
+                        }
+                        EngineError::new(
+                            1067,
+                            "42000",
+                            format!("Invalid default value for '{}'", column.name),
+                        )
+                    })?;
+                    column.default = Some(stored);
+                }
                 // Anything not a constant is stored as text and evaluated per
                 // row, so CURRENT_TIMESTAMP differs between inserts.
                 None => column.default_expr = Some(e.to_string()),

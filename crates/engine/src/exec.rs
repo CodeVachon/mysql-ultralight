@@ -430,7 +430,13 @@ impl Engine {
         // AUTO_INCREMENT PRIMARY KEY) AS SELECT ...`, not 2.
         let mut first_id = None;
 
-        for values in selected {
+        for (nth, values) in selected.into_iter().enumerate() {
+            // Counted like the rows of a VALUES list, for the same reason:
+            // an error naming the row it is on is only right if something
+            // keeps the count. `CREATE TABLE ... AS SELECT` is the caller
+            // here; an `INSERT ... SELECT` materialises its rows and goes
+            // through the VALUES loop.
+            let _row = crate::types::WriteScope::row(nth + 1);
             let mut row = default_row(table, &ctx)?;
             for (slot, (value, coerce)) in (first..).zip(values.into_iter().zip(coerce)) {
                 let column = &table.columns[slot];
@@ -438,8 +444,14 @@ impl Engine {
                 // widening its wire type implies, so coercing into it would
                 // narrow the value the expression already computed — see
                 // `merge_selected_columns`.
+                //
+                // The flag is exactly "some DDL declared this column", which
+                // is the condition `store` wants: 8.3 refuses
+                // `CREATE TABLE t (v VARCHAR(3)) AS SELECT v FROM wide` and
+                // leaves no table, where this stored six characters in a
+                // column declared for three.
                 row[slot] = if *coerce {
-                    column.ty.coerce(value, &column.name)?
+                    column.ty.store(value, &column.name)?
                 } else {
                     value
                 };
@@ -4393,7 +4405,16 @@ impl Engine {
         // The borrows it takes end at the semicolon, which is what gives
         // `session` and `working` back.
         let stored = (|| -> EngineResult<()> {
-            for values in &source_rows {
+            // IGNORE covers a value the column cannot hold as well as the
+            // constraint violations handled below: 8.3 stores `abc` for an
+            // `INSERT IGNORE` of `'abcdef'` into a `VARCHAR(3)`, and 127 for
+            // 300 into a TINYINT, each with a warning rather than an error.
+            let _ignoring = ignore.then(crate::types::WriteScope::ignoring);
+            for (nth, values) in source_rows.iter().enumerate() {
+                // Named on the error a value that does not fit raises: 8.3
+                // counts the rows of the statement, so a three-row INSERT
+                // whose second row is too wide says `at row 2`.
+                let _row = crate::types::WriteScope::row(nth + 1);
                 let ctx = Context::rowless(&session_snapshot).with_executor(self);
                 let mut row = default_row(table, &ctx)?;
 
@@ -4415,7 +4436,7 @@ impl Engine {
                         SourceValue::Value(v) => v.clone(),
                     };
                     let column = &table.columns[*slot];
-                    row[*slot] = column.ty.coerce(value, &column.name)?;
+                    row[*slot] = column.ty.store(value, &column.name)?;
                 }
 
                 let generated_id = assign_auto_increment(table, &mut row)?;
@@ -4469,7 +4490,7 @@ impl Engine {
                                 }
                                 None => expr::eval(&assignment.value, &ctx)?,
                             };
-                            updated[slot] = table.columns[slot].ty.coerce(value, &column_name)?;
+                            updated[slot] = table.columns[slot].ty.store(value, &column_name)?;
                         }
 
                         let updated = self.finalise_row(table, updated, &session_snapshot)?;
@@ -4697,7 +4718,11 @@ impl Engine {
         let chosen =
             self.dml_row_order(&session_snapshot, &refs, &rows, matching, order_by, limit)?;
 
-        for index in chosen {
+        for (nth, index) in chosen.into_iter().enumerate() {
+            // The rows in the order this statement writes them, which is what
+            // 8.3 counts: `UPDATE ... ORDER BY k DESC` failing on the row it
+            // reaches first says `at row 1` whatever that row's key is.
+            let _row = crate::types::WriteScope::row(nth + 1);
             let ctx = Context::for_row(&refs, &rows[index], &session_snapshot).with_executor(self);
 
             let mut candidate = rows[index].clone();
@@ -4708,7 +4733,7 @@ impl Engine {
                 // statement, so `SET a = b, b = a` swaps rather than copies.
                 let value = expr::eval(&assignment.value, &ctx)?;
                 let column = &table.columns[slot];
-                candidate[slot] = column.ty.coerce(value, &column.name)?;
+                candidate[slot] = column.ty.store(value, &column.name)?;
                 assigned.push(slot);
             }
             Self::restamp_on_update(
@@ -4934,7 +4959,7 @@ impl Engine {
                         .column_index(&target.column)
                         .ok_or_else(|| EngineError::unknown_column(&target.column, "field list"))?;
                     let value = expr::eval(&target.value, &ctx)?;
-                    candidate[slot] = table.columns[slot].ty.coerce(value, &target.column)?;
+                    candidate[slot] = table.columns[slot].ty.store(value, &target.column)?;
                     assigned.push(slot);
                 }
                 Self::restamp_on_update(
@@ -5856,7 +5881,7 @@ impl Engine {
         for (slot, column) in table.columns.iter().enumerate() {
             if column.on_update_now && !assigned.contains(&slot) {
                 let now = crate::functions::call("now", Vec::new(), session)?;
-                candidate[slot] = column.ty.coerce(now, &column.name)?;
+                candidate[slot] = column.ty.store(now, &column.name)?;
             }
         }
         Ok(())
@@ -5891,7 +5916,7 @@ impl Engine {
                 expr::eval(&parsed, &ctx)?
             };
             let column = &table.columns[index];
-            row[index] = column.ty.coerce(value, &column.name)?;
+            row[index] = column.ty.store(value, &column.name)?;
         }
 
         for (index, column) in table.columns.iter().enumerate() {
@@ -6795,7 +6820,7 @@ fn assign_auto_increment(table: &mut Table, row: &mut [Value]) -> EngineResult<O
             // rests on nothing outliving the declared code, and a `TINYINT
             // AUTO_INCREMENT` counting past 127 would otherwise be sent as one
             // byte and read back negative.
-            row[slot] = table.columns[slot].ty.coerce(
+            row[slot] = table.columns[slot].ty.store(
                 Value::Int(table.next_auto_increment),
                 &table.columns[slot].name,
             )?;
@@ -6827,7 +6852,7 @@ fn default_row(table: &Table, ctx: &Context<'_>) -> EngineResult<Vec<Value>> {
                 // Coerced like any other value written to the column: an
                 // expression default that produces text for a JSON column has
                 // to arrive as a document, not as a string of one.
-                column.ty.coerce(expr::eval(&parsed, ctx)?, &column.name)?
+                column.ty.store(expr::eval(&parsed, ctx)?, &column.name)?
             }
             (None, None) => Value::Null,
         };
@@ -11945,6 +11970,8 @@ struct Origin {
     /// Whether `-` stays signed over an UNSIGNED operand. The tree records the
     /// operator; which domain it works in is the mode's answer.
     no_unsigned_subtraction: bool,
+    /// Whether a write that would truncate or clamp a value fails instead.
+    strict: bool,
 }
 
 thread_local! {
@@ -11989,6 +12016,21 @@ pub(crate) fn real_as_float() -> bool {
     })
 }
 
+/// Whether a write that would lose data fails in the statement being handled.
+///
+/// Read here rather than passed to `SqlType::store` for the same reason as
+/// above: a value is written into a column several calls below the only place
+/// that holds the session, through paths — a DDL default, a generated column,
+/// an `AUTO_INCREMENT` — that have no session argument at all.
+///
+/// `true` without a statement in scope, which is MySQL's default: the shipped
+/// `sql_mode` carries `STRICT_TRANS_TABLES`, so silently cutting a value down
+/// is the behaviour that has to be asked for. The other flags read this way
+/// default the other direction because their MySQL default is off.
+pub(crate) fn strict() -> bool {
+    SOURCE.with(|s| s.borrow().as_ref().is_none_or(|current| current.strict))
+}
+
 /// Whether `-` is signed over an UNSIGNED operand in the statement being run.
 ///
 /// Read here rather than passed to `expr::arithmetic` for the same reason as
@@ -12022,6 +12064,7 @@ impl Source {
             pipes_as_concat: mode.pipes_as_concat,
             real_as_float: mode.real_as_float,
             no_unsigned_subtraction: mode.no_unsigned_subtraction,
+            strict: mode.strict,
         };
         Self(SOURCE.with(|s| s.replace(Some(current))))
     }

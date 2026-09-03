@@ -6742,4 +6742,148 @@ pub const GROUPS: &[Group] = &[
             same("SELECT b LIKE 'A ', b LIKE 'a ' FROM Mix"),
         ],
     },
+    Group {
+        // What a column *declares* it holds, which `SqlType::coerce` did not
+        // enforce at all: a `VARCHAR(3)` stored `abcdef` whole and an INT
+        // truncated 1.5 to 1, so the engine held rows MySQL would have refused
+        // or rounded. #0194 and #0195.
+        name: "declared width and range",
+        setup: &[
+            "CREATE TABLE Narrow (k INT NOT NULL, v VARCHAR(3) NULL, c CHAR(5) NULL, \
+             b VARBINARY(3) NULL)",
+            "CREATE TABLE Ints (k INT NOT NULL, i INT NULL, t TINYINT NULL, \
+             u INT UNSIGNED NULL)",
+            "CREATE TABLE Upd (k INT NOT NULL, v VARCHAR(3) NULL, i TINYINT NULL)",
+            "INSERT INTO Upd VALUES (1, 'abc', 1), (2, 'xyz', 2)",
+            "CREATE TABLE Gen (k INT NOT NULL, s VARCHAR(3) NULL, \
+             g VARCHAR(2) AS (CONCAT(s, '!')) STORED)",
+        ],
+        cases: &[
+            // A string wider than the column is refused, and the width counts
+            // characters: 'ééé' is six bytes and fits a VARCHAR(3).
+            same("INSERT INTO Narrow (k, v) VALUES (1, 'abcdef')"),
+            same("INSERT INTO Narrow (k, v) VALUES (2, 'ééé')"),
+            same("INSERT INTO Narrow (k, v) VALUES (3, 'éééé')"),
+            // Trailing spaces are the exception: a value whose non-space
+            // content fits is cut to the width and taken, and one whose does
+            // not is still refused.
+            same("INSERT INTO Narrow (k, v) VALUES (4, 'ab   ')"),
+            same("INSERT INTO Narrow (k, v) VALUES (5, 'abc ')"),
+            same("INSERT INTO Narrow (k, v) VALUES (6, 'abcd ')"),
+            // A CHAR gives its trailing spaces up entirely, which is the type
+            // rather than a truncation.
+            same("INSERT INTO Narrow (k, c) VALUES (7, 'ab  ')"),
+            same("INSERT INTO Narrow (k, c) VALUES (8, '     ')"),
+            // A binary column has no such exemption: a space is a byte.
+            same("INSERT INTO Narrow (k, b) VALUES (9, 'abc')"),
+            same("INSERT INTO Narrow (k, b) VALUES (10, 'abc ')"),
+            // Selected back, because an INSERT that stores nothing and an
+            // INSERT that stores the wrong thing report the same count.
+            same(
+                "SELECT k, CONCAT('[', v, ']'), CONCAT('[', c, ']'), HEX(b), CHAR_LENGTH(v) \
+                 FROM Narrow ORDER BY k",
+            ),
+            // A fractional value rounds rather than truncating, and an exact
+            // one rounds half away from zero.
+            same("INSERT INTO Ints VALUES (1, 1.5, 1.5, 1.5)"),
+            same("INSERT INTO Ints VALUES (2, 2.5, 2.5, 2.5)"),
+            same("INSERT INTO Ints VALUES (3, -1.5, -1.5, 0.5)"),
+            same("INSERT INTO Ints VALUES (4, -2.5, -2.5, 254.5)"),
+            // A double rounds half to *even*, which is the other rule and not
+            // the same one: 2.5e0 is 2 where the exact 2.5 above is 3.
+            same("INSERT INTO Ints (k, i) VALUES (5, 2.5e0)"),
+            same("INSERT INTO Ints (k, i) VALUES (6, 3.5e0)"),
+            same("INSERT INTO Ints (k, i) VALUES (7, 0.5e0)"),
+            // A string is read as an exact decimal, exponent and all.
+            same("INSERT INTO Ints (k, i) VALUES (8, '2.5')"),
+            same("INSERT INTO Ints (k, i) VALUES (9, '2.5e0')"),
+            // The range is checked after the rounding, so a value that rounds
+            // past the end of the column is out of range.
+            same("INSERT INTO Ints (k, t) VALUES (10, 127.6)"),
+            // And the sign of an exact decimal is read before it, so -0.4 is
+            // refused by an UNSIGNED column where the same digits as a string
+            // or a double round to zero and are taken.
+            same("INSERT INTO Ints (k, u) VALUES (11, -0.4)"),
+            same("INSERT INTO Ints (k, u) VALUES (12, '-0.4')"),
+            same("INSERT INTO Ints (k, u) VALUES (13, -0.4e0)"),
+            // A row of a multi-row insert that does not fit refuses the whole
+            // statement.
+            same("INSERT INTO Ints (k, t) VALUES (14, 1), (15, 300), (16, 2)"),
+            same("SELECT k, i, t, u FROM Ints ORDER BY k"),
+            // An UPDATE is held to the same widths and rounds the same way.
+            same("UPDATE Upd SET v = 'abcdef' WHERE k = 1"),
+            same("UPDATE Upd SET i = 300 WHERE k = 1"),
+            same("UPDATE Upd SET i = 1.5"),
+            same("UPDATE Upd SET v = 'ab   ' WHERE k = 2"),
+            same("SELECT k, CONCAT('[', v, ']'), i FROM Upd ORDER BY k"),
+            // IGNORE cuts a value down instead of refusing it, under a strict
+            // mode like this one.
+            same("INSERT IGNORE INTO Upd VALUES (3, 'abcdef', 300)"),
+            same("SELECT k, v, i FROM Upd WHERE k = 3 ORDER BY v"),
+            // A default the column cannot hold is refused by the DDL that
+            // declares it, and with its own code rather than the write's.
+            same("CREATE TABLE BadDefault (s VARCHAR(3) DEFAULT 'abcdef')"),
+            same("CREATE TABLE BadDefaultNum (i TINYINT DEFAULT 300)"),
+            // A STORED generated column is held to its own declaration too:
+            // the expression's answer is written into the column like any
+            // other value.
+            same("INSERT INTO Gen (k, s) VALUES (1, 'ab')"),
+            same("INSERT INTO Gen (k, s) VALUES (2, 'a')"),
+            same("SELECT k, s, g FROM Gen ORDER BY k"),
+        ],
+    },
+    Group {
+        // Without a STRICT flag the same writes truncate and clamp instead of
+        // failing, which is the half of #0194 and #0195 that decides what a
+        // row *holds* rather than whether there is one. Replacing the mode
+        // rather than adding to it, because dropping STRICT_TRANS_TABLES is
+        // the whole point of the group; the harness puts the stock mode back
+        // before the next one.
+        name: "sql_mode: no STRICT",
+        setup: &[
+            "SET SESSION sql_mode = 'ONLY_FULL_GROUP_BY,NO_ZERO_IN_DATE,NO_ZERO_DATE,\
+             ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'",
+            "CREATE TABLE Loose (k INT NOT NULL, v VARCHAR(3) NULL, b VARBINARY(3) NULL, \
+             t TINYINT NULL, u INT UNSIGNED NULL)",
+            "INSERT INTO Loose VALUES (1, 'ab', 'ab', 1, 1)",
+        ],
+        cases: &[
+            same("INSERT INTO Loose (k, v) VALUES (2, 'abcdef')"),
+            // Cut at a character boundary, not a byte one.
+            same("INSERT INTO Loose (k, v) VALUES (3, 'ééééé')"),
+            same("INSERT INTO Loose (k, b) VALUES (4, 'abcdef')"),
+            // Clamped to the end of the range it overran, in both directions.
+            same("INSERT INTO Loose (k, t) VALUES (5, 300)"),
+            same("INSERT INTO Loose (k, t) VALUES (6, -300)"),
+            same("INSERT INTO Loose (k, u) VALUES (7, -1)"),
+            same("UPDATE Loose SET v = 'zzzzzz' WHERE k = 1"),
+            same("UPDATE Loose SET t = 999 WHERE k = 1"),
+            same(
+                "SELECT k, CONCAT('[', v, ']'), HEX(b), t, u, CHAR_LENGTH(v), LENGTH(v) \
+                 FROM Loose ORDER BY k",
+            ),
+        ],
+    },
+    Group {
+        // The compound mode that turns strictness *on*, where `ANSI` above
+        // leaves it off. It reached the parser as a name no arm matched, so
+        // the strictest mode MySQL ships behaved here as the loosest one:
+        // `'abcdef'` into a `VARCHAR(3)` stored `abc` and reported success.
+        // Replacing the mode rather than adding to it, because the point is
+        // what the one word expands to on its own.
+        name: "sql_mode: TRADITIONAL",
+        setup: &[
+            "SET SESSION sql_mode = 'TRADITIONAL'",
+            "CREATE TABLE Trad (k INT NOT NULL, v VARCHAR(3) NULL, t TINYINT NULL)",
+            "INSERT INTO Trad VALUES (1, 'ab', 1)",
+        ],
+        cases: &[
+            same("INSERT INTO Trad (k, v) VALUES (2, 'abcdef')"),
+            same("INSERT INTO Trad (k, t) VALUES (3, 300)"),
+            same("UPDATE Trad SET v = 'zzzzzz' WHERE k = 1"),
+            // Read back, because a refused INSERT and a truncating one report
+            // the same count and only the rows tell them apart.
+            same("SELECT k, v, t FROM Trad ORDER BY k"),
+        ],
+    },
 ];

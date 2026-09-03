@@ -28767,3 +28767,591 @@ fn the_recursive_table_may_not_be_on_the_padded_side_of_either_outer_join() {
         vec![vec!["1"], vec!["2"]]
     );
 }
+
+/// A string wider than the column declares is refused, not stored whole.
+///
+/// Measured on 8.3, which answers 1406 (22001) for every one of these — and
+/// stored `abcdef` in a `VARCHAR(3)` here until #0194. The unit differs by
+/// type and that is the point of the table: a `VARCHAR(3)` counts three
+/// *characters*, so `'ééé'` is six bytes and taken, while a `TINYTEXT` counts
+/// 255 *bytes*, so 128 of the same character is one byte too many.
+#[test]
+fn a_string_wider_than_the_column_declares_is_refused() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Narrow (v VARCHAR(3), c CHAR(3), t TINYTEXT, b VARBINARY(3), \
+         bc BINARY(3))",
+    );
+
+    for (sql, what) in [
+        ("INSERT INTO Narrow (v) VALUES ('abcdef')", "varchar"),
+        (
+            "INSERT INTO Narrow (v) VALUES ('éééé')",
+            "varchar, in characters",
+        ),
+        ("INSERT INTO Narrow (c) VALUES ('abcdef')", "char"),
+        ("INSERT INTO Narrow (b) VALUES ('abcd')", "varbinary"),
+        ("INSERT INTO Narrow (bc) VALUES ('abcd')", "binary"),
+        // A space is a byte like any other in a binary column: the exemption
+        // the text types get does not reach it. Measured.
+        (
+            "INSERT INTO Narrow (b) VALUES ('abc ')",
+            "varbinary, trailing space",
+        ),
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1406, "{what}: {sql}\n  -> {err}");
+        assert_eq!(err.sql_state, "22001", "{what}: {sql}");
+    }
+
+    let too_many_bytes = format!("INSERT INTO Narrow (t) VALUES ('{}')", "é".repeat(128));
+    let err = engine
+        .execute(&mut session, &too_many_bytes, &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1406, "tinytext counts bytes: {err}");
+
+    // The widths themselves, so a test that only ever saw failures cannot pass
+    // by refusing everything.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Narrow (v, c, b) VALUES ('ééé', 'abc', 'abc')",
+    );
+    let within = format!("INSERT INTO Narrow (t) VALUES ('{}')", "é".repeat(127));
+    run(&engine, &mut session, &within);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT v, CHAR_LENGTH(v) FROM Narrow WHERE v IS NOT NULL"
+        ),
+        vec![vec!["ééé", "3"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT LENGTH(t) FROM Narrow WHERE t IS NOT NULL"
+        ),
+        vec![vec!["254"]]
+    );
+}
+
+/// Trailing spaces are cut to the width rather than refusing the write.
+///
+/// MySQL truncates a value whose *non-space* content fits and takes it, with
+/// warning 1265 rather than 1406: `'ab   '` into a `VARCHAR(3)` is stored as
+/// `'ab '` on 8.3, `'abc '` as `'abc'`, and `'abcd '` is refused. A CHAR gives
+/// its trailing spaces up entirely, which is the type rather than a
+/// truncation — a `CHAR(5)` given `'ab  '` reads back `'ab'` there.
+#[test]
+fn trailing_spaces_are_cut_to_the_width_rather_than_refusing_the_write() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Pad (id INT, v VARCHAR(3), c CHAR(5))",
+    );
+
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Pad VALUES (1, 'ab   ', 'ab  '), (2, 'abc ', '     ')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, CONCAT('[', v, ']'), CONCAT('[', c, ']') FROM Pad ORDER BY id"
+        ),
+        vec![vec!["1", "[ab ]", "[ab]"], vec!["2", "[abc]", "[]"]]
+    );
+
+    // One character too much once the spaces are off the end, so the exemption
+    // does not apply and the row is refused.
+    let err = engine
+        .execute(&mut session, "INSERT INTO Pad (v) VALUES ('abcd ')", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1406, "{err}");
+}
+
+/// A fractional value rounds into an integer column rather than truncating.
+///
+/// Two rules, and the *value's* type picks which: an exact one rounds half
+/// away from zero, so 2.5 is 3 and -2.5 is -3, while a double rounds half to
+/// even, so `2.5e0` is 2 and `3.5e0` is 4. Both measured on 8.3. Everything
+/// here truncated towards zero until #0195, which through a recursive CTE left
+/// a `+0.5` step that never advanced at all.
+#[test]
+fn a_fractional_value_rounds_into_an_integer_column() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Ints (k INT, i INT, t TINYINT, b BIGINT, u INT UNSIGNED)",
+    );
+
+    // An exact decimal, half away from zero.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Ints (k, i, t, b, u) VALUES (1, 1.5, 1.5, 1.5, 1.5), \
+         (2, 2.5, 2.5, 2.5, 2.5), (3, -1.5, -1.5, -1.5, 0.5), (4, -2.5, -2.5, -2.5, 254.5)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT i, t, b, u FROM Ints ORDER BY k"
+        ),
+        vec![
+            vec!["2", "2", "2", "2"],
+            vec!["3", "3", "3", "3"],
+            vec!["-2", "-2", "-2", "1"],
+            vec!["-3", "-3", "-3", "255"],
+        ]
+    );
+
+    // A string is read as an exact decimal, exponent and all: '2.5e0' is 3
+    // where the *double* 2.5e0 below is 2.
+    run(&engine, &mut session, "DELETE FROM Ints");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Ints (k, i) VALUES (1, '1.5'), (2, '2.5'), (3, '-2.5'), (4, '2.5e0')",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT i FROM Ints ORDER BY k"),
+        vec![vec!["2"], vec!["3"], vec!["-3"], vec!["3"]]
+    );
+
+    // A double, half to even.
+    run(&engine, &mut session, "DELETE FROM Ints");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Ints (k, i) VALUES (1, 1.5e0), (2, 2.5e0), (3, 3.5e0), \
+         (4, 0.5e0), (5, -2.5e0)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT i FROM Ints ORDER BY k"),
+        vec![vec!["2"], vec!["2"], vec!["4"], vec!["0"], vec!["-2"]]
+    );
+
+    // The range is checked after the rounding, so a value that rounds past the
+    // end of the column is out of range even though it started inside it.
+    let err = engine
+        .execute(&mut session, "INSERT INTO Ints (t) VALUES (127.6)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1264, "{err}");
+    // And the sign of an exact decimal is read before the rounding, which is
+    // the one place the two disagree: -0.4 is refused by an UNSIGNED column
+    // where the string '-0.4' rounds to zero and is taken.
+    let err = engine
+        .execute(&mut session, "INSERT INTO Ints (u) VALUES (-0.4)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1264, "{err}");
+    run(&engine, &mut session, "DELETE FROM Ints");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Ints (k, u) VALUES (1, '-0.4'), (2, -0.4e0)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT u FROM Ints ORDER BY k"),
+        vec![vec!["0"], vec!["0"]]
+    );
+
+    // `'inf'` parses as a float and is not a decimal, so it is left to the
+    // saturating reading and refused. Rescaling it would have stored the 0
+    // that a text with no number in it rescales to — a value nobody wrote,
+    // where a refusal is at worst the wrong code. 8.3 refuses it too, with
+    // 1366 against this engine's 1264.
+    let err = engine
+        .execute(
+            &mut session,
+            "INSERT INTO Ints (k, i) VALUES (3, 'inf')",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1264, "{err}");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM Ints WHERE k = 3"
+        ),
+        vec![vec!["0"]]
+    );
+}
+
+/// An UPDATE is held to the column's width and range like an INSERT.
+///
+/// The two write through different loops, and a constraint enforced on one and
+/// not the other is worse than one enforced on neither.
+#[test]
+fn an_update_is_held_to_the_declared_type_like_an_insert() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Narrow (k INT, s VARCHAR(3), i TINYINT)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Narrow VALUES (1, 'abc', 1), (2, 'xyz', 2)",
+    );
+
+    for (sql, code) in [
+        ("UPDATE Narrow SET s = 'abcdef' WHERE k = 1", 1406),
+        ("UPDATE Narrow SET i = 300 WHERE k = 1", 1264),
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, code, "{sql}\n  -> {err}");
+    }
+    // Refused, and nothing written: the row is as it was.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT s, i FROM Narrow WHERE k = 1"),
+        vec![vec!["abc", "1"]]
+    );
+
+    // And an UPDATE rounds what it writes, exactly as an INSERT does.
+    run(&engine, &mut session, "UPDATE Narrow SET i = 1.5");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT i FROM Narrow ORDER BY k"),
+        vec![vec!["2"], vec!["2"]]
+    );
+}
+
+/// The error names the row of the statement it is on, not always the first.
+///
+/// Measured on 8.3: a three-row INSERT whose second row does not fit says
+/// `at row 2`, and so does an UPDATE that reaches its second row — counting
+/// the order the statement *writes* in, so `ORDER BY k DESC` failing on the
+/// row it reaches first still says `at row 1`.
+#[test]
+fn a_write_error_names_the_row_of_the_statement_it_is_on() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Narrow (k INT, s VARCHAR(3), i TINYINT)",
+    );
+
+    let err = engine
+        .execute(
+            &mut session,
+            "INSERT INTO Narrow (k, s) VALUES (1, 'abc'), (2, 'abcdef'), (3, 'xyz')",
+            &[],
+        )
+        .unwrap_err();
+    assert!(
+        err.message.ends_with("at row 2"),
+        "expected the second row to be named: {err}"
+    );
+
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Narrow VALUES (1, 'a', 1), (2, 'b', 2), (3, 'c', 3)",
+    );
+    let err = engine
+        .execute(&mut session, "UPDATE Narrow SET i = IF(k = 2, 300, i)", &[])
+        .unwrap_err();
+    assert!(
+        err.message.ends_with("at row 2"),
+        "expected the second row to be named: {err}"
+    );
+    // The order the statement writes in, and not the table's: the row that
+    // fails is reached first here, so it is row 1.
+    let err = engine
+        .execute(
+            &mut session,
+            "UPDATE Narrow SET i = IF(k = 3, 300, i) ORDER BY k DESC",
+            &[],
+        )
+        .unwrap_err();
+    assert!(
+        err.message.ends_with("at row 1"),
+        "expected the first row written to be named: {err}"
+    );
+}
+
+/// Without a STRICT mode, a value the column cannot hold is cut down to fit.
+///
+/// MySQL truncates the string, clamps the number to the end of the range it
+/// overran, and carries a warning: measured under `sql_mode=''`, `'abcdef'`
+/// into a `VARCHAR(3)` is `abc`, 300 into a TINYINT is 127 and -300 is -128,
+/// and -1 into an UNSIGNED column is 0. The warning itself is not carried —
+/// this engine has no diagnostics area — so the stored value matches and what
+/// is reported about it does not.
+#[test]
+fn a_non_strict_mode_cuts_a_value_down_instead_of_refusing_it() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "SET sql_mode = ''");
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Loose (k INT, s VARCHAR(3), m VARCHAR(3), b VARBINARY(3), \
+         t TINYINT, u INT UNSIGNED)",
+    );
+
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Loose VALUES (1, 'abcdef', 'ééééé', 'abcdef', 300, 0), \
+         (2, 'x', 'y', 'z', -300, 0)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT s, m, b, t FROM Loose ORDER BY k"
+        ),
+        vec![
+            vec!["abc", "ééé", "abc", "127"],
+            vec!["x", "y", "z", "-128"]
+        ]
+    );
+
+    run(&engine, &mut session, "UPDATE Loose SET u = -1 WHERE k = 1");
+    run(
+        &engine,
+        &mut session,
+        "UPDATE Loose SET s = 'zzzzzz' WHERE k = 1",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT s, u FROM Loose WHERE k = 1"),
+        vec![vec!["zzz", "0"]]
+    );
+
+    // And the mode is the whole of what decides it: the same statements are
+    // refused once STRICT_TRANS_TABLES is back.
+    run(
+        &engine,
+        &mut session,
+        "SET sql_mode = 'STRICT_TRANS_TABLES'",
+    );
+    for (sql, code) in [
+        ("INSERT INTO Loose (s) VALUES ('abcdef')", 1406),
+        ("INSERT INTO Loose (t) VALUES (300)", 1264),
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, code, "{sql}\n  -> {err}");
+    }
+}
+
+/// INSERT IGNORE cuts a value down to fit under a strict mode too.
+///
+/// Measured on 8.3: `INSERT IGNORE` of `'abcdef'` into a `VARCHAR(3)` stores
+/// `abc` and of 300 into a TINYINT stores 127, each with a warning, while the
+/// same statement without IGNORE is refused.
+#[test]
+fn insert_ignore_stores_what_fits_under_a_strict_mode() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "SET sql_mode = 'STRICT_TRANS_TABLES'",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Narrow (k INT, s VARCHAR(3), i TINYINT)",
+    );
+
+    run(
+        &engine,
+        &mut session,
+        "INSERT IGNORE INTO Narrow VALUES (1, 'abcdef', 1), (2, 'ab', 300)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT s, i FROM Narrow ORDER BY k"),
+        vec![vec!["abc", "1"], vec!["ab", "127"]]
+    );
+
+    // The leniency lasts for the statement and no longer: the next INSERT
+    // without IGNORE is refused.
+    let err = engine
+        .execute(
+            &mut session,
+            "INSERT INTO Narrow (s) VALUES ('abcdef')",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1406, "{err}");
+}
+
+/// A default the column cannot hold is refused by the DDL that declares it.
+///
+/// MySQL checks the default against the column at `CREATE TABLE` and answers
+/// 1067 `Invalid default value`, leaving the 1406 or 1264 that found it in the
+/// warning list. Storing it instead makes every row that takes the default a
+/// row the column could not have been given.
+#[test]
+fn a_default_the_column_cannot_hold_is_refused_by_the_ddl() {
+    let (engine, mut session) = engine();
+    for sql in [
+        "CREATE TABLE D (s VARCHAR(3) DEFAULT 'abcdef')",
+        "CREATE TABLE D (i TINYINT DEFAULT 300)",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1067, "{sql}\n  -> {err}");
+        assert_eq!(err.sql_state, "42000", "{sql}");
+    }
+    // Everything else a column can refuse keeps the code it came with — this
+    // one is not a width at all.
+    let err = engine
+        .execute(&mut session, "CREATE TABLE D (j JSON DEFAULT ('{'))", &[])
+        .unwrap_err();
+    assert_ne!(err.code, 1067, "a bad document is not a bad width: {err}");
+}
+
+/// A computed column is not held to the width this engine invents for it.
+///
+/// Every computed string is declared `varchar(512)` here, where MySQL declares
+/// one from the expression's own width — a view over `'ab'` is `varchar(2)`
+/// there. That number is cosmetic, and a recursive CTE writes every row it
+/// produces through the anchor's type: holding those rows to 512 characters
+/// would refuse a query 8.3 answers, which is why `store` applies a width and
+/// `coerce` does not.
+///
+/// It is also why #0194's CTE example is not fixed along with the rest of it.
+/// 8.3 refuses `SELECT 'a' AS x UNION ALL SELECT CONCAT(x, 'b')` at the
+/// *first* character, because its anchor is `varchar(1)`; this engine has no
+/// width arithmetic for an expression and so has nothing to refuse it with.
+/// That is the gap `Case::widths` in the differential corpus records, not this
+/// one.
+#[test]
+fn a_computed_column_is_not_held_to_the_width_the_engine_invents() {
+    let (engine, mut session) = engine();
+    let long = "a".repeat(600);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            &format!(
+                "WITH RECURSIVE t AS (SELECT 1 AS n, '{long}' AS x \
+                 UNION ALL SELECT n + 1, x FROM t WHERE n < 2) \
+                 SELECT CHAR_LENGTH(x) FROM t ORDER BY n"
+            )
+        ),
+        vec![vec!["600"], vec!["600"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            &format!("SELECT CHAR_LENGTH(s) FROM (SELECT CONCAT('{long}') AS s) d")
+        ),
+        vec![vec!["600"]]
+    );
+}
+
+/// `TRADITIONAL` is a strict mode, so the widths bite under it too.
+///
+/// Measured on 8.3: `SET sql_mode='TRADITIONAL'` reads back as
+/// `STRICT_TRANS_TABLES,STRICT_ALL_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,
+/// ERROR_FOR_DIVISION_BY_ZERO,TRADITIONAL,NO_ENGINE_SUBSTITUTION`, and
+/// `'abcdef'` into a `VARCHAR(3)` under it is 1406 rather than the `abc` a
+/// non-strict mode stores. The compound name was the whole of what the parser
+/// saw, so leaving it unexpanded turned the strictest mode MySQL ships into
+/// the loosest one this engine has.
+#[test]
+fn the_traditional_mode_is_a_strict_one() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "SET sql_mode = 'TRADITIONAL'");
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Narrow (k INT, s VARCHAR(3), i TINYINT)",
+    );
+
+    for (sql, code) in [
+        ("INSERT INTO Narrow (s) VALUES ('abcdef')", 1406),
+        ("INSERT INTO Narrow (i) VALUES (300)", 1264),
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, code, "{sql}\n  -> {err}");
+    }
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Narrow"),
+        vec![vec!["0"]]
+    );
+}
+
+/// A declaration with no width is held to no width.
+///
+/// `VARCHAR` and `VARBINARY` without a length are not MySQL types — 8.3
+/// answers 1064 for either declaration — but sqlparser takes them and this
+/// engine builds a column. Reading the absent length as 1 would refuse every
+/// value of more than one character in a column whose DDL never said so,
+/// which is a width the engine invented rather than one MySQL would enforce.
+#[test]
+fn a_declaration_with_no_width_is_held_to_none() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Bare (v VARCHAR, b VARBINARY)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Bare VALUES ('hello world', 'hello world')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CHAR_LENGTH(v), LENGTH(b) FROM Bare"
+        ),
+        vec![vec!["11", "11"]]
+    );
+}
+
+/// A `CREATE TABLE ... AS SELECT` column the DDL declared is held to its width.
+///
+/// The declared columns of a CTAS are the ones this engine coerces into at
+/// all, and they were the one write path left storing whatever the query
+/// produced: 8.3 refuses `CREATE TABLE t (v VARCHAR(3)) AS SELECT v FROM wide`
+/// and leaves no table behind, where this stored six characters in a column
+/// declared for three. (8.3 reports 1265 for a bare column-to-column copy and
+/// 1406 for anything computed; this engine says 1406 for both.)
+#[test]
+fn a_ctas_column_the_ddl_declared_is_held_to_its_width() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE Src (v VARCHAR(10))");
+    run(&engine, &mut session, "INSERT INTO Src VALUES ('abcdef')");
+
+    let err = engine
+        .execute(
+            &mut session,
+            "CREATE TABLE Ct (v VARCHAR(3)) AS SELECT v FROM Src",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1406, "{err}");
+    // And no table left behind, which is what makes the refusal a refusal.
+    let err = engine
+        .execute(&mut session, "SELECT v FROM Ct", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1146, "{err}");
+
+    // A column the query names but the DDL does not declare keeps whatever the
+    // expression produced, because its width here is invented — see
+    // `a_computed_column_is_not_held_to_the_width_the_engine_invents`.
+    let long = "a".repeat(600);
+    run(
+        &engine,
+        &mut session,
+        &format!("CREATE TABLE Wide AS SELECT CONCAT('{long}') AS s"),
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT CHAR_LENGTH(s) FROM Wide"),
+        vec![vec!["600"]]
+    );
+}
