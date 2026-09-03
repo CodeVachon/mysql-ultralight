@@ -27,6 +27,15 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// not fail cleanly, it would silently produce a catalog with the wrong shape,
 /// and every test running against it would be wrong in a way nothing reports.
 ///
+/// v11 is a meaning change like v3, not a layout one. Tag 5 still holds a
+/// document's text, but that text is now the engine's *stored* form rather
+/// than MySQL's: a decimal inside a document wears an explicit zero exponent
+/// so that `JSON_TYPE` can tell it from a double — `json::DECIMAL_MARK`, and
+/// #0121. A v10 reader would parse a v11 image cleanly and then send
+/// `{"a": 2.50e0}` to a client, which is a wrong answer rather than a failure;
+/// a v11 reader given a v10 image would type every decimal in it DOUBLE, which
+/// is the bug this closes, silently reintroduced by a reload.
+///
 /// v10 adds another to a column's type: the collation its text compares
 /// under. A v9 image has no place to put one, so every column in it would
 /// reload as `utf8mb4_0900_ai_ci` whatever it was declared — and the whole
@@ -76,7 +85,7 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// answering it, which is the wrong answer the version check exists to
 /// prevent. An image is a file a user keeps and boots from with `--state`, so
 /// the stale one has to fail rather than mislead.
-pub const FORMAT_VERSION: u32 = 10;
+pub const FORMAT_VERSION: u32 = 11;
 
 /// Writes the whole catalog.
 pub fn encode(catalog: &Catalog) -> Vec<u8> {

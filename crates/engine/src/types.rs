@@ -900,7 +900,11 @@ impl SqlType {
             // Decimals keep their text form so no precision is lost on the way
             // through, which is the whole reason MySQL transmits them as text.
             TypeKind::Decimal => {
-                let text = value.as_text();
+                // Numeric text, so a document converts through the scalar it
+                // holds: 8.3 stores `CAST('"2.505"' AS JSON)` into a
+                // `DECIMAL(10,2)` as 2.51, where the rendering's leading quote
+                // made it 0.00 here. See #0084.
+                let text = value.numeric_text().into_owned();
                 // By the text rather than a parsed float: the point of keeping
                 // the text is that parsing loses precision, and the sign is
                 // readable without it.
@@ -1210,11 +1214,18 @@ fn stored_int(value: &Value) -> Option<i128> {
             // past the column's range instead of somewhere inside it.
             Some(value.as_float()?.round_ties_even() as i128)
         }
-        // A JSON scalar and a binary string are read as text here for the same
-        // reason `as_exact_int` reads them that way: MySQL reads both in a
-        // numeric context exactly as it reads a string.
-        Value::Text(text, _) | Value::Json(text) | Value::Decimal(text) => {
+        // A binary string is read as text here for the same reason
+        // `as_exact_int` reads it that way: MySQL reads it in a numeric
+        // context exactly as it reads a string.
+        Value::Text(text, _) | Value::Decimal(text) => {
             rounded_digits(text).or_else(|| value.as_exact_int())
+        }
+        // And a document by the scalar it holds, so a quoted numeric goes into
+        // an `INT` column as the number it spells: 8.3 takes
+        // `CAST('"2026"' AS JSON)` into one as 2026 where this raised 1366.
+        // See #0084.
+        Value::Json(text) => {
+            rounded_digits(&crate::json::numeric_text(text)).or_else(|| value.as_exact_int())
         }
         Value::Bytes(bytes) => std::str::from_utf8(bytes)
             .ok()

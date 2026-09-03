@@ -984,11 +984,12 @@ fn a_boolean_never_reaches_the_image_and_is_written_as_its_integer_if_it_does() 
     );
 
     // And the boolean did not move the version: 7 was #0068's ENUM tag, 8 was
-    // #0069's unsigned one, 9 is #0126's binary collation and 10 is the
-    // column collation #0129/#0134/#0152 needed, none of them this. Pinned
-    // rather than derived, so the day something *does* give a boolean a tag of
-    // its own it has to come back here and say so.
-    assert_eq!(image::FORMAT_VERSION, 10);
+    // #0069's unsigned one, 9 is #0126's binary collation, 10 is the column
+    // collation #0129/#0134/#0152 needed and 11 is #0121's decimal mark inside
+    // a document, none of them this. Pinned rather than derived, so the day
+    // something *does* give a boolean a tag of its own it has to come back
+    // here and say so.
+    assert_eq!(image::FORMAT_VERSION, 11);
 }
 
 #[test]
@@ -1212,5 +1213,55 @@ fn a_quoted_name_survives_a_reload_as_it_was_written() {
     assert_eq!(
         rows(&restored, &mut session, "SELECT a FROM `my.table`"),
         vec![vec!["1"]]
+    );
+}
+
+#[test]
+fn a_decimal_inside_a_document_survives_the_image_as_a_decimal() {
+    // #0121's half of the format bump. The type of a number in a document is
+    // carried in the text a `Value::Json` holds, so an image that wrote the
+    // text MySQL sends instead of the text the engine stores would reload
+    // every decimal in every document as a double — the bug this closes,
+    // reintroduced by a restart and nowhere near its cause.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE D (id INT NOT NULL, v DECIMAL(10,1) NULL, doc JSON NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO D (id, v) VALUES (1, 2.5)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "UPDATE D SET doc = JSON_OBJECT('v', v)",
+    );
+    // The digits are the same either way — `DECIMAL(10,1)` 2.5 renders `2.5`
+    // and so does the double — so only the type below can tell the round trip
+    // worked.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO D (id, doc) VALUES (2, '{\"v\": 2.5}')",
+    );
+
+    let decoded = image::decode(&image::encode(&engine.catalog_snapshot().unwrap())).unwrap();
+    let restored = Engine::from_catalog(decoded, ServerConfig::default()).unwrap();
+    let mut session = Session::new(ServerConfig::default(), 1);
+    session.current_database = Some("testdb".to_owned());
+
+    assert_eq!(
+        rows(
+            &restored,
+            &mut session,
+            "SELECT id, doc, JSON_TYPE(JSON_EXTRACT(doc, '$.v')) FROM D ORDER BY id"
+        ),
+        vec![
+            vec!["1", r#"{"v": 2.5}"#, "DECIMAL"],
+            vec!["2", r#"{"v": 2.5}"#, "DOUBLE"],
+        ]
     );
 }

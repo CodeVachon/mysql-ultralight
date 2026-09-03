@@ -30501,3 +30501,364 @@ fn a_ctas_column_the_ddl_declared_is_held_to_its_width() {
         vec![vec!["600"]]
     );
 }
+
+#[test]
+fn a_quoted_numeric_scalar_is_unquoted_where_a_number_is_wanted() {
+    // #0084. MySQL converts the JSON *scalar* in a numeric context, not the
+    // document's rendering, so a quoted numeric is unquoted first and the
+    // string inside is then read the way any SQL string is. Reading the
+    // rendering stopped at the leading quote and answered 0 for all of it.
+    //
+    // Every row measured on 8.3 through `scripts/ask.sh`.
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        // The half the title is about, and the half that was still broken.
+        (r#"SELECT CAST('"2026"' AS JSON) + 0"#, "2026"),
+        (r#"SELECT CAST('"2026"' AS JSON) * 2"#, "4052"),
+        (r#"SELECT CAST('"2026"' AS JSON) - 1"#, "2025"),
+        (r#"SELECT CAST('"2026"' AS JSON) DIV 2"#, "1013"),
+        (r#"SELECT CAST('"2026"' AS JSON) MOD 3"#, "1"),
+        (r#"SELECT -CAST('"2026"' AS JSON)"#, "-2026"),
+        (r#"SELECT ABS(CAST('"2026"' AS JSON))"#, "2026"),
+        (r#"SELECT CAST('"2026"' AS JSON) | 0"#, "2026"),
+        (r#"SELECT CAST(CAST('"2026"' AS JSON) AS SIGNED)"#, "2026"),
+        (r#"SELECT CAST(CAST('"2026"' AS JSON) AS UNSIGNED)"#, "2026"),
+        (
+            r#"SELECT CAST(CAST('"2026"' AS JSON) AS DECIMAL(10,2))"#,
+            "2026.00",
+        ),
+        (r#"SELECT CAST(CAST('"2026"' AS JSON) AS DOUBLE)"#, "2026"),
+        // The string is read as a *string*: spaces, sign, exponent and
+        // trailing rubbish all get the rule an unquoted SQL string gets.
+        (r#"SELECT CAST('" 2026 "' AS JSON) + 0"#, "2026"),
+        (r#"SELECT CAST('"+2026"' AS JSON) + 0"#, "2026"),
+        (r#"SELECT CAST('"-4"' AS JSON) + 0"#, "-4"),
+        (r#"SELECT CAST('"2.5e3"' AS JSON) + 0"#, "2500"),
+        (r#"SELECT CAST('"12abc"' AS JSON) + 0"#, "12"),
+        (r#"SELECT CAST('"0x10"' AS JSON) + 0"#, "0"),
+        (r#"SELECT CAST('"abc"' AS JSON) + 0"#, "0"),
+        (r#"SELECT CAST('""' AS JSON) + 0"#, "0"),
+        // At the full width, because the unquoted string is read at it: an
+        // `f64` in the middle answers the nearest double instead.
+        (
+            r#"SELECT CAST(CAST('"18446744073709551615"' AS JSON) AS UNSIGNED)"#,
+            "18446744073709551615",
+        ),
+        (
+            r#"SELECT CAST(CAST('"18446744073709551615"' AS JSON) AS SIGNED)"#,
+            "-1",
+        ),
+        (
+            r#"SELECT CAST('"18446744073709551615"' AS JSON) + 0"#,
+            "1.8446744073709552e19",
+        ),
+        // A CAST to an integer reads the *leading integer* where arithmetic
+        // reads the whole number, which is the one place the two disagree:
+        // an exponent is not part of an integer.
+        (r#"SELECT CAST(CAST('"1e30"' AS JSON) AS SIGNED)"#, "1"),
+        (r#"SELECT CAST(CAST('"2.9"' AS JSON) AS SIGNED)"#, "2"),
+        (r#"SELECT CAST(CAST('"-2.5"' AS JSON) AS SIGNED)"#, "-2"),
+        (
+            r#"SELECT CAST(CAST('"2.9"' AS JSON) AS DECIMAL(10,2))"#,
+            "2.90",
+        ),
+        // The other scalars a numeric context can meet. A boolean is 1 or 0 —
+        // it was 0 for both, read out of the characters `true`.
+        ("SELECT CAST('true' AS JSON) + 0", "1"),
+        ("SELECT CAST('true' AS JSON) * 2", "2"),
+        ("SELECT CAST('true' AS JSON) | 0", "1"),
+        ("SELECT CAST(CAST('true' AS JSON) AS SIGNED)", "1"),
+        ("SELECT CAST('false' AS JSON) + 0", "0"),
+        ("SELECT CAST('null' AS JSON) + 0", "0"),
+        ("SELECT CAST('[1,2]' AS JSON) + 0", "0"),
+        (r#"SELECT CAST('{"a":1}' AS JSON) + 0"#, "0"),
+        // And the JSON *number* path, which was fixed before this and has to
+        // stay fixed: a probe of only these would look green and prove
+        // nothing about the quoted half above.
+        ("SELECT CAST('2026' AS JSON) + 0", "2026"),
+        ("SELECT CAST('2026' AS JSON) * 2", "4052"),
+        ("SELECT CAST('2026' AS JSON) - 1", "2025"),
+        ("SELECT CAST('2026' AS JSON) DIV 2", "1013"),
+        ("SELECT CAST('2026' AS JSON) | 0", "2026"),
+        ("SELECT ABS(CAST('2026' AS JSON))", "2026"),
+        ("SELECT CAST(CAST('2026' AS JSON) AS SIGNED)", "2026"),
+        (
+            "SELECT CAST(CAST('1e30' AS JSON) AS SIGNED)",
+            "9223372036854775807",
+        ),
+        // Unquoting is a *numeric* reading and nothing else. The rendering is
+        // still what a string context, a comparison and JSON_TYPE see, so a
+        // quoted numeric is not a number to any of them.
+        (
+            r#"SELECT CAST(CAST('"2026"' AS JSON) AS CHAR)"#,
+            r#""2026""#,
+        ),
+        (r#"SELECT LENGTH(CAST('"2026"' AS JSON))"#, "6"),
+        (r#"SELECT JSON_TYPE(CAST('"2026"' AS JSON))"#, "STRING"),
+        (r#"SELECT CAST('"2026"' AS JSON) = 2026"#, "0"),
+        (r#"SELECT CAST('"2026"' AS JSON) > 1000"#, "1"),
+        (r#"SELECT CAST('"abc"' AS JSON) > 1000"#, "1"),
+        // A function argument that wants a count is the same reading again,
+        // through `Value::as_int` rather than through arithmetic — and it is
+        // reached by a different set of callers, so nothing above covers it.
+        (r#"SELECT LEFT('abcdef', CAST('"3"' AS JSON))"#, "abc"),
+        (r#"SELECT RIGHT('abcdef', CAST('"3"' AS JSON))"#, "def"),
+        (r#"SELECT SUBSTRING('abcdef', CAST('"3"' AS JSON))"#, "cdef"),
+        (r#"SELECT LPAD('a', CAST('"3"' AS JSON), 'x')"#, "xxa"),
+        (r#"SELECT ROUND(1.23456, CAST('"3"' AS JSON))"#, "1.235"),
+        ("SELECT LEFT('abcdef', CAST('3' AS JSON))", "abc"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn a_quoted_numeric_scalar_is_unquoted_by_a_column_a_sum_and_an_order_by() {
+    // The same conversion reached through a stored document rather than a
+    // literal, because assignment, aggregation and sorting are three paths a
+    // literal never takes. Measured on 8.3.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE S (id INT NOT NULL, s JSON NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO S VALUES (1, '\"20\"'), (2, '\"3\"'), (3, '\"100\"'), \
+         (4, 'true'), (5, '\"abc\"')",
+    );
+
+    // 20 + 3 + 100 + 1 + 0, which was 0 when every scalar read as 0.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT SUM(s), AVG(s) FROM S"),
+        vec![vec!["124", "24.8"]]
+    );
+
+    // Numeric order, which is not the document order the same column sorts
+    // in — so a test that only ordered by the column would pass either way.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM S ORDER BY s + 0, id"),
+        vec![vec!["5"], vec!["4"], vec!["2"], vec!["1"], vec!["3"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM S ORDER BY s, id"),
+        vec![vec!["3"], vec!["1"], vec!["2"], vec!["5"], vec!["4"]]
+    );
+
+    // Into columns of each numeric kind. `INT` refused the quoted numeric
+    // with 1366 before this, where 8.3 takes it.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N (v INT NULL, u BIGINT UNSIGNED NULL, d DECIMAL(10,2) NULL, f DOUBLE NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO N (v, u, d, f) SELECT s, s, CAST('\"2.505\"' AS JSON), s \
+         FROM S WHERE id = 1",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT v, u, d, f FROM N"),
+        vec![vec!["20", "20", "2.51", "20"]]
+    );
+
+    // And the truth of a scalar is the truth of the number read out of it,
+    // which is what `IF` asks: 8.3 answers 1 for the three numerics and the
+    // boolean and 0 for `"abc"`, and this read 0 for all five.
+    //
+    // `WHERE s` is a *different* question on 8.3 and is deliberately not
+    // asserted here: there every document but the JSON number 0 is true,
+    // `"abc"`, `null`, `false` and `[]` included, so one `Value::truthy`
+    // cannot answer both. Measured, and unfiled.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, IF(s, 1, 0) FROM S ORDER BY id"
+        ),
+        vec![
+            vec!["1", "1"],
+            vec!["2", "1"],
+            vec!["3", "1"],
+            vec!["4", "1"],
+            vec!["5", "0"],
+        ]
+    );
+}
+
+#[test]
+fn a_decimal_in_a_document_types_decimal_where_a_double_types_double() {
+    // #0121. MySQL keeps a JSON number's type in the binary form it stores a
+    // document in; this engine stores a document as text, so the type has to
+    // ride in the text. What makes the digits alone insufficient is measured
+    // on 8.3: `DECIMAL(10,1) 2.5` and `CAST('2.5' AS JSON)` render
+    // byte-identically and type DECIMAL and DOUBLE.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE D (id INT NOT NULL, v DECIMAL(10,2) NULL, w DECIMAL(10,1) NULL, \
+         x DECIMAL(10,0) NULL, doc JSON NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO D (id, v, w, x) VALUES (1, 2.50, 2.5, 2)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "UPDATE D SET doc = JSON_OBJECT('v', v, 'w', w, 'x', x)",
+    );
+
+    // Every scale, including the two whose digits are indistinguishable from
+    // a double's and an integer's.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_TYPE(JSON_EXTRACT(doc, '$.v')), JSON_TYPE(JSON_EXTRACT(doc, '$.w')), \
+             JSON_TYPE(JSON_EXTRACT(doc, '$.x')) FROM D"
+        ),
+        vec![vec!["DECIMAL", "DECIMAL", "DECIMAL"]]
+    );
+
+    // And what carries it is invisible to every client-facing reading: the
+    // document renders, unquotes, measures and compares exactly as before.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT doc, JSON_UNQUOTE(doc), LENGTH(doc), CONCAT(doc, ''), \
+             JSON_UNQUOTE(JSON_EXTRACT(doc, '$.v')), JSON_EXTRACT(doc, '$.v') + 0, \
+             doc = CAST('{\"v\":2.50,\"w\":2.5,\"x\":2}' AS JSON) FROM D"
+        ),
+        vec![vec![
+            r#"{"v": 2.50, "w": 2.5, "x": 2}"#,
+            r#"{"v": 2.50, "w": 2.5, "x": 2}"#,
+            "29",
+            r#"{"v": 2.50, "w": 2.5, "x": 2}"#,
+            "2.50",
+            "2.5",
+            "1",
+        ]]
+    );
+
+    for (sql, expected) in [
+        // Through every constructor the app uses.
+        (
+            "SELECT JSON_TYPE(JSON_EXTRACT(JSON_ARRAY(v), '$[0]')) FROM D",
+            "DECIMAL",
+        ),
+        (
+            "SELECT JSON_TYPE(JSON_EXTRACT(JSON_SET(doc, '$.y', v), '$.y')) FROM D",
+            "DECIMAL",
+        ),
+        (
+            "SELECT JSON_TYPE(JSON_EXTRACT(JSON_ARRAY_APPEND(JSON_ARRAY(v), '$', w), '$[1]')) \
+             FROM D",
+            "DECIMAL",
+        ),
+        (
+            "SELECT JSON_TYPE(JSON_EXTRACT(JSON_MERGE_PATCH(doc, CAST('{\"z\":1}' AS JSON)), \
+             '$.v')) FROM D",
+            "DECIMAL",
+        ),
+        ("SELECT JSON_TYPE(CAST(v AS JSON)) FROM D", "DECIMAL"),
+        ("SELECT CAST(v AS JSON) FROM D", "2.50"),
+        // Arithmetic over a decimal is a decimal, and so is an aggregate.
+        (
+            "SELECT JSON_TYPE(JSON_EXTRACT(JSON_OBJECT('a', v + 0), '$.a')) FROM D",
+            "DECIMAL",
+        ),
+        (
+            "SELECT JSON_TYPE(JSON_EXTRACT(JSON_OBJECT('a', -v), '$.a')) FROM D",
+            "DECIMAL",
+        ),
+        (
+            "SELECT JSON_TYPE(JSON_EXTRACT(JSON_OBJECT('a', SUM(v)), '$.a')) FROM D",
+            "DECIMAL",
+        ),
+        // A SQL literal with a point is a decimal to MySQL, so it types
+        // DECIMAL inside a document where an exponent literal types DOUBLE.
+        (
+            "SELECT JSON_TYPE(JSON_EXTRACT(JSON_OBJECT('a', 1.5), '$.a'))",
+            "DECIMAL",
+        ),
+        (
+            "SELECT JSON_TYPE(JSON_EXTRACT(JSON_OBJECT('a', 1.5e0), '$.a'))",
+            "DOUBLE",
+        ),
+        (
+            "SELECT JSON_TYPE(JSON_EXTRACT(JSON_OBJECT('a', 3), '$.a'))",
+            "INTEGER",
+        ),
+        // The other side of every pair: source text parses to a double or an
+        // integer, whatever its digits look like.
+        ("SELECT JSON_TYPE(CAST('2.50' AS JSON))", "DOUBLE"),
+        ("SELECT JSON_TYPE(CAST('2.5' AS JSON))", "DOUBLE"),
+        ("SELECT JSON_TYPE(CAST('2.0' AS JSON))", "DOUBLE"),
+        ("SELECT JSON_TYPE(CAST('2' AS JSON))", "INTEGER"),
+        // Including text that spells the mark itself, which MySQL's parser
+        // reads as the double it names — so a document cannot acquire the
+        // type by being written with a zero exponent.
+        ("SELECT JSON_TYPE(CAST('2.50e0' AS JSON))", "DOUBLE"),
+        ("SELECT CAST('2.50e0' AS JSON)", "2.5"),
+        (
+            "SELECT JSON_TYPE(JSON_EXTRACT(CAST('{\"a\": 2.50e0}' AS JSON), '$.a'))",
+            "DOUBLE",
+        ),
+        ("SELECT CAST('{\"a\": 2.50e0}' AS JSON)", r#"{"a": 2.5}"#),
+        // And the rest of the list this answers, unchanged.
+        (r#"SELECT JSON_TYPE(CAST('{"a":1}' AS JSON))"#, "OBJECT"),
+        ("SELECT JSON_TYPE(CAST('[1,2]' AS JSON))", "ARRAY"),
+        ("SELECT JSON_TYPE(CAST('true' AS JSON))", "BOOLEAN"),
+        (r#"SELECT JSON_TYPE(CAST('"abc"' AS JSON))"#, "STRING"),
+        ("SELECT JSON_TYPE(CAST('null' AS JSON))", "NULL"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // The stored round trip, which is where a type read off the spelling
+    // would be lost: written into a JSON column and read back out.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE R (id INT NOT NULL, doc JSON NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO R SELECT 1, JSON_OBJECT('v', v) FROM D",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO R VALUES (2, '{\"v\": 2.50}')",
+    );
+    // Row 2 is the same digits arriving as *characters* rather than as a
+    // decimal, and 8.3 types that pair DECIMAL and DOUBLE — which is the
+    // whole of why the type is carried rather than read off the spelling.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, doc, JSON_TYPE(JSON_EXTRACT(doc, '$.v')) FROM R ORDER BY id"
+        ),
+        vec![
+            vec!["1", r#"{"v": 2.50}"#, "DECIMAL"],
+            vec!["2", r#"{"v": 2.5}"#, "DOUBLE"],
+        ]
+    );
+}

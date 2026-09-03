@@ -142,6 +142,12 @@ pub const GROUPS: &[Group] = &[
             "CREATE TABLE Wide (id INT NOT NULL, doc JSON NULL, PRIMARY KEY (id))",
             "INSERT INTO Wide VALUES (1, '{\"a\": 2000000000000000.25}'), \
              (2, '[12345678901234.5678]'), (3, '{\"a\": -9945313574470124358}')",
+            // Scalars a numeric context has to unquote before it can read
+            // them, which the corpus had no case for: every document in it
+            // was an object or an array. #0084.
+            "CREATE TABLE Quoted (id INT NOT NULL, s JSON NULL, PRIMARY KEY (id))",
+            "INSERT INTO Quoted VALUES (1, '\"2026\"'), (2, '\"3\"'), (3, '\"abc\"'), \
+             (4, 'true'), (5, '2026'), (6, 'null'), (7, '\" 12 \"'), (8, '\"2.5e3\"')",
         ],
         cases: &[
             same("SELECT JSON_OBJECT('a', JSON_ARRAY(1, 2))"),
@@ -266,6 +272,105 @@ pub const GROUPS: &[Group] = &[
             // Stored and read back, so the value is the column's and not the
             // expression's.
             same("SELECT id, doc, doc->'$.a', JSON_EXTRACT(doc, '$[0]') FROM Wide ORDER BY id"),
+            // A numeric context converts the JSON *scalar*, so a quoted
+            // numeric is unquoted first and then read as the string it is —
+            // spaces, exponent and trailing rubbish included. Reading the
+            // rendering stopped at the leading quote and answered 0 for all
+            // of it. #0084.
+            same(
+                "SELECT id, s + 0, s * 2, s - 1, s DIV 2, s MOD 3, -s, ABS(s), s | 0 \
+                 FROM Quoted ORDER BY id",
+            ),
+            // `CAST(s AS CHAR)` is left out on purpose: 8.3 describes that
+            // column LONG_BLOB where this engine says VAR_STRING, which is a
+            // divergence about how a cast over a document is *described* and
+            // has nothing to do with what it converts. Its value is asserted
+            // in `crates/engine/tests/sql.rs` instead.
+            same(
+                "SELECT id, CAST(s AS SIGNED), CAST(s AS UNSIGNED), CAST(s AS DECIMAL(10,2)), \
+                 CAST(s AS DOUBLE) FROM Quoted ORDER BY id",
+            ),
+            // A CAST to an integer reads the leading integer where arithmetic
+            // reads the whole number: an exponent is not part of an integer,
+            // and only a scalar that *is* a string takes that reading.
+            same(
+                "SELECT CAST(CAST('\"1e30\"' AS JSON) AS SIGNED), \
+                 CAST(CAST('1e30' AS JSON) AS SIGNED), \
+                 CAST(CAST('\"2.9\"' AS JSON) AS SIGNED), \
+                 CAST(CAST('\"18446744073709551615\"' AS JSON) AS UNSIGNED)",
+            ),
+            same(
+                "SELECT CAST('\" 2026 \"' AS JSON) + 0, CAST('\"+2026\"' AS JSON) + 0, \
+                 CAST('\"-4\"' AS JSON) + 0, CAST('\"0x10\"' AS JSON) + 0, \
+                 CAST('\"12abc\"' AS JSON) + 0, CAST('\"\"' AS JSON) + 0, \
+                 CAST('[1,2]' AS JSON) + 0, CAST('{\"a\":1}' AS JSON) + 0",
+            ),
+            // A function argument that wants a count takes the same reading
+            // through a different accessor, so none of the arithmetic above
+            // reaches it.
+            same(
+                "SELECT LEFT('abcdef', CAST('\"3\"' AS JSON)), \
+                 RIGHT('abcdef', CAST('\"3\"' AS JSON)), \
+                 SUBSTRING('abcdef', CAST('\"3\"' AS JSON)), \
+                 LPAD('a', CAST('\"3\"' AS JSON), 'x'), \
+                 ROUND(1.23456, CAST('\"3\"' AS JSON)), \
+                 LEFT('abcdef', CAST('3' AS JSON))",
+            ),
+            // Aggregated, sorted and filtered, which are three readings a
+            // scalar expression never reaches. The document order the same
+            // column sorts in is not the numeric one, so both are asked.
+            same("SELECT SUM(s), AVG(s), MIN(s), MAX(s), COUNT(s) FROM Quoted"),
+            same("SELECT id FROM Quoted ORDER BY s + 0, id"),
+            same("SELECT id FROM Quoted ORDER BY s, id"),
+            // `IF` asks the scalar the numeric question, so it moves with the
+            // conversion above. `WHERE s` is deliberately not asked: 8.3
+            // reads a document there by a *different* rule — every value but
+            // the JSON number 0 is true, `"abc"`, `null`, `false` and `[]`
+            // included — and one `Value::truthy` cannot answer both.
+            same("SELECT id, IF(s, 1, 0) FROM Quoted ORDER BY id"),
+            // Unquoting is a numeric reading and nothing else: the rendering
+            // is still what a string context, a comparison and JSON_TYPE see.
+            same(
+                "SELECT id, LENGTH(s), JSON_TYPE(s), s = 2026, s > 1000, JSON_UNQUOTE(s) \
+                 FROM Quoted ORDER BY id",
+            ),
+            // A decimal in a document types DECIMAL where the same digits
+            // arriving as text type DOUBLE — which is why the type is carried
+            // beside them rather than read off them: 8.3 renders
+            // `DECIMAL(10,1)` 2.5 and `CAST('2.5' AS JSON)` identically.
+            // #0121.
+            same(
+                "SELECT id, JSON_TYPE(JSON_EXTRACT(JSON_OBJECT('a', a), '$.a')), \
+                 JSON_TYPE(JSON_EXTRACT(JSON_OBJECT('a', b), '$.a')), \
+                 JSON_TYPE(JSON_EXTRACT(JSON_OBJECT('a', c), '$.a')) FROM Money ORDER BY id",
+            ),
+            same("SELECT id, JSON_TYPE(JSON_EXTRACT(doc, '$.a')) FROM MoneyJ ORDER BY id"),
+            same(
+                "SELECT JSON_TYPE(CAST('2.50' AS JSON)), JSON_TYPE(CAST('2.5' AS JSON)), \
+                 JSON_TYPE(CAST('2.0' AS JSON)), JSON_TYPE(CAST('2' AS JSON)), \
+                 JSON_TYPE(CAST('2.50e0' AS JSON)), CAST('2.50e0' AS JSON)",
+            ),
+            same(
+                "SELECT id, JSON_TYPE(CAST(a AS JSON)), \
+                 JSON_TYPE(JSON_EXTRACT(JSON_ARRAY(a), '$[0]')), \
+                 JSON_TYPE(JSON_EXTRACT(JSON_SET('{\"x\": 1}', '$.x', a), '$.x')), \
+                 JSON_TYPE(JSON_EXTRACT(JSON_ARRAY_APPEND('[1]', '$', a), '$[1]')), \
+                 JSON_TYPE(JSON_EXTRACT(JSON_MERGE_PATCH('{\"a\": 1}', JSON_OBJECT('a', a)), \
+                 '$.a')) FROM Money ORDER BY id",
+            ),
+            // A decimal that has been through arithmetic or an aggregate is
+            // still a decimal, and a SQL literal with a point is one too
+            // where the same value written with an exponent is a double.
+            same(
+                "SELECT JSON_TYPE(JSON_EXTRACT(JSON_OBJECT('a', SUM(a)), '$.a')), \
+                 JSON_TYPE(JSON_EXTRACT(JSON_OBJECT('a', MIN(a) + 0), '$.a')), \
+                 JSON_TYPE(JSON_EXTRACT(JSON_OBJECT('a', -MAX(a)), '$.a')) FROM Money",
+            ),
+            same(
+                "SELECT JSON_TYPE(JSON_EXTRACT(JSON_OBJECT('a', 1.5), '$.a')), \
+                 JSON_TYPE(JSON_EXTRACT(JSON_OBJECT('a', 1.5e0), '$.a')), \
+                 JSON_TYPE(JSON_EXTRACT(JSON_OBJECT('a', 3), '$.a'))",
+            ),
         ],
     },
     Group {

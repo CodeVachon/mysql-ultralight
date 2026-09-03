@@ -246,23 +246,16 @@ impl Value {
             Value::Unsigned(v) => Some(*v as i64),
             Value::Float(v) => Some(*v as i64),
             Value::Float32(v) => Some(*v as i64),
-            Value::Text(v, _) | Value::Json(v) | Value::Decimal(v) => {
-                let t = v.trim();
-                t.parse::<i64>()
-                    .ok()
-                    .or_else(|| t.parse::<f64>().ok().map(|f| f as i64))
-            }
+            // Through the scalar the document holds rather than through its
+            // rendering, so a quoted numeric is unquoted on the way — #0084.
+            Value::Json(v) => digits_as_int(&crate::json::numeric_text(v)),
+            Value::Text(v, _) | Value::Decimal(v) => digits_as_int(v),
             // Read the way the text arm above is, for the reason `as_float`
             // gives: a binary string is a string, and only its collation is
             // different. Left out, the two readings disagreed — a value that
             // an `INT` column refused with 1366 went into the `DOUBLE` column
             // beside it as a number, where 8.3 takes it into both.
-            Value::Bytes(v) => {
-                let t = std::str::from_utf8(v).ok()?.trim();
-                t.parse::<i64>()
-                    .ok()
-                    .or_else(|| t.parse::<f64>().ok().map(|f| f as i64))
-            }
+            Value::Bytes(v) => digits_as_int(std::str::from_utf8(v).ok()?),
             _ => None,
         }
     }
@@ -280,12 +273,12 @@ impl Value {
             // Parsed at the full width before falling back to a float, so
             // `'18446744073709551615'` into a `BIGINT UNSIGNED` is the number
             // it spells and not the nearest double to it.
-            Value::Text(v, _) | Value::Json(v) | Value::Decimal(v) => {
-                let t = v.trim();
-                t.parse::<i128>()
-                    .ok()
-                    .or_else(|| t.parse::<f64>().ok().map(|f| f as i128))
-            }
+            Value::Text(v, _) | Value::Decimal(v) => digits_as_exact_int(v),
+            // The scalar, not the rendering — #0084. At the full width for the
+            // same reason the text arm is: 8.3 takes the JSON string
+            // `"18446744073709551615"` into a `BIGINT UNSIGNED` as the number
+            // it spells.
+            Value::Json(v) => digits_as_exact_int(&crate::json::numeric_text(v)),
             // At the full width here as well, and not through `as_int` below.
             // That returns an `i64`, so a binary string spelling
             // 18446744073709551615 came back saturated at `i64::MAX` — and
@@ -295,12 +288,7 @@ impl Value {
             // the value would have been wrong too; 8.3 takes it. A clear
             // error turning into a wrong answer is the one trade this repo
             // does not make.
-            Value::Bytes(digits) => {
-                let text = std::str::from_utf8(digits).ok()?.trim();
-                text.parse::<i128>()
-                    .ok()
-                    .or_else(|| text.parse::<f64>().ok().map(|f| f as i128))
-            }
+            Value::Bytes(digits) => digits_as_exact_int(std::str::from_utf8(digits).ok()?),
             Value::Float(v) => Some(*v as i128),
             Value::Float32(v) => Some(*v as i128),
             other => other.as_int().map(i128::from),
@@ -312,7 +300,9 @@ impl Value {
             Value::Int(v) => Some(*v as f64),
             Value::Float(v) => Some(*v),
             Value::Float32(v) => Some(*v as f64),
-            Value::Text(v, _) | Value::Json(v) | Value::Decimal(v) => v.trim().parse().ok(),
+            Value::Text(v, _) | Value::Decimal(v) => v.trim().parse().ok(),
+            // The scalar, not the rendering — #0084.
+            Value::Json(v) => crate::json::numeric_text(v).trim().parse().ok(),
             // A binary string is still a *string*: MySQL reads a `BINARY`
             // value, a `VARBINARY` column and a `BLOB` in a numeric context
             // exactly as it reads text, and only the collation differs.
@@ -354,7 +344,11 @@ impl Value {
             Value::Int(v) => *v as f64,
             Value::Float(v) => *v,
             Value::Float32(v) => *v as f64,
-            Value::Text(v, _) | Value::Json(v) | Value::Decimal(v) => numeric_prefix(v),
+            Value::Text(v, _) | Value::Decimal(v) => numeric_prefix(v),
+            // The scalar, not the rendering — #0084. `"2026" + 0` is 2026 on
+            // 8.3 and was 0 here, because the leading quote stops
+            // `numeric_prefix` before it reaches a digit.
+            Value::Json(v) => numeric_prefix(&crate::json::numeric_text(v)),
             Value::Bytes(v) => numeric_prefix(&String::from_utf8_lossy(v)),
             Value::Enum { ordinal, .. } => f64::from(*ordinal),
             Value::Bool(b) => f64::from(u8::from(*b)),
@@ -367,6 +361,23 @@ impl Value {
                 Some(number) => number.as_number(),
                 None => numeric_prefix(v),
             },
+        }
+    }
+
+    /// The characters a numeric conversion reads this value out of.
+    ///
+    /// [`Value::as_text`] for everything but a document, where MySQL converts
+    /// the *scalar* and not the rendering: `CAST(CAST('"2.9"' AS JSON) AS
+    /// DECIMAL(10,2))` is 2.90 on 8.3, where reading `"2.9"` — quotes and all
+    /// — as digits gives 0.00. See [`crate::json::numeric_text`] and #0084.
+    ///
+    /// For the conversions that go through characters rather than through a
+    /// double: a DECIMAL cast and a DECIMAL column, both of which keep the
+    /// text precisely because parsing it would lose precision.
+    pub fn numeric_text(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Value::Json(document) => crate::json::numeric_text(document),
+            other => std::borrow::Cow::Owned(other.as_text()),
         }
     }
 
@@ -389,9 +400,13 @@ impl Value {
             // The member, not the ordinal: only the *numeric* reading of an
             // ENUM is its position, and `SELECT e` still shows `a`.
             Value::Enum { member, .. } => member.clone(),
-            // The document as it was serialised, which is what MySQL sends and
-            // what a client reads back.
-            Value::Json(v) | Value::Decimal(v) => v.clone(),
+            Value::Decimal(v) => v.clone(),
+            // The document as MySQL writes it, which is what it sends and what
+            // a client reads back. Not the stored text: a decimal inside one
+            // is *held* wearing a mark that says it is a decimal and not a
+            // double, and this is the boundary that takes it off again — see
+            // `json::DECIMAL_MARK`.
+            Value::Json(v) => crate::json::wire_text(v).into_owned(),
             // `1` and `0`. MySQL has no boolean on the wire — `SELECT TRUE`
             // and `SELECT 1 = 1` both send the character `1` — so the tag is
             // invisible to a client and shows up only inside a document.
@@ -435,7 +450,19 @@ impl Value {
             Value::Bytes(v) => Some(numeric_prefix(&String::from_utf8_lossy(v)) != 0.0),
             // Read like the text it used to be, so tagging a value changed
             // nothing about how a WHERE clause treats it.
-            Value::Json(v) | Value::Decimal(v) => Some(numeric_prefix(v) != 0.0),
+            Value::Decimal(v) => Some(numeric_prefix(v) != 0.0),
+            // And a document by the number read out of its *scalar*, which is
+            // 8.3's answer for `IF(j, 1, 0)`: 1 for `"2026"`, `"2.5e3"`, `3`
+            // and `true`, and 0 for `"abc"`, `"0"`, `null`, `false`, `[]` and
+            // `{}`. Read out of the rendering the quoted numerics were 0 too.
+            // See #0084.
+            //
+            // `WHERE j` is a *different* question on 8.3, and this does not
+            // answer it: there every document but the JSON number 0 is true,
+            // `"abc"` and `null` included. One `truthy` cannot be both, and
+            // the `IF` reading is the one the rest of this file agrees with.
+            // Measured, and a divergence of its own.
+            Value::Json(_) => Some(self.as_number() != 0.0),
             // By the packed number, for the same reason arithmetic is: MySQL
             // asks a temporal the numeric question the way it converts one.
             Value::Temporal(_) => Some(self.as_number() != 0.0),
@@ -869,11 +896,14 @@ impl Value {
             Value::Float32(v) => WireValue::F32(*v),
             Value::Text(v, _) => WireValue::Str(v.clone()),
             Value::Bytes(v) => WireValue::Bytes(v.clone()),
-            // JSON crosses the wire as text, which is how MySQL transmits it.
             // A decimal travels as its text, which is how MySQL sends one.
             // A temporal does too — the packed number is a reading, not a
             // representation, and a client asking for a DATE gets its text.
-            Value::Json(v) | Value::Decimal(v) | Value::Temporal(v) => WireValue::Str(v.clone()),
+            Value::Decimal(v) | Value::Temporal(v) => WireValue::Str(v.clone()),
+            // JSON crosses the wire as text, which is how MySQL transmits it —
+            // through `as_text`, so the stored form's decimal mark comes off
+            // here exactly as it does in every other rendering of a document.
+            Value::Json(_) => WireValue::Str(self.as_text()),
             // The member. A client asking for an ENUM column gets `a`, which
             // is what MySQL sends for it; the ordinal is a reading, not a
             // representation.
@@ -937,6 +967,33 @@ fn format_float(v: f64) -> String {
     // trailing `.0` and never reached for an exponent, so `1e20` was twenty-one
     // digits where MySQL writes `1e20`.
     mysql_ultralight_protocol::value::format_float(v, None)
+}
+
+/// Digits as a whole number, the way [`Value::as_int`] reads a value that is
+/// held as characters.
+///
+/// Every such value takes this reading — text, a decimal, a binary string and
+/// the scalar inside a document — and they have to take the *same* one: a
+/// value an `INT` column refuses with 1366 and the `DOUBLE` beside it accepts
+/// is a difference between two copies of this, not a rule MySQL has.
+///
+/// The integer parse comes first so that digits an `f64` cannot hold exactly
+/// are not rounded on the way through; the float is the fallback for anything
+/// with a point or an exponent in it.
+fn digits_as_int(text: &str) -> Option<i64> {
+    let t = text.trim();
+    t.parse::<i64>()
+        .ok()
+        .or_else(|| t.parse::<f64>().ok().map(|f| f as i64))
+}
+
+/// The same reading at the width [`Value::as_exact_int`] needs, where every
+/// `i64` and every `u64` is exact.
+fn digits_as_exact_int(text: &str) -> Option<i128> {
+    let t = text.trim();
+    t.parse::<i128>()
+        .ok()
+        .or_else(|| t.parse::<f64>().ok().map(|f| f as i128))
 }
 
 /// The number MySQL reads out of the front of a string.

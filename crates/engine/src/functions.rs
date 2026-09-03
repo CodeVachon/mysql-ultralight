@@ -808,35 +808,14 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
             if arg(0).is_null() {
                 return Ok(Value::Null);
             }
-            // DECIMAL is missing from this list, and cannot be added while a
-            // document is a rendering. MySQL has a third number type in the
-            // binary form it stores JSON in, and #0071 gave the engine the
-            // digits a decimal was written with — but the digits are not what
-            // separates the types. Measured on 8.3, its *own* rendering is
-            // byte-identical across the pairs it types differently:
-            //
-            //     DECIMAL(10,1) 2.5   ->  `2.5`  DECIMAL
-            //     CAST('2.5' AS JSON) ->  `2.5`  DOUBLE
-            //     DECIMAL(10,0) 2     ->  `2`    DECIMAL
-            //     CAST('2' AS JSON)   ->  `2`    INTEGER
-            //
-            // So `Number::as_str` carries the spelling and the spelling is
-            // not a function of the type. Answering DECIMAL for the decimals
-            // that *are* separable — the ones with a trailing zero past the
-            // shortest form, which no double spells — would make the answer
-            // depend on the column's scale rather than on its type, and 8.3
-            // says DECIMAL for both scales. Getting this right needs the type
-            // carried beside the text, which is a change to what a
-            // `Value::Json` is and to the image format that stores one.
-            Value::text(match json::parse(&arg(0))? {
-                serde_json::Value::Null => "NULL",
-                serde_json::Value::Bool(_) => "BOOLEAN",
-                serde_json::Value::Number(n) if n.is_f64() => "DOUBLE",
-                serde_json::Value::Number(_) => "INTEGER",
-                serde_json::Value::String(_) => "STRING",
-                serde_json::Value::Array(_) => "ARRAY",
-                serde_json::Value::Object(_) => "OBJECT",
-            })
+            // DECIMAL is answered now — see `json::DECIMAL_MARK` and #0121.
+            // DATE, TIME, DATETIME, TIMESTAMP, BLOB, BIT, OPAQUE and UNSIGNED
+            // INTEGER are still missing, because nothing carries those either:
+            // a temporal goes into a document as a JSON string and types
+            // STRING here where 8.3 says DATE, and an unsigned integer types
+            // INTEGER where 8.3 says UNSIGNED INTEGER. Each is measured
+            // against 8.3 and is a divergence of its own, not this one.
+            Value::text(json::type_name(&json::parse(&arg(0))?))
         }
         "json_keys" => {
             if arg(0).is_null() {
@@ -1750,9 +1729,14 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
                 // 1.2345678806 on 8.3 and was 1.2345700000 here, read back out
                 // of `1.23457`.
                 Value::Float32(v) => crate::decimal::plain(f64::from(*v)),
-                _ => value
-                    .temporal_number()
-                    .map_or_else(|| value.as_text(), |number| number.as_text()),
+                // Otherwise the numeric text, which is the rendering for
+                // everything but a document — a document converts through the
+                // scalar it holds, so `CAST(CAST('"2.9"' AS JSON) AS
+                // DECIMAL(10,2))` is 2.90 and not 0.00. See #0084.
+                _ => value.temporal_number().map_or_else(
+                    || value.numeric_text().into_owned(),
+                    |number| number.as_text(),
+                ),
             };
             Value::Decimal(crate::types::decimal_digits(&source, scale))
         }
@@ -2032,14 +2016,19 @@ fn digit_integer(value: &Value) -> i128 {
         // A document is not a string, and 8.3 says so: a JSON *number*
         // converts as the number it is, so `CAST(CAST('1e30' AS JSON) AS
         // SIGNED)` is 9223372036854775807 where the JSON string `"1e30"`
-        // beside it is 1. This engine holds both as text and cannot tell them
-        // apart — that is #0121 — so the number reading stays, saturating into
-        // the signed range the way an approximate operand does rather than
-        // wrapping at the unsigned one.
-        Value::Json(_) => value
-            .as_exact_int()
-            .unwrap_or(0)
-            .clamp(i128::from(i64::MIN), i128::from(i64::MAX)),
+        // beside it is 1 — an exponent is not part of an integer. So the two
+        // scalars take the two readings, which is the half of #0084 a
+        // rendering could not tell apart: a quoted numeric is unquoted and
+        // then read exactly as the string it is, and everything else keeps the
+        // number reading, saturating into the signed range the way an
+        // approximate operand does rather than wrapping at the unsigned one.
+        Value::Json(document) => match json::quoted_scalar(document) {
+            Some(text) => leading_integer(&text),
+            None => value
+                .as_exact_int()
+                .unwrap_or(0)
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)),
+        },
         // Everything already an integer: an ENUM's ordinal, a boolean, a
         // temporal's packed number. `as_exact_int` carries each of those
         // exactly, and its `None` is a value none of them describes.

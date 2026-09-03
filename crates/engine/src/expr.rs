@@ -2652,7 +2652,11 @@ fn bit_operand(v: &Value) -> EngineResult<u64> {
         // MySQL and 4503599627370496 through a double, which lands on the
         // wrong side of every bit it is then masked with.
         Value::Decimal(text) => decimal_bits(text),
-        Value::Text(s, _) | Value::Json(s) => integer_prefix(s),
+        Value::Text(s, _) => integer_prefix(s),
+        // Through the scalar the document holds, so `j | 0` and `j + 0` agree
+        // about a quoted numeric: `CAST('"2026"' AS JSON) | 0` is 2026 on 8.3
+        // and was 0 here. See #0084.
+        Value::Json(s) => integer_prefix(&crate::json::numeric_text(s)),
         // Its ordinal, through the same number arithmetic uses, so `e | 0` and
         // `e + 0` cannot disagree about what a member is worth. It is a whole
         // number already, so neither reading below would round it.

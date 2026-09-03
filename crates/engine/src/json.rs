@@ -19,6 +19,41 @@ use crate::value::Value;
 /// parse failure serde no longer raises for us — see [`normalise`].
 const TOO_BIG: &str = "Number too big to be stored in double.";
 
+/// The mark a decimal wears inside a document, so that `JSON_TYPE` can tell
+/// one from a double — #0121.
+///
+/// MySQL keeps a JSON number's *type* in the binary form it stores a document
+/// in. This engine stores a document as text, so the type has to be in the
+/// text or it is nowhere: measured on 8.3, its own rendering is byte-identical
+/// across pairs it types differently.
+///
+/// ```text
+/// DECIMAL(10,1) 2.5   ->  `2.5`  DECIMAL
+/// CAST('2.5' AS JSON) ->  `2.5`  DOUBLE
+/// DECIMAL(10,0) 2     ->  `2`    DECIMAL
+/// CAST('2' AS JSON)   ->  `2`    INTEGER
+/// ```
+///
+/// So the digits cannot carry it, and the partial rule available from them —
+/// a trailing zero past the shortest form, which no double spells — would
+/// answer DECIMAL for a `DECIMAL(10,2)` 2.50 and DOUBLE for the
+/// `DECIMAL(10,1)` 2.5 beside it, making the answer a function of the column's
+/// scale where 8.3 says DECIMAL for both.
+///
+/// An explicit zero exponent is the mark because nothing else in a document
+/// can wear it. A double is spelled by [`double`], which reaches exponent form
+/// only past 1e15 or below 1e-15 and writes the fixed form otherwise; an
+/// integer is spelled as its digits; and source text is re-spelled by
+/// [`normalise`] before it is held, so a literal `2.50e0` arrives as the
+/// double `2.5`. The mark therefore appears exactly where [`from_value`] put
+/// it, and it rides through every parse, render, `JSON_EXTRACT`, `JSON_SET`
+/// and stored round trip for free, because all of those move the number's held
+/// text.
+///
+/// It is *held* and not *sent*: [`render_text`] writes the stored form and
+/// [`output_text`] writes MySQL's, and `Value::as_text` is where the two meet.
+const DECIMAL_MARK: &str = "e0";
+
 /// One step of a JSON path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
@@ -795,7 +830,8 @@ pub fn render(json: &Json) -> Value {
     Value::Json(render_text(json))
 }
 
-/// A document as MySQL writes it.
+/// A document as the engine *stores* one, which is MySQL's spelling plus
+/// [`DECIMAL_MARK`].
 ///
 /// Not `serde_json::to_string`, which differs in two ways that both reach a
 /// test as a different string. MySQL puts a space after every comma and every
@@ -814,13 +850,132 @@ pub fn render(json: &Json) -> Value {
 /// written and a double is already in MySQL's spelling rather than serde's,
 /// which writes an exponent as `1e+30` where MySQL writes `1e30` and switches
 /// to exponent form earlier.
+///
+/// This is the form a `Value::Json` holds and an image stores, so it is also
+/// the form [`parse_document`] reads back. [`output_text`] is the one that
+/// goes out.
 pub fn render_text(json: &Json) -> String {
     let mut out = String::new();
-    write_json(&mut out, json);
+    write_json(&mut out, json, true);
     out
 }
 
-fn write_json(out: &mut String, json: &Json) {
+/// A document as MySQL writes it: the stored form with [`DECIMAL_MARK`] off.
+///
+/// Identical to [`render_text`] for every document that holds no decimal,
+/// which is why stripping the mark can be skipped when the text does not
+/// contain it — see [`wire_text`].
+///
+/// Not public: a caller outside this module has a `Value::Json` rather than a
+/// tree, and wants [`wire_text`] or `Value::as_text` to do the stripping for
+/// it.
+fn output_text(json: &Json) -> String {
+    let mut out = String::new();
+    write_json(&mut out, json, false);
+    out
+}
+
+/// The document `stored` holds, as MySQL would write it.
+///
+/// Borrowed unless there is a mark to take off, because this is on the path of
+/// every `SELECT` of a JSON column. A document with no mark renders back to
+/// itself — the stored form and MySQL's are the same text — so the shortcut
+/// changes nothing but the allocation.
+pub fn wire_text(stored: &str) -> std::borrow::Cow<'_, str> {
+    if !stored.contains(DECIMAL_MARK) {
+        return std::borrow::Cow::Borrowed(stored);
+    }
+    match parse_document(stored) {
+        Ok(document) => std::borrow::Cow::Owned(output_text(&document)),
+        // Every route to a tagged value validates it first, so this is
+        // unreachable; sending the text as it stands beats inventing one.
+        Err(_) => std::borrow::Cow::Borrowed(stored),
+    }
+}
+
+/// The text SQL reads out of a document when it wants a *number* — #0084.
+///
+/// MySQL converts the JSON scalar rather than its rendering, so a quoted
+/// numeric is unquoted first and the string inside is read the way any SQL
+/// string is read. Measured on 8.3, over `CAST(… AS JSON) + 0`:
+///
+/// ```text
+/// "2026"    2026     " 2026 "  2026     "+2026"  2026
+/// "2.5e3"   2500     "12abc"   12       "0x10"   0
+/// "abc"     0        true      1        false    0
+/// null      0        [1]       0        {"a":1}  0
+/// ```
+///
+/// So a string reads as its contents, a boolean as 1 or 0, and everything else
+/// as the text it renders to — where a number is itself and `null`, an array
+/// and an object all fail to start with a digit and come out 0, which is the
+/// answer 8.3 gives with a 3156 warning beside it.
+///
+/// The rendering is the *output* one: a decimal reaches arithmetic as its
+/// digits, not wearing [`DECIMAL_MARK`].
+pub fn numeric_text(stored: &str) -> std::borrow::Cow<'_, str> {
+    // Only a string, a boolean and a decimal read as something other than the
+    // text already there, and each announces itself in the first byte or in
+    // the mark. Anything else is its own numeric text and needs no parse.
+    let quoted_or_boolean = matches!(stored.as_bytes().first(), Some(b'"' | b't' | b'f'));
+    if !quoted_or_boolean && !stored.contains(DECIMAL_MARK) {
+        return std::borrow::Cow::Borrowed(stored);
+    }
+    match parse_document(stored) {
+        Ok(Json::String(text)) => std::borrow::Cow::Owned(text),
+        Ok(Json::Bool(b)) => std::borrow::Cow::Borrowed(if b { "1" } else { "0" }),
+        Ok(other) => std::borrow::Cow::Owned(output_text(&other)),
+        Err(_) => std::borrow::Cow::Borrowed(stored),
+    }
+}
+
+/// The scalar `stored` holds if it is a JSON string, and nothing otherwise.
+///
+/// The distinction a `CAST(… AS SIGNED)` needs: 8.3 reads a JSON *number* as
+/// the number it is and a JSON *string* as the string it is, and the two
+/// readings disagree — `CAST(CAST('1e30' AS JSON) AS SIGNED)` is
+/// 9223372036854775807 where the `"1e30"` beside it is 1, because an exponent
+/// is not part of an integer.
+pub fn quoted_scalar(stored: &str) -> Option<String> {
+    if !stored.starts_with('"') {
+        return None;
+    }
+    match parse_document(stored) {
+        Ok(Json::String(text)) => Some(text),
+        _ => None,
+    }
+}
+
+/// The word `JSON_TYPE` answers for a document.
+///
+/// Lives here rather than at the call site because the decimal case is a
+/// property of how a number is *held* — see [`DECIMAL_MARK`].
+pub fn type_name(json: &Json) -> &'static str {
+    match json {
+        Json::Null => "NULL",
+        Json::Bool(_) => "BOOLEAN",
+        Json::Number(n) if is_decimal(n) => "DECIMAL",
+        Json::Number(n) if n.is_f64() => "DOUBLE",
+        Json::Number(_) => "INTEGER",
+        Json::String(_) => "STRING",
+        Json::Array(_) => "ARRAY",
+        Json::Object(_) => "OBJECT",
+    }
+}
+
+/// Whether a held number is a decimal, which is whether it wears
+/// [`DECIMAL_MARK`].
+///
+/// Read off the exponent rather than by matching the tail of the text, because
+/// serde canonicalises the sign on the way in: `2.50e0` is held as `2.50e+0`.
+fn is_decimal(n: &Number) -> bool {
+    match n.as_str().rsplit_once(['e', 'E']) {
+        Some((_, exponent)) => exponent.strip_prefix('+').unwrap_or(exponent) == "0",
+        None => false,
+    }
+}
+
+fn write_json(out: &mut String, json: &Json, marked: bool) {
     match json {
         Json::Array(items) => {
             out.push('[');
@@ -828,7 +983,7 @@ fn write_json(out: &mut String, json: &Json) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                write_json(out, item);
+                write_json(out, item, marked);
             }
             out.push(']');
         }
@@ -841,13 +996,22 @@ fn write_json(out: &mut String, json: &Json) {
                 }
                 out.push_str(&Json::String((*key).clone()).to_string());
                 out.push_str(": ");
-                write_json(out, &members[*key]);
+                write_json(out, &members[*key], marked);
             }
             out.push('}');
         }
         // As held. Re-spelling it here would undo the two things the holding
         // is for: a decimal's scale, and a double already put in MySQL's form.
-        Json::Number(n) => out.push_str(&written(n)),
+        // The mark comes off only on the way out, where MySQL has no such
+        // exponent to write.
+        Json::Number(n) => {
+            let text = written(n);
+            if marked || !is_decimal(n) {
+                out.push_str(&text);
+            } else {
+                out.push_str(text.strip_suffix(DECIMAL_MARK).unwrap_or(&text));
+            }
+        }
         scalar => out.push_str(&scalar.to_string()),
     }
 }
@@ -1094,11 +1258,13 @@ pub fn unquote(json: &Json) -> Value {
         Json::String(s) => Value::text(s),
         // JSON null unquotes to the text `null`, as MySQL does — it is a value
         // that was there, not a value that was missing. Anything else keeps
-        // its document form, written the same way `render_text` writes one:
-        // `JSON_UNQUOTE` on an object is still that object's text, and having
-        // it spelled compactly here put two spellings in one row for
-        // `SELECT doc, doc->>'$.a'`.
-        other => Value::text(render_text(other)),
+        // its document form, written the way it goes out: `JSON_UNQUOTE` on an
+        // object is still that object's text, and having it spelled compactly
+        // here put two spellings in one row for `SELECT doc, doc->>'$.a'`.
+        // Out and not stored, because this leaves the document world — 8.3
+        // gives `JSON_UNQUOTE` over a DECIMAL(10,2) 2.50 the characters
+        // `2.50`, and a mark in them would be visible to the client.
+        other => Value::text(output_text(other)),
     }
 }
 
@@ -1150,8 +1316,16 @@ pub fn from_value(value: &Value) -> Json {
         // is what the number is, so the trailing zero the column's scale
         // exists to carry survives being embedded, stored, reloaded and
         // written back out.
-        Value::Decimal(s) => s
+        //
+        // And wearing [`DECIMAL_MARK`], which is the only place a document
+        // ever gets one: this is the one arm that knows a number is a decimal
+        // rather than a double, and #0121 is what happens when that is not
+        // written down. A decimal whose digits will not take the mark keeps
+        // its own spelling and types as whatever the digits say, which is the
+        // old answer rather than a new wrong one.
+        Value::Decimal(s) => format!("{s}{DECIMAL_MARK}")
             .parse::<Number>()
+            .or_else(|_| s.parse::<Number>())
             .map_or_else(|_| Json::String(s.clone()), Json::Number),
         // Every route to a tagged value validates it first — a constructor
         // serialised it from a `Json`, a column coerced it, an image checked
