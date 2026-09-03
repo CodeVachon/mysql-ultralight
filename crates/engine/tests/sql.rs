@@ -20541,3 +20541,300 @@ fn a_qualified_wildcard_does_not_coalesce_a_using_column() {
         vec![vec!["1", "20", "1", "7"]]
     );
 }
+
+/// #0116. SIGN reads its argument as a number and answers -1, 0 or 1.
+///
+/// Every expected value measured against 8.3 rather than reasoned about, and
+/// three of them are not what reasoning gives:
+///
+/// * a string is read by its leading number, so `SIGN('abc')` is 0 and not
+///   NULL — 8.3 warns 1292 and answers,
+/// * a temporal is read as its packed digits, so a DATE is positive and a
+///   negative TIME is -1, and
+/// * an ENUM is read as its ordinal, so every member is 1 whatever it spells.
+///
+/// The zeros are here in every spelling because zero is the answer with no
+/// direction to fall off: `-0.00`, `-0.0e0` and a `DECIMAL(6,2)` holding what
+/// was written as -0.001 are all 0 on 8.3, where `f64::signum` would call two
+/// of them -1.
+#[test]
+fn sign_answers_minus_one_zero_or_one() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE G (i INT, iu BIGINT UNSIGNED, d DECIMAL(6,2), dz DECIMAL(6,2), \
+         f FLOAT, db DOUBLE, s VARCHAR(20), bl BLOB, dt DATE, tm TIME, e ENUM('a','b','c'))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO G VALUES (-5, 0, 1.50, -0.001, -1.5, 2.5, '-12abc', '-7', \
+         '2020-01-02', '-01:00:00', 'a')",
+    );
+    for (sql, expected) in [
+        ("SELECT SIGN(5)", "1"),
+        ("SELECT SIGN(-5)", "-1"),
+        ("SELECT SIGN(0)", "0"),
+        // The two ends of a BIGINT, where `i64::abs` panics and `signum` does
+        // not: -1 and 1 are in range for every argument SIGN can be given.
+        ("SELECT SIGN(9223372036854775807)", "1"),
+        ("SELECT SIGN(-9223372036854775808)", "-1"),
+        // Past a BIGINT, which is where the unsigned reading starts.
+        ("SELECT SIGN(18446744073709551615)", "1"),
+        ("SELECT SIGN(18446744073709551616)", "1"),
+        ("SELECT SIGN(-18446744073709551616)", "-1"),
+        ("SELECT SIGN(1.50)", "1"),
+        ("SELECT SIGN(-1.50)", "-1"),
+        ("SELECT SIGN(0.00)", "0"),
+        ("SELECT SIGN(-0.0)", "0"),
+        ("SELECT SIGN(1.5e0)", "1"),
+        ("SELECT SIGN(-1.5e0)", "-1"),
+        ("SELECT SIGN(0e0)", "0"),
+        ("SELECT SIGN(-0.0e0)", "0"),
+        ("SELECT SIGN('12')", "1"),
+        ("SELECT SIGN('-12')", "-1"),
+        ("SELECT SIGN('abc')", "0"),
+        ("SELECT SIGN(TRUE)", "1"),
+        ("SELECT SIGN(FALSE)", "0"),
+        // NULL propagates, and a division by zero is a NULL on the way in
+        // rather than an infinity: 8.3 answers NULL for both.
+        ("SELECT SIGN(NULL)", "NULL"),
+        ("SELECT SIGN(1/0)", "NULL"),
+        ("SELECT SIGN(i) FROM G", "-1"),
+        // Zero through the unsigned reading, which `v > 0` has to allow for
+        // and `v >= 0` would get backwards.
+        ("SELECT SIGN(iu) FROM G", "0"),
+        ("SELECT SIGN(d) FROM G", "1"),
+        // Rounded to 0.00 on the way into the column, so it is genuinely zero
+        // and the sign it was written with is gone.
+        ("SELECT SIGN(dz) FROM G", "0"),
+        ("SELECT SIGN(f) FROM G", "-1"),
+        ("SELECT SIGN(db) FROM G", "1"),
+        ("SELECT SIGN(s) FROM G", "-1"),
+        ("SELECT SIGN(bl) FROM G", "-1"),
+        ("SELECT SIGN(dt) FROM G", "1"),
+        ("SELECT SIGN(tm) FROM G", "-1"),
+        ("SELECT SIGN(e) FROM G", "1"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+/// #0116. SIGN's answer is a *signed* LONGLONG whatever it was handed, which
+/// is not the rule its neighbour ABS follows.
+///
+/// Measured on 8.3, where all three of `SIGN(1.50)`, `SIGN(1.5e0)` and
+/// `SIGN(iu)` are LONGLONG, length 21, with no UNSIGNED bit — and `ABS` of the
+/// same three is a NEWDECIMAL, a DOUBLE and an *unsigned* LONGLONG. The
+/// unsigned half is the one worth reading off the wire description: a 1
+/// announced UNSIGNED and a 1 announced signed are the same digit, so nothing
+/// about the value catches it.
+///
+/// Nullability follows the argument, as it does for ABS: `SIGN(1)` is NOT NULL
+/// and `SIGN(NULL)`, `SIGN(1/0)` and SIGN over a nullable column are not.
+#[test]
+fn sign_is_a_signed_longlong_whatever_it_was_given() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE H (i INT, iu BIGINT UNSIGNED, d DECIMAL(6,2), nn INT NOT NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO H VALUES (1, 1, 1.50, 1)",
+    );
+    for (expression, nullable) in [
+        ("SIGN(1)", false),
+        ("SIGN(1.50)", false),
+        ("SIGN(1.5e0)", false),
+        ("SIGN('abc')", false),
+        ("SIGN(nn)", false),
+        ("SIGN(NULL)", true),
+        ("SIGN(1/0)", true),
+        ("SIGN(i)", true),
+        ("SIGN(iu)", true),
+        ("SIGN(d)", true),
+    ] {
+        let sql = format!("SELECT {expression} AS v FROM H");
+        let described = engine.describe(&session, &sql, 0).unwrap().unwrap();
+        assert_eq!(
+            format!("{:?}", described[0].ty),
+            "LongLong",
+            "{expression} is described as the wrong type"
+        );
+        assert_eq!(
+            described[0].nullable, nullable,
+            "{expression} is described with the wrong nullability"
+        );
+        assert!(!described[0].unsigned, "{expression} is described UNSIGNED");
+    }
+    // ABS beside it, because "not unsigned" only means something where the
+    // engine does mark one: `ABS(iu)` carries the column's unsigned reading
+    // out and SIGN does not.
+    let described = engine
+        .describe(&session, "SELECT ABS(iu) AS v FROM H", 0)
+        .unwrap()
+        .unwrap();
+    assert!(described[0].unsigned, "ABS(iu) lost the unsigned reading");
+}
+
+/// #0116. A decimal's sign comes from its digits, not from an `f64` of them.
+///
+/// 8.3 answers 0 for `SIGN(0.1 + 0.2 - 0.3)` and 1 for the same sum written
+/// with `e0` exponents, because the decimal sum is exactly zero and the double
+/// one is 5.55e-17. This engine computes the decimal exactly — #0070 — so both
+/// halves of that pair are decided before SIGN sees them; the pair is here
+/// because it is the statement of the rule, and because a SIGN that
+/// reconciled its argument back through a double would answer 1 twice.
+///
+/// The reading itself is asserted in `decimal.rs`, where the two disagree.
+#[test]
+fn sign_of_a_decimal_is_not_the_sign_of_a_double() {
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        ("SELECT SIGN(0.1+0.2-0.3)", "0"),
+        ("SELECT SIGN(0.1e0+0.2e0-0.3e0)", "1"),
+        // The rounding happens where the value is made, so a decimal that is
+        // zero only after it is rounded has no sign left to report. Both
+        // measured: 8.3 answers 0 for each, and prints the value as 0.00.
+        ("SELECT SIGN(CAST(0.001 AS DECIMAL(10,2)))", "0"),
+        ("SELECT SIGN(CAST(-0.001 AS DECIMAL(10,2)))", "0"),
+        ("SELECT CAST(-0.001 AS DECIMAL(10,2))", "0.00"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+/// #0116. SIGN with the wrong number of arguments is refused while the item is
+/// resolved, not while a row is evaluated.
+///
+/// 8.3 raises 1582 for `SIGN()`, `SIGN(1, 2)` and `SIGN(1, 2, 3)`, and raises
+/// it from the parser — so it refuses over an empty table, under `WHERE 1=0`,
+/// with `LIMIT 0`, down a `CASE` branch nothing takes and with no FROM clause
+/// at all. That list is the zero-rows pattern from #0009's note, which has
+/// caught three refusals in this epic already for living in the per-row path:
+/// `functions::call` runs once per row, so a check placed there is not a check
+/// over an empty relation.
+///
+/// The message echoes the name as it was written, which is also measured:
+/// `select sign()` says `'sign'` on 8.3 and `select SiGn(1, 2)` says `'SiGn'`.
+#[test]
+fn sign_with_the_wrong_parameter_count_refuses_before_any_row() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE K (i INT)");
+    for sql in [
+        "SELECT SIGN()",
+        "SELECT SIGN(1, 2)",
+        "SELECT SIGN(1, 2, 3)",
+        // K is empty, so none of these evaluates a row.
+        "SELECT SIGN(i, i) FROM K",
+        "SELECT SIGN(1, 2) FROM K WHERE 1=0",
+        "SELECT SIGN(1, 2) FROM K LIMIT 0",
+        "SELECT CASE WHEN 0 THEN SIGN(1, 2) ELSE 9 END",
+        // Beside the other refusal settled at this point, and ahead of it:
+        // 8.3 answers 1582 for this and not 1210. Across a *list* of items
+        // the first item's problem still wins here where 8.3 still says
+        // 1582, which `refuse_at_resolve` records.
+        "SELECT ('a' LIKE 'b' ESCAPE '!!') AND SIGN() > 0",
+        "SELECT 1 FROM K WHERE SIGN(1, 2) > 0",
+        "SELECT 1 FROM K GROUP BY i HAVING SIGN(1, 2) > 0",
+        "SELECT 1 FROM K ORDER BY SIGN(1, 2)",
+        "DELETE FROM K WHERE SIGN(1, 2) > 0",
+        "UPDATE K SET i = 1 WHERE SIGN(1, 2) > 0",
+        // An INSERT's written values are the one clause with no row to
+        // evaluate against — they *are* the row — so the refusal has to be
+        // settled where they are read or the statement writes a 1. All three
+        // measured on 8.3, and it writes nothing for any of them.
+        "INSERT INTO K VALUES (SIGN(1, 2))",
+        "INSERT INTO K VALUES (1), (SIGN(1, 2))",
+        "INSERT INTO K VALUES (1) ON DUPLICATE KEY UPDATE i = SIGN(1, 2)",
+        // A declaration's expressions are stored as text and evaluated per
+        // row, so the CREATE is the only place they can be settled — and a
+        // table accepted here would outlive the statement in the catalog and
+        // in the state image. All three are 1582 on 8.3.
+        "CREATE TABLE Gen (a INT, b INT AS (SIGN(1, 2)))",
+        "CREATE TABLE Def (a INT DEFAULT (SIGN(1, 2)))",
+        "CREATE TABLE Chk (a INT CHECK (SIGN(1, 2) > 0))",
+        // The expressions a call carries that are not its arguments. Reading
+        // the arguments alone answered all three where 8.3 raises 1582.
+        "SELECT GROUP_CONCAT(i ORDER BY SIGN(1, 2)) FROM K",
+        "SELECT SUM(i) OVER (ORDER BY SIGN(1, 2)) FROM K",
+        "SELECT SUM(i) OVER (PARTITION BY SIGN(1, 2)) FROM K",
+    ] {
+        let error = engine
+            .execute(&mut session, sql, &[])
+            .expect_err(&format!("{sql} was answered rather than refused"));
+        assert_eq!(error.code, 1582, "{sql}");
+        assert_eq!(
+            error.message, "Incorrect parameter count in the call to native function 'SIGN'",
+            "{sql}"
+        );
+    }
+    for (sql, written) in [("SELECT sign()", "sign"), ("SELECT SiGn(1, 2)", "SiGn")] {
+        let error = engine
+            .execute(&mut session, sql, &[])
+            .expect_err(&format!("{sql} was answered rather than refused"));
+        assert_eq!(
+            error.message,
+            format!("Incorrect parameter count in the call to native function '{written}'"),
+            "{sql}"
+        );
+    }
+    // A prepare is the other place with no rows to evaluate. 8.3 fails
+    // `PREPARE p FROM 'SELECT SIGN()'` rather than describing a statement that
+    // cannot run, and a client that prepares up front hears about it there.
+    assert_eq!(
+        engine
+            .describe(&session, "SELECT SIGN(1, 2)", 0)
+            .expect_err("the prepare was answered rather than refused")
+            .code,
+        1582
+    );
+    // One argument is still one argument, and the refusal is not in the way of
+    // it — including through the INSERT the refusals above went past.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT SIGN(-2)"),
+        vec![vec!["-1"]]
+    );
+    run(&engine, &mut session, "INSERT INTO K VALUES (SIGN(-2))");
+    // Nothing the refusals touched was written, which is the half a refusal
+    // that arrives late gets wrong: MySQL writes no row for any of them.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT i FROM K ORDER BY i"),
+        vec![vec!["-1"]]
+    );
+    // And no table either — a CREATE that was refused must leave nothing in
+    // the catalog for the state image to carry.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME FROM information_schema.tables \
+             WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME"
+        ),
+        vec![vec!["K"]]
+    );
+    // The same declarations with one argument are accepted, so the refusal is
+    // about the count and not about the position.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Gen (a INT, b INT AS (SIGN(a)))",
+    );
+    run(&engine, &mut session, "INSERT INTO Gen (a) VALUES (-4)");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT b FROM Gen"),
+        vec![vec!["-1"]]
+    );
+}

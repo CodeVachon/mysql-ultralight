@@ -136,6 +136,7 @@ const KNOWN: &[&str] = &[
     "schema",
     "second",
     "session_user",
+    "sign",
     "soundex",
     "space",
     "st_distance_sphere",
@@ -387,6 +388,26 @@ fn is_plain_decimal(text: &str) -> bool {
     !(whole.is_empty() && fraction.is_empty())
         && whole.bytes().all(|b| b.is_ascii_digit())
         && fraction.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// -1, 0 or 1 for a number that was read approximately.
+///
+/// Not `f64::signum`, which answers 1 for `0.0` and -1 for `-0.0`. A negative
+/// zero is zero to MySQL — `SIGN(-0.0e0)` is 0 on 8.3, as is `SIGN(-0.00)` —
+/// so the two zeros have to land on the same answer, and `signum` puts them at
+/// opposite ends.
+///
+/// NaN falls to 0 with them. Nothing this engine computes should reach one —
+/// `1/0` is NULL on 8.3 rather than an infinity, and this engine agrees — but
+/// an answer for every input beats a comparison that has none.
+fn float_sign(value: f64) -> i64 {
+    if value > 0.0 {
+        1
+    } else if value < 0.0 {
+        -1
+    } else {
+        0
+    }
 }
 
 /// `UNHEX`, which is `HEX` backwards and NULL for anything that is not hex.
@@ -1310,6 +1331,28 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
                 None => Value::Float(crate::value::numeric_prefix(text).abs()),
             },
             other => Value::Float(other.as_number().abs()),
+        },
+        // Not ABS's shape, although the two are neighbours. SIGN's answer is a
+        // LONGLONG whatever it was given — `SIGN(1.50)` is 1 and not 1.00 —
+        // and it never carries the argument's UNSIGNED reading, so `SIGN(iu)`
+        // is a signed BIGINT on 8.3 where `ABS(iu)` is an unsigned one. There
+        // is no `ABS(-9223372036854775808)` problem here either: -1, 0 and 1
+        // are in range for every argument.
+        //
+        // The decimal is read off its digits rather than through an `f64`,
+        // which is the one place the two readings disagree: 8.3 answers 0 for
+        // `SIGN(0.1 + 0.2 - 0.3)` and 1 for `SIGN(0.1e0 + 0.2e0 - 0.3e0)`,
+        // because the double sum is 5.55e-17 and the decimal one is exactly
+        // zero. Falling back to the float path for text that is not a plain
+        // decimal is what `ABS` does above and for the same reason.
+        "sign" => match arg(0).untag_bool() {
+            Value::Unsigned(v) => Value::Int(i64::from(v > 0)),
+            Value::Int(v) => Value::Int(v.signum()),
+            Value::Decimal(ref text) => Value::Int(match crate::decimal::sign(text) {
+                Some(sign) => sign,
+                None => float_sign(crate::value::numeric_prefix(text)),
+            }),
+            other => Value::Int(float_sign(other.as_number())),
         },
         "round" => {
             let places = args.get(1).and_then(Value::as_int).unwrap_or(0);

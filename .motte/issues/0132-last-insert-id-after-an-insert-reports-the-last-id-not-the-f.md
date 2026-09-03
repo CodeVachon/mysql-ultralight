@@ -1,11 +1,11 @@
 ---
 id: 132
 title: LAST_INSERT_ID after an INSERT reports the last id, not the first
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-08-27T22:46:01Z
-updated: 2026-08-27T22:46:01Z
+updated: 2026-09-03T02:41:43Z
 ---
 
 ## Description

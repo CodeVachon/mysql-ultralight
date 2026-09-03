@@ -266,6 +266,36 @@ pub fn is_zero(text: &str) -> bool {
     parts(text).is_some_and(|value| value.is_zero())
 }
 
+/// -1, 0 or 1 for a plain decimal, read off its digits rather than an `f64`.
+///
+/// `SIGN` is a question about a decimal that an approximation can get wrong in
+/// both directions: `0.1 + 0.2 - 0.3` is exactly zero here and 5.55e-17 as a
+/// double, and 8.3 answers 0 for the decimal and 1 for the same sum written
+/// with `e0` exponents. Reading the sign off the digits is what keeps those
+/// two apart.
+///
+/// Zero has no sign, which is the same rule [`compare`] holds to: `-0.00` is
+/// 0, not -1, and 8.3 agrees — `SIGN(-0.00)` is 0 there. A decimal that
+/// rounded to zero on the way into its column has genuinely become zero, so a
+/// `DECIMAL(6,2)` holding what was written as -0.001 is 0 too.
+///
+/// `None` for anything that is not a plain decimal; those read as numbers,
+/// which is a different question with a different answer.
+pub fn sign(text: &str) -> Option<i64> {
+    parts(text).as_ref().map(sign_of)
+}
+
+/// The sign of an already-parsed decimal.
+fn sign_of(value: &Parts) -> i64 {
+    if value.is_zero() {
+        0
+    } else if value.negative {
+        -1
+    } else {
+        1
+    }
+}
+
 /// `a` against `b`, exactly, over two decimals.
 ///
 /// The comparison to match the arithmetic. Read through an `f64` a decimal
@@ -282,16 +312,7 @@ pub fn is_zero(text: &str) -> bool {
 /// numbers, which is a different question and a different answer.
 pub fn compare(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     let (a, b) = (parts(a)?, parts(b)?);
-    let sign = |value: &Parts| {
-        if value.is_zero() {
-            0i8
-        } else if value.negative {
-            -1
-        } else {
-            1
-        }
-    };
-    let (a_sign, b_sign) = (sign(&a), sign(&b));
+    let (a_sign, b_sign) = (sign_of(&a), sign_of(&b));
     if a_sign != b_sign {
         return Some(a_sign.cmp(&b_sign));
     }
@@ -1066,5 +1087,45 @@ mod tests {
         assert_eq!(rescale_wide("1e3", 2), None);
         assert_eq!(rescale_wide("-", 2), None);
         assert_eq!(rescale_wide(".", 2), None);
+    }
+
+    /// #0116. The sign comes off the digits, and zero has none however it was
+    /// spelled.
+    ///
+    /// Asserted here rather than through `SELECT SIGN(...)` because this is
+    /// the level the two readings differ at. Every decimal MySQL can hold —
+    /// 65 digits, 30 of them after the point — has a magnitude an `f64`
+    /// represents, so over those a float reading gives the same answer and a
+    /// SQL test would pass with this function gone. It is the decimals this
+    /// engine holds and MySQL does not that separate them: a literal keeps all
+    /// of its places here where 8.3 cuts it at 72, so a value below the
+    /// smallest `f64` subnormal is reachable, and read through a float it
+    /// loses its sign along with everything else.
+    #[test]
+    fn the_sign_of_a_decimal_is_read_off_its_digits() {
+        assert_eq!(sign("1.50"), Some(1));
+        assert_eq!(sign("-1.50"), Some(-1));
+        assert_eq!(sign("+1.50"), Some(1));
+        assert_eq!(sign("0"), Some(0));
+        assert_eq!(sign("0.00"), Some(0));
+        // A signed zero is a zero. `f64::signum` splits these two.
+        assert_eq!(sign("-0.00"), Some(0));
+        assert_eq!(sign("+0.00"), Some(0));
+        // Past what an `f64` can hold in either direction.
+        let tiny = format!("0.{}1", "0".repeat(400));
+        assert_eq!(
+            tiny.parse::<f64>().unwrap().partial_cmp(&0.0),
+            Some(std::cmp::Ordering::Equal)
+        );
+        assert_eq!(sign(&tiny), Some(1));
+        assert_eq!(sign(&format!("-{tiny}")), Some(-1));
+        let huge = "9".repeat(400);
+        assert_eq!(sign(&huge), Some(1));
+        assert_eq!(sign(&format!("-{huge}")), Some(-1));
+        // Not a plain decimal, so not this function's to answer: an exponent
+        // is a double to MySQL and text is not a number at all.
+        assert_eq!(sign("1e3"), None);
+        assert_eq!(sign("abc"), None);
+        assert_eq!(sign(""), None);
     }
 }

@@ -457,6 +457,25 @@ fn build_column_with_checks(
     column.nullable = true;
 
     for option in &def.options {
+        // A declaration's expressions are stored as text here and evaluated
+        // per row later, so anything 8.3 settles while it *resolves* has to be
+        // settled by the CREATE or it is never settled at all — the zero-rows
+        // shape of #0009, arriving through DDL rather than through a query.
+        // Measured on 8.3: `CREATE TABLE U (a INT, b INT AS (SIGN(1, 2)))` is
+        // 1582 there and `b INT AS (a LIKE 'b' ESCAPE '!!')` is 1210, where
+        // both were accepted here — leaving the catalog, and the state image
+        // with it, holding a table 8.3 could not have made.
+        if let ColumnOption::Generated {
+            generation_expr: Some(e),
+            ..
+        }
+        | ColumnOption::Default(e) = &option.option
+        {
+            crate::exec::refuse_at_resolve([e])?;
+        }
+        if let ColumnOption::Check(check) = &option.option {
+            crate::exec::refuse_at_resolve([check.expr.as_ref()])?;
+        }
         match &option.option {
             ColumnOption::NotNull => column.nullable = false,
             ColumnOption::Null => column.nullable = true,

@@ -1491,7 +1491,7 @@ impl Engine {
             // Same reason, one clause further in: an ESCAPE is settled per row
             // too, so `WHERE s LIKE 'a' ESCAPE '!!'` over an empty table came
             // back empty where 8.3 raises 1210.
-            refuse_malformed_escape([predicate])?;
+            refuse_at_resolve([predicate])?;
         }
 
         let mut matching: Vec<&Vec<Value>> = Vec::new();
@@ -1687,7 +1687,7 @@ impl Engine {
         // statement to `grouped` — and is passed rather than assumed so the
         // check has one contract wherever it is called from.
         check_having_scope(having, &select.projection, group_exprs, refs, own)?;
-        refuse_malformed_escape([having])?;
+        refuse_at_resolve([having])?;
 
         let resolved = substitute_item_exprs(having, &select.projection);
         let mut keep = Vec::with_capacity(matching.len());
@@ -1944,7 +1944,7 @@ impl Engine {
         // join's is before its own: an empty left side expands nothing, so a
         // clause only read per produced row is never read at all.
         if let Some(JoinConstraint::On(predicate)) = constraint {
-            refuse_malformed_escape([predicate])?;
+            refuse_at_resolve([predicate])?;
         }
 
         let refs = left.refs();
@@ -2099,7 +2099,7 @@ impl Engine {
         // produces no pair, so `ON a.s LIKE b.s ESCAPE '!!'` answered no rows
         // where 8.3 raises 1210. A `USING` clause is built here rather than
         // written, so it has no ESCAPE to be wrong.
-        refuse_malformed_escape(condition.as_ref())?;
+        refuse_at_resolve(condition.as_ref())?;
 
         let null_right = vec![Value::Null; right.columns.len()];
         let null_left = vec![Value::Null; left.columns.len()];
@@ -2352,7 +2352,7 @@ impl Engine {
             // never evaluated: `SELECT CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE
             // '!!') ELSE 9 END` answered 9 where 8.3 raises 1210. The
             // table-backed projection is guarded at the same point.
-            refuse_malformed_escape([e])?;
+            refuse_at_resolve([e])?;
             let value = if let Expr::Function(f) = e {
                 if f.over.is_none() && is_aggregate(&f.name.to_string()) {
                     let name = f.name.to_string().to_ascii_lowercase();
@@ -2396,7 +2396,7 @@ impl Engine {
         let mut rows = vec![row];
         if let Some(having) = &select.having {
             check_having_scope(having, &select.projection, &[], &implicit_schema, 0)?;
-            refuse_malformed_escape([having])?;
+            refuse_at_resolve([having])?;
             let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
             let resolved = substitute_aliases(having, &names);
             let value = self.eval_over_group(
@@ -2902,7 +2902,7 @@ impl Engine {
         if let Some(name) = items.iter().find_map(|(_, e)| unresolved_column(e, refs)) {
             return Err(EngineError::unknown_column(&name, "field list"));
         }
-        refuse_malformed_escape(items.iter().map(|(_, e)| e))?;
+        refuse_at_resolve(items.iter().map(|(_, e)| e))?;
         // After the field list and before everything else, which is the order
         // 8.3 answers in: `SELECT nope FROM t GROUP BY 5` is 1054 for `nope`
         // there, and `SELECT id FROM t GROUP BY 5 ORDER BY 9` complains about
@@ -2929,7 +2929,7 @@ impl Engine {
         // a clause's names before its arguments: `GROUP BY s LIKE 'a' ESCAPE
         // '!!' HAVING zz > 1` is 1210 there and `HAVING zz LIKE 'a' ESCAPE
         // '!!'` is 1054. One helper still, so a mutation to it neuters both.
-        refuse_malformed_escape(group_exprs.iter())?;
+        refuse_at_resolve(group_exprs.iter())?;
         if let Some(having) = &select.having {
             check_having_scope(
                 having,
@@ -2939,7 +2939,7 @@ impl Engine {
                 input_columns.len(),
             )?;
         }
-        refuse_malformed_escape(select.having.as_ref())?;
+        refuse_at_resolve(select.having.as_ref())?;
 
         // The same resolution the ungrouped path uses, and ahead of the
         // grouping rules because that is the order 8.3 answers in: `SELECT id
@@ -3564,16 +3564,31 @@ impl Engine {
         // reads the table it inserts into sees the table as it was.
         let source_rows: Vec<Vec<SourceValue>> = match &insert.source {
             Some(query) => match query.body.as_ref() {
-                SetExpr::Values(values) => values
-                    .rows
-                    .iter()
-                    .map(|row| {
-                        row.iter()
-                            .cloned()
-                            .map(|e| SourceValue::Expr(Box::new(e)))
-                            .collect()
-                    })
-                    .collect(),
+                SetExpr::Values(values) => {
+                    // The written values are the one clause with no row to
+                    // evaluate against — they *are* the row — so an item 8.3
+                    // settles while resolving has to be settled here or not at
+                    // all. Both of these were measured: `INSERT INTO K VALUES
+                    // (SIGN(1, 2))` is 1582 on 8.3 and wrote a 1 here, and
+                    // `INSERT INTO K VALUES (('a' LIKE 'b' ESCAPE '!!'))` is
+                    // 1210 there and wrote a 0. Ahead of the table lookup,
+                    // which is also 8.3's order: both are raised for a table
+                    // that does not exist.
+                    refuse_at_resolve(values.rows.iter().flat_map(|row| row.iter()))?;
+                    refuse_at_resolve(
+                        duplicate_key_update.into_iter().flatten().map(|a| &a.value),
+                    )?;
+                    values
+                        .rows
+                        .iter()
+                        .map(|row| {
+                            row.iter()
+                                .cloned()
+                                .map(|e| SourceValue::Expr(Box::new(e)))
+                                .collect()
+                        })
+                        .collect()
+                }
                 _ => {
                     let selected = self.query(session, query)?;
                     selected
@@ -3936,7 +3951,7 @@ impl Engine {
         // here where 8.3 answers 1054. That issue's fix belongs beside this
         // line rather than in place of it.
         let assigned = assignments.iter().map(|a| &a.value);
-        refuse_malformed_escape(selection.into_iter().chain(assigned))?;
+        refuse_at_resolve(selection.into_iter().chain(assigned))?;
 
         // Resolved once, before any row is considered: whether writing to a
         // generated column is an error must not depend on the data, and
@@ -4076,7 +4091,7 @@ impl Engine {
         // missing table is still 1146 first. The ON clauses of the join are
         // settled inside `join()`; this is the WHERE and the assigned values.
         let assigned = assignments.iter().map(|a| &a.value);
-        refuse_malformed_escape(selection.into_iter().chain(assigned))?;
+        refuse_at_resolve(selection.into_iter().chain(assigned))?;
 
         // Each assignment is resolved to a source table and a column within it.
         struct Target {
@@ -4329,7 +4344,7 @@ impl Engine {
         // As on the UPDATE path, and for the same reason: the predicate is
         // only read per row, so `DELETE FROM LE WHERE s LIKE 'a' ESCAPE '!!'`
         // over an empty table reported nothing deleted where 8.3 raises 1210.
-        refuse_malformed_escape(delete.selection.as_ref())?;
+        refuse_at_resolve(delete.selection.as_ref())?;
 
         let mut matching = Vec::new();
         for (index, row) in table.rows.iter().enumerate() {
@@ -4422,7 +4437,7 @@ impl Engine {
 
         // The multi-table half of the same clause. The join's own ON is
         // settled in `join()`.
-        refuse_malformed_escape(delete.selection.as_ref())?;
+        refuse_at_resolve(delete.selection.as_ref())?;
 
         // MySQL rejects `DELETE FROM a JOIN b` outright: with a join, the
         // target has to be named. Defaulting to every table in the join would
@@ -6552,7 +6567,7 @@ fn resolve_order_by(
             descending: item.options.asc == Some(false),
         });
     }
-    refuse_malformed_escape(written.iter().map(|i| &i.expr))?;
+    refuse_at_resolve(written.iter().map(|i| &i.expr))?;
     Ok(keys)
 }
 
@@ -6725,7 +6740,7 @@ fn check_projected_order(
     // FROM-less SELECT has, down a branch nothing takes — a malformed one was
     // never read and the statement answered where 8.3 raises 1210. The same
     // zero-rows shape as #0058 and #0093.
-    refuse_malformed_escape(written.iter().map(|i| &i.expr))?;
+    refuse_at_resolve(written.iter().map(|i| &i.expr))?;
     Ok(())
 }
 
@@ -7366,6 +7381,13 @@ fn function_result_type(name: &str) -> Option<ColumnType> {
         | "dayofweek" | "dayofyear" | "dayofmonth" | "day" | "month" | "weekday" => {
             ColumnType::LongLong
         }
+        // The one arithmetic function whose answer does not follow its
+        // argument's kind: `SIGN(1.50)`, `SIGN(1.5e0)` and `SIGN(iu)` are all
+        // a signed LONGLONG of length 21 on 8.3, where `ABS` of the same three
+        // is a NEWDECIMAL, a DOUBLE and an *unsigned* LONGLONG. So it is typed
+        // here rather than through `numeric_answer`, and it is deliberately
+        // absent from `UNSIGNED_FOLLOWS_FIRST`.
+        "sign" => ColumnType::LongLong,
         "year" => ColumnType::Year,
         "curdate" | "current_date" | "last_day" | "date" => ColumnType::Date,
         "now" | "current_timestamp" | "localtime" | "localtimestamp" | "sysdate" => {
@@ -8383,7 +8405,12 @@ fn refused_at_prepare(e: &EngineError) -> bool {
     // resolving the item. Without this line the probe raised it, this said no,
     // and the error was swallowed into `Ok(None)` — so COM_STMT_PREPARE
     // succeeded describing zero columns where MySQL fails the prepare.
-    matches!(e.code, 1054 | 1051 | 1210)
+    //
+    // ER_WRONG_PARAMCOUNT_TO_NATIVE_FCT joins them on the same argument, and
+    // more plainly than any of them: how many arguments a call was written
+    // with is fixed by the text. Measured, not assumed — `PREPARE p FROM
+    // 'SELECT SIGN()'` is 1582 on 8.3.
+    matches!(e.code, 1054 | 1051 | 1210 | 1582)
 }
 
 /// The first column reference in `e` that nothing in scope answers to.
@@ -8490,25 +8517,128 @@ fn malformed_escape(e: &Expr) -> Option<EngineError> {
         }
     }
     match e {
-        // A function's arguments are read here too, and `subexpressions` does
-        // not carry them. `value_arguments` for the reason it is used above:
-        // a bare unit keyword is not an expression to descend into.
-        Expr::Function(f) => value_arguments(f).iter().find_map(malformed_escape),
+        // A call's own expressions are read here too, and `subexpressions`
+        // does not carry them.
+        Expr::Function(f) => function_carried(f).iter().find_map(malformed_escape),
         other => subexpressions(other).into_iter().find_map(malformed_escape),
     }
 }
 
-/// Refuses a clause whose ESCAPE cannot be one, before any row is evaluated.
+/// Every expression a function call carries, for the walks that look for
+/// something 8.3 settles while resolving the item.
+///
+/// The arguments, and then the two places a call holds an expression that is
+/// not one: an aggregate's own `ORDER BY`, and a window's `PARTITION BY` and
+/// `ORDER BY`. 8.3 settles those exactly as it settles an argument — `SELECT
+/// GROUP_CONCAT(i ORDER BY SIGN(1, 2)) FROM t` is 1582 there and `SELECT
+/// SUM(i) OVER (ORDER BY s LIKE 'a' ESCAPE '!!') FROM t` is 1210 — and both
+/// walks answered over neither until this existed.
+///
+/// `value_arguments` rather than `function_arguments` for the arguments, for
+/// the reason that function gives: `TIMESTAMPDIFF(DAY, a, b)` writes a bare
+/// unit keyword where an expression would go, and it is not one to descend
+/// into.
+///
+/// A frame's bounds are deliberately absent: `ROWS 2 PRECEDING` takes a
+/// literal count and not an expression, so there is nothing there to settle.
+fn function_carried(f: &sqlparser::ast::Function) -> Vec<Expr> {
+    use sqlparser::ast::{FunctionArgumentClause, FunctionArguments, WindowType};
+    let mut carried = value_arguments(f);
+    if let FunctionArguments::List(list) = &f.args {
+        for clause in &list.clauses {
+            if let FunctionArgumentClause::OrderBy(items) = clause {
+                carried.extend(items.iter().map(|i| i.expr.clone()));
+            }
+        }
+    }
+    if let Some(WindowType::WindowSpec(spec)) = &f.over {
+        carried.extend(spec.partition_by.iter().cloned());
+        carried.extend(spec.order_by.iter().map(|i| i.expr.clone()));
+    }
+    carried
+}
+
+/// The native functions this engine holds a statement to a parameter count
+/// for, as `(name, how many)`.
+///
+/// One entry, because each one is a measurement rather than a reading of the
+/// manual, and because the alternative to measuring is worse than the gap:
+/// `ABS(1, 2)` answers 1 here today where 8.3 raises 1582, and inventing an
+/// arity for every name in `KNOWN` would refuse the optional arguments several
+/// of them really have. `SIGN` was measured — 8.3 raises 1582 for `SIGN()`,
+/// for `SIGN(1, 2)` and for `SIGN(1, 2, 3)` — and without it the first would
+/// answer NULL and the rest would silently ignore the extra arguments.
+const FIXED_ARITY: &[(&str, usize)] = &[("sign", 1)];
+
+/// The first call in `e` to a [`FIXED_ARITY`] function with the wrong number
+/// of arguments.
+///
+/// Here rather than in `functions::call` for the reason the escape check above
+/// is: `call` runs once per row, so over an empty table, under `WHERE 1=0`, or
+/// down a `CASE` branch nothing takes, a refusal placed there does not happen
+/// at all and the statement answers where 8.3 refuses.
+///
+/// The name is echoed as it was written, which is what 8.3 does: `select
+/// sign()` says `'sign'` and `select SiGn(1,2)` says `'SiGn'`.
+///
+/// One ordering gap, measured and left: 8.3 raises 1582 in the *parser*, so it
+/// precedes even 1146 — `SELECT SIGN() FROM nosuchtable` is 1582 there, and
+/// 1146 here. Beating those would mean checking before the FROM clause is
+/// resolved, which is a statement-level pass this engine does not have; this
+/// runs where the other resolve-time refusals run.
+fn wrong_parameter_count(e: &Expr) -> Option<EngineError> {
+    if let Expr::Function(f) = e {
+        let written = f.name.to_string();
+        let arity = FIXED_ARITY
+            .iter()
+            .find(|(name, _)| written.eq_ignore_ascii_case(name))
+            .map(|(_, arity)| *arity);
+        if arity.is_some_and(|arity| function_arguments(f).len() != arity) {
+            return Some(EngineError::new(
+                1582,
+                "42000",
+                format!("Incorrect parameter count in the call to native function '{written}'"),
+            ));
+        }
+    }
+    match e {
+        Expr::Function(f) => function_carried(f).iter().find_map(wrong_parameter_count),
+        other => subexpressions(other)
+            .into_iter()
+            .find_map(wrong_parameter_count),
+    }
+}
+
+/// Refuses a clause 8.3 settles before it evaluates a row: an ESCAPE that
+/// cannot be one, and a native function called with the wrong parameter count.
 ///
 /// One function rather than the `if let Some(bad)` written out at each clause,
 /// because the number of clauses is the whole problem this has: #0093 wired
 /// the check into five of them and shipped with HAVING, GROUP BY, ON and
 /// every DML predicate still settling it per row, which over no rows is not
 /// settling it at all. A clause that needs it says so in one line here, and
-/// `malformed_escape` stays the single point a mutation can neuter to prove
-/// every one of them at once.
-fn refuse_malformed_escape<'a>(clauses: impl IntoIterator<Item = &'a Expr>) -> EngineResult<()> {
-    match clauses.into_iter().find_map(malformed_escape) {
+/// this stays the single point a mutation can neuter to prove every one of
+/// them at once.
+///
+/// `pub(crate)` for `ddl.rs`, which needs it for the same reason and one step
+/// earlier: a generated column, a default and a CHECK are expressions stored
+/// as text and evaluated per row, so a declaration carrying one of these is
+/// settled by the CREATE or never.
+///
+/// Within one expression the parameter count is asked first, because 8.3 asks
+/// it first: `SELECT ('a' LIKE 'b' ESCAPE '!!') AND SIGN() > 0` is 1582 there
+/// and not 1210. Across a *list* of them the first item's problem still wins,
+/// so `SELECT s LIKE 'a' ESCAPE '!!', SIGN() FROM t` is 1210 here and 1582 on
+/// 8.3 — the same ordering gap `wrong_parameter_count` records against 1146,
+/// and for the same reason. Both answers are refusals, which is the half that
+/// matters.
+pub(crate) fn refuse_at_resolve<'a>(
+    clauses: impl IntoIterator<Item = &'a Expr>,
+) -> EngineResult<()> {
+    let refusal = |e: &Expr| -> Option<EngineError> {
+        wrong_parameter_count(e).or_else(|| malformed_escape(e))
+    };
+    match clauses.into_iter().find_map(refusal) {
         Some(bad) => Err(bad),
         None => Ok(()),
     }
@@ -8602,7 +8732,7 @@ fn resolve_field_list(
                 if let Some(name) = unresolved_column(e, refs) {
                     return Err(EngineError::unknown_column(&name, "field list"));
                 }
-                refuse_malformed_escape([e])?;
+                refuse_at_resolve([e])?;
             }
             // Refused where the projection is built, because that is a gap in
             // this engine rather than a question about the statement.

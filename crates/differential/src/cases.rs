@@ -4303,4 +4303,111 @@ pub const GROUPS: &[Group] = &[
             same("SELECT 'a' COLLATE bogus_ci"),
         ],
     },
+    Group {
+        // #0116. SIGN reads anything it is given as a number and answers -1, 0
+        // or 1 as a signed LONGLONG — which is not the rule its neighbour ABS
+        // follows, and is the half of this worth asking twice: `ABS(1.50)` is
+        // a NEWDECIMAL and `ABS(iu)` an *unsigned* LONGLONG, where SIGN of
+        // either is a plain signed one. Only the binary protocol notices the
+        // difference between a signed and an unsigned 1.
+        //
+        // The columns are here for the readings that are not the value's own:
+        // a temporal is its packed digits, so a negative TIME is -1; an ENUM
+        // is its ordinal, so every member is 1; and a string is its leading
+        // number, so 'abc' is 0 rather than NULL.
+        name: "sign",
+        setup: &[
+            "CREATE TABLE Sg (id INT NOT NULL, i INT NULL, iu BIGINT UNSIGNED NULL, \
+             b BIGINT NULL, d2 DECIMAL(10,2) NULL, dw DECIMAL(65,30) NULL, \
+             dz DECIMAL(6,2) NULL, f FLOAT NULL, g DOUBLE NULL, s VARCHAR(20) NULL, \
+             dt DATE NULL, tm TIME NULL, e ENUM('a','b','c') NULL, nn INT NOT NULL, \
+             PRIMARY KEY (id))",
+            // Row 1 is negative wherever a column can be, row 2 positive, row
+            // 3 zero, and row 4 NULL. The zero row is the one that matters
+            // most: it is the only place `v > 0` and `v >= 0` differ, and the
+            // only place a signed zero can leak a -1.
+            "INSERT INTO Sg VALUES (1, -5, 0, -9223372036854775808, -1.50, \
+             -0.000000000000000000000000000001, -0.001, -1.5, -2.5, '-12abc', \
+             '2020-01-02', '-01:00:00', 'a', -7)",
+            "INSERT INTO Sg VALUES (2, 5, 18446744073709551615, 9223372036854775807, \
+             1.50, 0.000000000000000000000000000001, 0.001, 1.5, 2.5, '12abc', \
+             '2026-01-02', '01:00:00', 'c', 7)",
+            "INSERT INTO Sg VALUES (3, 0, 0, 0, 0.00, 0.000000000000000000000000000000, \
+             0.00, 0, 0, 'abc', '2026-01-02', '00:00:00', 'b', 0)",
+            "INSERT INTO Sg (id, nn) VALUES (4, 0)",
+            // Written to by the cases below, which is why it is empty here: an
+            // INSERT's values are the one clause with no row to evaluate
+            // against, so a refusal that arrives per row arrives after the
+            // write.
+            "CREATE TABLE Ins (i INT NULL, u INT NOT NULL, PRIMARY KEY (u))",
+        ],
+        cases: &[
+            same("SELECT SIGN(5), SIGN(-5), SIGN(0)"),
+            // The ends of the signed range and the first value past it, which
+            // is where the reading changes from an i64 to a u64.
+            same("SELECT SIGN(9223372036854775807), SIGN(-9223372036854775808), \
+                  SIGN(18446744073709551615)"),
+            same("SELECT SIGN(1.50), SIGN(-1.50), SIGN(0.00), SIGN(-0.0)"),
+            same("SELECT SIGN(1.5e0), SIGN(-1.5e0), SIGN(0e0), SIGN(-0.0e0)"),
+            same("SELECT SIGN('12'), SIGN('-12'), SIGN('abc'), SIGN(NULL)"),
+            same("SELECT SIGN(TRUE), SIGN(FALSE), SIGN(1/0)"),
+            // The pair that says the decimal is not read through a double.
+            // MySQL answers 0 for the exact sum and 1 for the approximate one,
+            // because the double is 5.55e-17 and the decimal is zero.
+            same("SELECT SIGN(0.1+0.2-0.3), SIGN(0.1e0+0.2e0-0.3e0)"),
+            // A value that is zero only after it is rounded is zero, and has
+            // no sign left to report in either direction.
+            same("SELECT SIGN(CAST(0.001 AS DECIMAL(10,2))), \
+                  SIGN(CAST(-0.001 AS DECIMAL(10,2)))"),
+            same("SELECT id, SIGN(i), SIGN(iu), SIGN(b), SIGN(nn) FROM Sg ORDER BY id"),
+            same("SELECT id, SIGN(d2), SIGN(dw), SIGN(dz), SIGN(f), SIGN(g) \
+                  FROM Sg ORDER BY id"),
+            same("SELECT id, SIGN(s), SIGN(dt), SIGN(tm), SIGN(e) FROM Sg ORDER BY id"),
+            // ABS beside it, because "signed LONGLONG" only means something
+            // against a function that answers otherwise for the same argument.
+            same("SELECT id, ABS(iu), SIGN(iu), ABS(d2), SIGN(d2) FROM Sg ORDER BY id"),
+            same("SELECT id, SIGN(ABS(i)), ABS(SIGN(i)) FROM Sg ORDER BY id"),
+            // The shapes an application writes: a sign in a predicate, and a
+            // sign over an aggregate.
+            same("SELECT id FROM Sg WHERE SIGN(i) = -1 ORDER BY id"),
+            same("SELECT SIGN(SUM(i)), SIGN(MIN(d2)), SIGN(MAX(g)) FROM Sg"),
+            same("SELECT SIGN(i) AS s, COUNT(*) FROM Sg GROUP BY SIGN(i) ORDER BY s"),
+            // No rows, so only the column definition answers — and that is the
+            // half of SIGN a populated table cannot check on its own.
+            same("SELECT SIGN(i), SIGN(iu), SIGN(d2) FROM Sg WHERE 1=0"),
+            // 1582, which 8.3 raises from the parser and therefore raises over
+            // an empty relation and down a branch nothing takes. A refusal
+            // settled per row would answer all four of these.
+            same("SELECT SIGN()"),
+            same("SELECT SIGN(1, 2)"),
+            same("SELECT SIGN(1, 2, 3)"),
+            same("SELECT SIGN(i, i) FROM Sg WHERE 1=0"),
+            same("SELECT CASE WHEN 0 THEN SIGN(1, 2) ELSE 9 END"),
+            // Against the other refusal settled at the same point, which it
+            // has to beat: 8.3 answers 1582 here and not 1210.
+            same("SELECT ('a' LIKE 'b' ESCAPE '!!') AND SIGN() > 0"),
+            // The write half, in order: three refusals, one that goes through,
+            // and then the table — which holds exactly the one row on both
+            // servers, so the refusals wrote nothing.
+            //
+            // Every case runs twice, once per protocol, so the one that goes
+            // through is written to be idempotent: without the ON DUPLICATE
+            // clause its second run would be a 1062 and the case would be
+            // asking about a collision instead.
+            same("INSERT INTO Ins VALUES (SIGN(1, 2), 1)"),
+            same("INSERT INTO Ins VALUES (1, 2), (SIGN(1, 2), 3)"),
+            same("INSERT INTO Ins VALUES (1, 4) ON DUPLICATE KEY UPDATE i = SIGN(1, 2)"),
+            same("INSERT INTO Ins VALUES (SIGN(-2), 5) ON DUPLICATE KEY UPDATE i = SIGN(-2)"),
+            same("SELECT i, u FROM Ins ORDER BY u"),
+            // A declaration's expressions are stored and evaluated per row, so
+            // a CREATE accepted here would leave a table 8.3 could not make.
+            // A refused CREATE makes nothing, so these are the same question
+            // on both of a case's protocol passes.
+            same("CREATE TABLE Gen (a INT NULL, b INT AS (SIGN(1, 2)))"),
+            same("CREATE TABLE Def (a INT NULL DEFAULT (SIGN(1, 2)))"),
+            // The expressions a call carries that are not its arguments.
+            same("SELECT GROUP_CONCAT(id ORDER BY SIGN(1, 2)) FROM Sg"),
+            same("SELECT SUM(id) OVER (ORDER BY SIGN(1, 2)) FROM Sg"),
+        ],
+    },
 ];

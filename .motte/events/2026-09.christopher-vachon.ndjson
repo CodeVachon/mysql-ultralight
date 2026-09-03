@@ -36,3 +36,6 @@
 {"at":"2026-09-03T01:51:05Z","id":92,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
 {"at":"2026-09-03T02:20:16Z","id":156,"by":"Christopher Vachon","as":"user","type":"created","title":"BETWEEN aggregates one comparison type across all three operands","state":"Todo"}
 {"at":"2026-09-03T02:40:14Z","id":157,"by":"Christopher Vachon","as":"user","type":"created","title":"The runner examples fail the gate under concurrent load","state":"Todo"}
+{"at":"2026-09-03T02:41:33Z","id":92,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T02:41:43Z","id":132,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T02:43:34Z","id":158,"by":"Christopher Vachon","as":"user","type":"created","title":"A FROM-less SELECT ignores its WHERE clause","state":"Todo"}
