@@ -625,10 +625,12 @@ fn a_wildcard_qualifier_is_read_in_the_query_that_wrote_it() {
 
     // A HAVING reads the select list, so the list is kept and the `*` in it
     // *is* resolved — the same statement without the HAVING is two entries
-    // above and answers. 8.3 refuses this with 1051; this engine refuses it
-    // one step earlier, with 1235, because a qualified `*` in a grouped query
-    // is not implemented at all. Both refuse, which is what the guard is for;
-    // the code will agree once that gap closes.
+    // above and answers. 1051, which is what 8.3 answers: the gap this used to
+    // record closed with #0099, which moved the field list's resolution ahead
+    // of the grouped path so that the select list is read before anything
+    // else in the query body. It was 1235 here until then — a qualified `*` in
+    // a grouped query is still not implemented, and the statement reached that
+    // refusal before it reached this one.
     let kept = engine
         .execute(
             &mut s,
@@ -636,7 +638,8 @@ fn a_wildcard_qualifier_is_read_in_the_query_that_wrote_it() {
             &[],
         )
         .expect_err("a HAVING did not keep the select list alive");
-    assert_eq!(kept.code, 1235);
+    assert_eq!(kept.code, 1051);
+    assert_eq!(kept.message, "Unknown table 'nope'");
 
     // A named column in that same position is resolved, and refused.
     let named = engine

@@ -171,12 +171,33 @@ pub struct OuterRow {
     pub values: Vec<Value>,
 }
 
+/// The clause a name is reported under when the caller has not named one.
+///
+/// The select list is the default because it is where most expressions are
+/// written, and because it is what 8.3 names for the two positions that have
+/// no clause word of their own: an assigned value in `SET k = zz.q` and an
+/// `INSERT` column list are both `'field list'` there.
+const FIELD_LIST: &str = "field list";
+
 /// Everything an expression may read.
 pub struct Context<'a> {
     pub row: Option<Row<'a>>,
     pub session: &'a Session,
     /// Absent where a subquery cannot appear, such as a column default.
     pub executor: Option<&'a dyn Executor>,
+    /// The clause an unresolvable name in this expression is reported in.
+    ///
+    /// 1054 names the clause the reference was *written* in, and this
+    /// evaluator used to hardcode `'field list'` for every one of them —
+    /// so `SELECT k FROM T GROUP BY zz.q` said the field list where 8.3 says
+    /// `'group statement'`, and a client matching on the message, or a person
+    /// reading it, was sent to the wrong clause. The message is the entire
+    /// product of this path, so the wrong half of it is the whole answer.
+    ///
+    /// Private, so a `Context` cannot be built without going through
+    /// `rowless` or `for_row` and a new evaluation site has to *decide* rather
+    /// than inherit a literal. The measured names are on `in_clause`.
+    clause: &'static str,
 }
 
 impl<'a> Context<'a> {
@@ -185,7 +206,38 @@ impl<'a> Context<'a> {
             row: None,
             session,
             executor: None,
+            clause: FIELD_LIST,
         }
+    }
+
+    /// A context over one row, reported under the field list until a caller
+    /// names its clause.
+    pub fn for_row(schema: &'a [ColumnRef], values: &'a [Value], session: &'a Session) -> Self {
+        Self {
+            row: Some(Row { schema, values }),
+            session,
+            executor: None,
+            clause: FIELD_LIST,
+        }
+    }
+
+    /// Names the clause this expression is written in, for 1054's message.
+    ///
+    /// Measured on 8.3, one string per position: `'where clause'`,
+    /// `'group statement'`, `'having clause'`, `'order clause'`,
+    /// `'on clause'`, `'window partition by'`, `'window order by'`,
+    /// `'from clause'` for a `USING` list, and `'field list'` for everything
+    /// else. The name follows where the reference is written and not which
+    /// query level owns the scope: a correlated `T.zz` written in a
+    /// subquery's ORDER BY is `'order clause'` there, not the outer query's.
+    ///
+    /// Only the positions that reach this evaluator with an unresolved name
+    /// call it. WHERE, HAVING and a SELECT's ORDER BY are resolved before any
+    /// row is evaluated, so their 1054 is raised — with its clause — by the
+    /// resolver in `exec.rs` and never gets here.
+    pub fn in_clause(mut self, clause: &'static str) -> Self {
+        self.clause = clause;
+        self
     }
 
     pub fn with_executor(mut self, runner: &'a dyn Executor) -> Self {
@@ -213,10 +265,7 @@ impl<'a> Context<'a> {
     /// Resolves a column reference, optionally qualified by table.
     fn lookup(&self, written: &crate::name::ColumnParts) -> EngineResult<Value> {
         let Some(row) = &self.row else {
-            return Err(EngineError::unknown_column(
-                &written.written(),
-                "field list",
-            ));
+            return Err(EngineError::unknown_column(&written.written(), self.clause));
         };
 
         let mut found: Option<&Value> = None;
@@ -233,7 +282,7 @@ impl<'a> Context<'a> {
 
         found
             .cloned()
-            .ok_or_else(|| EngineError::unknown_column(&written.written(), "field list"))
+            .ok_or_else(|| EngineError::unknown_column(&written.written(), self.clause))
     }
 }
 
@@ -388,9 +437,9 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
                     .join(".")
             };
             written
-                .ok_or_else(|| EngineError::unknown_column(&shown(), "field list"))
+                .ok_or_else(|| EngineError::unknown_column(&shown(), ctx.clause))
                 .and_then(|written| ctx.lookup(&written))
-                .map_err(|_| EngineError::unknown_column(&shown(), "field list"))
+                .map_err(|_| EngineError::unknown_column(&shown(), ctx.clause))
         }
 
         Expr::Value(v) => literal(&v.value),
@@ -1131,7 +1180,7 @@ fn variable(name: &str, ctx: &Context<'_>) -> EngineResult<Value> {
     }
     match name.strip_prefix('@') {
         Some(rest) => Ok(ctx.session.user_variable(rest)),
-        None => Err(EngineError::unknown_column(name, "field list")),
+        None => Err(EngineError::unknown_column(name, ctx.clause)),
     }
 }
 

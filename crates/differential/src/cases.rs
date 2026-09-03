@@ -3925,6 +3925,121 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // #0099. 1054 names the clause the reference was written in, and this
+        // engine reported every one of them as the field list because the
+        // evaluator carried no clause. GROUP BY said `'field list'` where 8.3
+        // says `'group statement'`, a join condition where it says
+        // `'on clause'`, and an OVER spec's two interior clauses have names of
+        // their own.
+        //
+        // What the harness can hold of that is the code and the SQLSTATE:
+        // `Answer::Failed` records those two and not the message, so a wrong
+        // clause name would compare equal here. The message itself is pinned
+        // by `crates/engine/tests/sql.rs`, statement for statement against the
+        // same measurements. These cases hold the other half — that each of
+        // these clauses is refused at all, and refused with 1054 rather than
+        // by answering — which is the half a message assertion cannot see.
+        //
+        // Every table has rows in it, because that is what makes the clause
+        // evaluate. Refusing one *before* the first row is #0100's, and a case
+        // over an empty table would be recording that divergence rather than
+        // this one.
+        name: "the clause a 1054 names",
+        setup: &[
+            "CREATE TABLE Cl (id INT NOT NULL, k INT NULL, s VARCHAR(20) NULL, \
+             PRIMARY KEY (id))",
+            "CREATE TABLE Cr (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Cl VALUES (1, 10, 'a'), (2, 20, 'b')",
+            "INSERT INTO Cr VALUES (1, 10), (2, 20)",
+        ],
+        cases: &[
+            // The two positions #0058 already settled, asked here as well:
+            // the clause names come from one mechanism now, so a change that
+            // moves it has to keep these two right along with the rest.
+            same("SELECT zz.q FROM Cl"),
+            same("SELECT k FROM Cl WHERE zz.q = 1"),
+            // The six the issue lists.
+            same("SELECT k FROM Cl GROUP BY zz.q"),
+            same("SELECT k FROM Cl GROUP BY k HAVING zz.q > 1"),
+            same("SELECT k FROM Cl ORDER BY zz.q"),
+            same("SELECT Cl.k FROM Cl JOIN Cr ON zz.q = Cr.id"),
+            same("SELECT SUM(k) OVER (PARTITION BY zz.q) FROM Cl"),
+            same("SELECT SUM(k) OVER (ORDER BY zz.q) FROM Cl"),
+            // A LEFT join names the same clause as an inner one, and a `USING`
+            // list names `'from clause'` rather than the `'on clause'` of the
+            // condition the engine builds from it.
+            same("SELECT Cl.k FROM Cl LEFT JOIN Cr ON zz.q = Cr.id"),
+            same("SELECT Cl.k FROM Cl JOIN Cr USING (zz)"),
+            // A DML ORDER BY, which #0100's note measured as `'order clause'`.
+            // The WHERE picks a row, so the clause is reached.
+            same("UPDATE Cl SET k = 1 WHERE id = 1 ORDER BY zz.q LIMIT 1"),
+            same("DELETE FROM Cl WHERE id = 1 ORDER BY zz.q LIMIT 1"),
+            // Inside a call and inside an operator: the position decides the
+            // name, not the shape of the expression sitting in it.
+            same("SELECT k FROM Cl GROUP BY ABS(zz.q)"),
+            same("SELECT Cl.k FROM Cl JOIN Cr ON ABS(zz.q) = Cr.id"),
+            same("SELECT SUM(k) OVER (PARTITION BY ABS(zz.q)) FROM Cl"),
+            same("SELECT SUM(k) OVER (ORDER BY ABS(zz.q)) FROM Cl"),
+            same("SELECT k FROM Cl ORDER BY zz.q + 1"),
+            // A window function's argument belongs to the clause the call is
+            // written in, not to the OVER spec beside it.
+            same("SELECT SUM(zz.q) OVER (ORDER BY k) FROM Cl"),
+            // A subquery's own clause is named, and so is the clause a
+            // correlated reference to the outer query is *written* in — the
+            // name follows the position, not the query level that owns the
+            // scope.
+            same("SELECT k FROM Cl WHERE id IN (SELECT id FROM Cr GROUP BY zz.q)"),
+            same("SELECT k FROM Cl WHERE id IN \
+                  (SELECT Cr.id FROM Cr JOIN Cl c2 ON zz.q = c2.id)"),
+            same("SELECT k FROM Cl WHERE Cl.id IN (SELECT Cr.id FROM Cr GROUP BY Cl.zz)"),
+            same("SELECT k FROM Cl WHERE Cl.id IN \
+                  (SELECT Cr.id FROM Cr JOIN Cl c2 ON Cl.zz = c2.id)"),
+            // Unqualified, which is the evaluator's other arm and the other of
+            // the two places this message is spelled.
+            same("SELECT k FROM Cl GROUP BY zz"),
+            same("SELECT Cl.k FROM Cl JOIN Cr ON zz = Cr.id"),
+            same("SELECT SUM(k) OVER (PARTITION BY zz) FROM Cl"),
+            same("SELECT SUM(k) OVER (ORDER BY zz) FROM Cl"),
+            same("UPDATE Cl SET k = 1 WHERE id = 1 ORDER BY zz LIMIT 1"),
+            same("DELETE FROM Cl WHERE id = 1 ORDER BY zz LIMIT 1"),
+            // Which clause is named only matters once two of them are bad at
+            // the same time, and then it is decided by which one is resolved
+            // first. 8.3 reads the select list before the rest of the query
+            // body; this engine grouped before it read the list, which nothing
+            // could see while every clause reported the same name. Review
+            // caught it, and these are the shapes it caught it with.
+            same("SELECT zz.q FROM Cl GROUP BY yy.r"),
+            same("SELECT zz.q FROM Cl GROUP BY zz.q"),
+            same("SELECT zz.q FROM Cl GROUP BY 1"),
+            same("SELECT zz.q AS a FROM Cl GROUP BY a"),
+            same("SELECT SUM(zz.q) FROM Cl GROUP BY k"),
+            // The WHERE is behind the select list too, and ahead of the
+            // GROUP BY.
+            same("SELECT zz.q FROM Cl WHERE yy.r = 1"),
+            same("SELECT zz.q FROM Cl WHERE yy.r = 1 ORDER BY xx.p"),
+            same("SELECT k FROM Cl WHERE zz.q = 1 GROUP BY yy.r"),
+            // And where the select list is fine, the GROUP BY beats what
+            // follows it.
+            same("SELECT k FROM Cl GROUP BY yy.r HAVING xx.p > 1"),
+            same("SELECT k FROM Cl GROUP BY yy.r ORDER BY xx.p"),
+            // The select list carries more than its names, and all of it is
+            // settled ahead of the WHERE and the GROUP BY: 1210 and 1582
+            // rather than the other clause's 1054, and 1051 for a wildcard
+            // qualifier that names nothing.
+            same("SELECT s LIKE 'a' ESCAPE '!!' FROM Cl GROUP BY zz.q"),
+            same("SELECT SIGN() FROM Cl GROUP BY zz.q"),
+            same("SELECT nope.* FROM Cl GROUP BY k"),
+            same("SELECT s LIKE 'a' ESCAPE '!!' FROM Cl WHERE nope = 1"),
+            same("SELECT SIGN() FROM Cl WHERE nope = 1"),
+            same("SELECT nope.* FROM Cl WHERE zz.q = 1"),
+            // Every case above is a refusal, so the rows are still there — and
+            // a group of nothing but refusals reads the same whether its setup
+            // ran or failed on both servers, which is the failure the README
+            // warns about.
+            same("SELECT id, k, s FROM Cl ORDER BY id"),
+        ],
+    },
+    Group {
         // #0070 and #0085. Arithmetic over a decimal went through an `f64` and
         // came back with whatever the float printed, so the scale MySQL
         // computes was lost at every operator: `a + b` over two columns

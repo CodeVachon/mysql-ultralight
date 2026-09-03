@@ -16,7 +16,7 @@ use sqlparser::parser::Parser;
 use crate::catalog::{Catalog, Database, Table, INFORMATION_SCHEMA};
 use crate::ddl;
 use crate::error::{unsupported, EngineError, EngineResult};
-use crate::expr::{self, ColumnRef, Context, OuterRow, Row};
+use crate::expr::{self, ColumnRef, Context, OuterRow};
 use crate::foreign_keys::{self, Action};
 use crate::image;
 use crate::info_schema;
@@ -1543,6 +1543,35 @@ impl Engine {
         });
         let source: &Vec<Vec<Value>> = widened.as_ref().unwrap_or(&relation.rows);
 
+        // The select list, before every other clause of the query body.
+        //
+        // 8.3 resolves it first and this engine resolved it late, which nothing
+        // could see while every clause reported `'field list'` anyway: the
+        // message was right about the clause whichever one had actually been
+        // read. Naming the clauses correctly (#0099) made the order visible,
+        // and it is the order, measured with a fault in two clauses at once:
+        //
+        //     SELECT zz.q FROM Cl WHERE yy.r = 1        'zz.q' in 'field list'
+        //     SELECT zz.q FROM Cl GROUP BY yy.r         'zz.q' in 'field list'
+        //     SELECT k FROM Cl WHERE zz.q = 1 GROUP BY yy.r
+        //                                               'zz.q' in 'where clause'
+        //
+        // Everything the select list carries travels with it and not just its
+        // names — `SELECT s LIKE 'a' ESCAPE '!!' FROM Cl WHERE nope = 1` is
+        // 1210 on 8.3, `SELECT SIGN() FROM Cl WHERE nope = 1` is 1582, and
+        // `SELECT nope.* FROM Cl WHERE zz.q = 1` is 1051 — which is why this is
+        // the whole of `resolve_field_list` rather than a name check.
+        //
+        // A join's ON is the one clause still out of place: it is read while
+        // the relation is being built, above, and this resolves against that
+        // relation. 8.3 puts it after both the select list and the WHERE. That
+        // ordering arrives with #0100, which owns settling an ON before its
+        // first row.
+        //
+        // `project` runs this same pass again when it gets there; it is pure,
+        // and one definition means a mutation to it neuters both.
+        resolve_field_list(&select.projection, &refs, &relation)?;
+
         // Resolved before the loop, not inside it. A predicate is only
         // evaluated once per row, so over a table with no rows -- an empty
         // one, or any statement being described -- a name nothing answers to
@@ -1560,14 +1589,7 @@ impl Engine {
 
         let mut matching: Vec<&Vec<Value>> = Vec::new();
         for row in source {
-            let ctx = Context {
-                row: Some(Row {
-                    schema: &refs,
-                    values: row,
-                }),
-                session,
-                executor: Some(self),
-            };
+            let ctx = Context::for_row(&refs, row, session).with_executor(self);
             let keep = match &select.selection {
                 Some(predicate) => expr::eval(predicate, &ctx)?.truthy() == Some(true),
                 None => true,
@@ -1625,13 +1647,6 @@ impl Engine {
             apply_distinct(&mut grouped, select.distinct.as_ref())?;
             return Ok(grouped);
         }
-
-        // Before the HAVING, because that is the order 8.3 resolves in:
-        // `SELECT nope FROM t HAVING zz > 1` is 1054 for `nope` in the field
-        // list, and `SELECT a.* FROM t HAVING zz > 1` is 1051. `project` runs
-        // the same pass again when it gets there; it is pure, and one
-        // definition means a mutation to it neuters both.
-        resolve_field_list(&select.projection, &refs, &relation)?;
 
         // A HAVING that groups nothing filters rows here, before anything is
         // projected — because a window function is computed over the rows the
@@ -1754,14 +1769,7 @@ impl Engine {
         let resolved = substitute_item_exprs(having, &select.projection);
         let mut keep = Vec::with_capacity(matching.len());
         for row in matching.iter() {
-            let ctx = Context {
-                row: Some(Row {
-                    schema: refs,
-                    values: row,
-                }),
-                session,
-                executor: Some(self),
-            };
+            let ctx = Context::for_row(refs, row, session).with_executor(self);
             keep.push(expr::eval(&resolved, &ctx)?.truthy() == Some(true));
         }
         *matching = std::mem::take(matching)
@@ -1812,14 +1820,7 @@ impl Engine {
         let mut outstanding = vec![false; items.len()];
         let mut keys: Vec<Vec<Option<Value>>> = Vec::with_capacity(rows.len());
         for row in rows.iter() {
-            let ctx = Context {
-                row: Some(Row {
-                    schema: refs,
-                    values: row,
-                }),
-                session,
-                executor: Some(self),
-            };
+            let ctx = Context::for_row(refs, row, session).with_executor(self);
             let mut key = Vec::with_capacity(items.len());
             for (position, item) in items.iter().enumerate() {
                 if outstanding[position] {
@@ -1886,14 +1887,15 @@ impl Engine {
         if !order_by.is_empty() {
             let mut keys: Vec<(Vec<Value>, usize)> = Vec::with_capacity(chosen.len());
             for index in chosen {
-                let ctx = Context {
-                    row: Some(Row {
-                        schema: refs,
-                        values: &rows[index],
-                    }),
-                    session,
-                    executor: Some(self),
-                };
+                // `'order clause'`, measured: `UPDATE Bare SET k = 1 WHERE
+                // id = 9 ORDER BY zz.q LIMIT 1` with a matching row present is
+                // 1054 under that name on 8.3, where this said the field list.
+                // Resolving it *before* any row is read is #0100's, which owns
+                // every clause not yet settled at prepare; this is the name the
+                // refusal carries when a row does reach it.
+                let ctx = Context::for_row(refs, &rows[index], session)
+                    .with_executor(self)
+                    .in_clause("order clause");
                 let mut key = Vec::with_capacity(order_by.len());
                 for item in order_by {
                     key.push(expr::eval(&item.expr, &ctx)?);
@@ -2055,14 +2057,11 @@ impl Engine {
                 let keep = match constraint {
                     None | Some(JoinConstraint::None) => true,
                     Some(JoinConstraint::On(predicate)) => {
-                        let ctx = Context {
-                            row: Some(Row {
-                                schema: &joined_refs,
-                                values: &joined,
-                            }),
-                            session,
-                            executor: Some(self),
-                        };
+                        // The lateral half of the pair below, named the same
+                        // way and for the same reason.
+                        let ctx = Context::for_row(&joined_refs, &joined, session)
+                            .with_executor(self)
+                            .in_clause("on clause");
                         expr::eval(predicate, &ctx)?.truthy() == Some(true)
                     }
                     Some(other) => {
@@ -2180,14 +2179,25 @@ impl Engine {
 
                 let keep = match &condition {
                     Some(e) => {
-                        let ctx = Context {
-                            row: Some(Row {
-                                schema: &refs,
-                                values: &combined,
-                            }),
-                            session,
-                            executor: Some(self),
-                        };
+                        // `'on clause'`, which is 8.3's name for a join
+                        // condition whichever join wrote it — INNER, LEFT and
+                        // the `USING` list's rewritten equality all report it.
+                        // The `USING` *names* themselves are `'from clause'`
+                        // and are resolved before this, in `using_condition`,
+                        // which is 8.3's order too.
+                        //
+                        // What is *not* 8.3's order is what comes between: the
+                        // select list and the WHERE both beat an ON there, and
+                        // both come after it here, because an ON is read while
+                        // the relation is being built and the other two resolve
+                        // against the relation. Measured: `SELECT zz.q FROM Cl
+                        // JOIN Cr ON yy.r = Cr.id` is `'zz.q' in 'field list'`
+                        // on 8.3 and `'yy.r'` here — the wrong name in either
+                        // spelling of the clause, and the fix is to settle an
+                        // ON before its first row, which is #0100's.
+                        let ctx = Context::for_row(&refs, &combined, session)
+                            .with_executor(self)
+                            .in_clause("on clause");
                         expr::eval(e, &ctx)?.truthy() == Some(true)
                     }
                     None => true,
@@ -2399,14 +2409,7 @@ impl Engine {
         // the enclosing row.
         let ctx = match outer {
             None => Context::rowless(session),
-            Some(outer) => Context {
-                row: Some(Row {
-                    schema: &outer.schema,
-                    values: &outer.values,
-                }),
-                session,
-                executor: None,
-            },
+            Some(outer) => Context::for_row(&outer.schema, &outer.values, session),
         }
         .with_executor(self);
         let mut columns = Vec::new();
@@ -2713,14 +2716,7 @@ impl Engine {
 
         let mut rows = Vec::with_capacity(matching.len());
         for (index, row) in matching.iter().enumerate() {
-            let ctx = Context {
-                row: Some(Row {
-                    schema: refs,
-                    values: row,
-                }),
-                session,
-                executor: Some(self),
-            };
+            let ctx = Context::for_row(refs, row, session).with_executor(self);
             let mut out = Vec::with_capacity(plan.len());
             for step in &plan {
                 out.push(match step {
@@ -2761,15 +2757,16 @@ impl Engine {
         let name = f.name.to_string().to_ascii_lowercase();
         let call = AggregateCall::read(f)?;
 
-        let evaluate = |e: &Expr, row: &Vec<Value>| -> EngineResult<Value> {
-            let ctx = Context {
-                row: Some(Row {
-                    schema: refs,
-                    values: row,
-                }),
-                session,
-                executor: Some(self),
-            };
+        // Takes the clause rather than fixing one, because the three things
+        // read through here are written in three different clauses: the OVER
+        // spec's PARTITION BY, its ORDER BY, and the call's own argument,
+        // which belongs to whatever clause the *call* is written in. Measured
+        // on 8.3, and the reason `unresolved_column` leaves an OVER spec alone
+        // rather than reporting it under the field list's name.
+        let evaluate = |e: &Expr, row: &Vec<Value>, clause: &'static str| -> EngineResult<Value> {
+            let ctx = Context::for_row(refs, row, session)
+                .with_executor(self)
+                .in_clause(clause);
             expr::eval(e, &ctx)
         };
 
@@ -2780,7 +2777,7 @@ impl Engine {
         for (index, row) in matching.iter().enumerate() {
             let mut key = Vec::with_capacity(spec.partition_by.len());
             for e in &spec.partition_by {
-                let value = evaluate(e, row)?;
+                let value = evaluate(e, row, "window partition by")?;
                 key.push(if value.is_null() {
                     "\u{0}NULL".to_owned()
                 } else {
@@ -2810,7 +2807,7 @@ impl Engine {
             for index in partition {
                 let mut key = Vec::with_capacity(spec.order_by.len());
                 for item in &spec.order_by {
-                    key.push(evaluate(&item.expr, matching[*index])?);
+                    key.push(evaluate(&item.expr, matching[*index], "window order by")?);
                 }
                 ordered.push((key, *index));
             }
@@ -2926,7 +2923,24 @@ impl Engine {
                         out[*index] =
                             match usize::try_from(target).ok().and_then(|t| ordered.get(t)) {
                                 Some((_, source)) => {
-                                    let found = evaluate(subject, matching[*source])?.untag_bool();
+                                    // The call's own argument, which belongs to
+                                    // the clause the call is written in and not
+                                    // to the OVER spec beside it: `SELECT
+                                    // LAG(zz.q) OVER (ORDER BY k) FROM Cl` is
+                                    // 1054 in the field list on 8.3, not in the
+                                    // window order by.
+                                    //
+                                    // A literal rather than a clause threaded in
+                                    // from above, because the field list is the
+                                    // only clause a window call reaches this from:
+                                    // one written in an ORDER BY is settled by
+                                    // `resolve_order_by` before any row is read
+                                    // and reports `'order clause'` — measured,
+                                    // `ORDER BY LAG(zz.q) OVER ()` is that on 8.3
+                                    // too — and one in a GROUP BY or a HAVING is
+                                    // 3593 or 3594 rather than 1054.
+                                    let found = evaluate(subject, matching[*source], "field list")?
+                                        .untag_bool();
                                     // The default is a candidate for the answer,
                                     // so it decides the sign alongside the subject
                                     // — the same all-candidates rule a conditional
@@ -3087,14 +3101,13 @@ impl Engine {
             groups.push(matching.to_vec());
         } else {
             for row in matching {
-                let ctx = Context {
-                    row: Some(Row {
-                        schema: refs,
-                        values: row,
-                    }),
-                    session,
-                    executor: Some(self),
-                };
+                // `'group statement'` — MySQL's name for the GROUP BY clause
+                // in this message, and not `'group clause'` as the pattern of
+                // the others would suggest. Measured: `SELECT k FROM T GROUP
+                // BY zz.q` is `Unknown column 'zz.q' in 'group statement'`.
+                let ctx = Context::for_row(refs, row, session)
+                    .with_executor(self)
+                    .in_clause("group statement");
                 let mut key = Vec::with_capacity(group_exprs.len());
                 for e in &group_exprs {
                     let value = expr::eval(e, &ctx)?;
@@ -3338,14 +3351,7 @@ impl Engine {
             values.push(value.clone());
         }
 
-        let ctx = Context {
-            row: Some(Row {
-                schema: &schema,
-                values: &values,
-            }),
-            session,
-            executor: Some(self),
-        };
+        let ctx = Context::for_row(&schema, &values, session).with_executor(self);
         expr::eval(&rewritten, &ctx)
     }
 
@@ -3546,14 +3552,7 @@ impl Engine {
         let mut values = Vec::new();
         if let Some(arg) = argument {
             for row in matching {
-                let ctx = Context {
-                    row: Some(Row {
-                        schema: refs,
-                        values: row,
-                    }),
-                    session,
-                    executor: Some(self),
-                };
+                let ctx = Context::for_row(refs, row, session).with_executor(self);
                 // Untagged here rather than in each fold below, because no
                 // aggregate keeps a boolean: measured on 8.3,
                 // `JSON_ARRAY(MIN(TRUE))`, `MAX`, `SUM` and `COUNT` are all
@@ -3711,14 +3710,7 @@ impl Engine {
         // The concatenated value and this row's sort keys, in arrival order.
         let mut rows: Vec<(Value, Vec<Value>)> = Vec::with_capacity(matching.len());
         for row in matching {
-            let ctx = Context {
-                row: Some(Row {
-                    schema: refs,
-                    values: row,
-                }),
-                session,
-                executor: Some(self),
-            };
+            let ctx = Context::for_row(refs, row, session).with_executor(self);
             let mut parts = Vec::with_capacity(call.arguments.len());
             for argument in &call.arguments {
                 parts.push(expr::eval(argument, &ctx)?.untag_bool());
@@ -3816,14 +3808,7 @@ impl Engine {
 
         let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(result.rows.len());
         for (index, row) in result.rows.iter().enumerate() {
-            let ctx = Context {
-                row: Some(Row {
-                    schema: &refs,
-                    values: row,
-                }),
-                session,
-                executor: Some(self),
-            };
+            let ctx = Context::for_row(&refs, row, session).with_executor(self);
             let mut key = Vec::with_capacity(items.len());
             for (position, item) in items.iter().enumerate() {
                 if let Some(value) = carried
@@ -4229,14 +4214,8 @@ impl Engine {
                             // is what `c = c + 1` means here — while `VALUES(c)`
                             // names the value the insert would have written, which
                             // is the ordinary way to spell an upsert.
-                            let ctx = Context {
-                                row: Some(Row {
-                                    schema: &updated_refs,
-                                    values: &updated,
-                                }),
-                                session: &session_snapshot,
-                                executor: Some(self),
-                            };
+                            let ctx = Context::for_row(&updated_refs, &updated, &session_snapshot)
+                                .with_executor(self);
                             let value = match values_reference(&assignment.value) {
                                 Some(referenced) => {
                                     let from =
@@ -4452,14 +4431,7 @@ impl Engine {
         // in hand before the first write.
         let mut matching = Vec::new();
         for (index, row) in rows.iter().enumerate() {
-            let ctx = Context {
-                row: Some(Row {
-                    schema: &refs,
-                    values: row,
-                }),
-                session: &session_snapshot,
-                executor: Some(self),
-            };
+            let ctx = Context::for_row(&refs, row, &session_snapshot).with_executor(self);
             let matched = match selection {
                 Some(p) => expr::eval(p, &ctx)?.truthy() == Some(true),
                 None => true,
@@ -4472,14 +4444,7 @@ impl Engine {
             self.dml_row_order(&session_snapshot, &refs, &rows, matching, order_by, limit)?;
 
         for index in chosen {
-            let ctx = Context {
-                row: Some(Row {
-                    schema: &refs,
-                    values: &rows[index],
-                }),
-                session: &session_snapshot,
-                executor: Some(self),
-            };
+            let ctx = Context::for_row(&refs, &rows[index], &session_snapshot).with_executor(self);
 
             let mut candidate = rows[index].clone();
             let mut assigned: Vec<usize> = Vec::with_capacity(assignments.len());
@@ -4659,14 +4624,7 @@ impl Engine {
         let mut changes: BTreeMap<usize, Vec<MovedRow>> = BTreeMap::new();
 
         for (row_index, row) in relation.rows.iter().enumerate() {
-            let ctx = Context {
-                row: Some(Row {
-                    schema: &refs,
-                    values: row,
-                }),
-                session: &session_snapshot,
-                executor: Some(self),
-            };
+            let ctx = Context::for_row(&refs, row, &session_snapshot).with_executor(self);
             let matched = match selection {
                 Some(p) => expr::eval(p, &ctx)?.truthy() == Some(true),
                 None => true,
@@ -4824,14 +4782,7 @@ impl Engine {
 
         let mut matching = Vec::new();
         for (index, row) in table.rows.iter().enumerate() {
-            let ctx = Context {
-                row: Some(Row {
-                    schema: &refs,
-                    values: row,
-                }),
-                session: &session_snapshot,
-                executor: Some(self),
-            };
+            let ctx = Context::for_row(&refs, row, &session_snapshot).with_executor(self);
             let matched = match &delete.selection {
                 Some(p) => expr::eval(p, &ctx)?.truthy() == Some(true),
                 None => true,
@@ -4996,14 +4947,7 @@ impl Engine {
             vec![std::collections::HashSet::new(); relation.sources.len()];
 
         for (row_index, row) in relation.rows.iter().enumerate() {
-            let ctx = Context {
-                row: Some(Row {
-                    schema: &refs,
-                    values: row,
-                }),
-                session: &session_snapshot,
-                executor: Some(self),
-            };
+            let ctx = Context::for_row(&refs, row, &session_snapshot).with_executor(self);
             let matched = match &delete.selection {
                 Some(p) => expr::eval(p, &ctx)?.truthy() == Some(true),
                 None => true,
@@ -5394,14 +5338,7 @@ impl Engine {
         // in the FROM, which reaches here as the lateral row.
         let outer = session.lateral.clone();
         let ctx = match &outer {
-            Some(row) => Context {
-                row: Some(Row {
-                    schema: &row.schema,
-                    values: &row.values,
-                }),
-                session,
-                executor: Some(self),
-            },
+            Some(row) => Context::for_row(&row.schema, &row.values, session).with_executor(self),
             None => Context::rowless(session).with_executor(self),
         };
         let source = expr::eval(document, &ctx)?;
@@ -5627,14 +5564,7 @@ impl Engine {
             };
             let parsed = parse_expression(&expression)?;
             let value = {
-                let ctx = Context {
-                    row: Some(Row {
-                        schema: &refs,
-                        values: &row,
-                    }),
-                    session,
-                    executor: Some(self),
-                };
+                let ctx = Context::for_row(&refs, &row, session).with_executor(self);
                 expr::eval(&parsed, &ctx)?
             };
             let column = &table.columns[index];
@@ -5649,14 +5579,7 @@ impl Engine {
 
         for check in &table.checks {
             let parsed = parse_expression(&check.expr)?;
-            let ctx = Context {
-                row: Some(Row {
-                    schema: &refs,
-                    values: &row,
-                }),
-                session,
-                executor: Some(self),
-            };
+            let ctx = Context::for_row(&refs, &row, session).with_executor(self);
             // A CHECK passes when it is true or unknown; only an outright
             // false is a violation, as in MySQL.
             if expr::eval(&parsed, &ctx)?.truthy() == Some(false) {
@@ -9455,11 +9378,14 @@ fn unresolved_column(e: &Expr, refs: &[ColumnRef]) -> Option<String> {
         // is settled here and not when a row reaches it. The whole clause was
         // being discarded before #0088, so this answered.
         //
-        // The OVER clause's own PARTITION BY and ORDER BY are left alone.
-        // MySQL resolves them too, but names them `window partition by` and
-        // `window order by` in the message rather than `field list`, and a
-        // right refusal under the wrong clause name is a divergence traded for
-        // a divergence.
+        // The OVER clause's own PARTITION BY and ORDER BY are left alone,
+        // because this walk carries one clause name for the whole expression
+        // and theirs is not the caller's: MySQL names them `window partition
+        // by` and `window order by`, and reporting them here would refuse them
+        // under the field list's name. `compute_window` names them as it
+        // evaluates them, so the message is right for every row that reaches
+        // it; resolving them ahead of the first row is #0100's, along with
+        // every other clause not yet settled at prepare.
         Expr::Function(f) => value_arguments(f)
             .iter()
             .chain(own_order_by(f).iter().map(|i| &i.expr))

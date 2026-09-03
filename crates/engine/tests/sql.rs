@@ -5605,6 +5605,264 @@ fn dml_resolves_its_names_even_where_no_row_evaluates_them() {
     );
 }
 
+/// 1054 names the clause the reference was written in, not the field list.
+///
+/// #0099. The evaluator reported every unknown name as being in the field
+/// list, because a `Context` carried no clause and `lookup` had a literal in
+/// it. The message is the entire product of this path — a client matching on
+/// it, or a person reading it, was sent to a clause the name is not in.
+///
+/// Every string below was measured on 8.3, and two of them are why they were
+/// measured rather than derived: GROUP BY is `'group statement'` and not
+/// `'group clause'` as every other name would suggest, and a window's two
+/// interior clauses have names of their own that neither the field list nor
+/// the plain `'order clause'` matches.
+///
+/// The tables have rows in them on purpose. Refusing these clauses *before* a
+/// row reaches them is #0100, which owns every clause not yet resolved at
+/// prepare; what is asserted here is the name the refusal carries, so each
+/// statement is one that does evaluate the clause.
+#[test]
+fn a_1054_names_the_clause_the_reference_was_written_in() {
+    let (engine, mut session) = engine();
+    for ddl in [
+        "CREATE TABLE Cl (id INT NOT NULL, k INT NULL, s VARCHAR(20) NULL, PRIMARY KEY (id))",
+        "CREATE TABLE Cr (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+        "INSERT INTO Cl VALUES (1, 10, 'a'), (2, 20, 'b')",
+        "INSERT INTO Cr VALUES (1, 10), (2, 20)",
+    ] {
+        run(&engine, &mut session, ddl);
+    }
+
+    for (sql, message) in [
+        // The two that were already right, kept beside the others so a change
+        // that reverts the whole mechanism to one name is visible as such.
+        (
+            "SELECT zz.q FROM Cl",
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT k FROM Cl WHERE zz.q = 1",
+            "Unknown column 'zz.q' in 'where clause'",
+        ),
+        // The six the issue lists.
+        (
+            "SELECT k FROM Cl GROUP BY zz.q",
+            "Unknown column 'zz.q' in 'group statement'",
+        ),
+        (
+            "SELECT k FROM Cl GROUP BY k HAVING zz.q > 1",
+            "Unknown column 'zz.q' in 'having clause'",
+        ),
+        (
+            "SELECT k FROM Cl ORDER BY zz.q",
+            "Unknown column 'zz.q' in 'order clause'",
+        ),
+        (
+            "SELECT Cl.k FROM Cl JOIN Cr ON zz.q = Cr.id",
+            "Unknown column 'zz.q' in 'on clause'",
+        ),
+        (
+            "SELECT SUM(k) OVER (PARTITION BY zz.q) FROM Cl",
+            "Unknown column 'zz.q' in 'window partition by'",
+        ),
+        (
+            "SELECT SUM(k) OVER (ORDER BY zz.q) FROM Cl",
+            "Unknown column 'zz.q' in 'window order by'",
+        ),
+        // A LEFT join reports the same clause as an inner one, and so does a
+        // condition the engine builds itself from a `USING` list — the list's
+        // own names are `'from clause'`, which is the pair below.
+        (
+            "SELECT Cl.k FROM Cl LEFT JOIN Cr ON zz.q = Cr.id",
+            "Unknown column 'zz.q' in 'on clause'",
+        ),
+        (
+            "SELECT Cl.k FROM Cl JOIN Cr USING (zz)",
+            "Unknown column 'zz' in 'from clause'",
+        ),
+        // A DML ORDER BY, which #0100's note measured as `'order clause'`
+        // against the `'field list'` this used to answer. The WHERE picks a
+        // row, so the clause is evaluated rather than skipped.
+        (
+            "UPDATE Cl SET k = 1 WHERE id = 1 ORDER BY zz.q LIMIT 1",
+            "Unknown column 'zz.q' in 'order clause'",
+        ),
+        (
+            "DELETE FROM Cl WHERE id = 1 ORDER BY zz.q LIMIT 1",
+            "Unknown column 'zz.q' in 'order clause'",
+        ),
+        // Wrapped in a call and in an operator, because MySQL names the
+        // position and not the shape of the expression sitting in it.
+        (
+            "SELECT k FROM Cl GROUP BY ABS(zz.q)",
+            "Unknown column 'zz.q' in 'group statement'",
+        ),
+        (
+            "SELECT Cl.k FROM Cl JOIN Cr ON ABS(zz.q) = Cr.id",
+            "Unknown column 'zz.q' in 'on clause'",
+        ),
+        (
+            "SELECT SUM(k) OVER (PARTITION BY ABS(zz.q)) FROM Cl",
+            "Unknown column 'zz.q' in 'window partition by'",
+        ),
+        (
+            "SELECT SUM(k) OVER (ORDER BY ABS(zz.q)) FROM Cl",
+            "Unknown column 'zz.q' in 'window order by'",
+        ),
+        (
+            "SELECT k FROM Cl ORDER BY zz.q + 1",
+            "Unknown column 'zz.q' in 'order clause'",
+        ),
+        // Written without a qualifier, which is a different arm of the
+        // evaluator and reaches a different one of the two places the
+        // evaluator spells this message: a bare name is reported by the lookup
+        // itself, a qualified one by the arm that called it. Reverting either
+        // to the field list on its own leaves the other right, so both
+        // spellings are asserted for each clause.
+        (
+            "SELECT k FROM Cl GROUP BY zz",
+            "Unknown column 'zz' in 'group statement'",
+        ),
+        (
+            "SELECT Cl.k FROM Cl JOIN Cr ON zz = Cr.id",
+            "Unknown column 'zz' in 'on clause'",
+        ),
+        (
+            "SELECT SUM(k) OVER (PARTITION BY zz) FROM Cl",
+            "Unknown column 'zz' in 'window partition by'",
+        ),
+        (
+            "SELECT SUM(k) OVER (ORDER BY zz) FROM Cl",
+            "Unknown column 'zz' in 'window order by'",
+        ),
+        (
+            "UPDATE Cl SET k = 1 WHERE id = 1 ORDER BY zz LIMIT 1",
+            "Unknown column 'zz' in 'order clause'",
+        ),
+        (
+            "DELETE FROM Cl WHERE id = 1 ORDER BY zz LIMIT 1",
+            "Unknown column 'zz' in 'order clause'",
+        ),
+        // A window function's own argument is in the clause the *call* is
+        // written in, not in the OVER spec beside it: measured, `SUM(a.b)
+        // OVER (ORDER BY b)` is 1054 in the field list on 8.3.
+        (
+            "SELECT SUM(zz.q) OVER (ORDER BY k) FROM Cl",
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        // The name follows where the reference is written and not which query
+        // level owns the scope. Each of these is a subquery whose own clause
+        // is named, and the last two are correlated references to the outer
+        // query written in an inner clause — 8.3 names the inner one.
+        (
+            "SELECT k FROM Cl WHERE id IN (SELECT id FROM Cr GROUP BY zz.q)",
+            "Unknown column 'zz.q' in 'group statement'",
+        ),
+        (
+            "SELECT k FROM Cl WHERE id IN (SELECT Cr.id FROM Cr JOIN Cl c2 ON zz.q = c2.id)",
+            "Unknown column 'zz.q' in 'on clause'",
+        ),
+        (
+            "SELECT k FROM Cl WHERE Cl.id IN (SELECT Cr.id FROM Cr GROUP BY Cl.zz)",
+            "Unknown column 'Cl.zz' in 'group statement'",
+        ),
+        (
+            "SELECT k FROM Cl WHERE Cl.id IN (SELECT Cr.id FROM Cr JOIN Cl c2 ON Cl.zz = c2.id)",
+            "Unknown column 'Cl.zz' in 'on clause'",
+        ),
+        // Which clause is named only matters once they differ, and then it is
+        // decided by which one is resolved first. 8.3 reads the select list
+        // before the rest of the query body, so with an unresolvable name in
+        // two clauses at once the field list wins — measured for each of
+        // these. Naming the clauses correctly is what exposed the ordering:
+        // while everything said `'field list'` this engine's answer looked
+        // right whichever clause it had actually read.
+        (
+            "SELECT zz.q FROM Cl GROUP BY yy.r",
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT zz.q FROM Cl GROUP BY zz.q",
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT SUM(zz.q) FROM Cl GROUP BY k",
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        // A GROUP BY that names a select item — by position or by alias —
+        // resolves to that item's expression, so the only place the reference
+        // is written is the field list and that is what 8.3 names.
+        (
+            "SELECT zz.q FROM Cl GROUP BY 1",
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT zz.q AS a FROM Cl GROUP BY a",
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT zz.q FROM Cl GROUP BY k HAVING yy.r > 1",
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT zz.q FROM Cl GROUP BY k ORDER BY yy.r",
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        // The WHERE is behind the select list too, and ahead of the GROUP BY.
+        (
+            "SELECT zz.q FROM Cl WHERE yy.r = 1",
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT zz.q FROM Cl WHERE yy.r = 1 ORDER BY xx.p",
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT k FROM Cl WHERE zz.q = 1 GROUP BY yy.r",
+            "Unknown column 'zz.q' in 'where clause'",
+        ),
+        // And where the select list is fine, the GROUP BY still beats the
+        // HAVING and the ORDER BY behind it.
+        (
+            "SELECT k FROM Cl GROUP BY yy.r HAVING xx.p > 1",
+            "Unknown column 'yy.r' in 'group statement'",
+        ),
+        (
+            "SELECT k FROM Cl GROUP BY yy.r ORDER BY xx.p",
+            "Unknown column 'yy.r' in 'group statement'",
+        ),
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, 1054, "expected ER_BAD_FIELD_ERROR for: {sql}");
+        assert_eq!(err.sql_state, "42S22", "for: {sql}");
+        assert_eq!(err.message, message, "for: {sql}");
+    }
+
+    // The select list carries more than its names, and all of it is settled
+    // ahead of the WHERE and the GROUP BY: 8.3 answers 1210 and 1582 for these
+    // rather than the 1054 the other clause would give, and 1051 for a
+    // wildcard whose qualifier names nothing.
+    for (sql, code) in [
+        ("SELECT s LIKE 'a' ESCAPE '!!' FROM Cl GROUP BY zz.q", 1210),
+        ("SELECT SIGN() FROM Cl GROUP BY zz.q", 1582),
+        ("SELECT nope.* FROM Cl GROUP BY k", 1051),
+        ("SELECT s LIKE 'a' ESCAPE '!!' FROM Cl WHERE nope = 1", 1210),
+        ("SELECT SIGN() FROM Cl WHERE nope = 1", 1582),
+        ("SELECT nope.* FROM Cl WHERE zz.q = 1", 1051),
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, code, "for: {sql}");
+    }
+
+    // Every refusal above left both tables as they were — the two DML cases
+    // included, which is the half a wrong clause name would not have shown.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id, k FROM Cl ORDER BY id"),
+        vec![vec!["1", "10"], vec!["2", "20"]]
+    );
+}
+
 /// `ON DUPLICATE KEY UPDATE` resolves its names before anything collides.
 ///
 /// The fifth entry point with #0009's recurring shape, and the one #0102 left
