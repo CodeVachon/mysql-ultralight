@@ -1755,12 +1755,12 @@ pub const GROUPS: &[Group] = &[
             // A keyword boolean carries no parse-time name at all, which is
             // why the plus stays on it where it comes off a number.
             //
-            // `X'41'` and `0x41` belong beside these and are not here: MySQL
-            // reports a hex literal's column UNSIGNED and this engine reports
-            // it signed, and `-'abc'` is a DOUBLE `-0` there against a string
-            // here. Both are real divergences and neither is about naming, so
-            // they are covered in `crates/engine/tests/sql.rs` rather than
-            // parked in a baseline this file says only ever shrinks.
+            // `X'41'`, `0x41` and `-'abc'` were held out of this group while
+            // they diverged on something that is not a name -- the hex
+            // literal's UNSIGNED flag and the negation's type code. Both are
+            // answered now, and both have a group of their own below rather
+            // than being folded in here, because neither is about naming.
+            // #0105 and #0106.
             same("SELECT TRUE, true, +TRUE"),
                         // Bytes against characters not asked: the operand is explicitly
             // binary -- `BINARY 'x'`, `CAST(x AS BINARY)`, a `BLOB` column --
@@ -1801,6 +1801,64 @@ pub const GROUPS: &[Group] = &[
             // 256 bytes as 128 two-byte characters, so the cut lands inside
             // one: MySQL reports 127 of them rather than half of the 128th.
             same("SELECT 'éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé'"),
+        ],
+    },
+    Group {
+        // The two the group above narrowed rather than blessed, now that both
+        // are answered. #0105 and #0106.
+        //
+        // A hex literal's column is UNSIGNED on 8.3 -- the one place that flag
+        // describes something that is not a number -- and its values are
+        // bytes. A *bit* literal is neither, which is why the cases below name
+        // one spelling: `b'101'` is a VAR_STRING with no UNSIGNED there, and
+        // it does not parse here at all, so it cannot be asked (#0141).
+        //
+        // Unary minus answers a number for every operand MySQL accepts, so
+        // `-'abc'` is a DOUBLE and not the VAR_STRING this engine sent. Only
+        // the type moved: `-0` is the text either way, which is why the text
+        // protocol never showed it and a prepared client read a string where
+        // MySQL sends eight bytes of a double.
+        //
+        // What is deliberately not here is `-X'41'` and `ABS(X'41')`: MySQL
+        // reads a hex literal as the *number* 65 in a numeric context and this
+        // engine reads its bytes, so those answer -65 against -0 and 65
+        // against 0. That is #0141 and not this, and it is why the cases below
+        // keep the hex literal in a string context.
+        name: "a hex literal and a unary minus on the wire",
+        setup: &[
+            "CREATE TABLE H (id INT NOT NULL, t VARCHAR(30) NOT NULL, \
+             d DECIMAL(10,2) NOT NULL, iu INT UNSIGNED NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO H VALUES (1, '12abc', 1.25, 7)",
+        ],
+        cases: &[
+            // Every spelling of the literal, and both edges of its length.
+            same("SELECT X'41', 0x41, x'41'"),
+            same("SELECT X'', X'4142434445464748494A4B4C4D4E4F5051525354555657'"),
+            // The wrappers MySQL's parser hands the item straight back
+            // through, which keep the flag and the character set with it.
+            same("SELECT (X'41'), ((X'41')), +X'41'"),
+            same("SELECT (SELECT X'41')"),
+            // A materialisation takes the flag off, because the temporary
+            // table it lands in has a field per column and a field is unsigned
+            // only where it is a number. The character set survives.
+            same("SELECT X'41' UNION SELECT X'42' ORDER BY 1"),
+            same("SELECT * FROM (SELECT X'41' AS h) z"),
+            // A string context, where both servers read the bytes.
+            same("SELECT LENGTH(X'41'), X'41' IS NULL, X'41' = 0x41"),
+            // The negations. A string of any shape is a DOUBLE, an exact
+            // fraction stays NEWDECIMAL and an integer of any width and either
+            // sign is a LONGLONG.
+            same("SELECT -'abc', -'12', -'12abc'"),
+            same("SELECT -NULL, -TRUE"),
+            same("SELECT -t, -d, -iu FROM H ORDER BY id"),
+            // Both branches answer -0, so the union is one row and its order
+            // is total without an ORDER BY.
+            same("SELECT -'abc' UNION SELECT -'def'"),
+            same("SELECT * FROM (SELECT -'abc' AS m) z"),
+            // The type reaches the arithmetic around it: a negated decimal
+            // still adds exactly, where announcing it approximate would have
+            // rounded the answer through an f64.
+            same("SELECT -d + 1, -iu + 1 FROM H ORDER BY id"),
         ],
     },
     Group {

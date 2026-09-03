@@ -1410,6 +1410,31 @@ impl Engine {
                         column.declared = None;
                     }
                 }
+                // The sign goes too, wherever the column it lands in is not a
+                // number. The temporary table has a field per column and a
+                // field's UNSIGNED is an attribute of a numeric type, so an
+                // expression that carried the flag while being a string does
+                // not carry it out again: `SELECT X'41'` is UNSIGNED on 8.3
+                // and `SELECT X'41' UNION SELECT X'42'` is not, though both
+                // branches are. The same rule as `OutColumn::sql_type`, which
+                // is where a derived table and a view lose it.
+                //
+                // Read after the ENUM correction above rather than before it,
+                // because that one rewrites the type code, and this asks the
+                // code.
+                //
+                // MySQL goes further than this and drops the flag for a
+                // DECIMAL and a FLOAT too — `SELECT du FROM t UNION SELECT du
+                // FROM t` over a `DECIMAL(10,2) UNSIGNED` is NEWDECIMAL with
+                // no UNSIGNED on 8.3, where the integer beside it keeps it and
+                // so does a YEAR. That is left alone deliberately: the loop
+                // below reads this same field to decide whether to untag the
+                // *values*, so widening the rule moves the arithmetic as well
+                // as the description, and it is a divergence of its own rather
+                // than part of this one.
+                for column in &mut left.columns {
+                    column.unsigned &= crate::result::is_numeric(column.ty);
+                }
                 // A boolean goes the same way, for the reason a derived
                 // table takes it off too: the operation gives the value a
                 // column to live in. Measured on 8.3, `SELECT JSON_ARRAY(x)
@@ -7467,6 +7492,21 @@ fn is_null_literal(e: &Expr) -> bool {
 fn binary_answer(e: &Expr, refs: &[ColumnRef], sub: Option<Sub<'_>>) -> bool {
     match e {
         Expr::Nested(inner) => binary_answer(inner, refs, sub),
+        // Unary plus is not an operator — the parser hands its operand back —
+        // so it answers whatever its operand does, exactly as parentheses do.
+        // `+X'41'` is binary on 8.3 where `-X'41'` is a DOUBLE and not a
+        // string at all.
+        Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Plus,
+            expr,
+        } => binary_answer(expr, refs, sub),
+        // A hex literal *is* bytes. `X'41'` is the binary character set on
+        // 8.3, and the engine held it as `Value::Bytes` all along while
+        // describing the column in the connection's character set — so a
+        // client that reads this bit to decide between a Buffer and a String
+        // was told the wrong one. `UNHEX('41')` beside it, which produces the
+        // same byte, was already right.
+        Expr::Value(v) => matches!(v.value, sqlparser::ast::Value::HexStringLiteral(_)),
         Expr::Function(f) => matches!(
             f.name.to_string().to_ascii_lowercase().as_str(),
             "unhex" | "from_base64"
@@ -7532,6 +7572,30 @@ fn unsigned_answer(
 ) -> bool {
     let recur = |inner: &Expr| unsigned_answer(inner, refs, input, sub);
     let integral = |e: &Expr| is_integer(computed_column_type(e, refs, input, sub));
+    // The whole of the rule for the families that build a *new* item out of
+    // several candidates — the conditional functions, `CASE`, and the window
+    // functions. Those aggregate a type across the candidates and take the
+    // sign from the aggregate rather than from any one of them, so the flag
+    // survives only where that aggregate is an integer.
+    //
+    // Every operand that was ever unsigned here answers the same to both
+    // questions — a column, a twenty-digit literal, a cast, a bitwise answer
+    // are all integers — and a hex literal is what tells them apart: `X'41'`
+    // is UNSIGNED on 8.3 while `COALESCE(X'41', X'42')`, `IFNULL(X'41', '')`,
+    // `GREATEST(X'41', X'42')`, `IF(1, X'41', X'42')`,
+    // `CASE WHEN 1 THEN X'41' END` and `LAG(X'41') OVER ()` are all signed. So
+    // is `GREATEST(iu, 'a')`, where an unsigned column aggregates with a
+    // string to a VAR_STRING.
+    //
+    // Not asked of `MIN`, `MAX`, `ABS` or `NULLIF`, and that is measured
+    // rather than an omission: those hand one item back instead of aggregating
+    // over several, so `MIN(X'41')` is a VAR_STRING that is UNSIGNED and
+    // `ABS(X'41')` a DOUBLE that is.
+    //
+    // A closure, not a value: `integral` reaches `computed_column_type`, which
+    // runs a probe query for a scalar subquery, and most of the arms below
+    // never need the answer.
+    let aggregates_to_integer = || integral(e);
     // The corrected shape, as in the arms below that ask `reassociated` for
     // it. `a XOR b IS NULL` arrives with the `IS NULL` at its root and means
     // `a XOR (b IS NULL)`, which is a different expression to read the sign
@@ -7571,6 +7635,21 @@ fn unsigned_answer(
             sqlparser::ast::Value::Number(text, _) => {
                 text.parse::<i64>().is_err() && text.parse::<u64>().is_ok()
             }
+            // A hex literal carries the flag whatever it holds, which is the
+            // one place UNSIGNED describes something that is not a number:
+            // `X'41'`, `x'41'` and `0x41` are all VAR_STRING with the binary
+            // character set and UNSIGNED on 8.3, and so are `X''` and a
+            // thirty-two byte one. A *bit* literal is not — `b'101'`, `B'101'`
+            // and `0b101` are the same VAR_STRING with the flag missing —
+            // which is why this names one spelling and not the family. (Bit
+            // literals do not parse here at all; that half is #0141.)
+            //
+            // Sending it matters for the same reason it matters on a number.
+            // A client reads the definition before the row, and Prisma reads
+            // this bit to decide how to decode; a column MySQL calls UNSIGNED
+            // and this engine calls signed is a difference the caller can see
+            // without ever looking at the bytes.
+            sqlparser::ast::Value::HexStringLiteral(_) => true,
             _ => false,
         },
         // A cast names the signedness in the statement itself.
@@ -7670,7 +7749,9 @@ fn unsigned_answer(
                     .map(|w| &w.result)
                     .chain(else_result.as_deref())
             };
-            candidates().any(&recur) && candidates().all(|r| is_null_literal(r) || recur(r))
+            aggregates_to_integer()
+                && candidates().any(&recur)
+                && candidates().all(|r| is_null_literal(r) || recur(r))
         }
         Expr::Function(f) => {
             let name = f.name.to_string().to_ascii_lowercase();
@@ -7685,24 +7766,35 @@ fn unsigned_answer(
                 // These hand back one of their arguments unchanged, so the
                 // flag survives only if every candidate carries it: MySQL
                 // makes `COALESCE(u, 1)` signed on the strength of the `1`.
+                //
+                // And `aggregates_to_integer` on top of that, which is where
+                // the rest of the reasoning lives.
                 "coalesce" | "ifnull" | "nvl" | "greatest" | "least" => {
-                    args.iter().any(&recur) && args.iter().all(|a| is_null_literal(a) || recur(a))
+                    aggregates_to_integer()
+                        && args.iter().any(&recur)
+                        && args.iter().all(|a| is_null_literal(a) || recur(a))
                 }
                 "if" => {
-                    args.len() == 3
+                    aggregates_to_integer()
+                        && args.len() == 3
                         && args[1..].iter().any(&recur)
                         && args[1..].iter().all(|a| is_null_literal(a) || recur(a))
                 }
                 // MIN and MAX answer one of the rows they folded; SUM and AVG
                 // widen past the column and come back signed.
+                // `aggregates_to_integer` is deliberately not asked here; the
+                // reason is recorded on it.
                 "min" | "max" => args.iter().all(&recur),
                 // A window reaching past the frame answers its default, which
                 // is why `LAG(u, 1, 0)` is signed — the `0` is. The *offset*
                 // is not a candidate and does not count, which is measured:
                 // `LAG(u, 1)` and `NTH_VALUE(u, 1)` are both UNSIGNED on 8.3
-                // though the 1 in each is not.
+                // though the 1 in each is not. The value and the default
+                // meet in one type, which is what `aggregates_to_integer`
+                // reads.
                 "lag" | "lead" => {
-                    args.first().is_some_and(&recur)
+                    aggregates_to_integer()
+                        && args.first().is_some_and(&recur)
                         && args.get(2).is_none_or(|d| is_null_literal(d) || recur(d))
                 }
                 // `NTH_VALUE` is described here and by `computed_column_type`
@@ -7711,10 +7803,25 @@ fn unsigned_answer(
                 // which does not know it. Described rather than removed
                 // because that is how it arrived; it needs implementing, not
                 // hiding.
-                "first_value" | "last_value" | "nth_value" => args.first().is_some_and(&recur),
+                "first_value" | "last_value" | "nth_value" => {
+                    aggregates_to_integer() && args.first().is_some_and(&recur)
+                }
                 // `MOD(a, b)` is `a % b` spelled as a call and takes its
                 // sign the same way, from its dividend alone.
                 "mod" => args.first().is_some_and(&recur),
+                // `NULLIF(a, b)` answers `a` or NULL, and
+                // `computed_column_type` already types it by that argument
+                // alone. The sign goes the same way and did not, which the hex
+                // literal is what turned up: `NULLIF(X'41', 'z')` is UNSIGNED
+                // on 8.3, and so is `NULLIF(iu, 1)` over an `INT UNSIGNED` and
+                // `NULLIF(bu, 1)` over a `BIGINT UNSIGNED` — the second of
+                // which this engine described signed while sending every digit
+                // of an unsigned value, so a binary client reading it over
+                // 18446744073709551615 got -1. Not asked
+                // `aggregates_to_integer` either, because there is nothing to
+                // aggregate: the second argument is compared against, never
+                // returned.
+                "nullif" => args.first().is_some_and(&recur),
                 _ => {
                     UNSIGNED_FOLLOWS_FIRST.contains(&name.as_str())
                         && args.first().is_some_and(&recur)
@@ -8918,22 +9025,34 @@ fn computed_column_type(
                 // expression, since a plus over a column reference on its own
                 // is that column and never comes here.
                 U::Plus => computed_column_type(expr, refs, input, sub),
-                // Unary minus computes, and MySQL answers a DOUBLE for the
-                // negation of a temporal even though `d + 0` is a LONGLONG.
-                // Measured, not derived: `-d` is DOUBLE -20240105 on 8.3.
-                U::Minus if is_temporal(computed_column_type(expr, refs, input, sub)) => {
-                    ColumnType::Double
-                }
+                // Unary minus computes, and what it computes is always a
+                // number: MySQL has no spelling of `-x` that answers a string.
+                // So the three arms below are the whole of it — an integer of
+                // any width negates to a LONGLONG, an exact fraction stays
+                // exact, and everything else is a DOUBLE.
+                //
+                // The catch-all is where this differs from the binary
+                // operators, which cannot say the same thing: `is_textual_code`
+                // deliberately leaves `VAR_STRING` out because that code also
+                // means "not typed at all" here, and calling an *operand* of
+                // unknown type approximate would make `unknown + 1` a DOUBLE
+                // over a value the evaluator still produces exactly. Under a
+                // minus there is nothing to get wrong in that direction:
+                // whether the operand is a VARCHAR, a string literal, a hex
+                // literal or an expression this cannot type, MySQL's answer is
+                // a DOUBLE and never the operand's own code. Measured on 8.3 —
+                // `-'abc'`, `-'12'`, `-'12abc'`, `-t` over a VARCHAR, `-vb`
+                // over a VARBINARY, `-X'41'`, `-e` over an ENUM, `-CAST('{}' AS
+                // JSON)` and `-NULL` are all DOUBLE, as is `-f` over a FLOAT,
+                // which widens as `ABS` does. `-d` over a temporal is DOUBLE
+                // too, which is worth saying because `d + 0` beside it is a
+                // LONGLONG: -20240105 on 8.3.
                 U::Minus => match computed_column_type(expr, refs, input, sub) {
                     t if is_integer(t) => ColumnType::LongLong,
-                    // As with `ABS`: computing with a float widens it, and
-                    // MySQL says so in the type as well as in the digits.
-                    ColumnType::Float => ColumnType::Double,
-                    // A string converts to a double before it is negated, so
-                    // `-e` over an ENUM is a DOUBLE -1 and not the member's
-                    // own type. `-t` over a VARCHAR is DOUBLE beside it.
-                    t if is_textual_code(t) => ColumnType::Double,
-                    t => t,
+                    // `-CAST(1 AS DECIMAL(5,2))` is NEWDECIMAL there: an exact
+                    // fraction has a sign already and loses nothing to it.
+                    t @ (ColumnType::Decimal | ColumnType::NewDecimal) => t,
+                    _ => ColumnType::Double,
                 },
                 _ => ColumnType::VarString,
             }

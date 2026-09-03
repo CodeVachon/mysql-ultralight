@@ -1,11 +1,11 @@
 ---
 id: 99
 title: The 1054 message names the wrong clause
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-08-25T14:48:39Z
-updated: 2026-08-25T14:48:39Z
+updated: 2026-09-03T08:26:12Z
 ---
 
 ## Description

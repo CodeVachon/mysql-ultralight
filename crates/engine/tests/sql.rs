@@ -23886,3 +23886,266 @@ fn describing_a_scalar_subquery_does_not_end_the_probe_around_it() {
         vec![vec!["1"]]
     );
 }
+
+/// The UNSIGNED flag on a column, described.
+///
+/// Read off the wire definition rather than off `OutColumn::unsigned`, because
+/// a YEAR carries the flag from its type code and not from that field.
+fn unsigned_flags(engine: &Engine, session: &Session, sql: &str) -> Vec<bool> {
+    engine
+        .describe(session, sql, 0)
+        .unwrap()
+        .unwrap()
+        .iter()
+        .map(|c| c.to_wire().flags & mysql_ultralight_protocol::column::flags::UNSIGNED != 0)
+        .collect()
+}
+
+/// A hex literal is UNSIGNED on the wire, and its values are bytes.
+///
+/// MySQL gives `SELECT X'41'` a VAR_STRING with the binary character set and
+/// the UNSIGNED flag, which is the one place that flag describes something
+/// that is not a number. Measured on 8.3 for every spelling — `X'41'`,
+/// `x'41'`, `0x41`, an empty `X''` and a twenty-three byte one — and against
+/// the bit literals beside them, which are the same VAR_STRING with the flag
+/// *missing*: `b'101'`, `B'101'` and `0b101` are signed there. So this is a
+/// rule about one spelling and not about the family. (Bit literals do not
+/// parse here at all, which is the other half of #0141.)
+///
+/// Neither the flag nor the character set moves under `sql_mode`: ANSI,
+/// TRADITIONAL and NO_UNSIGNED_SUBTRACTION all report the same definition.
+#[test]
+fn a_hex_literal_column_is_described_unsigned() {
+    let (engine, mut session) = engine();
+
+    // Every spelling, and both edges of the length. The charset is asked
+    // beside the flag because they are one fact about the literal: the engine
+    // held `X'41'` as bytes all along and described the column in the
+    // connection's character set, so a client reading that bit was told to
+    // decode a String.
+    for sql in [
+        "SELECT X'41'",
+        "SELECT x'41'",
+        "SELECT 0x41",
+        "SELECT X''",
+        "SELECT X'4142434445464748494A4B4C4D4E4F5051525354555657'",
+    ] {
+        let described = engine.describe(&session, sql, 0).unwrap().unwrap();
+        let wire = described[0].to_wire();
+        assert_eq!(format!("{:?}", wire.column_type), "VarString", "{sql}");
+        assert_eq!(
+            wire.flags & mysql_ultralight_protocol::column::flags::UNSIGNED,
+            mysql_ultralight_protocol::column::flags::UNSIGNED,
+            "described unsigned: {sql}"
+        );
+        assert_eq!(wire.charset, 63, "described as bytes: {sql}");
+        // The executed path builds its own columns, and a client that never
+        // prepares sees only those.
+        let executed = match run(&engine, &mut session, sql) {
+            Outcome::Rows(r) => r.columns,
+            Outcome::Affected { .. } => panic!("expected rows from: {sql}"),
+        };
+        assert_eq!(
+            format!("{:?}", executed[0].to_wire()),
+            format!("{:?}", wire),
+            "the two paths agree: {sql}"
+        );
+    }
+
+    // Which constructs carry it, measured one by one rather than derived. The
+    // ones that keep it hand the *item* back — parentheses, unary plus, a
+    // scalar subquery, `NULLIF`, and the row fold of `MIN` and `MAX` — and
+    // `ABS` keeps it while answering a DOUBLE, which is why "the result is an
+    // integer" is not the rule for those. The ones that lose it aggregate a
+    // type across their candidates and take the sign from that type: on 8.3
+    // `COALESCE(X'41', X'42')` is signed where `COALESCE(iu, bu)` over two
+    // unsigned columns is not.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (iu INT UNSIGNED NOT NULL, bu BIGINT UNSIGNED NOT NULL, i INT NOT NULL)",
+    );
+    run(&engine, &mut session, "INSERT INTO T VALUES (7, 7, 7)");
+    for (sql, expected) in [
+        ("SELECT (X'41')", true),
+        ("SELECT ((X'41'))", true),
+        ("SELECT +X'41'", true),
+        ("SELECT (SELECT X'41')", true),
+        ("SELECT NULLIF(X'41', 'z')", true),
+        ("SELECT MIN(X'41')", true),
+        ("SELECT MAX(X'41')", true),
+        ("SELECT ABS(X'41')", true),
+        ("SELECT COALESCE(X'41', X'42')", false),
+        ("SELECT IFNULL(X'41', '')", false),
+        ("SELECT GREATEST(X'41', X'42')", false),
+        ("SELECT IF(1, X'41', X'42')", false),
+        ("SELECT CASE WHEN 1 THEN X'41' END", false),
+        // A window frame aggregates the value and the default into one type
+        // and goes the same way, which is measured and not assumed: on 8.3
+        // `LAG(X'41') OVER ()` is signed while `LAG(iu) OVER ()` is not.
+        ("SELECT LAG(X'41') OVER () FROM T", false),
+        ("SELECT FIRST_VALUE(X'41') OVER () FROM T", false),
+        // A minus is not a sign here either: it computes, and what it computes
+        // is a DOUBLE with no flag on it.
+        ("SELECT -X'41'", false),
+        // The same aggregation over the operands that were unsigned before
+        // there was a hex literal to tell the two rules apart. Without these
+        // rows the guard could be spelled "never unsigned" and still pass.
+        ("SELECT COALESCE(iu, bu) FROM T", true),
+        ("SELECT CASE WHEN 1 THEN iu ELSE bu END FROM T", true),
+        ("SELECT NULLIF(iu, 1) FROM T", true),
+        ("SELECT IF(1, iu, bu) FROM T", true),
+        ("SELECT LAG(iu) OVER () FROM T", true),
+        ("SELECT FIRST_VALUE(iu) OVER () FROM T", true),
+        ("SELECT GREATEST(iu, 'a') FROM T", false),
+        ("SELECT IF(1, iu, 'a') FROM T", false),
+    ] {
+        assert_eq!(
+            unsigned_flags(&engine, &session, sql),
+            vec![expected],
+            "{sql}"
+        );
+    }
+
+    // Parentheses and a unary plus are not operators — the parser hands the
+    // operand back — so they carry the character set as well as the flag.
+    // 8.3 reports `(X'41')` and `+X'41'` binary, where `HEX(X'41')` and
+    // `CAST(X'41' AS CHAR)` beside them come back in the connection's
+    // character set.
+    for sql in ["SELECT (X'41')", "SELECT +X'41'", "SELECT (SELECT X'41')"] {
+        let described = engine.describe(&session, sql, 0).unwrap().unwrap();
+        assert_eq!(described[0].to_wire().charset, 63, "still bytes: {sql}");
+    }
+
+    // A materialisation takes the flag off, because the temporary table it
+    // lands in has a field per column and a field is unsigned only where it is
+    // a number: `SELECT X'41' UNION SELECT X'42'` and the same literal through
+    // a derived table are both signed on 8.3, though the branch inside each is
+    // not. The character set survives both, which is what still says bytes.
+    for sql in [
+        "SELECT X'41' UNION SELECT X'42'",
+        "SELECT * FROM (SELECT X'41' AS h) z",
+    ] {
+        let described = engine.describe(&session, sql, 0).unwrap().unwrap();
+        let wire = described[0].to_wire();
+        assert!(
+            wire.flags & mysql_ultralight_protocol::column::flags::UNSIGNED == 0,
+            "materialised signed: {sql}"
+        );
+        assert_eq!(wire.charset, 63, "still bytes: {sql}");
+        // The declared spelling is what a view hands to whatever reads
+        // `COLUMN_TYPE`, and `varbinary(512) unsigned` is not a type.
+        assert!(
+            !described[0].sql_type().declared.contains("unsigned"),
+            "materialised declaration: {sql}"
+        );
+    }
+    // An unsigned *number* keeps it through the same materialisation, which is
+    // what makes the rule about the type rather than about the union.
+    assert_eq!(
+        unsigned_flags(&engine, &session, "SELECT iu FROM T UNION SELECT iu FROM T"),
+        vec![true]
+    );
+
+    // The values are unchanged by any of it.
+    assert_eq!(rows(&engine, &mut session, "SELECT X'41'"), vec![vec!["A"]]);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT X'41' UNION SELECT X'42'"),
+        vec![vec!["A"], vec!["B"]]
+    );
+}
+
+/// Unary minus answers a number for every operand, including a string.
+///
+/// `SELECT -'abc'` is `MYSQL_TYPE_DOUBLE` on 8.3 and was a VAR_STRING here.
+/// The text is `-0` either way, so nothing is visibly wrong until a client
+/// prepares the statement: the binary protocol encodes by the declared code,
+/// so it read a string where MySQL sends eight bytes of a double.
+///
+/// Measured across the operand types rather than reasoned about, because the
+/// answer is not simply "a double": an integer of any width negates to a
+/// LONGLONG and an exact fraction stays NEWDECIMAL, while everything else — a
+/// string literal, a VARCHAR, a VARBINARY, an ENUM, a BLOB, a FLOAT, a
+/// temporal, a hex literal and NULL — is a DOUBLE. It does not move under
+/// `sql_mode` either.
+#[test]
+fn unary_minus_over_a_string_is_a_double() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE M (i INT NOT NULL, iu INT UNSIGNED NOT NULL, y YEAR NOT NULL, \
+         t VARCHAR(10) NOT NULL, vb VARBINARY(8) NOT NULL, e ENUM('a','b') NOT NULL, \
+         bl BLOB NULL, d DECIMAL(10,2) NOT NULL, f FLOAT NOT NULL, g DOUBLE NOT NULL, \
+         dt DATETIME NOT NULL, dd DATE NOT NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO M VALUES (7, 7, 2024, '12abc', 'y', 'a', 'x', 1.25, 1.5, 1.5, \
+         '2024-01-05 01:02:03', '2024-01-05')",
+    );
+
+    for (sql, ty) in [
+        ("SELECT -'abc'", "Double"),
+        ("SELECT -'12'", "Double"),
+        ("SELECT -'12abc'", "Double"),
+        ("SELECT -X'41'", "Double"),
+        ("SELECT -NULL", "Double"),
+        ("SELECT -t FROM M", "Double"),
+        ("SELECT -vb FROM M", "Double"),
+        ("SELECT -e FROM M", "Double"),
+        ("SELECT -bl FROM M", "Double"),
+        ("SELECT -f FROM M", "Double"),
+        ("SELECT -g FROM M", "Double"),
+        ("SELECT -dt FROM M", "Double"),
+        ("SELECT -dd FROM M", "Double"),
+        // The two that are not, and both matter: announcing a decimal as a
+        // DOUBLE would round its digits away, and an integer as one would hand
+        // a binary client a float where MySQL sends eight bytes of an integer.
+        ("SELECT -d FROM M", "NewDecimal"),
+        ("SELECT -i FROM M", "LongLong"),
+        ("SELECT -iu FROM M", "LongLong"),
+        ("SELECT -y FROM M", "LongLong"),
+        ("SELECT -TRUE", "LongLong"),
+        // Unary plus is not an operator at all — the parser hands the operand
+        // back — so a plus over a string is still that string. These are the
+        // rows that say the change is about the minus.
+        ("SELECT +'abc'", "VarString"),
+        ("SELECT +t FROM M", "VarString"),
+    ] {
+        let described = engine.describe(&session, sql, 0).unwrap().unwrap();
+        assert_eq!(format!("{:?}", described[0].ty), ty, "described: {sql}");
+        let executed = match run(&engine, &mut session, sql) {
+            Outcome::Rows(r) => r.columns,
+            Outcome::Affected { .. } => panic!("expected rows from: {sql}"),
+        };
+        assert_eq!(format!("{:?}", executed[0].ty), ty, "executed: {sql}");
+    }
+
+    // The answers are what they were. `-0` is the one worth writing down: the
+    // value never changed, which is why this went unnoticed in the text
+    // protocol.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT -'abc'"),
+        vec![vec!["-0"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT -'12'"),
+        vec![vec!["-12"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT -d, -i FROM M"),
+        vec![vec!["-1.25", "-7"]]
+    );
+
+    // The type survives a materialisation, where a column is rebuilt from the
+    // type rather than from the expression: 8.3 reports DOUBLE for both.
+    for sql in [
+        "SELECT * FROM (SELECT -'abc' AS m) z",
+        "SELECT -'abc' UNION SELECT -'def'",
+    ] {
+        let described = engine.describe(&session, sql, 0).unwrap().unwrap();
+        assert_eq!(format!("{:?}", described[0].ty), "Double", "{sql}");
+    }
+}

@@ -1,11 +1,11 @@
 ---
 id: 106
 title: Unary minus over a string is typed VAR_STRING
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-08-25T16:39:34Z
-updated: 2026-08-25T16:39:34Z
+updated: 2026-09-03T08:26:12Z
 ---
 
 ## Description

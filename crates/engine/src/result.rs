@@ -155,7 +155,16 @@ impl OutColumn {
             } else {
                 SqlType::from_column_type(self.ty)
             };
-            if self.unsigned {
+            // Only where the flag describes a *number*. UNSIGNED is a wire
+            // fact about the item and a hex literal carries it while being a
+            // string: `SELECT X'41'` is VAR_STRING UNSIGNED on 8.3. Carried
+            // into the materialised type it would declare a
+            // `varbinary(512) unsigned`, which is not a type, and hand it to
+            // whatever reads `COLUMN_TYPE` — and MySQL does not keep the flag
+            // through a materialisation anyway: `SELECT * FROM (SELECT X'41'
+            // AS h) z` is a VAR_STRING with no UNSIGNED there, where the same
+            // derived table over an `INT UNSIGNED` column keeps it.
+            if self.unsigned && is_numeric(self.ty) {
                 widened.unsigned = true;
                 // The spelling too, not only the flag: `declared` *is*
                 // `COLUMN_TYPE`, so a view built from this reported a `bigint`
@@ -415,7 +424,10 @@ impl ResultSet {
 /// The split that decides the BINARY flag on a stored column, and it is by the
 /// code rather than by the charset: a number and a date both report the binary
 /// character set, and only one of them is flagged binary.
-fn is_numeric(ty: ColumnType) -> bool {
+///
+/// It is also what UNSIGNED can survive a materialisation on — see
+/// [`OutColumn::sql_type`] and the set operation in `exec`.
+pub(crate) fn is_numeric(ty: ColumnType) -> bool {
     matches!(
         ty,
         ColumnType::Tiny

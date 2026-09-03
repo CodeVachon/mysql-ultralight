@@ -1,11 +1,11 @@
 ---
 id: 107
 title: An identifier longer than MySQL allows is accepted
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-08-25T16:39:41Z
-updated: 2026-08-25T16:39:41Z
+updated: 2026-09-03T08:27:05Z
 ---
 
 ## Description
