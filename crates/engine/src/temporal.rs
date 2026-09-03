@@ -70,6 +70,133 @@ impl Unit {
     }
 }
 
+/// A unit naming two ends of a range rather than one field.
+///
+/// MySQL takes eleven of these after `EXTRACT` and after `INTERVAL`, and the
+/// two sets are the same set — measured on 8.3 across all twenty units and
+/// nine non-MySQL spellings besides. Only `EXTRACT` reads them here;
+/// `Unit::parse` still refuses them, because an interval also needs the
+/// composite *literal* that goes with one.
+///
+/// sqlparser 0.62 has no keyword for any of them and its MySQL dialect refuses
+/// the `Custom` spelling, so none of them reaches the parser's `EXTRACT` node
+/// at all. `crate::rewrite::compound_extract_to_call` is what gets them here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compound {
+    YearMonth,
+    DayHour,
+    DayMinute,
+    DaySecond,
+    DayMicrosecond,
+    HourMinute,
+    HourSecond,
+    HourMicrosecond,
+    MinuteSecond,
+    MinuteMicrosecond,
+    SecondMicrosecond,
+}
+
+impl Compound {
+    /// All eleven, so the one list is the only list.
+    pub const ALL: [Compound; 11] = [
+        Compound::YearMonth,
+        Compound::DayHour,
+        Compound::DayMinute,
+        Compound::DaySecond,
+        Compound::DayMicrosecond,
+        Compound::HourMinute,
+        Compound::HourSecond,
+        Compound::HourMicrosecond,
+        Compound::MinuteSecond,
+        Compound::MinuteMicrosecond,
+        Compound::SecondMicrosecond,
+    ];
+
+    /// The unit a `DAY_SECOND` — or a `day_second`, which MySQL takes just as
+    /// readily — names.
+    ///
+    /// A space in place of the underscore is *not* one: `EXTRACT(DAY SECOND
+    /// FROM x)` is a 1064 on 8.3, so it stays a parse error here.
+    ///
+    /// Case-folded by comparison rather than by uppercasing the argument,
+    /// because this is asked once per row and the fold would allocate every
+    /// time — the cost `ExtractField::Week` avoids for the same reason.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|unit| unit.name().eq_ignore_ascii_case(name))
+    }
+
+    /// The one spelling of the name, whatever case it was written in.
+    pub fn name(self) -> &'static str {
+        match self {
+            Compound::YearMonth => "YEAR_MONTH",
+            Compound::DayHour => "DAY_HOUR",
+            Compound::DayMinute => "DAY_MINUTE",
+            Compound::DaySecond => "DAY_SECOND",
+            Compound::DayMicrosecond => "DAY_MICROSECOND",
+            Compound::HourMinute => "HOUR_MINUTE",
+            Compound::HourSecond => "HOUR_SECOND",
+            Compound::HourMicrosecond => "HOUR_MICROSECOND",
+            Compound::MinuteSecond => "MINUTE_SECOND",
+            Compound::MinuteMicrosecond => "MINUTE_MICROSECOND",
+            Compound::SecondMicrosecond => "SECOND_MICROSECOND",
+        }
+    }
+
+    /// Whether MySQL reads the argument as a DATETIME rather than as a TIME.
+    ///
+    /// `YEAR_MONTH` alone, which is the same split the single units make and
+    /// measured the same way: over a TIME column `EXTRACT(YEAR_MONTH FROM t)`
+    /// is *this* month, where `EXTRACT(DAY_SECOND FROM t)` is the clock the
+    /// TIME holds with no day in front of it.
+    pub fn calendar(self) -> bool {
+        matches!(self, Compound::YearMonth)
+    }
+
+    /// The fields this names, run together into one number.
+    ///
+    /// Concatenation by arithmetic rather than by string: every field is two
+    /// digits wide except the microseconds, which are six, and the year, which
+    /// is however many it has — `EXTRACT(YEAR_MONTH FROM '0999-03-04')` is
+    /// 99903 on 8.3 and not 099903. An hour is the same: a TIME runs to
+    /// 838:59:59, and `EXTRACT(DAY_HOUR FROM '126:07:08')` is 126.
+    ///
+    /// `day` is given rather than taken from the stamp because a TIME has no
+    /// day at all and MySQL puts a zero there, which multiplies out to
+    /// nothing. The caller knows which reading it made; the stamp does not.
+    ///
+    /// Nothing here can overflow: `parse` bounds a year to 0..=9999 and
+    /// `parse_clock` an hour to 838, which puts the widest of these — a
+    /// `DAY_MICROSECOND` — at about 4×10^13.
+    pub fn pack(self, day: u32, stamp: &Stamp) -> i64 {
+        let day = i64::from(day);
+        let hour = i64::from(stamp.hour);
+        let minute = i64::from(stamp.minute);
+        let second = i64::from(stamp.second);
+        let micros = i64::from(stamp.micros);
+        let day_hour = day * 100 + hour;
+        let day_minute = day_hour * 100 + minute;
+        let day_second = day_minute * 100 + second;
+        let hour_minute = hour * 100 + minute;
+        let hour_second = hour_minute * 100 + second;
+        let minute_second = minute * 100 + second;
+        match self {
+            Compound::YearMonth => stamp.year * 100 + i64::from(stamp.month),
+            Compound::DayHour => day_hour,
+            Compound::DayMinute => day_minute,
+            Compound::DaySecond => day_second,
+            Compound::DayMicrosecond => day_second * 1_000_000 + micros,
+            Compound::HourMinute => hour_minute,
+            Compound::HourSecond => hour_second,
+            Compound::HourMicrosecond => hour_second * 1_000_000 + micros,
+            Compound::MinuteSecond => minute_second,
+            Compound::MinuteMicrosecond => minute_second * 1_000_000 + micros,
+            Compound::SecondMicrosecond => second * 1_000_000 + micros,
+        }
+    }
+}
+
 /// Days since 1970-01-01 for a civil date, proleptic Gregorian.
 ///
 /// Howard Hinnant's `days_from_civil`, which is exact for any year rather than

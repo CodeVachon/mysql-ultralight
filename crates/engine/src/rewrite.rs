@@ -7,6 +7,7 @@
 //! small hand-written matchers rather than by forking the parser.
 
 use crate::dialect::SqlMode;
+use crate::temporal::Compound;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
@@ -221,6 +222,15 @@ pub fn normalise(sql: &str, mode: SqlMode) -> Normalised {
     // behaviour untouched.
     if mode.ignore_space {
         out = out.rewrite(close_call_spaces);
+    }
+
+    // `EXTRACT(DAY_SECOND FROM x)` names a unit the parser has no keyword for,
+    // so the whole call is turned into one the evaluator can reach. Gated on
+    // the word rather than inside the pass, because a pass copies the whole
+    // statement whether it edits anything or not and almost none of them
+    // mention `EXTRACT` at all.
+    if contains_the_word(&out.sql, b"extract") {
+        out = out.rewrite(compound_extract_to_call);
     }
 
     // `n MOD 3` is the same operator as `n % 3`, and only the second spelling
@@ -468,10 +478,8 @@ impl<'a> Rewriter<'a> {
 /// original through that.
 fn mod_operator_to_percent(text: Normalised) -> Normalised {
     // Nearly every statement is tokenized here for nothing, so the cheap test
-    // comes first. As a *word*: `model`, `mode` and `modified_at` are ordinary
-    // column names in the target schema, and a substring test would hand every
-    // statement mentioning one a tokenizer pass it can never use.
-    if !contains_the_word_mod(&text.sql) {
+    // comes first.
+    if !contains_the_word(&text.sql, b"mod") {
         return text;
     }
 
@@ -536,7 +544,7 @@ fn mod_operator_to_percent(text: Normalised) -> Normalised {
     // costs two full parses where every other statement costs one. That is a
     // real cost for an engine whose reason to exist is start-up and query
     // latency, and it is paid only by statements that reach here at all —
-    // `contains_the_word_mod` rejects the rest on a byte scan, and nothing
+    // `contains_the_word` rejects the rest on a byte scan, and nothing
     // substituted means nothing to check.
     if !substituted || Parser::parse_sql(&MySqlDialect {}, &out).is_err() {
         return text;
@@ -549,16 +557,148 @@ fn mod_operator_to_percent(text: Normalised) -> Normalised {
     }
 }
 
-/// Whether `mod` appears as a whole word, ignoring case.
-fn contains_the_word_mod(sql: &str) -> bool {
+/// Whether `word` appears as a whole word, ignoring case.
+///
+/// A whole word and not a substring, because the passes that ask are the
+/// expensive ones and the near misses are common: `model`, `mode` and
+/// `modified_at` are ordinary column names in the target schema, and
+/// `JSON_EXTRACT` appears far more often than `EXTRACT` does. A substring test
+/// would hand every statement mentioning one a tokenizer pass it can never
+/// use.
+fn contains_the_word(sql: &str, word: &[u8]) -> bool {
     let bytes = sql.as_bytes();
-    bytes.windows(3).enumerate().any(|(at, window)| {
-        window.eq_ignore_ascii_case(b"mod")
+    bytes.windows(word.len()).enumerate().any(|(at, window)| {
+        window.eq_ignore_ascii_case(word)
             && at
                 .checked_sub(1)
                 .is_none_or(|before| !is_ident_byte(bytes[before]))
-            && bytes.get(at + 3).is_none_or(|after| !is_ident_byte(*after))
+            && bytes
+                .get(at + word.len())
+                .is_none_or(|after| !is_ident_byte(*after))
     })
+}
+
+/// Rewrites `EXTRACT(DAY_SECOND FROM x)` to a call the evaluator can reach.
+///
+/// MySQL takes twenty units after `EXTRACT`; sqlparser 0.62 has a keyword for
+/// nine of them, and `MySqlDialect::allow_extract_custom()` is false, so the
+/// other eleven — `crate::temporal::Compound` — fail at parse time with a 1064
+/// naming the unit. `crate::dialect` says why a wrapper `Dialect` cannot fix
+/// that: sqlparser gates its MySQL parsing on the concrete type at 94 sites.
+///
+/// So the call becomes `ultralight_extract('DAY_SECOND', x)`, which parses as
+/// an ordinary function and is answered in `crate::expr`. Only the head of the
+/// call is replaced — `EXTRACT` through `FROM`, four tokens — so the argument
+/// is carried over untouched however long it is and `EXTRACT`'s own closing
+/// parenthesis becomes the call's. Nothing has to balance anything.
+///
+/// The pattern cannot be anything else, so unlike the `MOD` pass this one does
+/// not parse its answer before keeping it. `EXTRACT` is reserved in MySQL and
+/// cannot be a bare name; the only thing `EXTRACT ( <word> FROM` can be is
+/// this function; and a *column* named `day_second` in that position reads as
+/// the unit on 8.3 too, so the rewrite does not change what it means.
+///
+/// The name it uses is spelled the way `ultralight_snapshot` is, and carries
+/// the same trade: MySQL answers 1305 for a call to it and this engine
+/// answers, so the accepted grammar is a shade wider than MySQL's. A rewrite
+/// is text in and text out, so anything it can emit a client can also type —
+/// what that buys is that the extra spelling is one MySQL *rejects* rather
+/// than one it reads differently.
+fn compound_extract_to_call(w: &mut Rewriter<'_>) {
+    let sql = w.from;
+    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize_with_location() else {
+        // Text the tokenizer refuses is text the parser will refuse, with a
+        // better message than a half-applied rewrite could produce.
+        return;
+    };
+    // Whitespace and comments are not part of the shape, and MySQL allows any
+    // amount of either between these four tokens.
+    let code: Vec<&TokenWithSpan> = tokens
+        .iter()
+        .filter(|t| !matches!(t.token, Token::Whitespace(_)))
+        .collect();
+
+    for (index, token) in code.iter().enumerate() {
+        // A backquoted `extract` is a name rather than the construct, so it
+        // never starts a match.
+        if !matches!(&token.token, Token::Word(word)
+            if word.keyword == Keyword::EXTRACT && word.quote_style.is_none())
+        {
+            continue;
+        }
+        let (Some(open), Some(unit), Some(from)) = (
+            code.get(index + 1),
+            code.get(index + 2),
+            code.get(index + 3),
+        ) else {
+            continue;
+        };
+        if !matches!(open.token, Token::LParen) {
+            continue;
+        }
+        let Token::Word(unit) = &unit.token else {
+            continue;
+        };
+        // Backquoted, it is a name and not a unit — and MySQL agrees:
+        // ``EXTRACT(`DAY_SECOND` FROM x)`` is a 1064 there.
+        if unit.quote_style.is_some() {
+            continue;
+        }
+        let Some(compound) = Compound::parse(&unit.value) else {
+            continue;
+        };
+        if !matches!(&from.token, Token::Word(word) if word.keyword == Keyword::FROM) {
+            continue;
+        }
+        let (Some(start), Some(end)) = (
+            byte_offset(sql, token.span.start),
+            byte_offset(sql, from.span.end),
+        ) else {
+            continue;
+        };
+        // The unit goes in as a string rather than as the bare word MySQL
+        // wrote, because a string is a *value*: every walk over the AST that
+        // looks for column references steps over it, where a bare keyword
+        // parses as an identifier indistinguishable from a column and needs a
+        // special case in each of them — which is what `value_arguments` is
+        // for `TIMESTAMPDIFF(DAY, a, b)`.
+        w.substitute(start, end, &compound_extract_call(compound));
+    }
+}
+
+/// The head of the call a compound `EXTRACT` becomes, up to its argument.
+fn compound_extract_call(compound: Compound) -> String {
+    format!("ultralight_extract('{}', ", compound.name())
+}
+
+/// Puts `EXTRACT(DAY_SECOND FROM x)` back into text rendered from the parsed
+/// tree.
+///
+/// A column's *name* reads back through `Normalised`, which is exact. Anything
+/// rendered from the tree instead has no mapping to read — an
+/// `ONLY_FULL_GROUP_BY` message names the select item it walked, and a view
+/// keeps what its query renders to — and would show a client the internal
+/// spelling of a function MySQL answers 1305 for.
+///
+/// Text in and text out, like the pass it undoes, and it is the same
+/// substitution backwards: the head of the call up to the argument, with the
+/// closing parenthesis left where it is. A string literal spelling the head
+/// out character for character would be rewritten too, which is the same trade
+/// the forward pass makes and no worse than it.
+pub fn extract_as_written(rendered: &str) -> String {
+    // The cheap test first: nothing else here is reached by a statement that
+    // never went through the pass, which is nearly all of them.
+    if !rendered.contains("ultralight_extract(") {
+        return rendered.to_owned();
+    }
+    let mut out = rendered.to_owned();
+    for compound in Compound::ALL {
+        let call = compound_extract_call(compound);
+        if out.contains(&call) {
+            out = out.replace(&call, &format!("EXTRACT({} FROM ", compound.name()));
+        }
+    }
+    out
 }
 
 /// Whether a token can end an operand, and so be the left side of an operator.
@@ -1486,10 +1626,29 @@ mod tests {
             "SELECT model, mode, modified_at, module FROM t",
             "SELECT amod, x_mod, mod$ FROM t",
         ] {
-            assert!(!contains_the_word_mod(sql), "{sql}");
+            assert!(!contains_the_word(sql, b"mod"), "{sql}");
         }
         for sql in ["SELECT n MOD 3", "SELECT mod FROM t", "mod", "SELECT a-mod"] {
-            assert!(contains_the_word_mod(sql), "{sql}");
+            assert!(contains_the_word(sql, b"mod"), "{sql}");
+        }
+    }
+
+    /// The same gate in front of the compound-`EXTRACT` pass, where the near
+    /// miss is `JSON_EXTRACT` — which the target schema uses far more often
+    /// than it uses `EXTRACT`.
+    #[test]
+    fn the_fast_path_matches_extract_only_as_a_word() {
+        for sql in [
+            "SELECT JSON_EXTRACT(doc, '$.a') FROM t",
+            "SELECT extracted, extract_id FROM t",
+        ] {
+            assert!(!contains_the_word(sql, b"extract"), "{sql}");
+        }
+        for sql in [
+            "SELECT EXTRACT(DAY_SECOND FROM d) FROM t",
+            "select extract(year from d)",
+        ] {
+            assert!(contains_the_word(sql, b"extract"), "{sql}");
         }
     }
 

@@ -8050,6 +8050,11 @@ fn function_result_type(name: &str) -> Option<ColumnType> {
         | "dayofweek" | "dayofyear" | "dayofmonth" | "day" | "month" | "weekday" => {
             ColumnType::LongLong
         }
+        // `EXTRACT` with one of the compound units, which `crate::rewrite`
+        // turns into a call because sqlparser has no unit for it. MySQL sends
+        // a LONGLONG for every unit, compound ones included — measured — which
+        // is what the `Expr::Extract` arm below says for the other nine.
+        "ultralight_extract" => ColumnType::LongLong,
         // The one arithmetic function whose answer does not follow its
         // argument's kind: `SIGN(1.50)`, `SIGN(1.5e0)` and `SIGN(iu)` are all
         // a signed LONGLONG of length 21 on 8.3, where `ABS` of the same three
@@ -10131,6 +10136,10 @@ fn check_full_group_by(
     // `SELECT COUNT(*), b FROM t` and `SELECT b FROM t HAVING COUNT(*) > 0`
     // are the shapes that reach it, and a client branching on the code was
     // told the wrong thing about which rule it broke.
+    //
+    // Rendered from the tree, so a compound `EXTRACT` would name the call
+    // `crate::rewrite` turned it into rather than the one the client wrote.
+    let top = crate::rewrite::extract_as_written(&top.to_string());
     if group_exprs.is_empty() {
         return Err(EngineError::new(
             1140,

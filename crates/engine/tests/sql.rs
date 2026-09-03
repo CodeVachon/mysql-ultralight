@@ -19106,6 +19106,343 @@ fn extract_refuses_a_unit_mysql_does_not_take() {
 }
 
 #[test]
+fn extract_answers_every_compound_unit_mysql_takes_from_it() {
+    // The eleven units that name two ends of a range and run the fields
+    // between them together. Every number was read off MySQL 8.3 rather than
+    // worked out from the rule, because the rule is the thing under test: the
+    // fields concatenate at two digits each and six for the microseconds, so
+    // over `2024-01-05 06:07:08` a `DAY_SECOND` is 5060708 and a
+    // `DAY_MICROSECOND` is 5060708000000.
+    //
+    // The column list is the point, the same way it is for the single units:
+    // a clock unit over a DATE is 0 while `DAY_HOUR` over the same DATE is
+    // 500, and `YEAR_MONTH` is the one compound on the calendar side.
+    let (engine, mut session) = engine();
+    extractable(&engine, &mut session);
+    for (sql, expected) in [
+        (
+            "SELECT EXTRACT(YEAR_MONTH FROM d), EXTRACT(DAY_HOUR FROM d), \
+             EXTRACT(DAY_MINUTE FROM d), EXTRACT(DAY_SECOND FROM d), \
+             EXTRACT(DAY_MICROSECOND FROM d) FROM X",
+            vec!["202401", "500", "50000", "5000000", "5000000000000"],
+        ),
+        // A DATE has no clock, and every unit that names only clock fields is
+        // 0 over one — where the DAY_ ones above still carry the day.
+        (
+            "SELECT EXTRACT(HOUR_MINUTE FROM d), EXTRACT(HOUR_SECOND FROM d), \
+             EXTRACT(HOUR_MICROSECOND FROM d), EXTRACT(MINUTE_SECOND FROM d), \
+             EXTRACT(MINUTE_MICROSECOND FROM d), EXTRACT(SECOND_MICROSECOND FROM d) FROM X",
+            vec!["0", "0", "0", "0", "0", "0"],
+        ),
+        (
+            "SELECT EXTRACT(YEAR_MONTH FROM dt), EXTRACT(DAY_HOUR FROM dt), \
+             EXTRACT(DAY_MINUTE FROM dt), EXTRACT(DAY_SECOND FROM dt), \
+             EXTRACT(DAY_MICROSECOND FROM dt), EXTRACT(HOUR_MINUTE FROM dt), \
+             EXTRACT(HOUR_SECOND FROM dt), EXTRACT(HOUR_MICROSECOND FROM dt), \
+             EXTRACT(MINUTE_SECOND FROM dt), EXTRACT(MINUTE_MICROSECOND FROM dt), \
+             EXTRACT(SECOND_MICROSECOND FROM dt) FROM X",
+            vec![
+                "202401",
+                "506",
+                "50607",
+                "5060708",
+                "5060708000000",
+                "607",
+                "60708",
+                "60708000000",
+                "708",
+                "708000000",
+                "8000000",
+            ],
+        ),
+        // The same instant with a fraction, which is the only difference the
+        // four microsecond-ending units show.
+        (
+            "SELECT EXTRACT(DAY_MICROSECOND FROM dt6), EXTRACT(HOUR_MICROSECOND FROM dt6), \
+             EXTRACT(MINUTE_MICROSECOND FROM dt6), EXTRACT(SECOND_MICROSECOND FROM dt6), \
+             EXTRACT(DAY_SECOND FROM dt6), EXTRACT(YEAR_MONTH FROM dt6) FROM X",
+            vec![
+                "5060708123456",
+                "60708123456",
+                "708123456",
+                "8123456",
+                "5060708",
+                "202401",
+            ],
+        ),
+        (
+            "SELECT EXTRACT(YEAR_MONTH FROM ts), EXTRACT(DAY_SECOND FROM ts), \
+             EXTRACT(HOUR_SECOND FROM ts) FROM X",
+            vec!["202401", "5060708", "60708"],
+        ),
+        // A string spelling the same instant, read by the same rules once it
+        // parses as a datetime.
+        (
+            "SELECT EXTRACT(YEAR_MONTH FROM s), EXTRACT(DAY_SECOND FROM s) FROM X",
+            vec!["202401", "5060708"],
+        ),
+        (
+            "SELECT EXTRACT(DAY_SECOND FROM '2024-01-05 06:07:08.123456'), \
+             EXTRACT(DAY_MICROSECOND FROM '2024-01-05 06:07:08.123456'), \
+             EXTRACT(YEAR_MONTH FROM '2024-01-05 06:07:08.123456'), \
+             EXTRACT(SECOND_MICROSECOND FROM '2024-01-05 06:07:08.123456')",
+            vec!["5060708", "5060708123456", "202401", "8123456"],
+        ),
+        // The year is however many digits it has rather than four: 8.3
+        // answers 99903 for the first of these and not 099903.
+        (
+            "SELECT EXTRACT(YEAR_MONTH FROM '0999-03-04'), \
+             EXTRACT(YEAR_MONTH FROM '0099-03-04'), \
+             EXTRACT(YEAR_MONTH FROM '1000-12-04'), \
+             EXTRACT(YEAR_MONTH FROM '9999-12-31 23:59:59.999999'), \
+             EXTRACT(DAY_MICROSECOND FROM '9999-12-31 23:59:59.999999')",
+            vec!["99903", "9903", "100012", "999912", "31235959999999"],
+        ),
+        // NULL in, NULL out, on both sides of the calendar split.
+        (
+            "SELECT EXTRACT(YEAR_MONTH FROM NULL), EXTRACT(DAY_SECOND FROM NULL), \
+             EXTRACT(SECOND_MICROSECOND FROM NULL)",
+            vec!["NULL", "NULL", "NULL"],
+        ),
+    ] {
+        assert_eq!(rows(&engine, &mut session, sql), vec![expected], "{sql}");
+    }
+}
+
+#[test]
+fn a_compound_extract_over_a_time_has_no_day_in_front_of_it() {
+    // The sharpest thing measured about the compound units: over a TIME,
+    // `DAY_SECOND` is 60708 and not 5060708 — a TIME has no calendar, so
+    // MySQL puts a zero where the day would go and it multiplies out to
+    // nothing. Which makes each DAY_ unit answer exactly what its HOUR_
+    // neighbour does over the same value, and that is asserted rather than
+    // described, because a day of *today's* month would be the obvious wrong
+    // answer here and the calendar units really do take one.
+    let (engine, mut session) = engine();
+    extractable(&engine, &mut session);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT EXTRACT(DAY_HOUR FROM tm), EXTRACT(DAY_MINUTE FROM tm), \
+             EXTRACT(DAY_SECOND FROM tm), EXTRACT(DAY_MICROSECOND FROM tm), \
+             EXTRACT(HOUR_MINUTE FROM tm), EXTRACT(HOUR_SECOND FROM tm), \
+             EXTRACT(MINUTE_SECOND FROM tm), EXTRACT(SECOND_MICROSECOND FROM tm) FROM X"
+        ),
+        vec![vec![
+            "6",
+            "607",
+            "60708",
+            "60708000000",
+            "607",
+            "60708",
+            "708",
+            "8000000"
+        ]]
+    );
+    // The hours a TIME holds run to 838, well past two digits, and the
+    // concatenation is arithmetic rather than a fixed-width format: 8.3
+    // answers 126 here and not 26 or 0126.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT EXTRACT(DAY_HOUR FROM '126:07:08'), EXTRACT(DAY_MINUTE FROM '126:07:08'), \
+             EXTRACT(DAY_SECOND FROM '126:07:08'), EXTRACT(HOUR_MINUTE FROM '126:07:08')"
+        ),
+        vec![vec!["126", "12607", "1260708", "12607"]]
+    );
+    // The sign rides on every compound that reads the clock, and on none of
+    // the calendar ones — `YEAR_MONTH` over a negative TIME is this month.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT EXTRACT(DAY_HOUR FROM tmneg), EXTRACT(DAY_MINUTE FROM tmneg), \
+             EXTRACT(DAY_SECOND FROM tmneg), EXTRACT(DAY_MICROSECOND FROM tmneg), \
+             EXTRACT(HOUR_MINUTE FROM tmneg), EXTRACT(MINUTE_SECOND FROM tmneg), \
+             EXTRACT(SECOND_MICROSECOND FROM tmneg) FROM X"
+        ),
+        vec![vec![
+            "-6",
+            "-607",
+            "-60708",
+            "-60708000000",
+            "-607",
+            "-708",
+            "-8000000"
+        ]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT EXTRACT(DAY_MICROSECOND FROM tm6), EXTRACT(HOUR_MICROSECOND FROM tm6), \
+             EXTRACT(MINUTE_MICROSECOND FROM tm6), EXTRACT(SECOND_MICROSECOND FROM tm6) FROM X"
+        ),
+        vec![vec![
+            "-60708123456",
+            "-60708123456",
+            "-708123456",
+            "-8123456"
+        ]]
+    );
+    // A string TIME carries the sign too, which is the path a column does not
+    // take.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT EXTRACT(DAY_HOUR FROM '06:07:08'), EXTRACT(DAY_SECOND FROM '06:07:08'), \
+             EXTRACT(HOUR_SECOND FROM '-06:07:08'), \
+             EXTRACT(SECOND_MICROSECOND FROM '-06:07:08')"
+        ),
+        vec![vec!["6", "60708", "-60708", "-8000000"]]
+    );
+    // And `YEAR_MONTH` is on the calendar side with the single units, so a
+    // TIME lands on today. Asserted against the engine's own CURDATE rather
+    // than a fixed month, since a literal would pass for exactly one of them.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT EXTRACT(YEAR_MONTH FROM tm) = EXTRACT(YEAR_MONTH FROM CURDATE()), \
+             EXTRACT(YEAR_MONTH FROM tmneg) > 0 FROM X"
+        ),
+        vec![vec!["1", "1"]]
+    );
+}
+
+#[test]
+fn a_compound_extract_parses_in_every_spelling_mysql_takes_and_no_other() {
+    // sqlparser has no unit for any of these, so they reach the evaluator only
+    // through a token rewrite — which makes what the rewrite matches, and what
+    // it leaves alone, part of the answer rather than an implementation
+    // detail. Each refusal below is a 1064 on 8.3 as well.
+    let (engine, mut session) = engine();
+    extractable(&engine, &mut session);
+    // Case, and whitespace anywhere the tokens allow it. MySQL takes all four.
+    for sql in [
+        "SELECT EXTRACT(day_second FROM dt) FROM X",
+        "SELECT EXTRACT(Day_Second FROM dt) FROM X",
+        "SELECT EXTRACT(  DAY_SECOND   FROM   dt  ) FROM X",
+        "SELECT EXTRACT(\n  DAY_SECOND\n  FROM dt) FROM X",
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec!["5060708"]],
+            "{sql}"
+        );
+    }
+    // A space in place of the underscore is a syntax error on 8.3, and a
+    // backquoted unit is one too — both stay parse errors here rather than
+    // being read as the unit they spell.
+    for sql in [
+        "SELECT EXTRACT(DAY SECOND FROM dt) FROM X",
+        "SELECT EXTRACT(`DAY_SECOND` FROM dt) FROM X",
+        "SELECT EXTRACT(DAY_OF_WEEK FROM dt) FROM X",
+        "SELECT EXTRACT(DAY_MILLISECOND FROM dt) FROM X",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1064, "expected a syntax error for: {sql}");
+    }
+    // The word only counts where it is the construct. A column named
+    // `day_second`, a string holding the whole call, and `JSON_EXTRACT` all
+    // still mean what they meant.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Q (day_second INT NULL, doc JSON NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Q VALUES (7, '{\"a\": 1}')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT day_second, 'EXTRACT(DAY_SECOND FROM d)', JSON_EXTRACT(doc, '$.a') FROM Q"
+        ),
+        vec![vec!["7", "EXTRACT(DAY_SECOND FROM d)", "1"]]
+    );
+}
+
+#[test]
+fn a_compound_extract_is_described_and_named_the_way_mysql_does_it() {
+    // The rewrite turns the call into a different one, and two things the
+    // client sees are derived from what it turned it *into*: the column's type
+    // code and its name. MySQL sends a LONGLONG for every unit — the compound
+    // ones included, measured — and names an unaliased column after the text
+    // the client wrote, which here is the text from before the rewrite.
+    let (engine, mut session) = engine();
+    extractable(&engine, &mut session);
+    let described = engine
+        .describe(
+            &session,
+            "SELECT EXTRACT(DAY_SECOND FROM dt), EXTRACT( year_month  FROM dt ), \
+             EXTRACT(YEAR FROM dt), EXTRACT(DAY_HOUR FROM dt) AS h FROM X",
+            0,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        described
+            .iter()
+            .map(|c| format!("{:?}", c.ty))
+            .collect::<Vec<_>>(),
+        vec!["LongLong"; 4]
+    );
+    assert_eq!(
+        described.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+        vec![
+            "EXTRACT(DAY_SECOND FROM dt)",
+            "EXTRACT( year_month  FROM dt )",
+            "EXTRACT(YEAR FROM dt)",
+            "h",
+        ]
+    );
+}
+
+#[test]
+fn a_compound_extract_works_where_any_other_expression_does() {
+    // The rewrite happens before the parser, so a compound unit has to reach
+    // every place an expression reaches — and the call it becomes has to be
+    // walked for aggregates and grouped columns the way `EXTRACT` itself had
+    // to be. Every number was read off 8.3.
+    let (engine, mut session) = engine();
+    extractable(&engine, &mut session);
+    for (sql, expected) in [
+        (
+            "SELECT COUNT(*) FROM X WHERE EXTRACT(DAY_SECOND FROM dt) = 5060708",
+            "1",
+        ),
+        (
+            "SELECT EXTRACT(DAY_SECOND FROM dt) FROM X GROUP BY EXTRACT(DAY_SECOND FROM dt)",
+            "5060708",
+        ),
+        (
+            "SELECT EXTRACT(YEAR_MONTH FROM dt) + 0 FROM X ORDER BY EXTRACT(DAY_HOUR FROM dt)",
+            "202401",
+        ),
+        // Two in one statement, and one inside another expression: a pass has
+        // to report its edits in order, and a second match is where one that
+        // does not gets caught.
+        (
+            "SELECT EXTRACT(DAY_SECOND FROM dt) - EXTRACT(HOUR_SECOND FROM dt) FROM X",
+            "5000000",
+        ),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn an_aggregate_and_a_grouped_column_are_seen_through_extract() {
     // `EXTRACT` is a node of its own rather than a call, so the two walks that
     // have to look inside an expression did not: an aggregate under one was
@@ -25813,4 +26150,61 @@ fn a_row_that_violates_several_keys_reports_the_primary_one() {
     run(&engine, &mut session, "INSERT INTO K2 VALUES (1, 1)");
     let err = fails(&engine, &mut session, "INSERT INTO K2 VALUES (1, 1)");
     assert_eq!(err.message, "Duplicate entry '1' for key 'ub'");
+}
+
+#[test]
+fn a_compound_extract_never_shows_a_client_the_call_it_was_rewritten_to() {
+    // A column's name reads back through the rewriter's mapping, which is
+    // exact. Everything else a client sees that mentions the expression is
+    // rendered from the *parsed* tree instead, where there is no mapping to
+    // read — so all three of these showed `ultralight_extract('DAY_SECOND',
+    // dt)`, a call MySQL answers 1305 for and no client could have written.
+    //
+    // The engine's own spellings here already differ from MySQL's for every
+    // unit — 8.3 names the offending *column* in both messages and stores a
+    // view definition lowercased and fully qualified — so what is asserted is
+    // that a compound unit reads exactly like a single one, not that either
+    // matches MySQL word for word.
+    let (engine, mut session) = engine();
+    extractable(&engine, &mut session);
+    // The 1140, which is an aggregate with no GROUP BY, and the 1055, which
+    // is a GROUP BY the column is not in.
+    for (sql, expected) in [
+        (
+            "SELECT EXTRACT(DAY_SECOND FROM dt), COUNT(*) FROM X",
+            "expression 'EXTRACT(DAY_SECOND FROM dt)'",
+        ),
+        (
+            "SELECT s, EXTRACT(DAY_SECOND FROM dt) FROM X GROUP BY s",
+            "Expression 'EXTRACT(DAY_SECOND FROM dt)'",
+        ),
+    ] {
+        let message = engine.execute(&mut session, sql, &[]).unwrap_err().message;
+        assert!(message.contains(expected), "{sql}\n  -> {message}");
+    }
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Vc AS SELECT EXTRACT(DAY_SECOND FROM dt) AS a, \
+         EXTRACT(YEAR_MONTH FROM dt) AS b, EXTRACT(YEAR FROM dt) AS c FROM X",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT VIEW_DEFINITION FROM information_schema.views WHERE TABLE_NAME = 'Vc'"
+        ),
+        vec![vec![
+            "SELECT EXTRACT(DAY_SECOND FROM dt) AS a, EXTRACT(YEAR_MONTH FROM dt) AS b, \
+             EXTRACT(YEAR FROM dt) AS c FROM X"
+        ]]
+    );
+    // And the view still answers, which is the half that would break if the
+    // *stored* definition were undone rather than only what is shown: the
+    // catalog re-parses that text to refresh the view and to read the state
+    // image back.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a, b, c FROM Vc"),
+        vec![vec!["5060708", "202401", "2024"]]
+    );
 }

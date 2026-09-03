@@ -1056,7 +1056,12 @@ fn views(catalog: &Catalog) -> Table {
                 text("def"),
                 text(&name),
                 text(&view.name),
-                text(&view.definition),
+                // The definition is what the view's query renders to, which
+                // for a compound `EXTRACT` is the call `crate::rewrite` turned
+                // it into. Undone here rather than in the catalog: the stored
+                // text is re-parsed to refresh the view and to read the state
+                // image back, and only this row is read by a client.
+                text(crate::rewrite::extract_as_written(&view.definition)),
                 text("NONE"),
                 // Nothing here is updatable: a view is materialised on read.
                 text("NO"),

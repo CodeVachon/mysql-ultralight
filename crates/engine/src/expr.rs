@@ -8,6 +8,7 @@ use sqlparser::ast::{
 use crate::error::{unsupported, EngineError, EngineResult};
 use crate::functions;
 use crate::session::Session;
+use crate::temporal;
 use crate::value::Value;
 
 /// One column visible to an expression.
@@ -892,6 +893,14 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             | "timestampadd" = name.as_str()
             {
                 return temporal_call(&name, f, ctx);
+            }
+
+            // `EXTRACT(DAY_SECOND FROM x)` arrives here rather than as
+            // `Expr::Extract`, because sqlparser has no unit for it. Beside
+            // the pair above because it is the same kind of thing: part of
+            // what looks like an argument list is syntax.
+            if name == "ultralight_extract" {
+                return compound_extract(f, ctx);
             }
 
             let args = function_args(f, ctx)?;
@@ -2644,19 +2653,32 @@ enum ExtractField {
     Minute,
     Second,
     Microsecond,
+    /// One of the eleven that name two ends of a range and run the fields
+    /// between them together. They arrive as a call rather than as a unit —
+    /// see `crate::rewrite::compound_extract_to_call` — and they make the same
+    /// split, with `YEAR_MONTH` on the calendar side and the other ten on the
+    /// clock one.
+    Compound(temporal::Compound),
 }
 
 impl ExtractField {
     /// Whether MySQL reads the argument as a DATETIME rather than as a TIME.
     fn calendar(self) -> bool {
-        matches!(
-            self,
+        // Listed both ways rather than with a catch-all: a unit added later
+        // has to be put on one side or the other, and the wrong side answers
+        // a plausible number rather than failing.
+        match self {
             ExtractField::Year
-                | ExtractField::Quarter
-                | ExtractField::Month
-                | ExtractField::Week
-                | ExtractField::Day
-        )
+            | ExtractField::Quarter
+            | ExtractField::Month
+            | ExtractField::Week
+            | ExtractField::Day => true,
+            ExtractField::Hour
+            | ExtractField::Minute
+            | ExtractField::Second
+            | ExtractField::Microsecond => false,
+            ExtractField::Compound(unit) => unit.calendar(),
+        }
     }
 }
 
@@ -2665,23 +2687,19 @@ impl ExtractField {
 /// catch-all and answered 1235 for every unit.
 ///
 /// MySQL takes twenty units here, measured against 8.3 by asking it each in
-/// turn: the nine below and eleven compounds — `YEAR_MONTH`, `DAY_HOUR`,
-/// `DAY_MINUTE`, `DAY_SECOND`, `DAY_MICROSECOND`, `HOUR_MINUTE`,
-/// `HOUR_SECOND`, `HOUR_MICROSECOND`, `MINUTE_SECOND`, `MINUTE_MICROSECOND`
-/// and `SECOND_MICROSECOND` — which pack the fields they name into one number
-/// at two digits each and six for the microseconds, so `DAY_SECOND` over
-/// `2024-01-05 06:07:08` is 5060708. Those eleven do not arrive here at all:
-/// sqlparser has no keyword for them and its MySQL dialect refuses the
-/// `Custom` spelling, so the statement fails to parse. It is exactly the same
-/// set MySQL accepts after `INTERVAL`, which was measured rather than assumed
-/// — neither side takes a unit the other refuses.
+/// turn: the nine below and the eleven compounds of `temporal::Compound`. It
+/// is exactly the same set MySQL accepts after `INTERVAL`, which was measured
+/// rather than assumed — neither side takes a unit the other refuses.
+///
+/// The compounds reach `extract_unit` through `compound_extract` instead of
+/// this function, because sqlparser has no keyword for any of them and its
+/// MySQL dialect refuses the `Custom` spelling. Everything after the unit is
+/// shared.
 ///
 /// Every unit sqlparser *does* recognise but MySQL does not — `DOW`, `EPOCH`,
 /// `ISOYEAR`, the plural forms — is refused here rather than answered, since
 /// MySQL calls each of them a syntax error.
 fn extract(field: &DateTimeField, arg: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
-    use crate::temporal;
-
     let unit = match field {
         DateTimeField::Year => ExtractField::Year,
         DateTimeField::Quarter => ExtractField::Quarter,
@@ -2694,7 +2712,39 @@ fn extract(field: &DateTimeField, arg: &Expr, ctx: &Context<'_>) -> EngineResult
         DateTimeField::Microsecond => ExtractField::Microsecond,
         other => return Err(unsupported(format!("the `{other}` unit in EXTRACT()"))),
     };
+    extract_unit(unit, arg, ctx)
+}
 
+/// `ultralight_extract('DAY_SECOND', x)`, which is what
+/// `crate::rewrite::compound_extract_to_call` turns
+/// `EXTRACT(DAY_SECOND FROM x)` into.
+///
+/// The unit arrives as a string rather than as the bare word MySQL wrote, so
+/// that every walk over the AST reads it as the value it is: a bare keyword
+/// parses as an identifier no different from a column reference, and each of
+/// those walks would need to be told to skip it — which is the special case
+/// `exec::value_arguments` exists to make for `TIMESTAMPDIFF(DAY, a, b)`.
+fn compound_extract(f: &sqlparser::ast::Function, ctx: &Context<'_>) -> EngineResult<Value> {
+    let args = argument_exprs(f);
+    let [unit, arg] = args.as_slice() else {
+        return Err(unsupported("ultralight_extract() with these arguments"));
+    };
+    let name = match unit {
+        Expr::Value(ValueWithSpan {
+            value: AstValue::SingleQuotedString(name),
+            ..
+        }) => name.as_str(),
+        other => return Err(unsupported(format!("`{other}` as a unit in EXTRACT()"))),
+    };
+    let Some(compound) = temporal::Compound::parse(name) else {
+        return Err(unsupported(format!("the `{name}` unit in EXTRACT()")));
+    };
+    extract_unit(ExtractField::Compound(compound), arg, ctx)
+}
+
+/// Reads the argument the way the unit does, and takes the unit's fields out
+/// of it.
+fn extract_unit(unit: ExtractField, arg: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
     let value = eval(arg, ctx)?;
     if value.is_null() {
         return Ok(Value::Null);
@@ -2708,9 +2758,26 @@ fn extract(field: &DateTimeField, arg: &Expr, ctx: &Context<'_>) -> EngineResult
     // the *time* 00:20:24.
     let typed = matches!(value, Value::Temporal(_));
 
-    let (negative, stamp) = if unit.calendar() {
+    // `clock` says the stamp came from reading the value as a TIME, which has
+    // no calendar and so no day. Only the compound units that name one ask,
+    // and MySQL puts a zero there: `EXTRACT(DAY_SECOND FROM '06:07:08')` is
+    // 60708 on 8.3 and `EXTRACT(DAY_HOUR FROM '126:07:08')` is 126, where the
+    // same units over a DATETIME carry the day of the month in front.
+    //
+    // Which reading MySQL makes of a *datetime* is finer than this, and finer
+    // than the engine models: measured on 8.3, `EXTRACT(DAY_SECOND FROM dt)`
+    // over a DATETIME column is 5060708 and over `MAX(dt)`, `CAST(dt AS
+    // DATETIME)`, `COALESCE(dt, dt)`, `GREATEST(dt, dt)` or a `TIMESTAMP '…'`
+    // literal it is 50607 — MySQL converts a datetime-typed *item* to a TIME
+    // by dropping the date, and reads a column, a string, a `CASE` and
+    // `DATE_ADD` through their text, which keeps the day of the month. That is
+    // an `Item` distinction with no counterpart here, where both are a
+    // `Temporal`. The column and the literal are what this engine answers,
+    // being what nearly every query asks; the rest is a divergence of its own
+    // rather than part of #0094.
+    let (negative, stamp, clock) = if unit.calendar() {
         match temporal::parse(&text) {
-            Some(stamp) => (false, stamp),
+            Some(stamp) => (false, stamp, false),
             // A TIME has no calendar of its own, so MySQL puts it on today's:
             // `EXTRACT(DAY FROM t)` over a TIME column holding `-06:07:08` is
             // yesterday until the clock passes six in the morning. Only for a
@@ -2735,7 +2802,7 @@ fn extract(field: &DateTimeField, arg: &Expr, ctx: &Context<'_>) -> EngineResult
                     temporal::Unit::Microsecond,
                     if negative { -micros } else { micros },
                 ) {
-                    Some(stamp) => (false, stamp),
+                    Some(stamp) => (false, stamp, false),
                     None => return Ok(Value::Null),
                 }
             }
@@ -2768,9 +2835,9 @@ fn extract(field: &DateTimeField, arg: &Expr, ctx: &Context<'_>) -> EngineResult
             .then(|| temporal::parse(trimmed))
             .flatten()
         {
-            Some(stamp) => (false, stamp),
+            Some(stamp) => (false, stamp, false),
             None => match temporal::parse_signed_clock(&text) {
-                Some(read) => read,
+                Some((negative, stamp)) => (negative, stamp, true),
                 // A typed temporal that is neither is a column holding text
                 // nothing validated on the way in; MySQL has no such state and
                 // NULL is what the engine answers for it elsewhere.
@@ -2798,6 +2865,12 @@ fn extract(field: &DateTimeField, arg: &Expr, ctx: &Context<'_>) -> EngineResult
         ExtractField::Minute => i64::from(stamp.minute),
         ExtractField::Second => i64::from(stamp.second),
         ExtractField::Microsecond => i64::from(stamp.micros),
+        // A compound reads several at once. Where the day comes from is the
+        // whole of what `clock` decides; the rest of the fields are the same
+        // fields the single units take.
+        ExtractField::Compound(compound) => {
+            compound.pack(if clock { 0 } else { stamp.day }, &stamp)
+        }
     };
     // The sign rides on every clock field and on none of the calendar ones,
     // which is measured: over a TIME of `-06:07:08`, `EXTRACT(HOUR ...)` is -6

@@ -3389,6 +3389,93 @@ pub const GROUPS: &[Group] = &[
             same("SELECT EXTRACT(YEAR FROM NOW()) > 2000, \
                   EXTRACT(MONTH FROM CURDATE()) BETWEEN 1 AND 12, \
                   EXTRACT(HOUR FROM CURTIME()) BETWEEN 0 AND 23"),
+
+            // The eleven compound units, which name two ends of a range and
+            // run the fields between them together. They make the same
+            // calendar-or-clock split the single units do, with `YEAR_MONTH`
+            // alone on the calendar side — so a DATE has a `DAY_HOUR` of 500
+            // and a `HOUR_MINUTE` of 0.
+            same("SELECT EXTRACT(YEAR_MONTH FROM d), EXTRACT(DAY_HOUR FROM d), \
+                  EXTRACT(DAY_MINUTE FROM d), EXTRACT(DAY_SECOND FROM d), \
+                  EXTRACT(DAY_MICROSECOND FROM d) FROM Ex ORDER BY id"),
+            same("SELECT EXTRACT(HOUR_MINUTE FROM d), EXTRACT(HOUR_SECOND FROM d), \
+                  EXTRACT(HOUR_MICROSECOND FROM d), EXTRACT(MINUTE_SECOND FROM d), \
+                  EXTRACT(MINUTE_MICROSECOND FROM d), EXTRACT(SECOND_MICROSECOND FROM d) \
+                  FROM Ex ORDER BY id"),
+            // All eleven over one DATETIME, which is the packing rule itself.
+            same("SELECT EXTRACT(YEAR_MONTH FROM dt), EXTRACT(DAY_HOUR FROM dt), \
+                  EXTRACT(DAY_MINUTE FROM dt), EXTRACT(DAY_SECOND FROM dt), \
+                  EXTRACT(DAY_MICROSECOND FROM dt), EXTRACT(HOUR_MINUTE FROM dt), \
+                  EXTRACT(HOUR_SECOND FROM dt), EXTRACT(HOUR_MICROSECOND FROM dt), \
+                  EXTRACT(MINUTE_SECOND FROM dt), EXTRACT(MINUTE_MICROSECOND FROM dt), \
+                  EXTRACT(SECOND_MICROSECOND FROM dt) FROM Ex ORDER BY id"),
+            // The fraction, which is all four microsecond-ending units differ
+            // by and which only a column declared with one carries.
+            same("SELECT EXTRACT(DAY_MICROSECOND FROM dt6), \
+                  EXTRACT(HOUR_MICROSECOND FROM dt6), \
+                  EXTRACT(MINUTE_MICROSECOND FROM dt6), \
+                  EXTRACT(SECOND_MICROSECOND FROM dt6), EXTRACT(DAY_SECOND FROM dt6) \
+                  FROM Ex ORDER BY id"),
+            same("SELECT EXTRACT(YEAR_MONTH FROM ts), EXTRACT(DAY_SECOND FROM ts), \
+                  EXTRACT(HOUR_SECOND FROM ts) FROM Ex ORDER BY id"),
+            same("SELECT EXTRACT(YEAR_MONTH FROM s), EXTRACT(DAY_SECOND FROM s), \
+                  EXTRACT(DAY_MICROSECOND FROM s) FROM Ex ORDER BY id"),
+            // A TIME has no calendar, so the day is a zero that multiplies out
+            // to nothing: each DAY_ unit answers what its HOUR_ neighbour
+            // does, where a *calendar* unit over the same TIME is today.
+            same("SELECT EXTRACT(DAY_HOUR FROM tm), EXTRACT(DAY_MINUTE FROM tm), \
+                  EXTRACT(DAY_SECOND FROM tm), EXTRACT(DAY_MICROSECOND FROM tm), \
+                  EXTRACT(HOUR_MINUTE FROM tm), EXTRACT(HOUR_SECOND FROM tm), \
+                  EXTRACT(MINUTE_SECOND FROM tm), EXTRACT(SECOND_MICROSECOND FROM tm) \
+                  FROM Ex ORDER BY id"),
+            // And the sign rides on every one of them, exactly as it does on
+            // the single clock units.
+            same("SELECT EXTRACT(DAY_HOUR FROM tmneg), EXTRACT(DAY_SECOND FROM tmneg), \
+                  EXTRACT(HOUR_MINUTE FROM tmneg), EXTRACT(MINUTE_SECOND FROM tmneg), \
+                  EXTRACT(SECOND_MICROSECOND FROM tmneg) FROM Ex ORDER BY id"),
+            same("SELECT EXTRACT(DAY_MICROSECOND FROM tm6), \
+                  EXTRACT(HOUR_MICROSECOND FROM tm6), \
+                  EXTRACT(MINUTE_MICROSECOND FROM tm6), \
+                  EXTRACT(SECOND_MICROSECOND FROM tm6) FROM Ex ORDER BY id"),
+            same("SELECT EXTRACT(YEAR_MONTH FROM tm) = EXTRACT(YEAR_MONTH FROM CURDATE()) \
+                  FROM Ex ORDER BY id"),
+            // Literals. The year is however many digits it has rather than
+            // four, and the hours a TIME holds run past two digits — both of
+            // which a fixed-width format would get wrong.
+            same("SELECT EXTRACT(DAY_SECOND FROM '2024-01-05 06:07:08.123456'), \
+                  EXTRACT(DAY_MICROSECOND FROM '2024-01-05 06:07:08.123456'), \
+                  EXTRACT(YEAR_MONTH FROM '2024-01-05 06:07:08.123456'), \
+                  EXTRACT(SECOND_MICROSECOND FROM '2024-01-05 06:07:08.123456')"),
+            same("SELECT EXTRACT(YEAR_MONTH FROM '0999-03-04'), \
+                  EXTRACT(YEAR_MONTH FROM '0099-03-04'), \
+                  EXTRACT(YEAR_MONTH FROM '1000-12-04'), \
+                  EXTRACT(YEAR_MONTH FROM '9999-12-31 23:59:59.999999'), \
+                  EXTRACT(DAY_MICROSECOND FROM '9999-12-31 23:59:59.999999')"),
+            same("SELECT EXTRACT(DAY_HOUR FROM '126:07:08'), \
+                  EXTRACT(DAY_MINUTE FROM '126:07:08'), \
+                  EXTRACT(DAY_SECOND FROM '126:07:08'), \
+                  EXTRACT(HOUR_MINUTE FROM '126:07:08')"),
+            same("SELECT EXTRACT(DAY_HOUR FROM '06:07:08'), \
+                  EXTRACT(DAY_SECOND FROM '06:07:08'), \
+                  EXTRACT(HOUR_SECOND FROM '-06:07:08'), \
+                  EXTRACT(SECOND_MICROSECOND FROM '-06:07:08')"),
+            same("SELECT EXTRACT(YEAR_MONTH FROM NULL), EXTRACT(DAY_SECOND FROM NULL), \
+                  EXTRACT(SECOND_MICROSECOND FROM NULL)"),
+            // None of these reaches the parser as a unit: sqlparser has no
+            // keyword for one, so the whole call is rewritten before parsing.
+            // Which makes the spelling part of the answer — the case it was
+            // written in, the whitespace around it, and the *name* the column
+            // comes back with, which is the text from before the rewrite.
+            same("SELECT EXTRACT(day_second FROM dt), EXTRACT( Day_Second  FROM dt ) \
+                  FROM Ex ORDER BY id"),
+            // And it has to reach everywhere an expression reaches. Not
+            // selecting the group key, for the reason the `EXTRACT(MONTH ...)`
+            // case above gives.
+            same("SELECT id FROM Ex WHERE EXTRACT(DAY_SECOND FROM dt) = 5060708 ORDER BY id"),
+            same("SELECT COUNT(*) FROM Ex GROUP BY EXTRACT(DAY_HOUR FROM d) ORDER BY 1"),
+            same("SELECT id FROM Ex ORDER BY EXTRACT(DAY_MICROSECOND FROM dt6) DESC, id"),
+            same("SELECT EXTRACT(DAY_SECOND FROM dt) - EXTRACT(HOUR_SECOND FROM dt) \
+                  FROM Ex ORDER BY id"),
         ],
     },
     Group {
