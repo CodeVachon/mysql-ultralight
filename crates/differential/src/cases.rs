@@ -5363,6 +5363,117 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // What a write reports as affected. #0089: an UPDATE counted the rows
+        // its WHERE matched, where MySQL counts the rows whose stored values
+        // actually moved -- `UPDATE t SET x = x` over two rows already holding
+        // the value answered 2 here and 0 there. Prisma reads that number to
+        // decide whether an update found its target.
+        //
+        // The count cannot be read back with `SELECT ROW_COUNT()`, because
+        // every case is asked twice -- once per protocol -- and the second ask
+        // of a bare `SELECT ROW_COUNT()` follows the first, which MySQL answers
+        // -1 for. So each count is written into `Rn` by the case after it, with
+        // IGNORE so the second ask stores nothing, and the whole table is read
+        // at the end. The same trick the group above uses for its ids.
+        //
+        // Which leaves the *second* ask of each UPDATE as the one measured, so
+        // every one of them is written to say the same thing twice: `x + 1`
+        // over a WHERE that keeps matching, `IF(id = 1, x + 1, x)` to change
+        // one of three on every run, and `s = 'a'` over a column already
+        // holding it.
+        //
+        // These pin the *changed* meaning only: this harness's client does not
+        // negotiate CLIENT_FOUND_ROWS, which is the flag that switches the same
+        // statements back to reporting what they matched -- and node `mysql2`
+        // and Prisma both set it, so the meaning with no coverage here is the
+        // one most clients actually get. It is asked in the engine's own tests
+        // instead, against numbers measured by hand through a client that can
+        // ask for the flag. Nothing below can catch a mistake on that side, so
+        // a change to it wants re-measuring rather than a green run here.
+        name: "what an UPDATE reports as affected",
+        setup: &[
+            "CREATE TABLE Ra (id INT NOT NULL, x INT NOT NULL, s VARCHAR(8) NOT NULL, \
+             z INT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Ra (id, x, s) VALUES (1, 5, 'a'), (2, 5, 'a'), (3, 5, 'a')",
+            "CREATE TABLE Rj (id INT NOT NULL, x INT NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Rj VALUES (1, 5), (2, 5)",
+            "CREATE TABLE Rk (id INT NOT NULL, x INT NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Rk VALUES (1, 5), (2, 5)",
+            // A fixed default rather than CURRENT_TIMESTAMP, so the case that
+            // reads `ts` back is asking whether it moved rather than comparing
+            // two servers' clocks.
+            "CREATE TABLE Rt (id INT NOT NULL, x INT NOT NULL, \
+             ts TIMESTAMP NOT NULL DEFAULT '2020-01-01 00:00:00' ON UPDATE CURRENT_TIMESTAMP, \
+             PRIMARY KEY (id))",
+            "INSERT INTO Rt (id, x) VALUES (1, 5)",
+            "CREATE TABLE Rd (k INT NOT NULL, v INT NOT NULL, PRIMARY KEY (k))",
+            "INSERT INTO Rd VALUES (1, 1)",
+            "CREATE TABLE Rn (probe INT NOT NULL, n BIGINT NOT NULL, PRIMARY KEY (probe))",
+        ],
+        cases: &[
+            // Two rows matched, neither changed.
+            same("UPDATE Ra SET s = 'a' WHERE id <= 2"),
+            same("INSERT IGNORE INTO Rn (probe, n) VALUES (1, ROW_COUNT())"),
+            // Two matched, both changed -- the control that stops this being
+            // fixed by reporting nothing at all.
+            same("UPDATE Ra SET x = x + 1 WHERE id <= 2"),
+            same("INSERT IGNORE INTO Rn (probe, n) VALUES (2, ROW_COUNT())"),
+            // Three matched, one changed: the two counts differ and neither is
+            // zero, so a count of matched and a count of changed are told apart
+            // by the answer rather than by which of them happens to be 0.
+            same("UPDATE Ra SET x = IF(id = 1, x + 1, x)"),
+            same("INSERT IGNORE INTO Rn (probe, n) VALUES (3, ROW_COUNT())"),
+            // Nothing matched at all, which is 0 either way.
+            same("UPDATE Ra SET x = 0 WHERE id = 99"),
+            same("INSERT IGNORE INTO Rn (probe, n) VALUES (4, ROW_COUNT())"),
+            // Two columns assigned, one of them a no-op.
+            same("UPDATE Ra SET x = IF(id = 2, x + 1, x), s = 'a' WHERE id <= 2"),
+            same("INSERT IGNORE INTO Rn (probe, n) VALUES (5, ROW_COUNT())"),
+            // LIMIT bounds what is matched; none of it changes.
+            same("UPDATE Ra SET s = 'a' ORDER BY id LIMIT 2"),
+            same("INSERT IGNORE INTO Rn (probe, n) VALUES (6, ROW_COUNT())"),
+            // NULL written over NULL, which is not a change.
+            same("UPDATE Ra SET z = NULL WHERE id <= 2"),
+            same("INSERT IGNORE INTO Rn (probe, n) VALUES (7, ROW_COUNT())"),
+            // A multi-table UPDATE matches a base row per table per join row --
+            // four here -- and changes one of them.
+            same(
+                "UPDATE Rj JOIN Rk ON Rj.id = Rk.id \
+                 SET Rj.x = IF(Rj.id = 1, Rj.x + 1, Rj.x), Rk.x = Rk.x",
+            ),
+            same("INSERT IGNORE INTO Rn (probe, n) VALUES (8, ROW_COUNT())"),
+            same("UPDATE Rj JOIN Rk ON Rj.id = Rk.id SET Rj.x = Rj.x, Rk.x = Rk.x"),
+            same("INSERT IGNORE INTO Rn (probe, n) VALUES (9, ROW_COUNT())"),
+            // An ON UPDATE CURRENT_TIMESTAMP column does not turn a no-op into
+            // a change: MySQL restamps it only when something else moved, so
+            // the count is 0 and `ts` still holds its default. Both halves are
+            // asked, because a restamp that did happen would make the count
+            // right for the wrong reason.
+            same("UPDATE Rt SET x = x"),
+            same("INSERT IGNORE INTO Rn (probe, n) VALUES (10, ROW_COUNT())"),
+            // Asked as a comparison rather than by selecting `ts` itself: a
+            // TIMESTAMP column carries a flag this engine does not set yet,
+            // which is a divergence of its own and would answer this case
+            // before it ever got to the value.
+            same(
+                "SELECT id, x, ts = '2020-01-01 00:00:00' AS ts_still_the_default \
+                 FROM Rt ORDER BY id",
+            ),
+            // An upsert that updates nothing reports nothing, where one that
+            // updates reports two.
+            same("INSERT INTO Rd VALUES (1, 9) ON DUPLICATE KEY UPDATE v = v"),
+            same("INSERT IGNORE INTO Rn (probe, n) VALUES (11, ROW_COUNT())"),
+            same("INSERT INTO Rd VALUES (1, 9) ON DUPLICATE KEY UPDATE v = v + 1"),
+            same("INSERT IGNORE INTO Rn (probe, n) VALUES (12, ROW_COUNT())"),
+            // The counts themselves, and the rows they were counting.
+            same("SELECT probe, n FROM Rn ORDER BY probe"),
+            same("SELECT id, x, s, z FROM Ra ORDER BY id"),
+            same("SELECT id, x FROM Rj ORDER BY id"),
+            same("SELECT id, x FROM Rk ORDER BY id"),
+            same("SELECT k, v FROM Rd ORDER BY k"),
+        ],
+    },
+    Group {
         // A SELECT with no FROM, clause by clause. #0158: the path evaluated
         // its projection and its HAVING and dropped the WHERE and the GROUP BY
         // on the floor, so `SELECT 1 WHERE 0` answered a row — a wrong answer

@@ -17,11 +17,27 @@ use mysql_ultralight_server::{
 use tokio::net::{TcpListener, TcpStream};
 
 /// A handler with just enough behaviour to exercise every protocol path.
-struct TestHandler;
+#[derive(Default)]
+struct TestHandler {
+    /// What the handshake settled on, as the handler was told it.
+    negotiated: Capabilities,
+}
 
 impl Handler for TestHandler {
+    fn negotiated(&mut self, capabilities: Capabilities) {
+        self.negotiated = capabilities;
+    }
+
     fn query(&mut self, sql: &str) -> HandlerResult {
         match sql.trim() {
+            // Answers with the flag itself, because a handler that is never
+            // told which capabilities were negotiated cannot tell one client
+            // from another — and `CLIENT_FOUND_ROWS` decides what an UPDATE
+            // reports as affected, so the wrong answer there is a number the
+            // client believes rather than an error it can see.
+            "FOUND_ROWS" => Ok(Response::affected(u64::from(
+                self.negotiated.contains(Capabilities::FOUND_ROWS),
+            ))),
             "SELECT 1" => Ok(Response::ResultSet(ResultSet::with_rows(
                 vec![ColumnDef::new("1", ColumnType::LongLong)],
                 vec![vec![Value::I64(1)]],
@@ -135,7 +151,7 @@ async fn start_server(password: Option<String>) -> String {
         ..Default::default()
     };
     let server = Arc::new(Server::new(config));
-    tokio::spawn(async move { server.serve_tcp(listener, |_| TestHandler).await });
+    tokio::spawn(async move { server.serve_tcp(listener, |_| TestHandler::default()).await });
 
     addr
 }
@@ -150,6 +166,16 @@ struct Client {
 impl Client {
     /// Connects and completes the handshake.
     async fn connect(addr: &str, password: &str, deprecate_eof: bool) -> std::io::Result<Self> {
+        Self::connect_asking_for(addr, password, deprecate_eof, Capabilities::EMPTY).await
+    }
+
+    /// The same, with capabilities beyond the ones every client here asks for.
+    async fn connect_asking_for(
+        addr: &str,
+        password: &str,
+        deprecate_eof: bool,
+        extra: Capabilities,
+    ) -> std::io::Result<Self> {
         let mut stream = TcpStream::connect(addr).await?;
         let mut seq = Sequence::new();
 
@@ -171,6 +197,7 @@ impl Client {
         if deprecate_eof {
             caps |= Capabilities::DEPRECATE_EOF;
         }
+        caps |= extra;
 
         let scramble = native_password_scramble(password.as_bytes(), &nonce);
         let mut w = BufWriter::new();
@@ -503,6 +530,35 @@ async fn affected_row_counts_are_reported() {
     let mut r = BufReader::new(&packet);
     r.u8().unwrap();
     assert_eq!(r.lenenc_int().unwrap(), Some(7));
+}
+
+/// #0089. The handler is told what the handshake settled on, because some
+/// capabilities change the answer rather than the packet: `CLIENT_FOUND_ROWS`
+/// decides whether an UPDATE reports the rows it matched or the rows it
+/// changed, and only the handler knows both numbers. A connection that never
+/// passes the set along answers every client the same way, which is a wrong
+/// count rather than a visible failure.
+#[tokio::test]
+async fn the_handler_is_told_which_capabilities_were_negotiated() {
+    let addr = start_server(None).await;
+
+    for (asked, expected) in [(Capabilities::EMPTY, 0), (Capabilities::FOUND_ROWS, 1)] {
+        let mut client = Client::connect_asking_for(&addr, "", true, asked)
+            .await
+            .unwrap();
+        client.send(0x03, b"FOUND_ROWS").await.unwrap();
+        let packet = client.recv().await.unwrap();
+        assert_eq!(packet[0], 0x00);
+
+        let mut r = BufReader::new(&packet);
+        r.u8().unwrap();
+        assert_eq!(
+            r.lenenc_int().unwrap(),
+            Some(expected),
+            "asking for {:?}",
+            asked.names()
+        );
+    }
 }
 
 #[tokio::test]

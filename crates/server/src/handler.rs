@@ -4,7 +4,7 @@
 //! in-memory with no IO in the query path, so making handlers async would add
 //! a boxed future per statement and buy nothing.
 
-use mysql_ultralight_protocol::{ColumnDef, ErrPacket, OkPacket, Value};
+use mysql_ultralight_protocol::{Capabilities, ColumnDef, ErrPacket, OkPacket, Value};
 
 /// A result set: column metadata plus fully materialised rows.
 ///
@@ -83,6 +83,17 @@ pub struct Prepared {
 /// per-session state (current schema, transaction, session variables) without
 /// synchronisation.
 pub trait Handler: Send {
+    /// The capabilities the handshake settled on, once it has.
+    ///
+    /// Called before the first command and never again, because the set cannot
+    /// change afterwards. A handler needs it when a flag changes the *answer*
+    /// rather than the packet: `CLIENT_FOUND_ROWS` decides whether an UPDATE
+    /// reports the rows it matched or the rows it changed, and only the
+    /// handler knows both numbers.
+    fn negotiated(&mut self, capabilities: Capabilities) {
+        let _ = capabilities;
+    }
+
     /// Executes a statement arriving via `COM_QUERY`.
     fn query(&mut self, sql: &str) -> HandlerResult;
 

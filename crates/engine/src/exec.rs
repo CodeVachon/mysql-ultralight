@@ -4270,10 +4270,17 @@ impl Engine {
                         table.check_unique(&updated, Some(existing))?;
 
                         // MySQL reports two affected rows for a row it updated this
-                        // way, and one for a row it inserted.
+                        // way, and one for a row it inserted. A row it left as it
+                        // was counts as nothing — unless the connection negotiated
+                        // CLIENT_FOUND_ROWS, which makes the same row count one.
+                        // Measured on 8.3: a repeated `INSERT INTO D VALUES (1,5)
+                        // ON DUPLICATE KEY UPDATE v = VALUES(v)` answers 0 without
+                        // the flag and 1 with it.
                         if updated != before {
                             table.rows[existing] = updated;
                             inserted += 2;
+                        } else if session_snapshot.found_rows {
+                            inserted += 1;
                         }
                         continue;
                     }
@@ -4454,7 +4461,11 @@ impl Engine {
             })
             .collect::<EngineResult<_>>()?;
 
-        let mut updated = 0u64;
+        // Both counts, because which of them the client is told depends on the
+        // capability it negotiated rather than on the statement. See
+        // `Session::found_rows`.
+        let mut matched_rows = 0u64;
+        let mut changed_rows = 0u64;
         let mut changed: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
         let mut rows = table.rows.clone();
 
@@ -4501,10 +4512,23 @@ impl Engine {
             let candidate = self.finalise_row(table, candidate, &session_snapshot)?;
             foreign_keys::check(&fk_parents, &candidate, &table_name)?;
             table.check_unique_against(&rows, &candidate, index)?;
+            // Compared after `finalise_row` and the restamp above, so what is
+            // weighed is the row as it will be stored: a coercion that lands
+            // back on the value already there — `SET n = '7'` over an INT
+            // holding 7 — is not a change, and MySQL does not count one.
+            //
+            // Plain value equality, deliberately not the collation-aware
+            // comparison: MySQL counts a case-only rewrite as a change even
+            // where the two values compare equal under the column's
+            // collation. Measured on 8.3 — a `varchar` holding 'A', `UPDATE U
+            // SET y = 'a' WHERE y = 'A'` reports one row changed.
+            matched_rows += 1;
+            if candidate != rows[index] {
+                changed_rows += 1;
+            }
             // Children follow the key, so both halves of the change are needed.
             changed.push((rows[index].clone(), candidate.clone()));
             rows[index] = candidate;
-            updated += 1;
         }
 
         table.rows = rows;
@@ -4513,8 +4537,9 @@ impl Engine {
         self.commit_database(&db, working)?;
         mark_modified(session, &db, &touched);
 
-        session.affected_rows = updated;
-        Ok(Outcome::affected(updated))
+        let affected = session.rows_affected_by_update(matched_rows, changed_rows);
+        session.affected_rows = affected;
+        Ok(Outcome::affected(affected))
     }
 
     /// `UPDATE a JOIN b ON ... SET a.x = ..., b.y = ...`.
@@ -4653,7 +4678,13 @@ impl Engine {
         // MySQL updates each base row at most once however many join rows it
         // appears in, and every assignment to that table applies to it.
         let mut seen: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
-        let mut updated = 0u64;
+        // Both counts, for the reason the single-table path keeps both: which
+        // one the client is told is the capability's decision, not this
+        // statement's. Measured on 8.3 over two joined rows apiece, `UPDATE A
+        // JOIN B ON A.id = B.id SET A.v = A.v, B.v = B.v` reports 4 with
+        // CLIENT_FOUND_ROWS and 0 without.
+        let mut matched_rows = 0u64;
+        let mut changed_rows = 0u64;
         let mut changes: BTreeMap<usize, Vec<MovedRow>> = BTreeMap::new();
 
         for (row_index, row) in relation.rows.iter().enumerate() {
@@ -4711,10 +4742,14 @@ impl Engine {
                 let rows = table.rows.clone();
                 table.check_unique_against(&rows, &candidate, origin)?;
 
+                // Counted per row, not per assignment.
+                matched_rows += 1;
+                if candidate != before {
+                    changed_rows += 1;
+                }
+
                 table.rows[origin] = candidate.clone();
                 changes.entry(source).or_default().push((before, candidate));
-                // Counted per row, not per assignment.
-                updated += 1;
             }
         }
 
@@ -4728,8 +4763,9 @@ impl Engine {
         self.commit_database(&db, working)?;
         mark_modified(session, &db, &touched);
 
-        session.affected_rows = updated;
-        Ok(Outcome::affected(updated))
+        let affected = session.rows_affected_by_update(matched_rows, changed_rows);
+        session.affected_rows = affected;
+        Ok(Outcome::affected(affected))
     }
 
     fn delete(

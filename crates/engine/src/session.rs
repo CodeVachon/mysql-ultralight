@@ -116,6 +116,24 @@ pub struct Session {
     parsed_from: String,
     pub last_insert_id: u64,
     pub affected_rows: u64,
+    /// Whether this connection negotiated `CLIENT_FOUND_ROWS`.
+    ///
+    /// It decides what an UPDATE *means* by "affected": with the flag, MySQL
+    /// reports the rows the WHERE matched; without it, the rows whose stored
+    /// values actually changed. Measured on 8.3 over two rows already holding
+    /// the value: `UPDATE U SET x = x` answers 2 with the flag and 0 without,
+    /// and `ROW_COUNT()` follows the same rule. Both meanings are correct
+    /// answers to different questions, so this is read rather than picked.
+    /// Which branch a client lands on is not the obvious split: the `mysql`
+    /// command-line client and the `mysql` crate the differential harness uses
+    /// leave the flag off, while node `mysql2` sets it by default and Prisma's
+    /// query engine sets it too — all four measured against this server's own
+    /// handshake trace. So the *changed* meaning below is what an unadorned
+    /// client gets and the matched meaning is what the drivers ask for, and
+    /// both reach this engine.
+    ///
+    /// False by default, which is the meaning a client that says nothing gets.
+    pub found_rows: bool,
 }
 
 impl Session {
@@ -138,6 +156,21 @@ impl Session {
             parsed_from,
             last_insert_id: 0,
             affected_rows: 0,
+            found_rows: false,
+        }
+    }
+
+    /// What an UPDATE reports as affected, given the rows it matched and the
+    /// rows whose stored values it actually changed.
+    ///
+    /// One place rather than one per DML path, because the two counts are only
+    /// ever different when this decision is the thing being got wrong. See
+    /// `found_rows` for the measurements.
+    pub fn rows_affected_by_update(&self, matched: u64, changed: u64) -> u64 {
+        if self.found_rows {
+            matched
+        } else {
+            changed
         }
     }
 

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use mysql_ultralight_engine::value::Value as EngineValue;
 use mysql_ultralight_engine::{Engine, Outcome, ServerConfig, Session};
-use mysql_ultralight_protocol::{ColumnDef, ErrPacket, OkPacket, Value as WireValue};
+use mysql_ultralight_protocol::{Capabilities, ColumnDef, ErrPacket, OkPacket, Value as WireValue};
 use mysql_ultralight_server::{Answered, Handler, HandlerResult, Prepared, Response, ResultSet};
 
 pub struct EngineHandler {
@@ -76,6 +76,10 @@ impl EngineHandler {
 }
 
 impl Handler for EngineHandler {
+    fn negotiated(&mut self, capabilities: Capabilities) {
+        self.session.found_rows = capabilities.contains(Capabilities::FOUND_ROWS);
+    }
+
     fn query(&mut self, sql: &str) -> HandlerResult {
         self.run(sql, &[])
     }
@@ -167,8 +171,15 @@ impl Handler for EngineHandler {
         let config = self.session.config.clone();
         let id = self.session.connection_id;
         let database = self.session.current_database.clone();
+        // Carried over for a different reason than the schema: capabilities are
+        // settled by the handshake and COM_RESET_CONNECTION does not
+        // renegotiate, so a connection that asked for CLIENT_FOUND_ROWS still
+        // has it afterwards. Dropping it would silently change what every
+        // later UPDATE on that connection reports.
+        let found_rows = self.session.found_rows;
         self.session = Session::new(config, id);
         self.session.current_database = database;
+        self.session.found_rows = found_rows;
     }
 
     fn statistics(&self) -> String {
@@ -311,6 +322,55 @@ mod tests {
             h.execute(&write, &[WireValue::I64(i), WireValue::Str("x".to_owned())])
                 .unwrap();
             assert!(h.execute(&read, &[WireValue::I64(i)]).is_ok());
+        }
+    }
+
+    /// The affected count an OK packet carries, so what is asserted is what
+    /// the client would read rather than a field of the session.
+    fn affected(h: &mut EngineHandler, sql: &str) -> u64 {
+        match h.run(sql, &[]).unwrap() {
+            Response::Ok(ok) => ok.affected_rows,
+            Response::ResultSet(_) => panic!("expected an affected count from: {sql}"),
+        }
+    }
+
+    /// #0089. `CLIENT_FOUND_ROWS` decides whether an UPDATE reports the rows it
+    /// matched or the rows it changed, and the handshake is the only place that
+    /// number is known — so a handler that never learns the capability answers
+    /// every client the same way. Both branches are reached in practice:
+    /// node `mysql2` and Prisma's query engine both set the flag, while the
+    /// `mysql` command-line client does not — measured off this server's
+    /// handshake trace, one connection each.
+    #[test]
+    fn the_negotiated_capabilities_decide_what_an_update_reports() {
+        for found_rows in [false, true] {
+            let mut h = handler();
+            h.negotiated(if found_rows {
+                Capabilities::FOUND_ROWS
+            } else {
+                Capabilities::EMPTY
+            });
+            h.run("CREATE TABLE T (id INT, a VARCHAR(10))", &[])
+                .unwrap();
+            h.run("INSERT INTO T VALUES (1, 'x'), (2, 'x')", &[])
+                .unwrap();
+
+            let matched_but_unchanged = affected(&mut h, "UPDATE T SET a = 'x'");
+            assert_eq!(
+                matched_but_unchanged,
+                if found_rows { 2 } else { 0 },
+                "with FOUND_ROWS = {found_rows}"
+            );
+
+            // COM_RESET_CONNECTION does not renegotiate, so the capability
+            // outlives it. Dropping it here would silently change what every
+            // later UPDATE on a pooled connection reports.
+            h.reset();
+            assert_eq!(
+                affected(&mut h, "UPDATE T SET a = 'x'"),
+                matched_but_unchanged,
+                "after reset, with FOUND_ROWS = {found_rows}"
+            );
         }
     }
 

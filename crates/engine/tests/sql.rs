@@ -26464,3 +26464,329 @@ fn a_compound_extract_never_shows_a_client_the_call_it_was_rewritten_to() {
         vec![vec!["5060708", "202401", "2024"]]
     );
 }
+
+/// A table with rows that will and will not move under the same UPDATE.
+fn countable(engine: &Engine, session: &mut Session) {
+    run(
+        engine,
+        session,
+        "CREATE TABLE Rc (
+            id INT NOT NULL,
+            x INT NOT NULL,
+            s VARCHAR(8) NOT NULL,
+            z INT NULL,
+            PRIMARY KEY (id)
+        )",
+    );
+    run(
+        engine,
+        session,
+        "INSERT INTO Rc (id, x, s) VALUES (1, 5, 'a'), (2, 5, 'a'), (3, 5, 'a')",
+    );
+}
+
+/// #0089. An UPDATE counted the rows its WHERE matched; MySQL counts the rows
+/// whose stored values actually moved. `UPDATE Rc SET s = 'a'` over rows
+/// already holding 'a' answered 2 here and 0 on 8.3, and Prisma reads that
+/// number to decide whether an update found its target.
+#[test]
+fn an_update_reports_the_rows_it_changed_not_the_rows_it_matched() {
+    let (engine, mut session) = engine();
+    countable(&engine, &mut session);
+
+    // Nothing moves.
+    assert_eq!(
+        affected(&engine, &mut session, "UPDATE Rc SET s = 'a' WHERE id <= 2"),
+        0
+    );
+    // Everything matched moves -- the control that stops this being "fixed" by
+    // reporting nothing at all.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE Rc SET x = x + 1 WHERE id <= 2"
+        ),
+        2
+    );
+    // Three matched, one moves: the two counts differ and neither is zero, so
+    // this tells a count of matched from a count of changed by the answer
+    // rather than by which of them happens to be 0.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE Rc SET x = IF(id = 1, x + 1, x)"
+        ),
+        1
+    );
+    // Two columns assigned and only one of them moves.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE Rc SET x = IF(id = 2, x + 1, x), s = 'a' WHERE id <= 2"
+        ),
+        1
+    );
+    // NULL written over NULL is not a change.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE Rc SET z = NULL WHERE id <= 2"
+        ),
+        0
+    );
+    // Nothing matched at all, which is 0 under either meaning.
+    assert_eq!(
+        affected(&engine, &mut session, "UPDATE Rc SET x = 0 WHERE id = 99"),
+        0
+    );
+    // LIMIT bounds what is matched; none of it moves.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE Rc SET s = 'a' ORDER BY id LIMIT 2"
+        ),
+        0
+    );
+    // A coercion that lands back on the value already stored is not a change
+    // either: what is weighed is the row as it will be *stored*, not the text
+    // the statement wrote.
+    assert_eq!(
+        affected(&engine, &mut session, "UPDATE Rc SET x = '7' WHERE id = 3"),
+        1
+    );
+    assert_eq!(
+        affected(&engine, &mut session, "UPDATE Rc SET x = '7' WHERE id = 3"),
+        0
+    );
+    // And ROW_COUNT() answers the same number the statement did.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT ROW_COUNT()"),
+        vec![vec!["0"]]
+    );
+}
+
+/// A case-only rewrite is a change, even though the two values compare equal
+/// under a case-insensitive collation. Measured on 8.3: over a `varchar`
+/// holding 'A', `UPDATE Rc SET s = 'a' WHERE s = 'A'` reports one row changed.
+/// So the count is decided by the stored value, not by the collation, and this
+/// is why the comparison behind it is not the collation-aware one.
+#[test]
+fn a_case_only_rewrite_counts_as_a_change() {
+    let (engine, mut session) = engine();
+    countable(&engine, &mut session);
+
+    assert_eq!(
+        affected(&engine, &mut session, "UPDATE Rc SET s = 'A' WHERE id = 1"),
+        1
+    );
+    // The WHERE still matches case-insensitively, which is what makes this a
+    // question about the count rather than about the predicate.
+    assert_eq!(
+        affected(&engine, &mut session, "UPDATE Rc SET s = 'a' WHERE s = 'A'"),
+        1
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT s FROM Rc ORDER BY id"),
+        vec![vec!["a"], vec!["a"], vec!["a"]]
+    );
+}
+
+/// An `ON UPDATE CURRENT_TIMESTAMP` column must not turn a no-op into a
+/// change. MySQL restamps it only when something else moved, so a statement
+/// that writes back the values already there reports 0 and leaves the column
+/// alone -- an engine that restamped first and counted afterwards would report
+/// every matched row while looking like it had counted changes.
+#[test]
+fn an_on_update_timestamp_does_not_make_a_no_op_into_a_change() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Rt (
+            id INT NOT NULL,
+            x INT NOT NULL,
+            ts TIMESTAMP NOT NULL DEFAULT '2020-01-01 00:00:00' ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id)
+        )",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Rt (id, x) VALUES (1, 5)",
+    );
+
+    assert_eq!(affected(&engine, &mut session, "UPDATE Rt SET x = x"), 0);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT ts FROM Rt"),
+        vec![vec!["2020-01-01 00:00:00"]]
+    );
+
+    // And a real change does restamp, so the assertion above is about the
+    // no-op rather than about a column that never moves.
+    assert_eq!(affected(&engine, &mut session, "UPDATE Rt SET x = 6"), 1);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ts = '2020-01-01 00:00:00' FROM Rt"
+        ),
+        vec![vec!["0"]]
+    );
+}
+
+/// A multi-table UPDATE counts one base row per table per join row, and the
+/// same distinction applies to it. Measured on 8.3 over two rows apiece:
+/// `SET Rj.x = Rj.x, Rk.x = Rk.x` reports 0, and changing one of the four
+/// reports 1.
+#[test]
+fn a_multi_table_update_counts_the_base_rows_it_changed() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Rj (id INT NOT NULL, x INT NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Rk (id INT NOT NULL, x INT NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Rj VALUES (1, 5), (2, 5)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Rk VALUES (1, 5), (2, 5)",
+    );
+
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE Rj JOIN Rk ON Rj.id = Rk.id SET Rj.x = Rj.x, Rk.x = Rk.x"
+        ),
+        0
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE Rj JOIN Rk ON Rj.id = Rk.id \
+             SET Rj.x = IF(Rj.id = 1, Rj.x + 1, Rj.x), Rk.x = Rk.x"
+        ),
+        1
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE Rj JOIN Rk ON Rj.id = Rk.id SET Rj.x = Rj.x + 1, Rk.x = Rk.x + 1"
+        ),
+        4
+    );
+}
+
+/// With CLIENT_FOUND_ROWS the same statements report what they *matched*.
+/// Both meanings are correct answers to different questions, which is why the
+/// flag is read rather than a meaning picked: measured on 8.3 through one
+/// client asked for the flag and then asked without it, `UPDATE U SET x = x`
+/// over two matching rows answers 2 and then 0. Both branches are reached in
+/// practice -- node `mysql2` sets the flag by default and so does Prisma's
+/// query engine, while the `mysql` command-line client and the `mysql` crate
+/// the differential harness uses do not, which is why the corpus can only pin
+/// the other meaning and these numbers are asserted here.
+#[test]
+fn client_found_rows_switches_the_count_back_to_rows_matched() {
+    let (engine, mut session) = engine();
+    session.found_rows = true;
+    countable(&engine, &mut session);
+
+    assert_eq!(
+        affected(&engine, &mut session, "UPDATE Rc SET s = 'a' WHERE id <= 2"),
+        2
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE Rc SET x = IF(id = 1, x + 1, x)"
+        ),
+        3
+    );
+    assert_eq!(
+        affected(&engine, &mut session, "UPDATE Rc SET x = 0 WHERE id = 99"),
+        0
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT ROW_COUNT()"),
+        vec![vec!["0"]]
+    );
+    // The multi-table path reads the same flag. Four, not two: MySQL matches
+    // one base row per table per join row, measured on 8.3 through a client
+    // asked for the flag -- `UPDATE A JOIN B ON A.id = B.id SET A.v = A.v,
+    // B.v = B.v` over two rows apiece answers 4 there and 0 without it.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Rk (id INT NOT NULL, x INT NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Rk VALUES (1, 5), (2, 5)",
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE Rc JOIN Rk ON Rc.id = Rk.id SET Rc.s = Rc.s, Rk.x = Rk.x"
+        ),
+        4
+    );
+}
+
+/// An upsert that leaves the row as it was reports nothing, and the same flag
+/// moves that to one. Measured on 8.3: a repeated `INSERT ... ON DUPLICATE KEY
+/// UPDATE v = v` answers 0 without CLIENT_FOUND_ROWS and 1 with it, while one
+/// that does change the row answers 2 either way.
+#[test]
+fn an_upsert_that_changes_nothing_reports_nothing() {
+    let (engine, mut session) = engine();
+    for found_rows in [false, true] {
+        session.found_rows = found_rows;
+        run(
+            &engine,
+            &mut session,
+            "CREATE TABLE Rd (k INT NOT NULL, v INT NOT NULL, PRIMARY KEY (k))",
+        );
+        run(&engine, &mut session, "INSERT INTO Rd VALUES (1, 1)");
+
+        assert_eq!(
+            affected(
+                &engine,
+                &mut session,
+                "INSERT INTO Rd VALUES (1, 9) ON DUPLICATE KEY UPDATE v = v"
+            ),
+            u64::from(found_rows),
+            "with found_rows = {found_rows}"
+        );
+        assert_eq!(
+            affected(
+                &engine,
+                &mut session,
+                "INSERT INTO Rd VALUES (1, 9) ON DUPLICATE KEY UPDATE v = v + 1"
+            ),
+            2,
+            "with found_rows = {found_rows}"
+        );
+        run(&engine, &mut session, "DROP TABLE Rd");
+    }
+}
