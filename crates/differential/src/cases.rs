@@ -3437,6 +3437,81 @@ pub const GROUPS: &[Group] = &[
             // name. Compared as a predicate rather than as itself, because
             // the two servers are different versions.
             same("SELECT @@GLOBAL.version IS NOT NULL AS v, S.k FROM S ORDER BY S.id"),
+
+            // #0102. The same hole seen from a write, and the worse half of
+            // it: an UPDATE and a DELETE resolved no name at all, so over an
+            // empty table every one of these reported nought rows affected —
+            // which is exactly what a WHERE that matched nothing reports, so
+            // the caller could not tell it from an illegal statement.
+            same("UPDATE Bare SET k = 1 WHERE a.b = 1"),
+            same("UPDATE Bare SET k = 1 WHERE nope = 1"),
+            same("DELETE FROM Bare WHERE a.b = 1"),
+            same("DELETE FROM Bare WHERE nope = 1"),
+            // The assigned value, which is where the issue's own example
+            // sits: nothing evaluates it either.
+            same("UPDATE Bare SET k = a.b"),
+            // A table with rows in it, refused for the other three reasons a
+            // clause goes unevaluated — a filter nothing survives, a LIMIT of
+            // none, and a CASE branch nothing takes.
+            same("UPDATE S SET k = 1 WHERE 1 = 0 AND a.b = 1"),
+            same("DELETE FROM S WHERE 1 = 0 AND a.b = 1"),
+            same("UPDATE S SET k = 1 WHERE a.b = 1 LIMIT 0"),
+            same("UPDATE S SET k = CASE WHEN 0 THEN a.b ELSE k END"),
+            // The joined forms, which reach a different pair of entry points.
+            // A join with an empty side produces no pair of rows at all.
+            same("UPDATE S a JOIN T b ON a.id = b.id SET a.k = 1 WHERE zz.q = 1"),
+            same("UPDATE S a JOIN T b ON a.id = b.id SET a.k = zz.q"),
+            same("DELETE a FROM S a JOIN T b ON a.id = b.id WHERE zz.q = 1"),
+            same("DELETE FROM a USING S a JOIN T b ON a.id = b.id WHERE zz.q = 1"),
+            same("UPDATE Bare a JOIN T b ON a.id = b.id SET a.k = 1 WHERE zz.q = 1"),
+            same("DELETE a FROM Bare a JOIN T b ON a.id = b.id WHERE zz.q = 1"),
+            // An alias replaces the table name on a write too, so the table's
+            // own name no longer resolves.
+            same("UPDATE S a JOIN T b ON a.id = b.id SET a.k = 1 WHERE S.k = 1"),
+            // The orderings, which are what makes these worth more than a
+            // refusal each: every one is a different *code* on 8.3 and the
+            // engine had to be measured against it rather than reasoned at.
+            // A missing table first, then the name, then the malformed
+            // ESCAPE — and for a multi-table DELETE, which tables it names
+            // before any of them.
+            same("UPDATE nosuch SET k = 1 WHERE a.b = 1"),
+            same("UPDATE T SET label = 'x' WHERE nope = 1 AND label LIKE 'a' ESCAPE '!!'"),
+            same("DELETE a, a FROM S a JOIN T b ON a.id = b.id WHERE nope = 1"),
+            // Within a SET list the first assignment's problem wins, exactly
+            // as the first select item's does: these two differ only in the
+            // order of the assignments and 8.3 answers a different code for
+            // each.
+            same("UPDATE T SET label = ('a' LIKE 'b' ESCAPE '!!'), sid = nope"),
+            same("UPDATE T SET sid = nope, label = ('a' LIKE 'b' ESCAPE '!!')"),
+
+            // Legal from here down, over the empty table so each affects
+            // nothing and the group's own rows are left alone. A correlated
+            // reference resolves against the row being written rather than
+            // against the subquery's FROM, and a back-quoted qualifier is a
+            // spelling rather than a name — the two shapes #0058's first
+            // resolver wrongly refused.
+            same("UPDATE Bare SET k = 1 WHERE id IN (SELECT sid FROM T WHERE T.id = Bare.id)"),
+            same("UPDATE Bare SET k = 1 WHERE EXISTS (SELECT 1 FROM T t WHERE t.sid = Bare.id)"),
+            same("UPDATE Bare SET k = (SELECT MAX(T.sid) FROM T WHERE T.id = Bare.id)"),
+            same("UPDATE Bare b SET b.k = 1 WHERE b.id = 1"),
+            same("UPDATE `Bare` SET `k` = 1 WHERE `Bare`.`id` = 1"),
+            same("UPDATE differential.Bare SET k = 1 WHERE differential.Bare.id = 1"),
+            same("DELETE FROM Bare WHERE `Bare`.`id` = 1"),
+            // A bare keyword that parses as an identifier, in a predicate
+            // that has to keep resolving.
+            same("UPDATE Bare SET k = 1 WHERE TIMESTAMPDIFF(DAY, '2026-01-01', '2026-03-05') > 1"),
+            // `DEFAULT` parses as an identifier, so a resolver that does not
+            // know the keyword reads it as an unknown column and refuses a
+            // statement 8.3 accepts. Over the empty table, because the
+            // evaluator has no meaning for it either.
+            same("UPDATE Bare SET k = DEFAULT"),
+            same("UPDATE Bare a JOIN T b ON a.id = b.id SET a.k = DEFAULT"),
+            // Last, and the reason the writes above are safe to have here: a
+            // refusal that nonetheless wrote would show up as a changed row
+            // rather than as nothing at all.
+            same("SELECT id, k FROM S ORDER BY id"),
+            same("SELECT id, sid, label FROM T ORDER BY id"),
+            same("SELECT id, k FROM Bare ORDER BY id"),
         ],
     },
     Group {
@@ -4778,6 +4853,142 @@ pub const GROUPS: &[Group] = &[
             // a divergence of its own that would drown this case's question.
             same("SELECT id FROM Fl WHERE 1 IN (SELECT 1 WHERE Fl.b > 7) ORDER BY id"),
             same("SELECT id FROM Fl WHERE EXISTS (SELECT 1 WHERE Fl.b > 7) ORDER BY id"),
+        ],
+    },
+    Group {
+        name: "casting to an integer",
+        setup: &[
+            // One column per way a number can arrive, all holding the same
+            // half: the point of the group is that they do *not* all cast to
+            // the same integer.
+            "CREATE TABLE Ci (id INT NOT NULL, d1 DECIMAL(10,1) NULL, d2 DECIMAL(10,2) NULL, \
+             d5 DECIMAL(20,5) NULL, wide DECIMAL(20,1) NULL, g DOUBLE NULL, f FLOAT NULL, \
+             s VARCHAR(40) NULL, e ENUM('a','b','c') NULL, at DATETIME(3) NULL, \
+             tm TIME(3) NULL, bu BIGINT UNSIGNED NULL, PRIMARY KEY (id))",
+            // `wide` is 2^52 and a half, which no double holds: a reading that
+            // goes through one loses the tie and answers one less.
+            "INSERT INTO Ci VALUES (1, 2.5, 2.505, 2.500005, 4503599627370496.5, 2.5, 2.5, \
+             '2.5', 'b', '2024-01-05 06:07:08.500', '06:07:08.500', 18446744073709551615)",
+            "INSERT INTO Ci VALUES (2, -2.5, -2.505, -2.500005, -4503599627370496.5, -2.5, \
+             -2.5, '-2.5', 'c', '2024-01-05 06:07:09.500', '06:07:09.500', 1)",
+            "INSERT INTO Ci VALUES (3, 1.5, 1.50, 1.50000, 1.5, 1.5, 1.5, '1.9', 'a', \
+             '2024-01-05 00:00:00.000', '00:00:00.000', 0)",
+            "INSERT INTO Ci (id) VALUES (4)",
+            // The ranges, one row per direction and one inside.
+            "CREATE TABLE Rng (id INT NOT NULL, g DOUBLE NULL, d DECIMAL(30,1) NULL, \
+             s VARCHAR(40) NULL, PRIMARY KEY (id))",
+            "INSERT INTO Rng VALUES (1, 1e30, 99999999999999999999.5, '99999999999999999999')",
+            "INSERT INTO Rng VALUES (2, -1e30, -99999999999999999999.5, \
+             '-99999999999999999999')",
+            "INSERT INTO Rng VALUES (3, 1.5e0, 18446744073709551615.5, '18446744073709551616')",
+        ],
+        cases: &[
+            // An exact operand rounds half away from zero. #0120: this
+            // truncated, so the first two were 0 and 1.
+            same("SELECT CAST(0.5 AS SIGNED), CAST(1.5 AS SIGNED), CAST(2.5 AS SIGNED), \
+                  CAST(3.5 AS SIGNED)"),
+            same("SELECT CAST(-0.5 AS SIGNED), CAST(-1.5 AS SIGNED), CAST(-2.5 AS SIGNED), \
+                  CAST(-3.5 AS SIGNED)"),
+            // Either side of a half, so the group says rounding and not "a
+            // fraction adds one".
+            same("SELECT CAST(1.49 AS SIGNED), CAST(1.51 AS SIGNED), CAST(-1.49 AS SIGNED), \
+                  CAST(-1.51 AS SIGNED)"),
+            // An approximate one rounds half to *even*, which is a different
+            // rule and not a different bug.
+            same("SELECT CAST(0.5e0 AS SIGNED), CAST(1.5e0 AS SIGNED), \
+                  CAST(2.5e0 AS SIGNED), CAST(3.5e0 AS SIGNED), CAST(4.5e0 AS SIGNED)"),
+            same("SELECT CAST(-0.5e0 AS SIGNED), CAST(-1.5e0 AS SIGNED), \
+                  CAST(-2.5e0 AS SIGNED)"),
+            // The three rules over one number, which is the case this group
+            // exists for: 3, 2 and 2.
+            same("SELECT CAST(2.5 AS SIGNED), CAST(2.5e0 AS SIGNED), CAST('2.5' AS SIGNED)"),
+            // A string truncates rather than rounding at all.
+            same("SELECT CAST('1.5' AS SIGNED), CAST('1.9' AS SIGNED), \
+                  CAST('-1.9' AS SIGNED), CAST('0.9' AS SIGNED)"),
+            same("SELECT CAST('12abc' AS SIGNED), CAST('abc' AS SIGNED), \
+                  CAST('  2.7  ' AS SIGNED), CAST('.5' AS SIGNED)"),
+            // It stops at the first character an integer cannot contain, and
+            // an exponent is one: read as a *number* instead these were 10^30
+            // and an infinity.
+            same("SELECT CAST('1e30' AS SIGNED), CAST('1e3' AS SIGNED), \
+                  CAST('1.9e3' AS SIGNED), CAST('0x1F' AS SIGNED), \
+                  CAST('12 34' AS SIGNED)"),
+            same("SELECT CAST('inf' AS SIGNED), CAST('-inf' AS SIGNED), \
+                  CAST('nan' AS SIGNED), CAST('inf' AS UNSIGNED)"),
+            // A lone sign is 0 and not a saturation.
+            same("SELECT CAST('- 12' AS SIGNED), CAST('--12' AS SIGNED), \
+                  CAST('' AS SIGNED), CAST('  +12' AS SIGNED)"),
+            // More digits than fit, saturating at the unsigned boundary in
+            // each direction before the target reinterprets it.
+            same("SELECT CAST('99999999999999999999999999999999999999999' AS SIGNED), \
+                  CAST('99999999999999999999999999999999999999999' AS UNSIGNED), \
+                  CAST('-99999999999999999999999999999999999999999' AS SIGNED), \
+                  CAST('-99999999999999999999999999999999999999999' AS UNSIGNED)"),
+            same("SELECT CAST(NULL AS SIGNED), CAST(NULL AS UNSIGNED)"),
+            // UNSIGNED shares the reading: a negative rounds first and wraps
+            // second, which is what puts -1.5 two below the maximum.
+            same("SELECT CAST(1.5 AS UNSIGNED), CAST(2.5 AS UNSIGNED), \
+                  CAST(-1.5 AS UNSIGNED), CAST(-2.5 AS UNSIGNED)"),
+            same("SELECT CAST(-0.5 AS UNSIGNED), CAST(-0.4 AS UNSIGNED), \
+                  CAST(-1 AS UNSIGNED)"),
+            same("SELECT CAST(1.5e0 AS UNSIGNED), CAST(-1.5e0 AS UNSIGNED), \
+                  CAST(-2.5e0 AS UNSIGNED)"),
+            // The longer spellings of the same two targets.
+            same("SELECT CAST(1.5 AS SIGNED INTEGER), CAST(1.5 AS UNSIGNED INTEGER)"),
+            // A decimal that arrived by arithmetic or by a cast, which is
+            // where an application meets this.
+            same("SELECT CAST(1.25 + 1.25 AS SIGNED), CAST(5/2 AS SIGNED), \
+                  CAST(CAST('2.5' AS DECIMAL(10,1)) AS SIGNED)"),
+            // An exact operand saturates into the target's own range.
+            same("SELECT CAST(99999999999999999999 AS SIGNED), \
+                  CAST(-99999999999999999999 AS SIGNED), \
+                  CAST(99999999999999999999 AS UNSIGNED), \
+                  CAST(-99999999999999999999 AS UNSIGNED)"),
+            // Past the 38 digits an i128 counts, where only the sign is left
+            // to answer with. MySQL's DECIMAL holds 65, so these are numbers
+            // it converts rather than refuses.
+            same("SELECT CAST(99999999999999999999999999999999999999999 AS SIGNED), \
+                  CAST(-99999999999999999999999999999999999999999 AS SIGNED), \
+                  CAST(99999999999999999999999999999999999999999 AS UNSIGNED), \
+                  CAST(-99999999999999999999999999999999999999999 AS UNSIGNED)"),
+            // An approximate operand converts through a *signed* longlong
+            // whichever integer it was asked for, so 1e19 stops at the signed
+            // maximum where the same size as a decimal reaches the unsigned
+            // one.
+            same("SELECT CAST(1e19 AS UNSIGNED), CAST(1e30 AS SIGNED), \
+                  CAST(1e30 AS UNSIGNED)"),
+            // A string saturates at the unsigned boundary and the signed
+            // target reinterprets those bits: -1 for digits a decimal literal
+            // answers 9223372036854775807 for.
+            same("SELECT CAST('99999999999999999999' AS SIGNED), \
+                  CAST('99999999999999999999' AS UNSIGNED)"),
+            // An integer literal above i64::MAX and inside u64 is one MySQL
+            // holds unsigned, so the signed cast hands its bits back.
+            same("SELECT CAST(10000000000000000000 AS SIGNED), \
+                  CAST(10000000000000000000 AS UNSIGNED)"),
+            // A half at the very edge of each range, where rounding and
+            // saturation meet.
+            same("SELECT CAST(9223372036854775807.5 AS SIGNED), \
+                  CAST(18446744073709551615.5 AS UNSIGNED)"),
+            // Stored rather than written, because a column is where the scale
+            // is a declaration and not a spelling.
+            same("SELECT id, CAST(d1 AS SIGNED), CAST(d2 AS SIGNED), CAST(d5 AS SIGNED), \
+                  CAST(wide AS SIGNED) FROM Ci ORDER BY id"),
+            same("SELECT id, CAST(g AS SIGNED), CAST(f AS SIGNED), CAST(s AS SIGNED) \
+                  FROM Ci ORDER BY id"),
+            // The readings that are neither: an ENUM converts through its
+            // ordinal and a temporal through its packed number, which rounds
+            // half away from zero like the decimal it is.
+            same("SELECT id, CAST(e AS SIGNED), CAST(at AS SIGNED), CAST(tm AS SIGNED), \
+                  CAST(bu AS SIGNED) FROM Ci ORDER BY id"),
+            same("SELECT id, CAST(d1 AS UNSIGNED), CAST(g AS UNSIGNED), \
+                  CAST(f AS UNSIGNED), CAST(bu AS UNSIGNED) FROM Ci ORDER BY id"),
+            same("SELECT id, CAST(g AS SIGNED), CAST(g AS UNSIGNED) FROM Rng ORDER BY id"),
+            same("SELECT id, CAST(d AS SIGNED), CAST(d AS UNSIGNED) FROM Rng ORDER BY id"),
+            same("SELECT id, CAST(s AS SIGNED), CAST(s AS UNSIGNED) FROM Rng ORDER BY id"),
+            // Where the rounding decides a row rather than a printed value.
+            same("SELECT id FROM Ci WHERE CAST(d1 AS SIGNED) = 3 ORDER BY id"),
+            same("SELECT id FROM Ci ORDER BY CAST(d1 AS SIGNED), id"),
         ],
     },
 ];

@@ -329,28 +329,23 @@ fn hex_of(bytes: &[u8]) -> String {
 /// raises 1690 there too rather than saturating everywhere and being wrong
 /// about the arithmetic instead.
 fn hex_integer(value: &Value) -> EngineResult<u64> {
+    // Counted exactly rather than read through a double, and rounded half away
+    // from zero — the rule an integer cast applies too, which is why both ask
+    // `decimal::whole` for it rather than keeping a spelling each. Its `None`
+    // is text that is not a decimal at all, and that falls through to the
+    // number reading below, where the leading number is 0: saturating there
+    // would answer `7FFFFFFFFFFFFFFF` for a value nobody wrote. Nothing builds
+    // a decimal out of anything else today, so this is about how the *next*
+    // thing to build one would fail.
+    if let Value::Decimal(text) = value {
+        if let Some(rounded) = crate::decimal::whole(text) {
+            return Ok(rounded.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64 as u64);
+        }
+    }
     Ok(match value {
         Value::Int(v) => *v as u64,
         Value::Unsigned(v) => *v,
         Value::Bool(b) => u64::from(*b),
-        Value::Decimal(text) if is_plain_decimal(text) => {
-            // `units` at scale 0 is the half-away-from-zero rounding MySQL
-            // does. `None` can only be more digits than an `i128` holds now
-            // that the guard above has established the text *is* digits, and
-            // that is past saturation in whichever direction the sign points.
-            let rounded = crate::decimal::units(text, 0).unwrap_or_else(|| {
-                if text.trim().starts_with('-') {
-                    i128::MIN
-                } else {
-                    i128::MAX
-                }
-            });
-            rounded.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64 as u64
-        }
-        // Everything else, and a `Value::Decimal` the guard above turned away
-        // with it: reading an unparseable one for its leading number gives 0,
-        // where sharing the saturation above would have invented the largest
-        // BIGINT there is.
         other => {
             let rounded = other.as_number().round_ties_even();
             // Half-open at the top and closed at the bottom, because
@@ -366,25 +361,6 @@ fn hex_integer(value: &Value) -> EngineResult<u64> {
             rounded as i64 as u64
         }
     })
-}
-
-/// Whether a `Value::Decimal` holds what its name says: an optional sign, at
-/// least one digit, and at most one point.
-///
-/// Nothing builds a decimal out of anything else today — they are rendered
-/// from digits at a known scale — so this is about how the *next* thing to
-/// build one would fail rather than about a case that exists. Without it,
-/// [`crate::decimal::units`] returning `None` means two unrelated things at
-/// once: a number with more digits than an `i128` holds, and text that is not
-/// a number at all. Saturating covers the first and is exactly wrong for the
-/// second, where it would answer `7FFFFFFFFFFFFFFF` — a maximal number nobody
-/// wrote — for a value whose leading number is 0.
-fn is_plain_decimal(text: &str) -> bool {
-    let digits = text.trim().trim_start_matches(['-', '+']);
-    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
-    !(whole.is_empty() && fraction.is_empty())
-        && whole.bytes().all(|b| b.is_ascii_digit())
-        && fraction.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// -1, 0 or 1 for a number that was read approximately.
@@ -1692,30 +1668,12 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
         // MySQL spells the integer cast `SIGNED`, and it is by far the most
         // common one written by hand.
         | D::Signed
-        | D::SignedInteger => Value::Int(int_prefix(&value)),
+        | D::SignedInteger => Value::Int(cast_signed(&value)),
         // UNSIGNED reinterprets rather than refusing, which it could not do
         // while the engine held an `i64`: `CAST(-1 AS UNSIGNED)` is
         // 18446744073709551615 on 8.3 and `CAST(-2 AS UNSIGNED)` is
         // 18446744073709551614. This used to answer 1235.
-        //
-        // Read exactly rather than through `int_prefix`, which returns an
-        // `i64` and so saturates on the values this cast exists to produce:
-        // `CAST('18446744073709551615' AS UNSIGNED)` came back `i64::MAX`.
-        //
-        // A fractional argument truncates toward zero here where MySQL rounds
-        // half away from zero — `CAST(-1.5 AS UNSIGNED)` is
-        // 18446744073709551614 there and 18446744073709551615 here. That is
-        // the signed cast's rounding rule above, which this one inherits by
-        // sharing the reading, and it belongs to whichever issue takes it:
-        // fixing it for one target and not the other would leave
-        // `CAST(1.5 AS SIGNED)` and `CAST(1.5 AS UNSIGNED)` disagreeing about
-        // the same number.
-        D::Unsigned | D::UnsignedInteger => {
-            let exact = value
-                .as_exact_int()
-                .unwrap_or_else(|| i128::from(int_prefix(&value)));
-            Value::Unsigned(exact as u64)
-        }
+        D::Unsigned | D::UnsignedInteger => Value::Unsigned(cast_unsigned(&value)),
         // By the number MySQL reads out of the value: `CAST('abc' AS DOUBLE)`
         // is 0 there, not NULL. Answering NULL made the cast contradict the
         // NOT NULL a numeric target is described with.
@@ -1992,26 +1950,167 @@ fn json_contains(target: &serde_json::Value, candidate: &serde_json::Value) -> b
     }
 }
 
-/// The integer MySQL reads out of a value being cast.
+/// The whole number a *numeric* operand of an integer cast carries.
 ///
-/// MySQL takes the leading numeric part and warns about the rest, so
-/// `CAST('12abc' AS SIGNED)` is 12 and `CAST('abc' AS SIGNED)` is 0. Returning
-/// NULL for either would be a value the real server never produces.
-fn int_prefix(value: &Value) -> i64 {
-    if let Some(n) = value.as_int() {
-        return n;
+/// MySQL rounds here rather than truncating, and by two rules rather than one.
+/// An exact operand rounds half away from zero — `CAST(2.5 AS SIGNED)` is 3
+/// and `CAST(-2.5 AS SIGNED)` is -3 — and an approximate one rounds half to
+/// *even*: `CAST(2.5e0 AS SIGNED)` is 2, `CAST(0.5e0 AS SIGNED)` is 0 and
+/// `CAST(4.5e0 AS SIGNED)` is 4. Both measured; the two do not share a rule,
+/// and the same split is what #0130 found under `HEX`. Truncating toward zero
+/// agreed with the approximate rule wherever the digit it kept was already
+/// even, which is why one defect looked like it covered every operand:
+/// `CAST(2.5e0 AS SIGNED)` was right by accident and `CAST(1.5e0 AS SIGNED)`
+/// was not.
+///
+/// Exact means exact, so the count goes through [`crate::decimal::whole`]
+/// rather than an `f64`: a `DECIMAL(20,1)` holding 4503599627370496.5 casts to
+/// 4503599627370497, where a double loses that tie at 2^52 and answers ...496.
+/// That helper is also what `HEX` counts a decimal with, so the two cannot
+/// come to different answers about the same number.
+///
+/// An approximate operand is clamped into the *signed* range before it comes
+/// back, because MySQL converts a double through a `longlong` whichever
+/// integer it was asked for: `CAST(1e30 AS UNSIGNED)` is 9223372036854775807
+/// on 8.3, not the unsigned maximum an exact operand of the same size gives.
+///
+/// `None` for everything MySQL converts by its digits instead — a string, a
+/// document, and anything that is already an integer. Those truncate rather
+/// than round and saturate at a different boundary, which is [`digit_integer`]
+/// below.
+fn numeric_operand(value: &Value) -> Option<i128> {
+    let signed = |n: i128| n.clamp(i128::from(i64::MIN), i128::from(i64::MAX));
+    match value {
+        // Left unclamped, because the two targets clamp it differently: a
+        // 41-digit DECIMAL is 9223372036854775807 as SIGNED and
+        // 18446744073709551615 as UNSIGNED, and `whole` saturating at
+        // `i128::MAX` reaches both of those through the clamps below.
+        Value::Decimal(text) => crate::decimal::whole(text),
+        // `as` saturates on a float in Rust, which is the answer wanted here:
+        // `CAST(1e300 AS SIGNED)` is the signed maximum on 8.3.
+        Value::Float(v) => Some(signed(v.round_ties_even() as i128)),
+        Value::Float32(v) => Some(signed(f64::from(*v).round_ties_even() as i128)),
+        _ => None,
     }
-    let text = value.as_text();
+}
+
+/// The integer MySQL reads out of a value it converts by its digits.
+///
+/// Saturating at the *unsigned* boundary in both directions rather than the
+/// signed one, which is measured and is the half that is not obvious:
+/// `CAST('99999999999999999999' AS SIGNED)` is -1 on 8.3, the unsigned
+/// maximum's bits read back as a signed number, where the same digits written
+/// as a decimal literal saturate into the signed range and answer
+/// 9223372036854775807. A value already inside the range comes back untouched,
+/// so `CAST(bu AS SIGNED)` over a `BIGINT UNSIGNED` holding the maximum is -1
+/// by the same reinterpretation.
+fn digit_integer(value: &Value) -> i128 {
+    let read = match value {
+        // A string is read by its leading integer and by nothing else, which
+        // is what MySQL's own conversion does and what reading it as a
+        // *number* first loses. Measured: `CAST('1e30' AS SIGNED)` is 1 on
+        // 8.3 — an exponent is not part of an integer — and `CAST('inf' AS
+        // SIGNED)` is 0. Through a float parse those were 10^30 and an
+        // infinity, and the unsigned boundary below then turned both into -1.
+        Value::Text(_) | Value::Bytes(_) => leading_integer(&value.as_text()),
+        // A document is not a string, and 8.3 says so: a JSON *number*
+        // converts as the number it is, so `CAST(CAST('1e30' AS JSON) AS
+        // SIGNED)` is 9223372036854775807 where the JSON string `"1e30"`
+        // beside it is 1. This engine holds both as text and cannot tell them
+        // apart — that is #0121 — so the number reading stays, saturating into
+        // the signed range the way an approximate operand does rather than
+        // wrapping at the unsigned one.
+        Value::Json(_) => value
+            .as_exact_int()
+            .unwrap_or(0)
+            .clamp(i128::from(i64::MIN), i128::from(i64::MAX)),
+        // Everything already an integer: an ENUM's ordinal, a boolean, a
+        // temporal's packed number. `as_exact_int` carries each of those
+        // exactly, and its `None` is a value none of them describes.
+        _ => value
+            .as_exact_int()
+            .unwrap_or_else(|| leading_integer(&value.as_text())),
+    };
+    read.clamp(i128::from(i64::MIN), i128::from(u64::MAX))
+}
+
+/// `CAST(x AS SIGNED)`.
+fn cast_signed(value: &Value) -> i64 {
+    match numeric_operand(value) {
+        // Saturating, which is the numeric operand's rule and not the digit
+        // reading's: `CAST(99999999999999999999 AS SIGNED)` is
+        // 9223372036854775807 and `CAST(-99999999999999999999 AS SIGNED)` is
+        // -9223372036854775808.
+        Some(n) => n.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
+        // Reinterpreted rather than saturated, which is what makes
+        // `CAST(10000000000000000000 AS SIGNED)` -8446744073709551616 — the
+        // literal is above `i64::MAX` and inside `u64`, so MySQL holds it as
+        // an unsigned integer and the cast hands its bits back.
+        None => digit_integer(value) as u64 as i64,
+    }
+}
+
+/// `CAST(x AS UNSIGNED)`.
+fn cast_unsigned(value: &Value) -> u64 {
+    // Through the same reading the signed cast uses, so the two cannot
+    // disagree about the same number: rounding one target and not the other
+    // would leave `CAST(1.5 AS SIGNED)` and `CAST(1.5 AS UNSIGNED)` giving
+    // different answers for 1.5.
+    let n = numeric_operand(value).unwrap_or_else(|| digit_integer(value));
+    // Saturating at the top and wrapping at the bottom, both measured.
+    // `CAST(-1.5 AS UNSIGNED)` is 18446744073709551614 — the two's complement
+    // of the -2 the rounding produced, so the rounding has to happen before
+    // the wrap or the answer is off by one. Below the signed range it stops at
+    // `i64::MIN`'s bits rather than continuing to wrap:
+    // `CAST(-99999999999999999999 AS UNSIGNED)` is 9223372036854775808.
+    n.clamp(i128::from(i64::MIN), i128::from(u64::MAX)) as u64
+}
+
+/// The integer MySQL reads out of the leading characters of a string.
+///
+/// It takes an optional sign and the digits after it, stops at the first
+/// character that is neither, and warns about the rest: `CAST('12abc' AS
+/// SIGNED)` is 12 and `CAST('abc' AS SIGNED)` is 0. Returning NULL for either
+/// would be a value the real server never produces.
+///
+/// *Stopping there* is the rule, and it is the part a float parse loses. An
+/// exponent is not part of an integer, so `CAST('1e30' AS SIGNED)` is 1 on 8.3
+/// and `CAST('1.9e3' AS SIGNED)` is 1; `inf` and `nan` are not numbers to this
+/// reading at all and cast to 0. Read as a number those were 10^30 and an
+/// infinity, which the unsigned boundary then turned into -1.
+///
+/// More digits than an `i128` counts saturate at the unsigned boundary in
+/// whichever direction the sign points, which is where the target's own
+/// reinterpretation takes over: a 41-digit string is -1 as SIGNED and
+/// 18446744073709551615 as UNSIGNED, and its negative is
+/// -9223372036854775808 and 9223372036854775808.
+fn leading_integer(text: &str) -> i128 {
     let text = text.trim_start();
     let mut end = 0;
+    let mut any_digit = false;
     for (i, c) in text.char_indices() {
-        if c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+')) {
+        if c.is_ascii_digit() {
+            any_digit = true;
+            end = i + c.len_utf8();
+        } else if i == 0 && (c == '-' || c == '+') {
             end = i + c.len_utf8();
         } else {
             break;
         }
     }
-    text[..end].parse().unwrap_or(0)
+    // A lone sign and an empty string are 0, not a saturation: the fallback
+    // below has to mean "too many digits" only, or `CAST('-' AS SIGNED)`
+    // would answer the smallest BIGINT there is.
+    if !any_digit {
+        return 0;
+    }
+    text[..end]
+        .parse::<i128>()
+        .unwrap_or(if text.starts_with('-') {
+            i128::from(i64::MIN)
+        } else {
+            i128::from(u64::MAX)
+        })
 }
 
 /// Compiles a pattern, reporting a bad one rather than treating it as literal

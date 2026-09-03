@@ -1,11 +1,11 @@
 ---
 id: 120
 title: CAST to an integer truncates where MySQL rounds
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-08-26T00:18:26Z
-updated: 2026-08-26T00:18:26Z
+updated: 2026-09-03T04:09:46Z
 ---
 
 ## Description

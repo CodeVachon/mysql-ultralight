@@ -64,6 +64,30 @@ pub fn units(text: &str, scale: usize) -> Option<i128> {
     Some(if negative { -value } else { value })
 }
 
+/// A decimal's whole number, rounded the way MySQL rounds one.
+///
+/// [`units`] at scale 0 *is* that rounding — half away from zero — and this
+/// adds the two answers its `None` is missing. That `None` means two unrelated
+/// things at once: a number with more digits than an `i128` counts, and text
+/// that is not a number at all. The first saturates, because 38 digits is past
+/// every integer range there is and MySQL saturates a `DECIMAL(65,0)` rather
+/// than wrapping it; the second has a reading of its own — the leading number
+/// MySQL takes out of it — and saturating there would answer the largest
+/// integer there is for a value nobody wrote.
+///
+/// So the sign settles the first and `None` is left to mean only the second.
+/// Every reader that turns a decimal into an integer wants this one rule:
+/// `CAST(2.5 AS SIGNED)` is 3 and `HEX(2.5)` is 3's digits.
+pub fn whole(text: &str) -> Option<i128> {
+    units(text, 0).or_else(|| {
+        Some(if sign(text)? < 0 {
+            i128::MIN
+        } else {
+            i128::MAX
+        })
+    })
+}
+
 /// `text` at exactly `scale` digits, worked on the characters.
 ///
 /// [`rescale`] counts in an `i128` and runs out at 38 digits — and spends the

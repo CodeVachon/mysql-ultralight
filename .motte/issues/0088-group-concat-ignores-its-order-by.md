@@ -1,11 +1,11 @@
 ---
 id: 88
 title: GROUP_CONCAT ignores its ORDER BY
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-08-25T03:02:14Z
-updated: 2026-08-25T03:02:14Z
+updated: 2026-09-03T04:09:46Z
 ---
 
 ## Description

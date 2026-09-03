@@ -4085,8 +4085,8 @@ impl Engine {
         // Carrying the database, so a reference qualified by the wrong one is
         // refused rather than read as this table's: `UPDATE J2 SET b = b WHERE
         // nodb.J2.a = 1` is 1054 on 8.3. Over an *empty* table nothing
-        // evaluates these at all and the statement still succeeds, which is
-        // the half #0102 owns — the guard belongs beside the one below it.
+        // evaluates these at all, which is why the guard below reads this
+        // rather than leaving it to the row loop.
         let refs: Vec<ColumnRef> = table
             .columns
             .iter()
@@ -4094,21 +4094,22 @@ impl Engine {
             .collect();
 
         // Before any row is considered, and after the table has been resolved
-        // because 8.3 answers 1146 for a missing table ahead of 1210. The
-        // predicate and the assigned values are otherwise only read per row,
-        // so over an empty table `UPDATE LE SET id = 2 WHERE s LIKE 'a'
-        // ESCAPE '!!'` reported nothing affected where 8.3 raises 1210 — and a
-        // caller cannot tell that from a WHERE nothing matched, which is what
-        // makes the silence worse on a write than on a query. Ahead of the
-        // assignment targets for the same reason: `UPDATE LE SET nope = 'x'
-        // WHERE s LIKE 'a' ESCAPE '!!'` is 1210 on 8.3, not 1054.
+        // because 8.3 answers 1146 for a missing table ahead of both of these.
+        // The predicate and the assigned values are otherwise only read per
+        // row, so over an empty table `UPDATE LE SET id = 2 WHERE s LIKE 'a'
+        // ESCAPE '!!'` reported nothing affected where 8.3 raises 1210, and
+        // `UPDATE Bare SET k = 1 WHERE a.b = 1` nothing where it raises 1054 —
+        // and a caller cannot tell either from a WHERE nothing matched, which
+        // is what makes the silence worse on a write than on a query.
         //
-        // The *name* half of the same ordering is not checked on this path at
-        // all — #0102 owns it — so a statement wrong both ways answers 1210
-        // here where 8.3 answers 1054. That issue's fix belongs beside this
-        // line rather than in place of it.
-        let assigned = assignments.iter().map(|a| &a.value);
-        refuse_at_resolve(selection.into_iter().chain(assigned))?;
+        // Ahead of the assignment targets, which is 8.3's order for the
+        // predicate in both codes: `UPDATE LE SET nope = 'x' WHERE s LIKE 'a'
+        // ESCAPE '!!'` is 1210 there and `UPDATE Bare SET nope1 = 1 WHERE
+        // nope2 = 1` names `nope2` in the where clause, not `nope1`.
+        //
+        // The WHERE before the values, because 8.3 settles it first.
+        resolve_dml_where(selection, &refs)?;
+        resolve_assigned_values(assignments, &refs)?;
 
         // Resolved once, before any row is considered: whether writing to a
         // generated column is an error must not depend on the data, and
@@ -4244,11 +4245,14 @@ impl Engine {
         reject_duplicate_sources(&relation)?;
         let refs = relation.refs();
 
-        // As on the single-table path, and after the relation is built so a
-        // missing table is still 1146 first. The ON clauses of the join are
-        // settled inside `join()`; this is the WHERE and the assigned values.
-        let assigned = assignments.iter().map(|a| &a.value);
-        refuse_at_resolve(selection.into_iter().chain(assigned))?;
+        // As on the single-table path, and after the relation is built and its
+        // sources checked so a missing table is still 1146 and a repeated
+        // alias still 1066 — 8.3 answers both ahead of the WHERE's own 1054,
+        // measured on `UPDATE S a JOIN T a ON 1 SET a.k = 1 WHERE nope = 1`.
+        // The ON clauses of the join are settled inside `join()`; this is the
+        // WHERE and the assigned values.
+        resolve_dml_where(selection, &refs)?;
+        resolve_assigned_values(assignments, &refs)?;
 
         // Each assignment is resolved to a source table and a column within it.
         struct Target {
@@ -4500,8 +4504,9 @@ impl Engine {
 
         // As on the UPDATE path, and for the same reason: the predicate is
         // only read per row, so `DELETE FROM LE WHERE s LIKE 'a' ESCAPE '!!'`
-        // over an empty table reported nothing deleted where 8.3 raises 1210.
-        refuse_at_resolve(delete.selection.as_ref())?;
+        // over an empty table reported nothing deleted where 8.3 raises 1210,
+        // and `DELETE FROM Bare WHERE a.b = 1` nothing where it raises 1054.
+        resolve_dml_where(delete.selection.as_ref(), &refs)?;
 
         let mut matching = Vec::new();
         for (index, row) in table.rows.iter().enumerate() {
@@ -4592,10 +4597,6 @@ impl Engine {
         let relation = self.build_relation_list(&session_snapshot, from)?;
         let refs = relation.refs();
 
-        // The multi-table half of the same clause. The join's own ON is
-        // settled in `join()`.
-        refuse_at_resolve(delete.selection.as_ref())?;
-
         // MySQL rejects `DELETE FROM a JOIN b` outright: with a join, the
         // target has to be named. Defaulting to every table in the join would
         // empty tables nobody asked to touch.
@@ -4623,6 +4624,18 @@ impl Engine {
             }
             sources.push(source);
         }
+
+        // The multi-table half of the same clause. The join's own ON is
+        // settled in `join()`.
+        //
+        // Below the targets rather than beside the relation, which is where
+        // #0087 first put the ESCAPE half of it, because 8.3 settles which
+        // tables a multi-table DELETE names before it looks at the predicate:
+        // `DELETE a, a FROM LE a JOIN LF b ON a.id = b.id WHERE a.s LIKE 'x'
+        // ESCAPE '!!'` is 1066 there and was 1210 here, and adding the name
+        // check at the old point would have made the same statement with an
+        // unknown column 1054 where 8.3 still says 1066.
+        resolve_dml_where(delete.selection.as_ref(), &refs)?;
 
         // Collect first, delete after: removing as we go would shift the
         // indices the remaining join rows point at.
@@ -5782,9 +5795,8 @@ enum SourceValue {
 fn writes_nothing(source: &SourceValue) -> bool {
     match source {
         SourceValue::Expr(e) => match e.as_ref() {
-            Expr::Identifier(i) => i.value.eq_ignore_ascii_case("default"),
             Expr::Value(v) => matches!(v.value, sqlparser::ast::Value::Null),
-            _ => false,
+            other => is_default_keyword(other),
         },
         SourceValue::Value(v) => v.is_null(),
     }
@@ -8869,6 +8881,98 @@ fn resolve_projected_expr(e: &Expr, refs: &[ColumnRef]) -> EngineResult<()> {
         return Err(EngineError::unknown_column(&name, "field list"));
     }
     refuse_at_resolve([e])
+}
+
+/// Resolves the WHERE of an UPDATE or a DELETE, before any row is considered.
+///
+/// The DML half of what `resolve_projected_expr` does for a select list, and
+/// the same hole: a predicate is read once per row, so over an empty table
+/// nothing in it is resolved at all and `UPDATE Bare SET k = 1 WHERE a.b = 1`
+/// reported nought rows affected where 8.3 raises 1054. On a write that
+/// silence is the worst spelling of it — the caller cannot tell "nothing
+/// matched" from "the statement was illegal".
+///
+/// `'where clause'`, which is where 8.3 puts it and *not* where this engine
+/// used to: the per-row path raised the name through the evaluator, which
+/// reports every unknown name as being in the field list, so `DELETE FROM S
+/// WHERE nope = 1` over a table with rows in it said `in 'field list'` where
+/// 8.3 says `in 'where clause'`.
+///
+/// One definition for the four entry points that have a WHERE — `update`,
+/// `update_joined`, `delete` and `delete_joined` — so a mutation to it neuters
+/// every one of them at once, and a clause the next statement form needs is a
+/// single line.
+///
+/// `INSERT ... ON DUPLICATE KEY UPDATE` is the write this does *not* reach and
+/// the same hole is still open there: its assignments are read only for a row
+/// that actually collides, so `INSERT INTO Bare (id, k) VALUES (1, 1) ON
+/// DUPLICATE KEY UPDATE k = a.b` inserts and reports success where 8.3 raises
+/// 1054. Left rather than folded in, because that clause resolves `VALUES(x)`
+/// and the insert's own column list as well, and getting its scope wrong
+/// refuses legal SQL — the failure this whole mechanism is careful about.
+fn resolve_dml_where(selection: Option<&Expr>, refs: &[ColumnRef]) -> EngineResult<()> {
+    let Some(predicate) = selection else {
+        return Ok(());
+    };
+    if let Some(name) = unresolved_column(predicate, refs) {
+        return Err(EngineError::unknown_column(&name, "where clause"));
+    }
+    // After the name, because 8.3 resolves names first: `UPDATE LE SET s = 'x'
+    // WHERE nope = 1 AND s LIKE 'a' ESCAPE '!!'` is 1054 there and was 1210
+    // here — the ordering #0087 recorded as this issue's to correct.
+    refuse_at_resolve([predicate])
+}
+
+/// Resolves the values an UPDATE assigns, before any row is considered.
+///
+/// The other half of the same hole, and the one the issue leads with: `UPDATE
+/// Bare SET k = a.b` over an empty table affected nought rows where 8.3 raises
+/// 1054. `'field list'`, measured — 8.3 names an assigned value's clause the
+/// same way it names a selected one's.
+///
+/// Left where #0087 put the ESCAPE guard, which is ahead of the assignment
+/// *targets*. 8.3 settles the targets first, so a statement whose target and
+/// whose value are both unknown is reported here by its value where 8.3
+/// reports it by its target: `UPDATE Bare SET k = nope1, nope2 = 1` names
+/// `nope1` and 8.3 names `nope2`. Both are 1054 in the field list and the
+/// difference is which name the message carries, where moving this below the
+/// targets would trade it for a difference in *code* — the generated-column
+/// refusal lives in that loop, and `UPDATE Gn SET g = 1, k = nope` is 1054 on
+/// 8.3 and not 3105.
+/// Per assignment rather than every name and then every ESCAPE, because that
+/// is how the select list settles the same pair: `SELECT ('a' LIKE 'b' ESCAPE
+/// '!!'), nope FROM t` is 1210 on 8.3 and the first item's problem wins.
+fn resolve_assigned_values(assignments: &[Assignment], refs: &[ColumnRef]) -> EngineResult<()> {
+    for assignment in assignments {
+        // `SET k = DEFAULT` writes the column's declared default, and the
+        // parser hands it over as a bare identifier indistinguishable from a
+        // column called `DEFAULT` — the same shape `writes_nothing` has to
+        // recognise on the INSERT path. Resolving it as a name refused a
+        // statement 8.3 accepts, which is the direction that matters: over an
+        // empty table `UPDATE Bare SET k = DEFAULT` answered nothing affected
+        // before this guard existed and 1054 with it.
+        //
+        // Exempted rather than implemented. The evaluator still has no
+        // meaning for it, so the same statement over a table *with* rows in it
+        // is 1054 here as it was before — a gap of its own, and one this
+        // change must not widen rather than one it can close in passing.
+        if is_default_keyword(&assignment.value) {
+            continue;
+        }
+        if let Some(name) = unresolved_column(&assignment.value, refs) {
+            return Err(EngineError::unknown_column(&name, "field list"));
+        }
+        refuse_at_resolve([&assignment.value])?;
+    }
+    Ok(())
+}
+
+/// Whether an expression is the bare `DEFAULT` keyword.
+///
+/// It parses as an identifier, so nothing about the AST distinguishes it from
+/// a column of that name; every walk that reads a written value has to know.
+fn is_default_keyword(e: &Expr) -> bool {
+    matches!(e, Expr::Identifier(i) if i.value.eq_ignore_ascii_case("default"))
 }
 
 /// Resolves every name and every ESCAPE in a select list.

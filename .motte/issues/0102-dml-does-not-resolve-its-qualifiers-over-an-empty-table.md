@@ -1,11 +1,11 @@
 ---
 id: 102
 title: DML does not resolve its qualifiers over an empty table
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-08-25T14:48:58Z
-updated: 2026-08-31T17:24:08Z
+updated: 2026-09-03T04:09:47Z
 ---
 
 ## Description

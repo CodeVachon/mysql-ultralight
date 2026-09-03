@@ -4918,6 +4918,199 @@ fn an_out_of_scope_qualifier_is_an_unknown_column() {
     );
 }
 
+/// An UPDATE or a DELETE resolves its names before it looks at a row.
+///
+/// The write half of the hole #0058 closed for SELECT, and the worse half: a
+/// name is only resolved when a row is evaluated against it, so over an empty
+/// table nothing was resolved and the statement reported nought rows affected.
+/// `Affected { rows: 0 }` is exactly what a WHERE that matched nothing looks
+/// like, so the caller could not tell "nothing matched" from "the statement was
+/// illegal". Every code below was measured on 8.3.
+///
+/// Every statement here is one where the clause is evaluated for *no* row,
+/// which is what a mutation moving the check back into the row path cannot
+/// survive: the whole zero-rows checklist — an empty table, `WHERE 1 = 0`,
+/// `LIMIT 0` and a CASE branch nothing takes.
+#[test]
+fn dml_resolves_its_names_even_where_no_row_evaluates_them() {
+    let (engine, mut session) = engine();
+    for ddl in [
+        "CREATE TABLE Bare (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+        "CREATE TABLE Other (id INT NOT NULL, q INT NULL, PRIMARY KEY (id))",
+        "CREATE TABLE Pop (id INT NOT NULL, s VARCHAR(20) NULL, PRIMARY KEY (id))",
+    ] {
+        run(&engine, &mut session, ddl);
+    }
+    run(&engine, &mut session, "INSERT INTO Other VALUES (1, 7)");
+    run(&engine, &mut session, "INSERT INTO Pop VALUES (1, 'a')");
+
+    // The clause name is asserted with the code, because it is the half that
+    // was wrong even where the statement did refuse: the evaluator reports
+    // every unknown name as being in the field list, so `DELETE FROM Pop WHERE
+    // nope = 1` over a table with rows in it said `in 'field list'` where 8.3
+    // says `in 'where clause'`.
+    for (sql, message) in [
+        // An empty table, through every clause each of the four entry points
+        // reaches. `Bare` has no rows, so nothing evaluates any of these.
+        (
+            "UPDATE Bare SET k = 1 WHERE a.b = 1",
+            "Unknown column 'a.b' in 'where clause'",
+        ),
+        (
+            "UPDATE Bare SET k = 1 WHERE nope = 1",
+            "Unknown column 'nope' in 'where clause'",
+        ),
+        (
+            "DELETE FROM Bare WHERE a.b = 1",
+            "Unknown column 'a.b' in 'where clause'",
+        ),
+        (
+            "UPDATE Bare SET k = a.b",
+            "Unknown column 'a.b' in 'field list'",
+        ),
+        // A join with an empty side produces no pair of rows, so the joined
+        // paths settle their WHERE for no row at all.
+        (
+            "UPDATE Bare a JOIN Other b ON a.id = b.id SET a.k = 1 WHERE zz.q = 1",
+            "Unknown column 'zz.q' in 'where clause'",
+        ),
+        (
+            "UPDATE Bare a JOIN Other b ON a.id = b.id SET a.k = zz.q",
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "DELETE a FROM Bare a JOIN Other b ON a.id = b.id WHERE zz.q = 1",
+            "Unknown column 'zz.q' in 'where clause'",
+        ),
+        // The USING spelling of the same statement, which reaches
+        // `delete_joined` by the other road.
+        (
+            "DELETE FROM a USING Bare a JOIN Other b ON a.id = b.id WHERE zz.q = 1",
+            "Unknown column 'zz.q' in 'where clause'",
+        ),
+        // A table that *has* rows, refused for the other three reasons a
+        // clause can go unevaluated: a filter nothing survives, a LIMIT of
+        // none, and a branch nothing takes.
+        (
+            "UPDATE Pop SET s = 'x' WHERE 1 = 0 AND a.b = 1",
+            "Unknown column 'a.b' in 'where clause'",
+        ),
+        (
+            "DELETE FROM Pop WHERE 1 = 0 AND a.b = 1",
+            "Unknown column 'a.b' in 'where clause'",
+        ),
+        (
+            "UPDATE Pop SET s = 'x' WHERE a.b = 1 LIMIT 0",
+            "Unknown column 'a.b' in 'where clause'",
+        ),
+        (
+            "DELETE FROM Pop WHERE a.b = 1 LIMIT 0",
+            "Unknown column 'a.b' in 'where clause'",
+        ),
+        (
+            "UPDATE Pop SET s = CASE WHEN 0 THEN a.b ELSE 'z' END",
+            "Unknown column 'a.b' in 'field list'",
+        ),
+        // Named without a qualifier, which is the same resolution and a
+        // different spelling of the message.
+        (
+            "DELETE FROM Pop WHERE nope = 1",
+            "Unknown column 'nope' in 'where clause'",
+        ),
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, 1054, "expected ER_BAD_FIELD_ERROR for: {sql}");
+        assert_eq!(err.message, message, "for: {sql}");
+    }
+
+    // The orderings, each measured on 8.3 rather than assumed.
+    for (sql, code, why) in [
+        // A missing table comes first, so the guard sits after the table is
+        // resolved and not before it.
+        (
+            "UPDATE nosuch SET k = 1 WHERE a.b = 1",
+            1146,
+            "1146 is answered before 1054",
+        ),
+        (
+            "DELETE FROM nosuch WHERE a.b = 1",
+            1146,
+            "1146 is answered before 1054",
+        ),
+        // The name beats the malformed ESCAPE, which is the ordering #0087
+        // recorded as this one's to correct: it answered 1210 here.
+        (
+            "UPDATE Pop SET s = 'x' WHERE nope = 1 AND s LIKE 'a' ESCAPE '!!'",
+            1054,
+            "1054 is resolved before 1210",
+        ),
+        (
+            "DELETE FROM Pop WHERE nope = 1 AND s LIKE 'a' ESCAPE '!!'",
+            1054,
+            "1054 is resolved before 1210",
+        ),
+        // And the predicate's ESCAPE still beats an unknown assignment
+        // target, so the WHERE is settled ahead of the SET either way.
+        (
+            "UPDATE Pop SET nope = 'x' WHERE s LIKE 'a' ESCAPE '!!'",
+            1210,
+            "the predicate is settled before the assignment target",
+        ),
+        // Which tables a multi-table DELETE names is settled before its
+        // predicate: 8.3 answers 1066 for the repeated target.
+        (
+            "DELETE a, a FROM Bare a JOIN Other b ON a.id = b.id WHERE nope = 1",
+            1066,
+            "1066 is answered before 1054",
+        ),
+        // A repeated alias in the FROM of a joined UPDATE, likewise.
+        (
+            "UPDATE Bare a JOIN Bare a ON 1 SET a.k = 1 WHERE nope = 1",
+            1066,
+            "1066 is answered before 1054",
+        ),
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, code, "{why}, for: {sql}");
+    }
+
+    // Nothing legal now refuses, which is the direction that matters: #0058's
+    // first attempt at this resolver rejected a back-quoted qualifier, and
+    // only review caught it. A correlated reference is the other trap — it
+    // resolves against the enclosing row rather than against the subquery's
+    // own FROM, and a walk that descended into the subquery would refuse it.
+    for sql in [
+        "UPDATE Pop SET s = 'x' WHERE id IN (SELECT id FROM Other WHERE Other.q = Pop.id)",
+        "UPDATE Pop SET s = 'x' WHERE EXISTS (SELECT 1 FROM Other o WHERE o.id = Pop.id)",
+        "UPDATE Pop SET s = (SELECT 'y' FROM Other o WHERE o.id = Pop.id)",
+        "UPDATE Pop p SET p.s = 'x' WHERE p.id = 1",
+        "UPDATE `Pop` SET `s` = 'x' WHERE `Pop`.`id` = 1",
+        "UPDATE testdb.Pop SET s = 'x' WHERE testdb.Pop.id = 1",
+        "UPDATE Pop SET s = 'x' WHERE @@sql_mode IS NOT NULL",
+        "UPDATE Pop SET s = 'x' WHERE TIMESTAMPDIFF(DAY, '2026-01-01', '2026-03-05') > 1",
+        "DELETE FROM Pop WHERE `Pop`.`id` = 99",
+        "DELETE a FROM Pop a JOIN Other b ON a.id = b.id WHERE b.q = 99",
+        // `DEFAULT` in a value position parses as an identifier, so a resolver
+        // that does not know the keyword reports it as an unknown column and
+        // refuses a statement 8.3 accepts. Over the empty table, which is the
+        // only shape this engine answers at all: the evaluator has no meaning
+        // for the keyword either, so the same statement over rows is still
+        // 1054 — a gap of its own, and not one this guard may widen.
+        "UPDATE Bare SET k = DEFAULT",
+        "UPDATE Bare a JOIN Other b ON a.id = b.id SET a.k = DEFAULT",
+    ] {
+        run(&engine, &mut session, sql);
+    }
+
+    // Every refusal above left the tables as they were, and every legal write
+    // above touched only the one row it was aimed at.
+    assert!(rows(&engine, &mut session, "SELECT id FROM Bare").is_empty());
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id, s FROM Pop ORDER BY id"),
+        vec![vec!["1", "x"]]
+    );
+}
+
 #[test]
 fn a_self_join_update_counts_each_physical_row_once() {
     let (engine, mut session) = engine();
@@ -5796,6 +5989,346 @@ fn cast_to_an_integer_reads_the_leading_number() {
             "18446744073709551615",
             "0"
         ]]
+    );
+}
+
+#[test]
+fn cast_to_an_integer_rounds_an_exact_operand_half_away_from_zero() {
+    // #0120: this truncated toward zero, so `CAST(1.5 AS SIGNED)` was 1
+    // against 8.3's 2 and `CAST(2.5 AS SIGNED)` was 2 against its 3. Every
+    // number below measured on mysql:8.3.
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(0.5 AS SIGNED), CAST(1.5 AS SIGNED), CAST(2.5 AS SIGNED), \
+                    CAST(3.5 AS SIGNED), CAST(-0.5 AS SIGNED), CAST(-1.5 AS SIGNED), \
+                    CAST(-2.5 AS SIGNED)"
+        ),
+        vec![vec!["1", "2", "3", "4", "-1", "-2", "-3"]]
+    );
+
+    // Either side of a half as well, so the assertion says *rounding* and not
+    // "a fraction adds one": 1.49 has to stay 1 while 1.51 becomes 2.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(1.49 AS SIGNED), CAST(1.51 AS SIGNED), \
+                    CAST(-1.49 AS SIGNED), CAST(-1.51 AS SIGNED)"
+        ),
+        vec![vec!["1", "2", "-1", "-2"]]
+    );
+
+    // UNSIGNED shares the reading, because rounding one target and not the
+    // other would leave `CAST(1.5 AS SIGNED)` and `CAST(1.5 AS UNSIGNED)`
+    // disagreeing about 1.5. A negative rounds *before* it wraps, which is
+    // what puts -1.5 two below the maximum rather than one.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(1.5 AS UNSIGNED), CAST(2.5 AS UNSIGNED), CAST(-1.5 AS UNSIGNED), \
+                    CAST(-2.5 AS UNSIGNED), CAST(-0.5 AS UNSIGNED), CAST(-0.4 AS UNSIGNED)"
+        ),
+        vec![vec![
+            "2",
+            "3",
+            "18446744073709551614",
+            "18446744073709551613",
+            "18446744073709551615",
+            "0"
+        ]]
+    );
+
+    // A decimal that arrived by arithmetic or a cast is exact in the same
+    // way, and 5/2 is here because a quotient is where an application meets
+    // this: 8.3 answers 3.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(1.25 + 1.25 AS SIGNED), CAST(5/2 AS SIGNED), \
+                    CAST(CAST('2.5' AS DECIMAL(10,1)) AS SIGNED)"
+        ),
+        vec![vec!["3", "3", "3"]]
+    );
+}
+
+#[test]
+fn cast_to_an_integer_counts_a_stored_decimal_rather_than_reading_a_double() {
+    // The scale the value is stored at does not change the rule, and the
+    // widest row is the one that says the count is exact: 4503599627370496.5
+    // is 2^52 and a half, which no `f64` can hold, so a reading that goes
+    // through one answers ...496 where 8.3 answers ...497.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Scales (d1 DECIMAL(10,1), d2 DECIMAL(10,2), d5 DECIMAL(20,5), \
+                              wide DECIMAL(20,1))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Scales VALUES (2.5, 2.505, 2.500005, 4503599627370496.5), \
+                                   (-2.5, -2.505, -2.500005, -4503599627370496.5)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(d1 AS SIGNED), CAST(d2 AS SIGNED), CAST(d5 AS SIGNED), \
+                    CAST(wide AS SIGNED) FROM Scales"
+        ),
+        vec![
+            vec!["3", "3", "3", "4503599627370497"],
+            vec!["-3", "-3", "-3", "-4503599627370497"],
+        ]
+    );
+}
+
+#[test]
+fn cast_to_an_integer_rounds_an_approximate_operand_half_to_even() {
+    // An approximate operand does *not* share the exact one's rule, which is
+    // measured and not assumed — the same split #0130 found under `HEX`.
+    // Truncating agreed with this rule wherever the digit it kept was already
+    // even, which is why 2.5e0 was right here while 1.5e0 was not.
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(0.5e0 AS SIGNED), CAST(1.5e0 AS SIGNED), CAST(2.5e0 AS SIGNED), \
+                    CAST(3.5e0 AS SIGNED), CAST(4.5e0 AS SIGNED), CAST(-1.5e0 AS SIGNED), \
+                    CAST(-2.5e0 AS SIGNED)"
+        ),
+        vec![vec!["0", "2", "2", "4", "4", "-2", "-2"]]
+    );
+
+    // The two rules in one row, which is the pair this test exists for.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(2.5 AS SIGNED), CAST(2.5e0 AS SIGNED)"
+        ),
+        vec![vec!["3", "2"]]
+    );
+
+    // Stored, and a FLOAT beside the DOUBLE: both are approximate, so both
+    // take the even rule however wide the column is.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Approx (d DOUBLE, f FLOAT)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Approx VALUES (2.5, 2.5), (1.5, 1.5)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(d AS SIGNED), CAST(f AS SIGNED) FROM Approx"
+        ),
+        vec![vec!["2", "2"], vec!["2", "2"]]
+    );
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(1.5e0 AS UNSIGNED), CAST(-1.5e0 AS UNSIGNED), CAST(-2.5e0 AS UNSIGNED)"
+        ),
+        vec![vec!["2", "18446744073709551614", "18446744073709551614"]]
+    );
+}
+
+#[test]
+fn cast_to_an_integer_truncates_a_string_rather_than_rounding_it() {
+    // A third rule, and the one the rounding above must not be extended to:
+    // MySQL reads a string's leading *integer* and warns about the rest, so
+    // `CAST('1.5' AS SIGNED)` is 1 on 8.3 where `CAST(1.5 AS SIGNED)` is 2.
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('1.5' AS SIGNED), CAST('1.9' AS SIGNED), CAST('0.9' AS SIGNED), \
+                    CAST('-1.9' AS SIGNED), CAST('2.5' AS SIGNED), CAST(1.5 AS SIGNED)"
+        ),
+        vec![vec!["1", "1", "0", "-1", "2", "2"]]
+    );
+
+    // It stops at the first character that is not part of an integer, which
+    // reading the text as a *number* first does not: an exponent belongs to a
+    // double and not to this, and `inf` and `nan` are not numbers here at all.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('1e30' AS SIGNED), CAST('1e3' AS SIGNED), \
+                    CAST('1.9e3' AS SIGNED), CAST('0x1F' AS SIGNED), \
+                    CAST('12 34' AS SIGNED)"
+        ),
+        vec![vec!["1", "1", "1", "0", "12"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('inf' AS SIGNED), CAST('-inf' AS SIGNED), \
+                    CAST('nan' AS SIGNED), CAST('inf' AS UNSIGNED)"
+        ),
+        vec![vec!["0", "0", "0", "0"]]
+    );
+    // A lone sign is 0 and not a saturation, which is what separates "no
+    // digits" from "more digits than fit".
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('- 12' AS SIGNED), CAST('--12' AS SIGNED), \
+                    CAST('' AS SIGNED), CAST('  +12' AS SIGNED)"
+        ),
+        vec![vec!["0", "0", "0", "12"]]
+    );
+    // A document is not a string: 8.3 reads a JSON *number* as the number it
+    // is, so this saturates into the signed range where the string spelling
+    // the same digits is read for its leading integer.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(CAST('1e30' AS JSON) AS SIGNED), CAST('1e30' AS SIGNED)"
+        ),
+        vec![vec!["9223372036854775807", "1"]]
+    );
+    // More digits than an `i128` counts, saturating at the unsigned boundary
+    // in each direction and then reinterpreted by the target.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('99999999999999999999999999999999999999999' AS SIGNED), \
+                    CAST('99999999999999999999999999999999999999999' AS UNSIGNED), \
+                    CAST('-99999999999999999999999999999999999999999' AS SIGNED), \
+                    CAST('-99999999999999999999999999999999999999999' AS UNSIGNED)"
+        ),
+        vec![vec![
+            "-1",
+            "18446744073709551615",
+            "-9223372036854775808",
+            "9223372036854775808"
+        ]]
+    );
+}
+
+#[test]
+fn cast_to_an_integer_saturates_by_the_range_its_operand_carries() {
+    // Three different boundaries, all measured, and the rounding above had to
+    // be put in front of every one of them.
+    let (engine, mut session) = engine();
+
+    // An exact operand saturates into the target's own range.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(99999999999999999999 AS SIGNED), \
+                    CAST(-99999999999999999999 AS SIGNED), \
+                    CAST(99999999999999999999 AS UNSIGNED), \
+                    CAST(-99999999999999999999 AS UNSIGNED)"
+        ),
+        vec![vec![
+            "9223372036854775807",
+            "-9223372036854775808",
+            "18446744073709551615",
+            "9223372036854775808"
+        ]]
+    );
+
+    // Past the 38 digits an `i128` counts, where the answer comes from the
+    // sign alone. MySQL's DECIMAL holds 65 digits, so these are values it
+    // gives an answer for rather than refusing.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(99999999999999999999999999999999999999999 AS SIGNED), \
+                    CAST(-99999999999999999999999999999999999999999 AS SIGNED), \
+                    CAST(99999999999999999999999999999999999999999 AS UNSIGNED), \
+                    CAST(-99999999999999999999999999999999999999999 AS UNSIGNED)"
+        ),
+        vec![vec![
+            "9223372036854775807",
+            "-9223372036854775808",
+            "18446744073709551615",
+            "9223372036854775808"
+        ]]
+    );
+
+    // An approximate operand converts through a *signed* longlong whichever
+    // integer it was asked for, so its unsigned answer stops at the signed
+    // maximum where an exact operand of the same size reaches the unsigned
+    // one. 1e19 is inside `u64` and still stops there.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Huge (id INT NOT NULL, d DOUBLE, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Huge VALUES (1, 1e30), (2, -1e30)",
+    );
+    // Ordered for the same reason the decimal test above is: the two rows say
+    // different things, so without it the assertion is about the scan order
+    // as much as about the conversion.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(d AS SIGNED), CAST(d AS UNSIGNED) FROM Huge ORDER BY id"
+        ),
+        vec![
+            vec!["9223372036854775807", "9223372036854775807"],
+            vec!["-9223372036854775808", "9223372036854775808"],
+        ]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT CAST(1e19 AS UNSIGNED)"),
+        vec![vec!["9223372036854775807"]]
+    );
+
+    // A string saturates at the *unsigned* boundary and the signed target
+    // reinterprets those bits, which is why the same digits answer -1 as text
+    // and 9223372036854775807 as a decimal literal.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('99999999999999999999' AS SIGNED), \
+                    CAST('99999999999999999999' AS UNSIGNED), \
+                    CAST(99999999999999999999 AS SIGNED)"
+        ),
+        vec![vec!["-1", "18446744073709551615", "9223372036854775807"]]
+    );
+
+    // An integer literal above `i64::MAX` and inside `u64` is one MySQL holds
+    // unsigned, so the signed cast hands its bits back rather than saturating.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(10000000000000000000 AS SIGNED), \
+                    CAST(10000000000000000000 AS UNSIGNED)"
+        ),
+        vec![vec!["-8446744073709551616", "10000000000000000000"]]
     );
 }
 

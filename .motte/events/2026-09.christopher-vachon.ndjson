@@ -49,3 +49,8 @@
 {"at":"2026-09-03T03:55:00Z","id":132,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-09-03T04:07:42Z","id":163,"by":"Christopher Vachon","as":"user","type":"created","title":"FROM DUAL is not a one-row table","state":"Todo"}
 {"at":"2026-09-03T04:07:42Z","id":164,"by":"Christopher Vachon","as":"user","type":"created","title":"check.sh exits non-zero on its own skip path","state":"Todo"}
+{"at":"2026-09-03T04:09:34Z","id":158,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T04:09:46Z","id":88,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T04:09:47Z","id":120,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T04:09:47Z","id":102,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T04:51:36Z","id":165,"by":"Christopher Vachon","as":"user","type":"created","title":"ON DUPLICATE KEY UPDATE does not resolve its names","state":"Todo"}
