@@ -214,12 +214,14 @@ impl SqlType {
     /// view or table value constructor fed back in as a relation, which all
     /// read their columns through `from_column_type`.
     ///
-    /// Not every typeless column comes through one of those. A scalar subquery
-    /// is typed by `computed_column_type`, which has no arm for one and falls
-    /// to its string catch-all, so `SELECT (SELECT NULL UNION SELECT NULL)` is
-    /// VAR_STRING here against `binary(0)` on 8.3 — and `SELECT (SELECT NULL)`
-    /// VAR_STRING against `MYSQL_TYPE_NULL`. That is #0104, whose cause is the
-    /// missing arm rather than the materialising, and it is untouched here.
+    /// A scalar subquery reaches it through the first of those, and only
+    /// because it is described at the `query` boundary rather than at
+    /// `query_with_outer`'s: `SELECT (SELECT NULL UNION SELECT NULL)` is
+    /// `binary(0)` and `SELECT (SELECT NULL)` is `MYSQL_TYPE_NULL`, which is
+    /// what 8.3 answers for both. That was #0104 — `computed_column_type` had
+    /// no arm for a subquery and fell to its string catch-all — and the arm it
+    /// has now hands back whatever the inner query was described with,
+    /// materialised or not.
     pub fn materialised_null() -> Self {
         Self {
             kind: TypeKind::Blob,

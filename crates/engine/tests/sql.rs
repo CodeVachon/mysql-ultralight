@@ -5605,6 +5605,284 @@ fn dml_resolves_its_names_even_where_no_row_evaluates_them() {
     );
 }
 
+/// `ON DUPLICATE KEY UPDATE` resolves its names before anything collides.
+///
+/// The fifth entry point with #0009's recurring shape, and the one #0102 left
+/// out: the clause is read only for a row that actually *does* collide, so on
+/// an empty table, against a row with a different key, or on a table with no
+/// unique key at all, nothing in it was resolved — `INSERT INTO Dup (id, k)
+/// VALUES (1, 1) ON DUPLICATE KEY UPDATE k = a.b` inserted the row and
+/// reported success where 8.3 raises 1054. "No collision" is this clause's
+/// spelling of "no rows", so every refusal below is asserted over one.
+///
+/// The scope was measured rather than copied from the WHERE path, because
+/// #0102's review had already shown what a wrong scope costs: it is the target
+/// table's columns, `VALUES(x)` included and the insert's own column list
+/// adding nothing to it. The `INSERT ... SELECT` and row-alias forms have a
+/// *wider* scope on 8.3 and are left unresolved for that reason — they are in
+/// the legal list below, where a guard that overreached would show up.
+#[test]
+fn on_duplicate_key_update_resolves_its_names_before_anything_collides() {
+    let (engine, mut session) = engine();
+    for ddl in [
+        // Empty, which is the shape the hole hides in.
+        "CREATE TABLE Dup (id INT NOT NULL, k INT NULL, s VARCHAR(20) NULL, PRIMARY KEY (id))",
+        // One row, so the clause can be asked both with a collision and with
+        // a key that misses one.
+        "CREATE TABLE Hit (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+        // No unique key at all, so nothing can ever collide here.
+        "CREATE TABLE NoKey (a INT NULL, b INT NULL)",
+        "CREATE TABLE Gen (id INT NOT NULL, k INT NULL, g INT AS (k + 1), PRIMARY KEY (id))",
+        "CREATE TABLE Src (a INT NULL, b INT NULL)",
+    ] {
+        run(&engine, &mut session, ddl);
+    }
+    run(&engine, &mut session, "INSERT INTO Hit VALUES (1, 5)");
+    run(&engine, &mut session, "INSERT INTO Src VALUES (7, 8)");
+
+    // 8.3 names this clause `'field list'` for both halves of an assignment,
+    // the same way it names a selected item's and an UPDATE's assigned value.
+    for (sql, message) in [
+        // The issue's own example, over the empty table.
+        (
+            "INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE k = a.b",
+            "Unknown column 'a.b' in 'field list'",
+        ),
+        (
+            "INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE k = nope",
+            "Unknown column 'nope' in 'field list'",
+        ),
+        // `VALUES(x)` names a column of the target table, so an unknown one is
+        // the same refusal — and the qualifier is compared rather than
+        // dropped, as everywhere else a name is read here.
+        (
+            "INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE k = VALUES(nope)",
+            "Unknown column 'nope' in 'field list'",
+        ),
+        (
+            "INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE k = VALUES(a.b)",
+            "Unknown column 'a.b' in 'field list'",
+        ),
+        (
+            "INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE k = nodb.Dup.k",
+            "Unknown column 'nodb.Dup.k' in 'field list'",
+        ),
+        // A row that exists and a key that does not meet it: the insert
+        // succeeds, so the clause is never reached at all.
+        (
+            "INSERT INTO Hit (id, k) VALUES (2, 1) ON DUPLICATE KEY UPDATE k = nope",
+            "Unknown column 'nope' in 'field list'",
+        ),
+        // A table with no unique key, where a collision is not merely absent
+        // but impossible.
+        (
+            "INSERT INTO NoKey (a) VALUES (1) ON DUPLICATE KEY UPDATE b = nope",
+            "Unknown column 'nope' in 'field list'",
+        ),
+        // A branch nothing takes, which is the rest of #0009's checklist: even
+        // a collision would not evaluate this name.
+        (
+            "INSERT INTO Hit (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE \
+             k = CASE WHEN 0 THEN nope ELSE 1 END",
+            "Unknown column 'nope' in 'field list'",
+        ),
+        // And with a collision, where the evaluator would have reached the
+        // name anyway — the case that always worked, kept so the guard is not
+        // measured only by the rows it does not have.
+        (
+            "INSERT INTO Hit (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE k = nope",
+            "Unknown column 'nope' in 'field list'",
+        ),
+        // The target half, which #0125 hoisted out of the collision branch
+        // for this same reason. Here so a mutation to either line is caught.
+        (
+            "INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE nope = 1",
+            "Unknown column 'nope' in 'field list'",
+        ),
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, 1054, "expected ER_BAD_FIELD_ERROR for: {sql}");
+        assert_eq!(err.message, message, "for: {sql}");
+    }
+
+    // The orderings, every one measured on 8.3. They are what makes this
+    // worth more than a refusal each: the clause sits behind four of the
+    // insert's own checks and in front of none of them.
+    for (sql, code, why) in [
+        (
+            "INSERT INTO nosuch (k) VALUES (1) ON DUPLICATE KEY UPDATE k = nope",
+            1146,
+            "a missing table is answered before the clause is resolved",
+        ),
+        (
+            "INSERT INTO Dup (nope2) VALUES (1) ON DUPLICATE KEY UPDATE k = nope",
+            1054,
+            "the insert's own column list resolves first",
+        ),
+        (
+            "INSERT INTO Dup (id, k) VALUES (1) ON DUPLICATE KEY UPDATE k = nope",
+            1136,
+            "the value count is settled before the clause",
+        ),
+        (
+            "INSERT INTO Gen (g) VALUES (1) ON DUPLICATE KEY UPDATE k = nope",
+            3105,
+            "a generated column in the insert list is settled before the clause",
+        ),
+        // The same two checks reached by their other road — a *later* value
+        // list rather than the column list, which is where the engine settles
+        // them for the statement rather than for a row.
+        (
+            "INSERT INTO Dup (id, k) VALUES (1, 1), (2) ON DUPLICATE KEY UPDATE k = nope",
+            1136,
+            "a later row's value count is settled before the clause",
+        ),
+        (
+            "INSERT INTO Gen VALUES (1, 1, 1) ON DUPLICATE KEY UPDATE k = nope",
+            3105,
+            "a written value for a generated column is settled before the clause",
+        ),
+        // 1582 comes out of 8.3's parser, so it precedes even a missing
+        // table; the malformed ESCAPE does not. Both spellings measured.
+        (
+            "INSERT INTO nosuch (k) VALUES (1) ON DUPLICATE KEY UPDATE k = SIGN(1, 2)",
+            1582,
+            "1582 is raised in the parser, ahead of 1146",
+        ),
+        (
+            "INSERT INTO nosuch (k) VALUES (1) ON DUPLICATE KEY UPDATE \
+             k = ('a' LIKE 'b' ESCAPE '!!')",
+            1146,
+            "1210 is a resolve-time refusal, so 1146 comes first",
+        ),
+        // Within the clause: every target resolves before any value. This is
+        // the opposite of the order the same pair settles in for an UPDATE,
+        // which is why it had to be measured rather than reused.
+        (
+            "INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE k = nope2, nope1 = 1",
+            1054,
+            "the whole target list resolves before any value",
+        ),
+        (
+            "INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE \
+             nope1 = ('a' LIKE 'b' ESCAPE '!!')",
+            1054,
+            "an unknown target beats a malformed ESCAPE in its own value",
+        ),
+        // Among the values, the name and the ESCAPE interleave by position,
+        // exactly as they do in a select list and in an UPDATE's SET: these
+        // two differ only in the order of the assignments.
+        (
+            "INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE \
+             k = ('a' LIKE 'b' ESCAPE '!!'), s = nope",
+            1210,
+            "the first assignment's problem wins",
+        ),
+        (
+            "INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE \
+             k = nope, s = ('a' LIKE 'b' ESCAPE '!!')",
+            1054,
+            "the first assignment's problem wins",
+        ),
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, code, "{why}, for: {sql}");
+    }
+    // Which name the first of those carries, not just that it refuses: a guard
+    // that resolved the values before the targets would still answer 1054.
+    assert_eq!(
+        refusal_of(
+            &engine,
+            &mut session,
+            "INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE k = nope2, nope1 = 1",
+        )
+        .message,
+        "Unknown column 'nope1' in 'field list'"
+    );
+
+    // Nothing legal now refuses, which is the direction #0102's review made
+    // the point about — it caught `SET col = DEFAULT` being read as a column
+    // called DEFAULT. Each id is its own, so none of these collides and the
+    // table below says exactly which ones ran.
+    for sql in [
+        // A column of the table the insert did not name, bare and through
+        // `VALUES()`: the insert's column list is not the scope.
+        "INSERT INTO Dup (id, k) VALUES (11, 1) ON DUPLICATE KEY UPDATE s = s",
+        "INSERT INTO Dup (id, k) VALUES (12, 1) ON DUPLICATE KEY UPDATE s = VALUES(s)",
+        "INSERT INTO Dup (id, k) VALUES (13, 1) ON DUPLICATE KEY UPDATE k = VALUES(k)",
+        "INSERT INTO Dup (id, k) VALUES (14, 1) ON DUPLICATE KEY UPDATE k = VALUES(Dup.k)",
+        // The target table by name, by database and by back-quoted spelling.
+        "INSERT INTO Dup (id, k) VALUES (15, 1) ON DUPLICATE KEY UPDATE k = Dup.k + 1",
+        "INSERT INTO Dup (id, k) VALUES (16, 1) ON DUPLICATE KEY UPDATE k = testdb.Dup.k + 1",
+        "INSERT INTO Dup (id, k) VALUES (17, 1) ON DUPLICATE KEY UPDATE Dup.k = 1",
+        "INSERT INTO `Dup` (`id`, `k`) VALUES (18, 1) ON DUPLICATE KEY UPDATE `k` = `Dup`.`k`",
+        // `DEFAULT` parses as a bare identifier and 8.3 accepts it here, so a
+        // resolver that does not know the keyword refuses a legal statement.
+        "INSERT INTO Dup (id, k) VALUES (19, 1) ON DUPLICATE KEY UPDATE k = DEFAULT",
+        // A bare keyword that is an argument rather than a column, a variable,
+        // and a subquery resolved in its own scope.
+        "INSERT INTO Dup (id, k) VALUES (20, 1) ON DUPLICATE KEY UPDATE \
+         k = TIMESTAMPDIFF(DAY, '2026-01-01', '2026-03-05')",
+        "INSERT INTO Dup (id, k) VALUES (21, 1) ON DUPLICATE KEY UPDATE k = @v",
+        "INSERT INTO Dup (id, k) VALUES (22, 1) ON DUPLICATE KEY UPDATE k = (SELECT MAX(a) FROM Src)",
+        // The two forms whose scope is *wider* than the target table on 8.3,
+        // and which this engine does not model: the clause of an `INSERT ...
+        // SELECT` also sees the SELECT's FROM tables — `k = a` writes `Src`.`a`
+        // there and `k = x.b` reads the alias — and the row alias form names
+        // the row being inserted. Resolving either against the table alone
+        // would refuse SQL 8.3 answers, so neither is resolved at all.
+        "INSERT INTO Dup (id, k) SELECT a, b FROM Src x ON DUPLICATE KEY UPDATE k = x.b",
+        "INSERT INTO Dup (id, k) SELECT a + 100, b FROM Src x ON DUPLICATE KEY UPDATE k = a",
+        "INSERT INTO Dup (id, k) VALUES (23, 1) AS new ON DUPLICATE KEY UPDATE k = new.k",
+    ] {
+        run(&engine, &mut session, sql);
+    }
+
+    // Every refusal above stored nothing — 8.3 stores nothing for them either,
+    // and a guard that refused after writing would show up here as an extra
+    // row rather than as a failing assertion somewhere else.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Dup ORDER BY id"),
+        vec![
+            vec!["7"],
+            vec!["11"],
+            vec!["12"],
+            vec!["13"],
+            vec!["14"],
+            vec!["15"],
+            vec!["16"],
+            vec!["17"],
+            vec!["18"],
+            vec!["19"],
+            vec!["20"],
+            vec!["21"],
+            vec!["22"],
+            vec!["23"],
+            vec!["107"],
+        ]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id, k FROM Hit ORDER BY id"),
+        vec![vec!["1", "5"]]
+    );
+    assert!(rows(&engine, &mut session, "SELECT a FROM NoKey").is_empty());
+
+    // The clause still does what it is for: a collision updates the row that
+    // was there, and `VALUES(x)` is the value the insert would have written.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "INSERT INTO Hit (id, k) VALUES (1, 9) ON DUPLICATE KEY UPDATE k = VALUES(k)",
+        ),
+        2
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id, k FROM Hit ORDER BY id"),
+        vec![vec!["1", "9"]]
+    );
+}
+
 #[test]
 fn a_self_join_update_counts_each_physical_row_once() {
     let (engine, mut session) = engine();
@@ -14499,9 +14777,11 @@ fn an_enum_expression_is_typed_the_way_mysql_types_it() {
         ("SELECT MIN(e) FROM E", "String"),
         // The counterweight to the rule above: `VAR_STRING` is also the
         // answer for an expression this cannot type at all, so it must stay
-        // *out* of the string family. MySQL types this NEWDECIMAL, and the
-        // evaluator still produces an integer for it — announcing DOUBLE
-        // would have the binary protocol send eight bytes of a float.
+        // *out* of the string family. This one stood here while a scalar
+        // subquery was one of those; #0104 gave it the `INT` its column
+        // really is, and the answer is the same NEWDECIMAL for the honest
+        // reason — a total over an exact operand is exact, which is what
+        // MySQL says and what the evaluator produces.
         (
             "SELECT SUM((SELECT n FROM I WHERE id = 1)) FROM I",
             "NewDecimal",
@@ -22895,5 +23175,377 @@ fn sign_with_the_wrong_parameter_count_refuses_before_any_row() {
     assert_eq!(
         rows(&engine, &mut session, "SELECT b FROM Gen"),
         vec![vec!["-1"]]
+    );
+}
+
+/// The shape of one described column, as far as anything is compared on it:
+/// the type code, whether the values are bytes, and the two flags a computed
+/// column is still held to.
+fn column_shape(column: &mysql_ultralight_engine::OutColumn) -> String {
+    let wire = column.to_wire();
+    format!(
+        "{:?} {} {} {}",
+        column.ty,
+        if wire.charset == mysql_ultralight_protocol::column::charset::BINARY {
+            "bytes"
+        } else {
+            "characters"
+        },
+        if column.nullable { "null" } else { "notnull" },
+        if wire.flags & mysql_ultralight_protocol::column::flags::UNSIGNED != 0 {
+            "unsigned"
+        } else {
+            "signed"
+        },
+    )
+}
+
+/// A table with one column of every family, for the subquery tests below.
+fn every_type(engine: &Engine, session: &mut Session) {
+    run(
+        engine,
+        session,
+        "CREATE TABLE Ty (
+            id INT NOT NULL AUTO_INCREMENT,
+            sid INT NOT NULL,
+            su INT UNSIGNED NOT NULL,
+            sm SMALLINT NULL,
+            label VARCHAR(32) NOT NULL,
+            ch CHAR(4) NULL,
+            dec1 DECIMAL(10,3) NOT NULL,
+            fl FLOAT NULL,
+            db DOUBLE NULL,
+            d DATE NULL,
+            dt DATETIME(3) NULL,
+            tm TIME(2) NULL,
+            yr YEAR NULL,
+            e ENUM('a','b','c') NOT NULL,
+            bl BLOB NULL,
+            bn BINARY(4) NULL,
+            tx TEXT NULL,
+            PRIMARY KEY (id)
+        )",
+    );
+    run(
+        engine,
+        session,
+        "INSERT INTO Ty (sid, su, sm, label, ch, dec1, fl, db, d, dt, tm, yr, e, bl, bn, tx)
+         VALUES (1, 7, 3, 'hello', 'ab', 12.500, 1.5, 2.5, '2026-01-02',
+                 '2026-01-02 03:04:05.678', '01:02:03.45', 2026, 'b', 'bytes', 'bin', 'text')",
+    );
+    run(
+        engine,
+        session,
+        "CREATE TABLE TyE (id INT NOT NULL, v INT NOT NULL, PRIMARY KEY (id))",
+    );
+}
+
+/// A scalar subquery is described with the type of the column *it* projects.
+///
+/// Every one of these was `VAR_STRING` before, which is what the binary
+/// protocol reads the value back through: a prepared-statement client was
+/// handed the string `"1"` where MySQL hands back the number 1. Measured on
+/// 8.3 — the whole table below is what that server answers, down to the
+/// character set and the two flags.
+#[test]
+fn a_scalar_subquery_takes_the_type_of_the_column_it_projects() {
+    let (engine, mut session) = engine();
+    every_type(&engine, &mut session);
+
+    // A temporal is deliberately absent: 8.3 reports one that has been through
+    // a scalar subquery in the connection's character set where the column
+    // read from its table is binary, and this engine describes both as bytes.
+    // That is the same divergence `MIN(tm)` already has — see `value_kind` in
+    // the differential harness — and not one this change introduces.
+    let expected = [
+        // The two the issue names.
+        (
+            "SELECT (SELECT COUNT(*) FROM Ty)",
+            "LongLong bytes null signed",
+        ),
+        (
+            "SELECT (SELECT MAX(t.sid) FROM Ty t)",
+            "Long bytes null signed",
+        ),
+        // A plain column, of each family. The width is the column's, not the
+        // widening every computed column used to get: an `INT` is a LONG and a
+        // `SMALLINT` a SHORT, because the binary protocol sends by the code.
+        ("SELECT (SELECT sid FROM Ty)", "Long bytes null signed"),
+        ("SELECT (SELECT sm FROM Ty)", "Short bytes null signed"),
+        ("SELECT (SELECT su FROM Ty)", "Long bytes null unsigned"),
+        ("SELECT (SELECT yr FROM Ty)", "Year bytes null unsigned"),
+        (
+            "SELECT (SELECT dec1 FROM Ty)",
+            "NewDecimal bytes null signed",
+        ),
+        ("SELECT (SELECT fl FROM Ty)", "Float bytes null signed"),
+        ("SELECT (SELECT db FROM Ty)", "Double bytes null signed"),
+        // A `VARCHAR` and a `CHAR` differ by their code on 8.3, and both are
+        // characters; an `ENUM` reaches the wire as its member's `STRING`
+        // without the ENUM flag, which a subquery does not carry.
+        (
+            "SELECT (SELECT label FROM Ty)",
+            "VarString characters null signed",
+        ),
+        (
+            "SELECT (SELECT ch FROM Ty)",
+            "String characters null signed",
+        ),
+        ("SELECT (SELECT e FROM Ty)", "String characters null signed"),
+        // The blob family splits on the charset and not on the code: a `TEXT`
+        // is characters and a `BLOB` is bytes, and describing the second as
+        // text hands the caller a String over bytes that are not UTF-8.
+        ("SELECT (SELECT tx FROM Ty)", "Blob characters null signed"),
+        ("SELECT (SELECT bl FROM Ty)", "Blob bytes null signed"),
+        ("SELECT (SELECT bn FROM Ty)", "String bytes null signed"),
+        // An expression and a literal are typed by what the subquery computes
+        // rather than by the subquery.
+        (
+            "SELECT (SELECT sid + 1 FROM Ty)",
+            "LongLong bytes null signed",
+        ),
+        ("SELECT (SELECT 1)", "LongLong bytes notnull signed"),
+        ("SELECT (SELECT 1.5)", "NewDecimal bytes notnull signed"),
+        ("SELECT (SELECT 1e3)", "Double bytes notnull signed"),
+        ("SELECT (SELECT 'x')", "VarString characters notnull signed"),
+        // The two #0073 measured from the other side. A bare `SELECT NULL` has
+        // no type at all; the same through a set operation is the `binary(0)`
+        // its temporary table gives it, and reaching that answer means the
+        // subquery is described at the boundary `query` answers at rather than
+        // at `query_with_outer`'s.
+        ("SELECT (SELECT NULL)", "Null bytes null signed"),
+        (
+            "SELECT (SELECT NULL UNION SELECT NULL)",
+            "String bytes null signed",
+        ),
+        (
+            "SELECT (SELECT c FROM (SELECT NULL AS c) d)",
+            "String bytes null signed",
+        ),
+        // Nothing about the *rows* decides it: over an empty table, under a
+        // LIMIT, and behind a correlated predicate the column is the same.
+        ("SELECT (SELECT v FROM TyE)", "Long bytes null signed"),
+        (
+            "SELECT (SELECT sid FROM Ty LIMIT 1)",
+            "Long bytes null signed",
+        ),
+        (
+            "SELECT (SELECT t.label FROM Ty t WHERE t.id = Ty.id) FROM Ty",
+            "VarString characters null signed",
+        ),
+        // Brackets peel and nesting recurses.
+        ("SELECT ((SELECT sid FROM Ty))", "Long bytes null signed"),
+        (
+            "SELECT (SELECT (SELECT (SELECT sid FROM Ty)))",
+            "Long bytes null signed",
+        ),
+    ];
+
+    for (sql, shape) in expected {
+        let described = engine.describe(&session, sql, 0).unwrap().unwrap();
+        assert_eq!(
+            described.iter().map(column_shape).collect::<Vec<_>>(),
+            vec![shape.to_owned()],
+            "described: {sql}"
+        );
+    }
+    // The same statements executed rather than described. Describing runs the
+    // subquery over no rows and executing runs it over the real ones, so the
+    // two are separate paths through this — and a client caches the metadata
+    // from the prepare and decodes every execution against it, which only
+    // works while they agree.
+    for (sql, shape) in expected {
+        let Outcome::Rows(result) = run(&engine, &mut session, sql) else {
+            panic!("expected rows from {sql}")
+        };
+        assert_eq!(
+            result.columns.iter().map(column_shape).collect::<Vec<_>>(),
+            vec![shape.to_owned()],
+            "executed: {sql}"
+        );
+    }
+}
+
+/// A scalar subquery's NOT_NULL flag needs the query as well as the column.
+///
+/// 8.3 takes it off `(SELECT sid FROM Ty)` even though `sid` is declared NOT
+/// NULL, because the table can be empty and an empty scalar subquery is NULL —
+/// and keeps it on `(SELECT 1)`, which reads no table and filters nothing.
+/// Getting this the wrong way round is what a client acts on: Prisma maps the
+/// flag to a non-optional field.
+#[test]
+fn a_scalar_subquery_is_nullable_unless_its_query_must_answer() {
+    let (engine, mut session) = engine();
+    every_type(&engine, &mut session);
+
+    for (sql, nullable) in [
+        // Reads a table: the table can be empty, whatever the column says.
+        ("SELECT (SELECT sid FROM Ty)", true),
+        ("SELECT (SELECT COUNT(*) FROM Ty)", true),
+        // Reads none: the projection is evaluated once and always answers.
+        ("SELECT (SELECT 1)", false),
+        ("SELECT (SELECT COUNT(*))", false),
+        ("SELECT (SELECT 1 ORDER BY 1)", false),
+        // A WHERE and a HAVING can reject the one implicit row, and 8.3 says
+        // so: both of these are nullable there.
+        ("SELECT (SELECT 1 WHERE 0)", true),
+        ("SELECT (SELECT 1 HAVING 1)", true),
+        // A LIMIT is nullable here and NOT_NULL on 8.3, which never applies
+        // the clause to a constant subquery at all — `SELECT (SELECT 1 LIMIT
+        // 0)` answers 1 there and NULL here. Following the flag would put
+        // NOT_NULL over a NULL this engine really does send.
+        ("SELECT (SELECT 1 LIMIT 0)", true),
+        // A UNION of two certain branches is certain; the operators that take
+        // rows *away* are not, and 8.3 agrees — both of these are nullable
+        // there and both answer NULL here.
+        ("SELECT (SELECT 1 UNION SELECT 1)", false),
+        ("SELECT (SELECT 1 EXCEPT SELECT 1)", true),
+        ("SELECT (SELECT 1 INTERSECT SELECT 2)", true),
+        // The literal decides it as much as the query does.
+        ("SELECT (SELECT NULL)", true),
+        // And it travels: a subquery inside a subquery inside brackets.
+        ("SELECT ((SELECT (SELECT 1)))", false),
+    ] {
+        let described = engine.describe(&session, sql, 0).unwrap().unwrap();
+        assert_eq!(described[0].nullable, nullable, "{sql}");
+    }
+}
+
+/// A scalar subquery is transparent to the expression around it.
+///
+/// Measured on 8.3 rather than derived: `(SELECT su FROM Ty) + 1` is UNSIGNED
+/// because `su` is, `(SELECT dt FROM Ty) + 0` is a NEWDECIMAL with three
+/// places because `dt` is a `DATETIME(3)`, and `(SELECT d FROM Ty) + 0` is a
+/// LONGLONG because a `DATE` packs into whole digits. Arithmetic over an
+/// operand nothing can type is approximate, so every one of those was a DOUBLE
+/// while the subquery had no type of its own.
+#[test]
+fn an_expression_over_a_scalar_subquery_reads_its_column() {
+    let (engine, mut session) = engine();
+    every_type(&engine, &mut session);
+
+    for (sql, ty, value) in [
+        ("SELECT (SELECT sid FROM Ty) + 1", "LongLong", "2"),
+        ("SELECT (SELECT su FROM Ty) + 1", "LongLong", "8"),
+        ("SELECT (SELECT yr FROM Ty) + 1", "LongLong", "2027"),
+        (
+            "SELECT (SELECT dt FROM Ty) + 0",
+            "NewDecimal",
+            "20260102030405.678",
+        ),
+        ("SELECT (SELECT d FROM Ty) + 0", "LongLong", "20260102"),
+        ("SELECT (SELECT tm FROM Ty) + 0", "NewDecimal", "10203.45"),
+        ("SELECT (SELECT sid FROM Ty) / 2", "NewDecimal", "0.5000"),
+        ("SELECT ABS((SELECT sid FROM Ty))", "LongLong", "1"),
+        (
+            "SELECT ROUND((SELECT dec1 FROM Ty), 1)",
+            "NewDecimal",
+            "12.5",
+        ),
+        ("SELECT NULLIF((SELECT sm FROM Ty), 1)", "Short", "3"),
+        (
+            "SELECT CASE WHEN 1 THEN (SELECT sm FROM Ty) ELSE 1000 END",
+            "LongLong",
+            "3",
+        ),
+        ("SELECT MIN((SELECT sid FROM Ty)) FROM Ty", "Long", "1"),
+        // An ENUM read through a subquery is its member and not its ordinal —
+        // the value already was, and now the type agrees: a string has no
+        // exact kind, so arithmetic over it is approximate.
+        ("SELECT (SELECT e FROM Ty) + 0", "Double", "0"),
+    ] {
+        let described = engine.describe(&session, sql, 0).unwrap().unwrap();
+        assert_eq!(format!("{:?}", described[0].ty), ty, "described: {sql}");
+        assert_eq!(rows(&engine, &mut session, sql), vec![vec![value]], "{sql}");
+    }
+
+    // The sign travels with the type, and has to: a column announced UNSIGNED
+    // over a signed value reaches a binary client as a number near 2^64.
+    for (sql, unsigned) in [
+        ("SELECT (SELECT su FROM Ty) + 1", true),
+        ("SELECT (SELECT yr FROM Ty) + 1", true),
+        ("SELECT (SELECT sid FROM Ty) + 1", false),
+    ] {
+        let described = engine.describe(&session, sql, 0).unwrap().unwrap();
+        assert_eq!(
+            described[0].to_wire().flags & mysql_ultralight_protocol::column::flags::UNSIGNED != 0,
+            unsigned,
+            "{sql}"
+        );
+    }
+}
+
+/// A nest of scalar subqueries is answered rather than run out of stack.
+///
+/// Describing one runs it, and running it describes the ones inside it, so the
+/// recursion follows the text as deep as it goes. Past the limit the type
+/// falls back to `VAR_STRING` — the answer every scalar subquery had before —
+/// and the statement still answers.
+#[test]
+fn a_deep_nest_of_scalar_subqueries_still_answers() {
+    let (engine, mut session) = engine();
+    every_type(&engine, &mut session);
+
+    // Each layer reads the table, which is what makes the *describe* recurse:
+    // a probe reads a stored table as empty, so there is no row to evaluate
+    // and the type is the only thing being worked out at every level.
+    let nested = |depth: usize| {
+        let mut sql = "(SELECT sid FROM Ty)".to_owned();
+        for _ in 0..depth {
+            sql = format!("(SELECT {sql} FROM Ty)");
+        }
+        format!("SELECT {sql}")
+    };
+
+    // Inside the limit the column is the one the innermost query projects,
+    // however many layers are in the way.
+    let shallow = nested(3);
+    assert_eq!(
+        format!(
+            "{:?}",
+            engine.describe(&session, &shallow, 0).unwrap().unwrap()[0].ty
+        ),
+        "Long"
+    );
+
+    // Past it — and still inside `sqlparser`'s own recursion limit, which
+    // refuses the text before any of this is reached — the type falls back and
+    // the statement answers anyway. That is the whole of the guard: a worse
+    // answer at the bottom rather than a recursion that follows the text.
+    let deep = nested(20);
+    assert_eq!(rows(&engine, &mut session, &deep), vec![vec!["1"]]);
+    // Described as well as executed: the describe is the path that recurses
+    // furthest, because it has no rows to stop it.
+    assert_eq!(
+        format!(
+            "{:?}",
+            engine.describe(&session, &deep, 0).unwrap().unwrap()[0].ty
+        ),
+        "VarString"
+    );
+}
+
+/// Describing a scalar subquery leaves the probe around it in place.
+///
+/// Typing one runs the inner query as a probe of its own, and that probe is
+/// *inside* the outer statement's. The flag saying so used to be cleared on the
+/// way out rather than restored, so everything after the first subquery in a
+/// prepared statement ran unprobed — and a prepare is exactly where a function
+/// with a consequence must not take it.
+#[test]
+fn describing_a_scalar_subquery_does_not_end_the_probe_around_it() {
+    let (engine, mut session) = engine();
+
+    // The subquery is written first on purpose: it has to have been described
+    // before the function is reached for the flag to matter at all.
+    assert!(engine
+        .describe(&session, "SELECT (SELECT 1), GET_LOCK('probe', 0)", 0)
+        .unwrap()
+        .is_none());
+    // The lock is the consequence, and it is still untaken: describing a
+    // statement must not do what running it would.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT IS_FREE_LOCK('probe')"),
+        vec![vec!["1"]]
     );
 }

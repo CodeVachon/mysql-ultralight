@@ -251,11 +251,22 @@ thread_local! {
 /// take a lock, or advance a counter whose whole point is to read the same on
 /// every run. Refusing them here rather than by inspecting the statement text
 /// catches the ones that hide — inside a view's definition, a CTE, a subquery.
+/// Restored through a guard rather than a trailing assignment, for the reason
+/// `Shaping` is: the flag is nested now. Typing a scalar subquery describes the
+/// inner query as a probe of its own, and that happens *inside* the outer
+/// statement's probe — so clearing the flag on the way out left the rest of a
+/// prepare running unprobed, and `SELECT (SELECT 1), UUID()` would have taken
+/// its consequence at prepare time. A guard also puts it back after a panic,
+/// where the assignment did not.
 pub fn probing<T>(f: impl FnOnce() -> T) -> T {
-    PROBING.with(|p| p.set(true));
-    let out = f();
-    PROBING.with(|p| p.set(false));
-    out
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PROBING.with(|p| p.set(self.0));
+        }
+    }
+    let _restore = Restore(PROBING.with(|p| p.replace(true)));
+    f()
 }
 
 /// An EXISTS subquery with its qualified `*` items replaced, or `None` when it

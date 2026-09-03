@@ -1,11 +1,11 @@
 ---
 id: 153
 title: Multi-table DELETE drops the database qualifier
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-09-02T14:59:43Z
-updated: 2026-09-02T14:59:43Z
+updated: 2026-09-03T05:25:45Z
 ---
 
 ## Description

@@ -1,11 +1,11 @@
 ---
 id: 165
 title: ON DUPLICATE KEY UPDATE does not resolve its names
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-09-03T04:51:36Z
-updated: 2026-09-03T04:51:36Z
+updated: 2026-09-03T05:25:45Z
 ---
 
 ## Description

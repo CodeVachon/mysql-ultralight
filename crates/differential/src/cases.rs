@@ -454,14 +454,18 @@ pub const GROUPS: &[Group] = &[
             same("SELECT id, b AS bb FROM Hv HAVING bb > 1 ORDER BY id"),
             same("SELECT x.b FROM Hv AS x HAVING x.b > 1 ORDER BY 1"),
             // An enclosing query's column is in scope; this query's own FROM
-            // is not.
-            // The subquery sits in the WHERE rather than the select list,
-            // because a scalar subquery *projected* is declared VAR_STRING by
-            // this engine and LONGLONG by 8.3 — a divergence with nothing to
-            // do with HAVING, which would drown this case's question.
+            // is not. Asked from the WHERE clause and from the select list:
+            // the second was written this way round only because a projected
+            // scalar subquery used to be declared VAR_STRING here (#0104), and
+            // it is the shape that reads the subquery's *answer* rather than
+            // only whether it has one.
             same(
                 "SELECT id FROM Hv WHERE (SELECT MAX(x.b) FROM Hv x HAVING Hv.id > 2) \
                  IS NOT NULL ORDER BY id",
+            ),
+            same(
+                "SELECT id, (SELECT MAX(x.b) FROM Hv x HAVING Hv.id > 2) AS m \
+                 FROM Hv ORDER BY id",
             ),
             same("SELECT b FROM Hv HAVING id > 1"),
             same("SELECT COUNT(*) FROM Hv HAVING b > 1"),
@@ -686,12 +690,13 @@ pub const GROUPS: &[Group] = &[
             same("SELECT 1 AS one ORDER BY one"),
             same("SELECT 1 AS one, 2 AS two ORDER BY 2"),
             // A correlated subquery's ORDER BY sees the enclosing row too.
-            // Asked from the WHERE clause rather than the select list, because
-            // this engine describes a scalar subquery's column as a string
-            // where 8.3 describes it as the INT it holds — a gap of its own,
-            // and one that would put ten divergences in the baseline for a
-            // reason that has nothing to do with this clause.
+            // From the WHERE clause and from the select list: the first was
+            // the only spelling here while a projected scalar subquery was
+            // described VAR_STRING (#0104), which would have put ten
+            // divergences in the baseline for a reason that has nothing to do
+            // with this clause.
             same("SELECT id FROM Ob WHERE (SELECT 1 ORDER BY id) = 1 ORDER BY id"),
+            same("SELECT id, (SELECT 1 ORDER BY id) AS one FROM Ob ORDER BY id"),
             same("SELECT id FROM Ob WHERE (SELECT 1 ORDER BY nope) = 1 ORDER BY id"),
             // A window is computed over the rows in the order they reach it,
             // which is the order the sort put them in. Every window here has
@@ -3440,6 +3445,16 @@ pub const GROUPS: &[Group] = &[
             // table with nothing in it answered `SELECT nope.k FROM Bare`
             // with an empty result set rather than 1054.
             "CREATE TABLE Bare (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+            // For `ON DUPLICATE KEY UPDATE`, whose version of "no rows" is
+            // "nothing collided": `Dup` is empty and `NoKey` has no unique
+            // key at all, so nothing written below can ever reach the clause
+            // by evaluating it. `Gen` is here for the one ordering that needs
+            // a generated column.
+            "CREATE TABLE Dup (id INT NOT NULL, k INT NULL, s VARCHAR(20) NULL, \
+             PRIMARY KEY (id))",
+            "CREATE TABLE NoKey (a INT NULL, b INT NULL)",
+            "CREATE TABLE Gen (id INT NOT NULL, k INT NULL, g INT AS (k + 1), \
+             PRIMARY KEY (id))",
             "INSERT INTO S VALUES (1, 10), (2, 20)",
             "INSERT INTO T VALUES (1, 1, 'p'), (2, 2, 'q')",
         ],
@@ -3495,11 +3510,15 @@ pub const GROUPS: &[Group] = &[
             // Legal from here down, and the reason this group is worth more
             // than its refusals: each is a scope that does not come from the
             // FROM clause of the query the reference is written in.
-            // Compared rather than selected: a scalar subquery projected on
-            // its own is described VAR_STRING by this engine where MySQL
-            // types it from the subquery's column, which is a divergence of
-            // its own and not this one.
+            // Compared and selected. Only the first of these was here while a
+            // projected scalar subquery was described VAR_STRING (#0104); the
+            // second is the one that carries the subquery's answer out to the
+            // client, under the type the client decodes it by.
             same("SELECT S.k, (SELECT COUNT(*) FROM T WHERE T.sid = S.id) > 0 AS has \
+                  FROM S ORDER BY S.id"),
+            same("SELECT S.k, (SELECT COUNT(*) FROM T WHERE T.sid = S.id) AS n \
+                  FROM S ORDER BY S.id"),
+            same("SELECT S.k, (SELECT MAX(t.sid) FROM T t WHERE t.id = S.id) AS m \
                   FROM S ORDER BY S.id"),
             same("SELECT S.k FROM S WHERE EXISTS (SELECT 1 FROM T t WHERE t.sid = S.id) \
                   ORDER BY S.k"),
@@ -3628,12 +3647,98 @@ pub const GROUPS: &[Group] = &[
             // evaluator has no meaning for it either.
             same("UPDATE Bare SET k = DEFAULT"),
             same("UPDATE Bare a JOIN T b ON a.id = b.id SET a.k = DEFAULT"),
+
+            // #0165. The fifth entry point with the same hole, and the one
+            // #0102 left out because its scope is different: the clause is
+            // read only for a row that collides, so on an empty table, against
+            // a key that misses, and on a table with no unique key at all it
+            // was not read — every one of these inserted the row and reported
+            // success where 8.3 raises 1054.
+            same("INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE k = a.b"),
+            same("INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE k = nope"),
+            same("INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE k = nodb.Dup.k"),
+            // `VALUES(x)` names a column of the target table, which is the
+            // measurement the scope turns on — so an unknown one is 1054 the
+            // same way a bare name is.
+            same("INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE k = VALUES(nope)"),
+            same("INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE k = VALUES(a.b)"),
+            // A collision that cannot happen, and a branch that is not taken:
+            // the rest of #0009's checklist as this clause spells it.
+            same("INSERT INTO NoKey (a) VALUES (1) ON DUPLICATE KEY UPDATE b = nope"),
+            same(
+                "INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE \
+                 k = CASE WHEN 0 THEN nope ELSE 1 END",
+            ),
+            // The orderings, each a different code on 8.3: the clause sits
+            // behind four of the insert's own checks. 1582 comes out of 8.3's
+            // parser so it beats even a missing table; a malformed ESCAPE does
+            // not, which is the pair that had to be measured rather than
+            // reasoned at.
+            same("INSERT INTO nosuch (k) VALUES (1) ON DUPLICATE KEY UPDATE k = nope"),
+            same("INSERT INTO Dup (nope2) VALUES (1) ON DUPLICATE KEY UPDATE k = nope"),
+            same("INSERT INTO Dup (id, k) VALUES (1) ON DUPLICATE KEY UPDATE k = nope"),
+            same("INSERT INTO Gen (g) VALUES (1) ON DUPLICATE KEY UPDATE k = nope"),
+            same("INSERT INTO Dup (id, k) VALUES (1, 1), (2) ON DUPLICATE KEY UPDATE k = nope"),
+            same("INSERT INTO Gen VALUES (1, 1, 1) ON DUPLICATE KEY UPDATE k = nope"),
+            same("INSERT INTO nosuch (k) VALUES (1) ON DUPLICATE KEY UPDATE k = SIGN(1, 2)"),
+            same(
+                "INSERT INTO nosuch (k) VALUES (1) ON DUPLICATE KEY UPDATE \
+                 k = ('a' LIKE 'b' ESCAPE '!!')",
+            ),
+            // Every target resolves before any value here, which is the
+            // opposite of the order the same pair settles in for an UPDATE's
+            // SET — and among the values the name and the ESCAPE interleave by
+            // position, as they do everywhere else.
+            same(
+                "INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE \
+                 nope1 = ('a' LIKE 'b' ESCAPE '!!')",
+            ),
+            same(
+                "INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE \
+                 k = ('a' LIKE 'b' ESCAPE '!!'), s = nope",
+            ),
+            same(
+                "INSERT INTO Dup (id, k) VALUES (1, 1) ON DUPLICATE KEY UPDATE \
+                 k = nope, s = ('a' LIKE 'b' ESCAPE '!!')",
+            ),
+            // Legal, and on `NoKey` so that the second of a case's two
+            // protocol runs still cannot collide: an upsert that fired on the
+            // second run would be comparing the affected-count rule rather
+            // than the resolution. A column the insert did not name, the
+            // target table by every spelling of its name, and the bare
+            // `DEFAULT` keyword that #0102's review caught being read as a
+            // column.
+            same("INSERT INTO NoKey (a) VALUES (1) ON DUPLICATE KEY UPDATE b = a"),
+            same("INSERT INTO NoKey (a) VALUES (1) ON DUPLICATE KEY UPDATE b = VALUES(a)"),
+            same("INSERT INTO NoKey (a) VALUES (1) ON DUPLICATE KEY UPDATE b = NoKey.a"),
+            same(
+                "INSERT INTO NoKey (a) VALUES (1) ON DUPLICATE KEY UPDATE \
+                 b = differential.NoKey.a",
+            ),
+            same("INSERT INTO NoKey (a) VALUES (1) ON DUPLICATE KEY UPDATE NoKey.b = 1"),
+            same("INSERT INTO `NoKey` (`a`) VALUES (1) ON DUPLICATE KEY UPDATE `b` = `NoKey`.`a`"),
+            same("INSERT INTO NoKey (a) VALUES (1) ON DUPLICATE KEY UPDATE b = DEFAULT"),
+            same(
+                "INSERT INTO NoKey (a) VALUES (1) ON DUPLICATE KEY UPDATE \
+                 b = TIMESTAMPDIFF(DAY, '2026-01-01', '2026-03-05')",
+            ),
+            // The two shapes whose scope is *wider* than the target table on
+            // 8.3 and which this engine does not model: an `INSERT ... SELECT`
+            // also sees the SELECT's FROM tables, and the row alias names the
+            // row being inserted. Both are here because resolving them against
+            // the table alone would refuse SQL 8.3 answers, which is the
+            // direction that matters.
+            same("INSERT INTO NoKey (a) SELECT id FROM S x ON DUPLICATE KEY UPDATE b = x.id"),
+            same("INSERT INTO NoKey (a) VALUES (1) AS new ON DUPLICATE KEY UPDATE b = new.a"),
             // Last, and the reason the writes above are safe to have here: a
             // refusal that nonetheless wrote would show up as a changed row
             // rather than as nothing at all.
             same("SELECT id, k FROM S ORDER BY id"),
             same("SELECT id, sid, label FROM T ORDER BY id"),
             same("SELECT id, k FROM Bare ORDER BY id"),
+            same("SELECT id, k, s FROM Dup ORDER BY id"),
+            same("SELECT a, b FROM NoKey ORDER BY a, b"),
+            same("SELECT id, k, g FROM Gen ORDER BY id"),
         ],
     },
     Group {
@@ -5111,6 +5216,112 @@ pub const GROUPS: &[Group] = &[
             // Where the rounding decides a row rather than a printed value.
             same("SELECT id FROM Ci WHERE CAST(d1 AS SIGNED) = 3 ORDER BY id"),
             same("SELECT id FROM Ci ORDER BY CAST(d1 AS SIGNED), id"),
+        ],
+    },
+    Group {
+        name: "a scalar subquery's column",
+        setup: &[
+            "CREATE TABLE Sq (id INT NOT NULL AUTO_INCREMENT, n INT NOT NULL, \
+             un INT UNSIGNED NOT NULL, sm SMALLINT NULL, s VARCHAR(32) NOT NULL, \
+             c CHAR(4) NULL, dc DECIMAL(10,3) NOT NULL, f FLOAT NULL, g DOUBLE NULL, \
+             dd DATE NULL, e ENUM('a','b','c') NOT NULL, bl BLOB NULL, bn BINARY(4) NULL, \
+             tx TEXT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE SqE (id INT NOT NULL, v INT NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Sq (n, un, sm, s, c, dc, f, g, dd, e, bl, bn, tx) \
+             VALUES (1, 7, 3, 'hello', 'ab', 12.500, 1.5, 2.5, '2026-01-02', 'b', \
+             'bytes', 'binx', 'text')",
+        ],
+        cases: &[
+            // The two #0104 was filed with. Every column in this group was a
+            // VAR_STRING before it, so the binary protocol sent the digits of
+            // a number as text and a prepared-statement client read a string.
+            same("SELECT (SELECT COUNT(*) FROM Sq)"),
+            same("SELECT (SELECT MAX(t.n) FROM Sq t)"),
+            // A plain column of each family, because the answer is the *inner*
+            // column's type and not a type of the subquery's own: an `INT` is
+            // a LONG and a `SMALLINT` a SHORT, and the sign travels with them.
+            same("SELECT (SELECT n FROM Sq), (SELECT sm FROM Sq), (SELECT un FROM Sq)"),
+            same("SELECT (SELECT dc FROM Sq), (SELECT f FROM Sq), (SELECT g FROM Sq)"),
+            same("SELECT (SELECT s FROM Sq), (SELECT c FROM Sq), (SELECT tx FROM Sq)"),
+            // Bytes rather than characters, which is the one part of a
+            // computed column's definition this harness compares: a `BLOB` and
+            // a `BINARY` come through binary where the `TEXT` beside them does
+            // not.
+            same("SELECT (SELECT bl FROM Sq), (SELECT bn FROM Sq)"),
+            // An ENUM arrives as its member under a STRING code and loses the
+            // ENUM flag on the way through, on both servers.
+            same("SELECT (SELECT e FROM Sq)"),
+            // The width and the flags are out of scope for a computed column,
+            // so this asks the type and the value. Not the character set: 8.3
+            // reports a temporal that has been through a scalar subquery in
+            // the connection's, where the column read straight from its table
+            // is binary — the same quirk `MIN(tm)` above declines, and this
+            // engine has no temporary table to model it with.
+            same("SELECT (SELECT dd FROM Sq)").without_value_kind(),
+            // A literal is typed by what it is, and keeps NOT_NULL: a
+            // subquery over no table answers whatever the database holds.
+            same("SELECT (SELECT 1), (SELECT 1.5), (SELECT 1e3), (SELECT 'x')"),
+            // #0073's pair, from the other side. A bare `SELECT NULL` has no
+            // type; through a set operation or a derived table it is the
+            // `binary(0)` a temporary table gives it, and a scalar subquery
+            // reports whichever of those the inner query answers with.
+            same("SELECT (SELECT NULL)"),
+            same("SELECT (SELECT NULL UNION SELECT NULL)"),
+            same("SELECT (SELECT c2 FROM (SELECT NULL AS c2) d)"),
+            // Nothing about the rows decides the column: over an empty table,
+            // under a LIMIT, behind a false predicate and through a set
+            // operation it is the same type carrying a different value.
+            same("SELECT (SELECT v FROM SqE)"),
+            same("SELECT (SELECT n FROM Sq LIMIT 1)"),
+            same("SELECT (SELECT n FROM Sq WHERE 1 = 0), (SELECT n FROM Sq LIMIT 0)"),
+            same("SELECT (SELECT n FROM Sq UNION SELECT n FROM Sq)"),
+            // More than one row is 1242 on both, and at execution rather than
+            // at prepare — 8.3 describes this statement and then refuses it.
+            same("SELECT (SELECT n FROM Sq UNION ALL SELECT n FROM Sq)"),
+            // Brackets peel and nesting recurses.
+            same("SELECT ((SELECT n FROM Sq)), (SELECT (SELECT (SELECT n FROM Sq)))"),
+            // The expression around it reads the column too, which is where a
+            // subquery with no type of its own was making everything
+            // approximate: arithmetic over an operand nothing can type is a
+            // DOUBLE.
+            same("SELECT (SELECT n FROM Sq) + 1, (SELECT un FROM Sq) + 1"),
+            same(
+                "SELECT ABS((SELECT n FROM Sq)), ROUND((SELECT dc FROM Sq), 1), \
+                 NULLIF((SELECT sm FROM Sq), 1)",
+            ),
+            same("SELECT CASE WHEN 1 THEN (SELECT sm FROM Sq) ELSE 1000 END"),
+            same("SELECT COALESCE((SELECT s FROM Sq), 1), CONCAT((SELECT n FROM Sq), 'x')"),
+            same("SELECT (SELECT e FROM Sq) + 0, (SELECT e FROM Sq) = 'b'"),
+            same("SELECT MIN((SELECT n FROM Sq)) FROM Sq"),
+            same("SELECT (SELECT SUM(t.n) FROM Sq t), (SELECT AVG(t.n) FROM Sq t)"),
+            // The NOT_NULL flag needs the query and not only the column. A
+            // WHERE and a HAVING can leave the one implicit row unmatched, so
+            // both of these are nullable; an ORDER BY cannot.
+            same("SELECT (SELECT 1 WHERE 0), (SELECT COUNT(*)), (SELECT 1 ORDER BY 1), \
+                  (SELECT 1 HAVING 1)"),
+            // The set operators split on the same question: a UNION of two
+            // certain branches answers a row, and the two that take rows away
+            // do not — both of those are empty, so both are NULL and both are
+            // nullable on 8.3, where reading the operation and not the
+            // operator would have called them NOT NULL.
+            same("SELECT (SELECT 1 UNION SELECT 1), (SELECT 1 EXCEPT SELECT 1), \
+                  (SELECT 1 INTERSECT SELECT 2)"),
+            // The three projections that type a column, because they are three
+            // pieces of code: a FROM-less select, a select over a table, and a
+            // grouped one.
+            same("SELECT (SELECT 1) FROM Sq"),
+            same("SELECT id, (SELECT t.s FROM Sq t WHERE t.id = Sq.id) AS lab \
+                  FROM Sq ORDER BY id"),
+            same("SELECT n, (SELECT COUNT(*) FROM SqE) AS c FROM Sq GROUP BY n ORDER BY n"),
+            // Correlated, and projected rather than compared: the enclosing
+            // row has to be in scope while the column is described as well as
+            // while it is evaluated.
+            same("SELECT (SELECT COUNT(*) FROM SqE WHERE SqE.v = Sq.id) AS c \
+                  FROM Sq ORDER BY c"),
+            // The clauses where the type is not reported at all, so that
+            // describing the subquery cannot have broken resolving it.
+            same("SELECT id FROM Sq WHERE id = (SELECT MAX(t.id) FROM Sq t) ORDER BY id"),
+            same("SELECT id FROM Sq ORDER BY (SELECT MAX(t.id) FROM Sq t), id"),
         ],
     },
 ];

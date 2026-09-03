@@ -1,11 +1,11 @@
 ---
 id: 104
 title: A scalar subquery in the projection is typed VAR_STRING
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat]
 created: 2026-08-25T14:48:58Z
-updated: 2026-08-26T09:44:53Z
+updated: 2026-09-03T05:25:45Z
 ---
 
 ## Description

@@ -99,6 +99,7 @@ impl Engine {
         sql: &str,
         parameters: usize,
     ) -> EngineResult<Option<Vec<OutColumn>>> {
+        let _memo = SubqueryMemo::fresh();
         let bound = params::bind(sql, &vec![Value::Null; parameters]);
         if rewrite::intercept(&bound).is_some() {
             return Ok(None);
@@ -477,6 +478,7 @@ impl Engine {
         sql: &str,
         parameters: &[Value],
     ) -> EngineResult<Outcome> {
+        let _memo = SubqueryMemo::fresh();
         let mut outcome = self.execute_at_depth(session, sql, parameters, 0)?;
         // On the way out only: an intermediate result feeds another expression
         // and should keep exactly the value it computed, where a result that
@@ -940,7 +942,23 @@ impl Engine {
     // ---------------------------------------------------------------- SELECT
 
     fn query(&self, session: &Session, query: &Query) -> EngineResult<ResultSet> {
-        let mut result = self.query_with_outer(session, query, None)?;
+        self.query_outer(session, query, None)
+    }
+
+    /// A whole query's answer, against an enclosing row where there is one.
+    ///
+    /// Split from [`Engine::query`] for `subquery_column`, which asks this
+    /// question of a *correlated* scalar subquery and needs the boundary
+    /// below rather than `query_with_outer`'s: the materialisation is what
+    /// gives an all-NULL set operation its `binary(0)`, and a scalar subquery
+    /// takes the type the inner query answers with.
+    fn query_outer(
+        &self,
+        session: &Session,
+        query: &Query,
+        outer: Option<&OuterRow>,
+    ) -> EngineResult<ResultSet> {
+        let mut result = self.query_with_outer(session, query, outer)?;
         // A set operation's answer goes through a temporary table, and a
         // temporary table has no field for `MYSQL_TYPE_NULL`, so a column that
         // was NULL on every branch comes out `binary(0)` — measured on 8.3,
@@ -1064,6 +1082,10 @@ impl Engine {
         session: &Session,
         values: &sqlparser::ast::Values,
     ) -> EngineResult<ResultSet> {
+        let sub = Some(Sub {
+            engine: self,
+            session,
+        });
         let ctx = Context::rowless(session).with_executor(self);
         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(values.rows.len());
         for row in &values.rows {
@@ -1138,10 +1160,11 @@ impl Engine {
                 // `VALUES ROW(1)` NOT NULL, and the column was announced
                 // nullable whatever it held. A constructor is NOT NULL only
                 // if *every* row's expression is, since they share one column.
-                column.nullable = !values
-                    .rows
-                    .iter()
-                    .all(|row| row.content.get(i).is_some_and(|e| never_null(e, &[], &[])));
+                column.nullable = !values.rows.iter().all(|row| {
+                    row.content
+                        .get(i)
+                        .is_some_and(|e| never_null(e, &[], &[], sub))
+                });
                 column
             })
             .collect();
@@ -2466,10 +2489,21 @@ impl Engine {
             // a later row could produce another type, and describing a
             // statement binds its parameters to NULL so there is often no
             // value worth reading.
-            let mut column = OutColumn::new(alias.clone(), computed_column_type(e, &[], &[]));
-            column.nullable = !never_null(e, &[], &[]);
-            column.unsigned = unsigned_answer(e, &[], &[]);
-            column.binary_values = binary_answer(e);
+            // `implicit_schema` rather than nothing, so a scalar subquery in a
+            // FROM-less select still resolves against the enclosing row it is
+            // evaluated against: `SELECT (SELECT (SELECT t.b)) FROM t` reads
+            // `t.b` through two of these.
+            let sub = Some(Sub {
+                engine: self,
+                session,
+            });
+            let mut column = OutColumn::new(
+                alias.clone(),
+                computed_column_type(e, &implicit_schema, &[], sub),
+            );
+            column.nullable = !never_null(e, &implicit_schema, &[], sub);
+            column.unsigned = unsigned_answer(e, &implicit_schema, &[], sub);
+            column.binary_values = binary_answer(e, &implicit_schema, sub);
             columns.push(column);
             row.push(value);
         }
@@ -2533,6 +2567,10 @@ impl Engine {
         refs: &[ColumnRef],
         matching: &[&Vec<Value>],
     ) -> EngineResult<ResultSet> {
+        let sub = Some(Sub {
+            engine: self,
+            session,
+        });
         let mut columns: Vec<OutColumn> = Vec::new();
         let mut plan: Vec<Projection> = Vec::new();
         // A window function sees the whole result rather than one row, so its
@@ -2587,14 +2625,14 @@ impl Engine {
                             // encodes by the declared type.
                             let mut column = OutColumn::new(
                                 alias.unwrap_or_else(|| render_expr(e)),
-                                computed_column_type(e, refs, &relation.columns),
+                                computed_column_type(e, refs, &relation.columns, sub),
                             );
                             // A ranking window numbers its rows and always has
                             // an answer; one that reaches past the frame has
                             // one only if it was given a default.
-                            column.nullable = !never_null(e, refs, &relation.columns);
-                            column.unsigned = unsigned_answer(e, refs, &relation.columns);
-                            column.binary_values = binary_answer(e);
+                            column.nullable = !never_null(e, refs, &relation.columns, sub);
+                            column.unsigned = unsigned_answer(e, refs, &relation.columns, sub);
+                            column.binary_values = binary_answer(e, refs, sub);
                             columns.push(column);
                             plan.push(Projection::Window(windows.len()));
                             windows.push(values);
@@ -2602,7 +2640,7 @@ impl Engine {
                         }
                     }
 
-                    let (column, projection) = self.plan_expr(e, alias, relation)?;
+                    let (column, projection) = self.plan_expr(e, alias, relation, refs, session)?;
                     columns.push(column);
                     plan.push(projection);
                 }
@@ -2869,11 +2907,19 @@ impl Engine {
     }
 
     /// Decides how one projected item is produced, and what its metadata is.
+    ///
+    /// `refs` is the scope a name resolves against — this query's columns and
+    /// the enclosing query's — rather than `relation.refs()`, which is only
+    /// this query's. A scalar subquery here is described against it, so the
+    /// two are told apart: `SELECT (SELECT t.b FROM u) FROM t` reads `t.b`
+    /// from the outer row and nothing else can supply it.
     fn plan_expr(
         &self,
         e: &Expr,
         alias: Option<String>,
         relation: &Relation,
+        refs: &[ColumnRef],
+        session: &Session,
     ) -> EngineResult<(OutColumn, Projection)> {
         // A bare column reference keeps the column's declared type, which
         // matters: clients decode a result by the type the metadata claims.
@@ -2918,13 +2964,19 @@ impl Engine {
         // computed column used to be a `VAR_STRING`, which is a third of what
         // the differential harness had to say — a typed client handed back
         // `"1"` where MySQL hands back `1`.
-        let mut column = OutColumn::new(
-            name,
-            computed_column_type(e, &relation.refs(), &relation.columns),
-        );
-        column.nullable = !never_null(e, &relation.refs(), &relation.columns);
-        column.unsigned = unsigned_answer(e, &relation.refs(), &relation.columns);
-        column.binary_values = binary_answer(e);
+        let sub = Some(Sub {
+            engine: self,
+            session,
+        });
+        // `refs` and not `relation.refs()`: the two differ only by the
+        // enclosing query's columns, which `direct_column` cannot reach
+        // anyway — their slots fall past `relation.columns` — and which a
+        // scalar subquery described here does have to resolve against.
+        let mut column =
+            OutColumn::new(name, computed_column_type(e, refs, &relation.columns, sub));
+        column.nullable = !never_null(e, refs, &relation.columns, sub);
+        column.unsigned = unsigned_answer(e, refs, &relation.columns, sub);
+        column.binary_values = binary_answer(e, refs, sub);
         Ok((column, Projection::Expr(Box::new(e.clone()))))
     }
 
@@ -2945,6 +2997,10 @@ impl Engine {
             columns: input_columns,
             matching,
         } = input;
+        let sub = Some(Sub {
+            engine: self,
+            session,
+        });
         // `GROUP BY 1` means the first select column, not the literal 1.
         // Treating it as a literal gives every row the same key and collapses
         // the whole table into one group.
@@ -3120,14 +3176,16 @@ impl Engine {
                 Some(column) => OutColumn::from_sql_type(alias, &column.ty, column.nullable)
                     .projected_from(&column.name, None),
                 None => {
-                    let mut column =
-                        OutColumn::new(alias.clone(), computed_column_type(e, refs, input_columns));
+                    let mut column = OutColumn::new(
+                        alias.clone(),
+                        computed_column_type(e, refs, input_columns, sub),
+                    );
                     // `COUNT` always has an answer, including zero for a group
                     // with nothing in it. Every other aggregate is nullable,
                     // even `SUM(1)`: an empty group has nothing to sum.
-                    column.nullable = !never_null(e, refs, input_columns);
-                    column.unsigned = unsigned_answer(e, refs, input_columns);
-                    column.binary_values = binary_answer(e);
+                    column.nullable = !never_null(e, refs, input_columns, sub);
+                    column.unsigned = unsigned_answer(e, refs, input_columns, sub);
+                    column.binary_values = binary_answer(e, refs, sub);
                     column
                 }
             })
@@ -3753,25 +3811,50 @@ impl Engine {
             Some(other) => return Err(unsupported(format!("INSERT ... {other}"))),
         };
 
+        // Whether the source is a written VALUES list, which is what settles
+        // the scope `ON DUPLICATE KEY UPDATE` resolves its values in — see the
+        // guard below, where the difference is measured.
+        let mut written_values = false;
+
         // `INSERT ... SELECT` runs its query first and to completion. MySQL
         // reads the whole source before writing, so a statement whose SELECT
         // reads the table it inserts into sees the table as it was.
         let source_rows: Vec<Vec<SourceValue>> = match &insert.source {
             Some(query) => match query.body.as_ref() {
                 SetExpr::Values(values) => {
+                    written_values = true;
                     // The written values are the one clause with no row to
                     // evaluate against — they *are* the row — so an item 8.3
                     // settles while resolving has to be settled here or not at
                     // all. Both of these were measured: `INSERT INTO K VALUES
                     // (SIGN(1, 2))` is 1582 on 8.3 and wrote a 1 here, and
                     // `INSERT INTO K VALUES (('a' LIKE 'b' ESCAPE '!!'))` is
-                    // 1210 there and wrote a 0. Ahead of the table lookup,
-                    // which is also 8.3's order: both are raised for a table
-                    // that does not exist.
+                    // 1210 there and wrote a 0.
+                    //
+                    // Ahead of the table lookup, which is 8.3's order for the
+                    // parameter count and *not* for the escape: `INSERT INTO
+                    // nosuch VALUES (SIGN(1, 2))` is 1582 there and `INSERT
+                    // INTO nosuch VALUES ('a' LIKE 'b' ESCAPE '!!')` is 1146.
+                    // 1582 comes out of 8.3's parser, which is the gap
+                    // `wrong_parameter_count` already records against 1146;
+                    // the escape does not, so this line is 1210 where 8.3
+                    // says 1146. Measured and left — moving it would mean
+                    // splitting the written values the way the clause below
+                    // is split, and the written values are #0102's half.
                     refuse_at_resolve(values.rows.iter().flat_map(|row| row.iter()))?;
-                    refuse_at_resolve(
-                        duplicate_key_update.into_iter().flatten().map(|a| &a.value),
-                    )?;
+                    // Only the parameter count of the clause's values here, for
+                    // exactly that reason: `INSERT INTO nosuch (k) VALUES (1)
+                    // ON DUPLICATE KEY UPDATE k = SIGN(1, 2)` is 1582 on 8.3
+                    // and the same statement with `('a' LIKE 'b' ESCAPE '!!')`
+                    // is 1146. Everything else the clause is held to is
+                    // settled below, once the table's columns are known.
+                    if let Some(bad) = duplicate_key_update
+                        .into_iter()
+                        .flatten()
+                        .find_map(|a| wrong_parameter_count(&a.value))
+                    {
+                        return Err(bad);
+                    }
                     values
                         .rows
                         .iter()
@@ -3861,40 +3944,6 @@ impl Engine {
                 .collect::<EngineResult<_>>()?
         };
 
-        // Resolved before any row is read, because 8.3 settles it there: a
-        // target no column answers to is 1054 whether or not a row collides,
-        // and `INSERT INTO J2 (a,b) VALUES (1,2) ON DUPLICATE KEY UPDATE
-        // nodb.J2.b = 1` on a table with no unique key raises it having
-        // collided with nothing. Resolving inside the collision branch made
-        // the refusal depend on the data — the same shape as a check living
-        // in a row loop, which is #0009's recurring one.
-        let duplicate_targets: Vec<usize> = match duplicate_key_update {
-            None => Vec::new(),
-            Some(assignments) => assignments
-                .iter()
-                .map(|assignment| {
-                    // The qualifier compared rather than dropped, as in the
-                    // column list above: `... ON DUPLICATE KEY UPDATE
-                    // nodb.J2.b = 1` is 1054 on 8.3 and wrote to `J2`.`b`
-                    // here.
-                    let parts = assignment_parts(&assignment.target)?;
-                    let values: Vec<&str> = parts.iter().map(String::as_str).collect();
-                    let written = name::split(&values).ok_or_else(|| {
-                        EngineError::unknown_column(&parts.join("."), "field list")
-                    })?;
-                    table
-                        .columns
-                        .iter()
-                        .position(|column| {
-                            ColumnRef::in_database(&db, &table.name, &column.name).matches(&written)
-                        })
-                        .ok_or_else(|| {
-                            EngineError::unknown_column(&written.written(), "field list")
-                        })
-                })
-                .collect::<EngineResult<_>>()?,
-        };
-
         let mut inserted = 0u64;
         // The *first* id the statement generated, which is what MySQL reports
         // — measured on 8.3, where a three-row insert into an empty
@@ -3942,6 +3991,107 @@ impl Engine {
                         ),
                     ));
                 }
+            }
+        }
+
+        // `ON DUPLICATE KEY UPDATE`, resolved before any row is read — because
+        // 8.3 settles the whole clause there, and because nothing here reads
+        // it otherwise until a row actually collides. That is #0009's
+        // recurring shape wearing its DML coat: the assignments live behind a
+        // condition the data decides, so on a table nothing collides with —
+        // an empty one, a row with a different key, a table with no unique key
+        // at all — none of them was read and `INSERT INTO Bare (id, k) VALUES
+        // (1, 1) ON DUPLICATE KEY UPDATE k = a.b` inserted and reported
+        // success where 8.3 raises 1054. #0125 hoisted the *targets* out for
+        // that reason; #0165 is the values beside them.
+        //
+        // Below the two statement-level checks above rather than above them,
+        // which is 8.3's order and was measured: `INSERT INTO Dup (id, k)
+        // VALUES (1, 1), (2) ON DUPLICATE KEY UPDATE k = zz` is 1136 there and
+        // `INSERT INTO Gen VALUES (1, 1, 1) ON DUPLICATE KEY UPDATE k = zz` is
+        // 3105, not 1054 for `zz` in either. The insert's own column list is
+        // resolved earlier still, so `INSERT INTO Gen (g) ...` is 3105 and
+        // `INSERT INTO Dup (nope) ...` is 1054 for `nope`.
+        let duplicate_targets: Vec<usize> = match duplicate_key_update {
+            None => Vec::new(),
+            Some(assignments) => assignments
+                .iter()
+                .map(|assignment| {
+                    // The qualifier compared rather than dropped, as in the
+                    // column list above: `... ON DUPLICATE KEY UPDATE
+                    // nodb.J2.b = 1` is 1054 on 8.3 and wrote to `J2`.`b`
+                    // here.
+                    let parts = assignment_parts(&assignment.target)?;
+                    let values: Vec<&str> = parts.iter().map(String::as_str).collect();
+                    let written = name::split(&values).ok_or_else(|| {
+                        EngineError::unknown_column(&parts.join("."), "field list")
+                    })?;
+                    table
+                        .columns
+                        .iter()
+                        .position(|column| {
+                            ColumnRef::in_database(&db, &table.name, &column.name).matches(&written)
+                        })
+                        .ok_or_else(|| {
+                            EngineError::unknown_column(&written.written(), "field list")
+                        })
+                })
+                .collect::<EngineResult<_>>()?,
+        };
+
+        // The values, after *every* target: 8.3 settles the whole target list
+        // first, measured on `... ON DUPLICATE KEY UPDATE k = zz2, zz1 = 1`,
+        // which names `zz1` there. That is the opposite of the order the same
+        // function runs in from `update`, and both are measured — see
+        // `resolve_assigned_values`.
+        //
+        // The scope is the *target table's* columns and nothing else, which is
+        // the half #0102 left this clause out for and is why it is measured
+        // here rather than copied from the WHERE path. All of these are 8.3:
+        //
+        // | in the clause | 8.3 |
+        // |---|---|
+        // | `k = s`, a column the insert did not name | resolves |
+        // | `k = VALUES(s)`, likewise | resolves |
+        // | `k = VALUES(nosuch)` | 1054 `nosuch` |
+        // | `k = T.k`, `k = thisdb.T.k` | resolve |
+        // | `k = nodb.T.k` | 1054 `nodb.T.k` |
+        //
+        // So `VALUES(x)` names a column of the table rather than a position in
+        // the insert's column list, and the insert's column list adds nothing
+        // to the scope — it can only name columns the table already has.
+        // `unresolved_column` reads a call's arguments in the scope around it,
+        // which is exactly that, so `VALUES(...)` needs no case of its own.
+        //
+        // Two sources are left alone rather than resolved, each because its
+        // scope is *wider* than this and refusing on this one would refuse
+        // legal SQL — the failure #0102's review caught and the direction that
+        // matters:
+        //
+        // - `INSERT ... SELECT`, where the clause also sees the SELECT's FROM
+        //   tables: `INSERT INTO E (id, k) SELECT a, b FROM Src x ON DUPLICATE
+        //   KEY UPDATE k = a` writes `Src`.`a` on 8.3 and `k = x.b` reads the
+        //   alias, while `k = aa` for an output alias and `k = Src.b` under
+        //   `Src x` are both 1054 there — one flat scope with the target
+        //   table, so `k = k + 1` over a source that also has a `k` is 1052.
+        //   A set operation contributes nothing: the same clause over `SELECT
+        //   ... UNION SELECT ...` is 1054 for `a`.
+        // - the row alias form, `VALUES (1, 1) AS new ON DUPLICATE KEY UPDATE
+        //   k = new.k`, which 8.3 accepts. Nothing here models `new`, so
+        //   resolving against the table alone would refuse it.
+        //
+        // Both are gaps of their own — this engine reads neither, so the two
+        // still answer where 8.3 refuses an unknown name in them — and both
+        // are a wrong *answer* left as it was rather than a wrong refusal
+        // added.
+        if written_values && insert.insert_alias.is_none() {
+            if let Some(assignments) = duplicate_key_update {
+                let refs: Vec<ColumnRef> = table
+                    .columns
+                    .iter()
+                    .map(|c| ColumnRef::in_database(&db, &table.name, &c.name))
+                    .collect();
+                resolve_assigned_values(assignments, &refs)?;
             }
         }
 
@@ -7164,13 +7314,43 @@ fn is_null_literal(e: &Expr) -> bool {
 /// It is not the whole of what carries binariness either: a derived table, a
 /// CTE and a view never reach this, because they rebuild their columns from an
 /// `SqlType`. `OutColumn::sql_type` is the other half.
-fn binary_answer(e: &Expr) -> bool {
+fn binary_answer(e: &Expr, refs: &[ColumnRef], sub: Option<Sub<'_>>) -> bool {
     match e {
-        Expr::Nested(inner) => binary_answer(inner),
+        Expr::Nested(inner) => binary_answer(inner, refs, sub),
         Expr::Function(f) => matches!(
             f.name.to_string().to_ascii_lowercase().as_str(),
             "unhex" | "from_base64"
         ),
+        // A scalar subquery hands back its column's values, bytes and all:
+        // 8.3 describes `(SELECT bl FROM T)` over a `BLOB` and
+        // `(SELECT bn FROM T)` over a `BINARY(4)` with the binary character
+        // set, and their `TEXT` and `VARCHAR` neighbours with the
+        // connection's.
+        //
+        // Asked only of the codes where it is a *choice*. A number, a temporal
+        // and a document already have their answer from the type — and saying
+        // "bytes" of one of those would go further than the wire: a relation
+        // built from this column reads `OutColumn::sql_type`, which turns a
+        // binary computed column into `varbinary`, so a subquery over a `DATE`
+        // inside a derived table would come back as bytes rather than a date.
+        Expr::Subquery(query) => {
+            let textual = |t: ColumnType| {
+                matches!(
+                    t,
+                    ColumnType::VarString
+                        | ColumnType::String
+                        | ColumnType::Blob
+                        | ColumnType::TinyBlob
+                        | ColumnType::MediumBlob
+                        | ColumnType::LongBlob
+                )
+            };
+            subquery_column(sub, query, refs).is_some_and(|column| {
+                textual(column.ty)
+                    && column.to_wire().charset
+                        == mysql_ultralight_protocol::column::charset::BINARY
+            })
+        }
         _ => false,
     }
 }
@@ -7194,9 +7374,14 @@ fn binary_answer(e: &Expr) -> bool {
 ///
 /// Defaults to signed, which is still the safe direction: an expression whose
 /// sign nothing here recognises answers within the signed range or not at all.
-fn unsigned_answer(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]) -> bool {
-    let recur = |inner: &Expr| unsigned_answer(inner, refs, input);
-    let integral = |e: &Expr| is_integer(computed_column_type(e, refs, input));
+fn unsigned_answer(
+    e: &Expr,
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+    sub: Option<Sub<'_>>,
+) -> bool {
+    let recur = |inner: &Expr| unsigned_answer(inner, refs, input, sub);
+    let integral = |e: &Expr| is_integer(computed_column_type(e, refs, input, sub));
     // The corrected shape, as in the arms below that ask `reassociated` for
     // it. `a XOR b IS NULL` arrives with the `IS NULL` at its root and means
     // `a XOR (b IS NULL)`, which is a different expression to read the sign
@@ -7219,6 +7404,14 @@ fn unsigned_answer(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelCo
             direct_column(e, refs, input).is_some_and(|column| column.ty.unsigned)
         }
         Expr::Nested(inner) => recur(inner),
+        // A scalar subquery keeps its column's sign, as it keeps its type:
+        // `(SELECT su FROM T) + 1` over an `INT UNSIGNED` is UNSIGNED on 8.3,
+        // and so is `(SELECT yr FROM T) + 1` over a `YEAR`. Read off the wire
+        // definition rather than off `OutColumn::unsigned`, because a YEAR
+        // carries the flag from its type code and not from a field.
+        Expr::Subquery(query) => subquery_column(sub, query, refs).is_some_and(|column| {
+            column.to_wire().flags & mysql_ultralight_protocol::column::flags::UNSIGNED != 0
+        }),
         // A whole number too big for an `i64` is a BIGINT UNSIGNED in MySQL,
         // which is the one literal that carries the flag: `SELECT
         // 18446744073709551615 - 1` is UNSIGNED there and answers
@@ -7464,8 +7657,13 @@ const CLOCK_NOT_NULL: &[&str] = &[
 /// acts on — Prisma maps it to a non-optional field. So every rule here was
 /// measured against MySQL 8.3, and anything unmeasured falls through to
 /// nullable rather than being reasoned about.
-fn never_null(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]) -> bool {
-    let recur = |inner: &Expr| never_null(inner, refs, input);
+fn never_null(
+    e: &Expr,
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+    sub: Option<Sub<'_>>,
+) -> bool {
+    let recur = |inner: &Expr| never_null(inner, refs, input, sub);
     // The corrected shape, as in the `BinaryOp` arm below: `a XOR b IS NULL`
     // arrives with the `IS NULL` at its root, where MySQL means
     // `a XOR (b IS NULL)` — nullable whenever `a` is, and the arm below that
@@ -7484,6 +7682,16 @@ fn never_null(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]
             direct_column(e, refs, input).is_some_and(|column| !column.nullable)
         }
         Expr::Nested(inner) => recur(inner),
+        // A scalar subquery is NOT NULL only where its column is *and* the
+        // query cannot come back empty, which is why this asks two questions
+        // where every other arm asks one. 8.3 takes the flag off
+        // `(SELECT sid FROM T)` over a column declared NOT NULL — the table
+        // can be empty, and an empty scalar subquery is NULL — and keeps it on
+        // `(SELECT 1)`, which reads no table.
+        Expr::Subquery(query) => {
+            always_one_row(query)
+                && subquery_column(sub, query, refs).is_some_and(|column| !column.nullable)
+        }
         // Only to a *numeric* target. `CAST(1 AS UNSIGNED)` is NOT NULL and
         // `CAST(1 AS CHAR)` is not, and nor is a cast to DATE — MySQL keeps
         // the door open for a conversion that cannot be made.
@@ -7739,12 +7947,13 @@ fn arithmetic_operand_type(
     e: &Expr,
     refs: &[ColumnRef],
     input: &[crate::relation::RelColumn],
+    sub: Option<Sub<'_>>,
 ) -> ColumnType {
-    let ty = computed_column_type(e, refs, input);
+    let ty = computed_column_type(e, refs, input, sub);
     if !is_temporal(ty) {
         return ty;
     }
-    if temporal_precision(e, refs, input) > 0 {
+    if temporal_precision(e, refs, input, sub) > 0 {
         ColumnType::NewDecimal
     } else {
         ColumnType::LongLong
@@ -7757,10 +7966,30 @@ fn arithmetic_operand_type(
 /// and the argument `NOW(3)` takes. Everything else answers zero, which is
 /// what a temporal with no declared precision has; guessing higher would type
 /// `CURDATE() + 0` a decimal where MySQL says LONGLONG.
-fn temporal_precision(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]) -> u64 {
+fn temporal_precision(
+    e: &Expr,
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+    sub: Option<Sub<'_>>,
+) -> u64 {
     use sqlparser::ast::DataType as D;
     match e {
-        Expr::Nested(inner) => temporal_precision(inner, refs, input),
+        Expr::Nested(inner) => temporal_precision(inner, refs, input, sub),
+        // A scalar subquery keeps the places its column declared, which is
+        // what decides whether arithmetic over it is exact: 8.3 answers
+        // NEWDECIMAL(3) for `(SELECT dt FROM T) + 0` over a `DATETIME(3)` and
+        // LONGLONG for the same over a `DATE`, exactly as it does for the
+        // column read directly.
+        //
+        // A *declared* precision only. A computed temporal has none to carry —
+        // `OutColumn` has no field for one — so `(SELECT NOW(3)) + 0` is a
+        // LONGLONG here where 8.3 says NEWDECIMAL(3). That is not this
+        // subquery's doing: `SELECT x + 0 FROM (SELECT NOW(3) AS x) d` loses
+        // it the same way, because every relation this engine builds from a
+        // computed column rebuilds it from a type code with no scale in it.
+        Expr::Subquery(query) => subquery_column(sub, query, refs)
+            .and_then(|column| column.declared.and_then(|declared| declared.length))
+            .unwrap_or(0),
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => direct_column(e, refs, input)
             .and_then(|column| column.ty.length)
             .unwrap_or(0),
@@ -7775,7 +8004,7 @@ fn temporal_precision(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::Re
             let widest = |candidates: &[Expr]| {
                 candidates
                     .iter()
-                    .map(|a| temporal_precision(a, refs, input))
+                    .map(|a| temporal_precision(a, refs, input, sub))
                     .max()
                     .unwrap_or(0)
             };
@@ -7803,9 +8032,9 @@ fn temporal_precision(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::Re
                 // value it shifts is the third argument.
                 "timestampadd" => args
                     .get(2)
-                    .map_or(0, |a| temporal_precision(a, refs, input)),
+                    .map_or(0, |a| temporal_precision(a, refs, input, sub)),
                 "min" | "max" => {
-                    aggregate_argument(f).map_or(0, |a| temporal_precision(&a, refs, input))
+                    aggregate_argument(f).map_or(0, |a| temporal_precision(&a, refs, input, sub))
                 }
                 "coalesce" | "ifnull" | "nvl" | "greatest" | "least" => widest(&args),
                 // `IF` chooses between its second and third; the condition
@@ -7822,11 +8051,11 @@ fn temporal_precision(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::Re
             ..
         } => conditions
             .iter()
-            .map(|w| temporal_precision(&w.result, refs, input))
+            .map(|w| temporal_precision(&w.result, refs, input, sub))
             .chain(
                 else_result
                     .iter()
-                    .map(|e| temporal_precision(e, refs, input)),
+                    .map(|e| temporal_precision(e, refs, input, sub)),
             )
             .max()
             .unwrap_or(0),
@@ -7845,12 +8074,12 @@ fn temporal_precision(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::Re
 ///
 /// `VAR_STRING` is deliberately not in the list, and a VARCHAR therefore is
 /// not either. It is also `computed_column_type`'s answer for an expression it
-/// cannot type at all, so treating it as a string would make every *unknown*
-/// operand approximate: `SUM((SELECT n FROM t))` over an integer is NEWDECIMAL
-/// in MySQL, and calling it DOUBLE would have the binary protocol send eight
-/// bytes of a float for a value the evaluator still produces as an integer.
-/// Telling a VARCHAR from an unknown needs a code they do not share, which is
-/// its own change.
+/// cannot type at all — a function it does not recognise, an operator with no
+/// arm, a scalar subquery nested past the describe limit — so treating it as a
+/// string would make every *unknown* operand approximate where the evaluator
+/// still produces an exact value for it, and the binary protocol would send
+/// eight bytes of a float. Telling a VARCHAR from an unknown needs a code they
+/// do not share, which is its own change.
 fn is_textual_code(t: ColumnType) -> bool {
     matches!(
         t,
@@ -7888,10 +8117,11 @@ fn arithmetic_type(a: ColumnType, b: ColumnType) -> ColumnType {
         // it under any narrower code.
         ColumnType::LongLong
     } else {
-        // An operand of unknown type — a string column, a subquery, a function
-        // this does not recognise. MySQL answers DOUBLE for arithmetic over a
-        // string, and so does the evaluator: `'3.5' + 1` is 4.5. Calling it an
-        // integer had the binary protocol send 4.
+        // An operand of unknown type — a string column, a function this does
+        // not recognise, a scalar subquery nested past the describe limit.
+        // MySQL answers DOUBLE for arithmetic over a string, and so does the
+        // evaluator: `'3.5' + 1` is 4.5. Calling it an integer had the binary
+        // protocol send 4.
         ColumnType::Double
     }
 }
@@ -7941,9 +8171,10 @@ fn candidate_type(
     e: &Expr,
     refs: &[ColumnRef],
     input: &[crate::relation::RelColumn],
+    sub: Option<Sub<'_>>,
 ) -> (ColumnType, bool) {
-    let ty = computed_column_type(e, refs, input);
-    let unsigned = is_integer(ty) && unsigned_answer(e, refs, input);
+    let ty = computed_column_type(e, refs, input, sub);
+    let unsigned = is_integer(ty) && unsigned_answer(e, refs, input, sub);
     (ty, unsigned)
 }
 
@@ -8013,6 +8244,196 @@ fn direct_column<'a>(
     column_slot(refs, written).and_then(|slot| input.get(slot))
 }
 
+/// What a scalar subquery's column is described against.
+///
+/// The type of `(SELECT ...)` is the type of the subquery's *own* projection,
+/// so nothing about the enclosing statement can answer it: the inner query has
+/// to be described, which needs the catalog, the session and therefore the
+/// engine. Every walker below that can meet a subquery carries this, and
+/// `None` means there is nothing to describe with — a column default, a check
+/// constraint, a unit test — where the answer stays what it was before this
+/// existed.
+#[derive(Clone, Copy)]
+struct Sub<'a> {
+    engine: &'a Engine,
+    session: &'a Session,
+}
+
+thread_local! {
+    /// The scalar subqueries already described while typing this statement,
+    /// by the scope they were described in and the text they were written as.
+    ///
+    /// Four walkers ask about the same subquery node — its type, its sign, its
+    /// fractional precision and whether it can be NULL — and describing it is
+    /// a whole query. Without this each of them ran it again, and a subquery
+    /// inside a subquery multiplied that per level.
+    ///
+    /// Keyed by the scope as well as the text because a correlated subquery's
+    /// answer depends on what encloses it, and one statement can write the
+    /// same text under two of them.
+    static SUBQUERY_COLUMNS: std::cell::RefCell<HashMap<String, Option<OutColumn>>> =
+        std::cell::RefCell::new(HashMap::new());
+
+    /// How many scalar subqueries deep the current description is.
+    static SUBQUERY_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How far a scalar subquery is described into a nest of them.
+///
+/// Describing one runs it, and running it types *its* projection, which
+/// describes the subqueries in that. A statement can nest them as deeply as it
+/// likes, so without a stop the describe recurses as deep as the text does and
+/// runs out of stack rather than answering. Past the limit the type falls back
+/// to `VAR_STRING`, which is what every one of these was before this change —
+/// a worse answer, not a wrong one.
+const SUBQUERY_DEPTH_LIMIT: usize = 8;
+
+/// Restores the depth however the scope is left, as `Shaping` does.
+struct SubqueryDepth;
+
+impl Drop for SubqueryDepth {
+    fn drop(&mut self) {
+        SUBQUERY_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+}
+
+/// Clears the memo above for the duration of one statement.
+///
+/// Entered at `execute` and `describe`, which are the only ways in. The
+/// previous map is put back rather than dropped because those two can nest —
+/// `ALTER TABLE` re-resolves the views over the table it changed — and a
+/// statement that cleared an enclosing one's memo would leave it describing
+/// nothing while still believing it had.
+struct SubqueryMemo(HashMap<String, Option<OutColumn>>);
+
+impl SubqueryMemo {
+    fn fresh() -> Self {
+        Self(SUBQUERY_COLUMNS.with(|m| std::mem::take(&mut *m.borrow_mut())))
+    }
+}
+
+impl Drop for SubqueryMemo {
+    fn drop(&mut self) {
+        SUBQUERY_COLUMNS.with(|m| *m.borrow_mut() = std::mem::take(&mut self.0));
+    }
+}
+
+/// The one column a scalar subquery produces, described rather than evaluated.
+///
+/// Run as a probe over no rows, for the two reasons `describe` is: a type is
+/// not a value, so the rows are wasted work — and a `SELECT` is not free of
+/// consequences, so typing `(SELECT GET_LOCK('x', 0))` must not take the lock
+/// a second time. That also keeps this answering the same thing at prepare and
+/// at execute, which is the invariant `describe_matches_execute` holds.
+///
+/// `None` where there is nothing to describe with, where the subquery does not
+/// resolve — a correlated reference this scope does not carry — or where it
+/// produces anything other than exactly one column. The last of those is 1241
+/// on 8.3 and answered here rather than refused, because this is a walker that
+/// types an expression and has no way to report an error; the refusal is its
+/// own issue.
+fn subquery_column(sub: Option<Sub<'_>>, query: &Query, refs: &[ColumnRef]) -> Option<OutColumn> {
+    let sub = sub?;
+    let depth = SUBQUERY_DEPTH.with(|d| d.get());
+    if depth >= SUBQUERY_DEPTH_LIMIT {
+        return None;
+    }
+
+    // The depth is part of the key because it is part of the answer: the limit
+    // above returns without storing anything, but every level *over* the one
+    // that hit it stores a type derived from the fallback. Sharing that with a
+    // shallower lookup of the same query would hand it a truncated answer it
+    // had the budget to compute properly.
+    let mut key = format!("{depth}:");
+    for r in refs {
+        key.push_str(&r.database);
+        key.push('.');
+        key.push_str(&r.table);
+        key.push('.');
+        key.push_str(&r.name);
+        key.push(',');
+    }
+    key.push_str("::");
+    key.push_str(&query.to_string());
+    if let Some(hit) = SUBQUERY_COLUMNS.with(|m| m.borrow().get(&key).cloned()) {
+        return hit;
+    }
+
+    // The enclosing columns with no values in them, exactly as `describe`
+    // binds every parameter to NULL: a correlated subquery has to *resolve*
+    // against the outer row, and nothing about which row it is changes the
+    // type it answers with.
+    let outer = OuterRow {
+        schema: refs.to_vec(),
+        values: vec![Value::Null; refs.len()],
+    };
+
+    SUBQUERY_DEPTH.with(|d| d.set(d.get() + 1));
+    let _depth = SubqueryDepth;
+    let described = expr::probing(|| {
+        shaping(|| {
+            sub.engine
+                .query_outer(sub.session, query, Some(&outer))
+                .ok()
+        })
+    });
+    let answer = match described {
+        Some(result) if result.columns.len() == 1 => result.columns.into_iter().next(),
+        _ => None,
+    };
+    SUBQUERY_COLUMNS.with(|m| m.borrow_mut().insert(key, answer.clone()));
+    answer
+}
+
+/// Whether a query answers with a row whatever is in the database.
+///
+/// The other half of a scalar subquery's nullability: 8.3 keeps the NOT_NULL
+/// flag on `(SELECT 1)` and takes it off `(SELECT sid FROM T)` even though
+/// `sid` is declared NOT NULL, because the table can be empty and an empty
+/// subquery is NULL. So the flag survives only where the query reads no table
+/// and filters nothing.
+///
+/// A LIMIT takes the flag off here where 8.3 keeps it, and that is deliberate:
+/// `SELECT (SELECT 1 LIMIT 0)` is NOT_NULL *and answers 1* on 8.3, which never
+/// applies the clause to a constant subquery at all. This engine does apply it
+/// and answers NULL, so following MySQL's flag would put NOT_NULL over a NULL
+/// — and under-reporting is the safe direction, as `never_null` says. It costs
+/// `(SELECT 1 LIMIT 1)`, which 8.3 calls NOT_NULL.
+///
+/// A WHERE and a HAVING are read, and there MySQL agrees: `(SELECT 1 WHERE 0)`
+/// and `(SELECT 1 HAVING 1)` are both nullable on 8.3.
+fn always_one_row(query: &Query) -> bool {
+    query.with.is_none() && query.limit_clause.is_none() && body_always_one_row(query.body.as_ref())
+}
+
+/// [`always_one_row`] for a query's body, which is what a set operation's arms
+/// are.
+fn body_always_one_row(body: &SetExpr) -> bool {
+    match body {
+        SetExpr::Select(select) => {
+            select.from.is_empty()
+                && select.selection.is_none()
+                && select.having.is_none()
+                && matches!(&select.group_by, GroupByExpr::Expressions(e, _) if e.is_empty())
+        }
+        // A UNION answers whatever its branches answer, so if both always
+        // have a row so does it: 8.3 reports `(SELECT 1 UNION SELECT 1)`
+        // NOT_NULL. The other three take rows *away* — `SELECT 1 EXCEPT
+        // SELECT 1` and `SELECT 1 INTERSECT SELECT 2` are both empty however
+        // certain their branches are — and 8.3 reports both of those
+        // nullable. Reading the operator is what tells them apart; without it
+        // this engine put NOT_NULL over the NULL it really sends for them.
+        SetExpr::SetOperation {
+            op: sqlparser::ast::SetOperator::Union,
+            left,
+            right,
+            ..
+        } => body_always_one_row(left) && body_always_one_row(right),
+        SetExpr::Query(inner) => always_one_row(inner),
+        _ => false,
+    }
+}
+
 /// The type to declare for an expression, before any row has been evaluated.
 ///
 /// A grouped projection cannot be typed from the first group's value: a later
@@ -8026,6 +8447,7 @@ fn computed_column_type(
     e: &Expr,
     refs: &[ColumnRef],
     input: &[crate::relation::RelColumn],
+    sub: Option<Sub<'_>>,
 ) -> ColumnType {
     // The corrected shape, for the reason the `BinaryOp` arm below asks for
     // it: the root as parsed is often not the operator that decides. Every
@@ -8035,7 +8457,7 @@ fn computed_column_type(
     // over these trees have to agree with the shape `eval` reads, and
     // `never_null` already does.
     if let Some(fixed) = crate::expr::reassociated_postfix(e) {
-        return computed_column_type(&fixed, refs, input);
+        return computed_column_type(&fixed, refs, input, sub);
     }
     match e {
         Expr::Function(f) => {
@@ -8044,7 +8466,7 @@ fn computed_column_type(
                 // MIN and MAX keep the type of what they fold, because the
                 // smallest and largest of a column are values of that column.
                 "min" | "max" => aggregate_argument(f)
-                    .map(|argument| computed_column_type(&argument, refs, input))
+                    .map(|argument| computed_column_type(&argument, refs, input, sub))
                     .unwrap_or(ColumnType::VarString),
                 // A total is not. `SUM` over a TINYINT reaches 300, and
                 // announcing the column as one byte makes the binary protocol
@@ -8053,7 +8475,7 @@ fn computed_column_type(
                 // and DOUBLE where the argument was already approximate.
                 "sum" | "avg" => {
                     let argument = aggregate_argument(f)
-                        .map(|argument| computed_column_type(&argument, refs, input));
+                        .map(|argument| computed_column_type(&argument, refs, input, sub));
                     match argument {
                         Some(ColumnType::Float | ColumnType::Double) => ColumnType::Double,
                         // A string has no exact type to total up, so the
@@ -8069,7 +8491,7 @@ fn computed_column_type(
                 "lag" | "lead" | "first_value" | "last_value" | "nth_value" => {
                     let argument = function_arguments(f)
                         .first()
-                        .map(|argument| computed_column_type(argument, refs, input));
+                        .map(|argument| computed_column_type(argument, refs, input, sub));
                     match argument {
                         Some(t) if is_integer(t) => ColumnType::LongLong,
                         Some(t) => t,
@@ -8092,7 +8514,7 @@ fn computed_column_type(
                     } else {
                         args.first()
                     };
-                    match subject.map(|argument| computed_column_type(argument, refs, input)) {
+                    match subject.map(|argument| computed_column_type(argument, refs, input, sub)) {
                         Some(ColumnType::Date) => ColumnType::Date,
                         Some(ColumnType::DateTime | ColumnType::Timestamp) => ColumnType::DateTime,
                         // MySQL answers `STRING` here rather than
@@ -8120,7 +8542,11 @@ fn computed_column_type(
                     // returned when the first is NULL. `COALESCE(i, 'x')` is a
                     // string in MySQL, and calling it a LONGLONG had the binary
                     // protocol send 0 for the `'x'`.
-                    combined(candidates.iter().map(|a| candidate_type(a, refs, input)))
+                    combined(
+                        candidates
+                            .iter()
+                            .map(|a| candidate_type(a, refs, input, sub)),
+                    )
                 }
                 // These hand back one of their arguments unchanged, so they
                 // keep its width: `GREATEST(tinyint, smallint)` really is a
@@ -8130,7 +8556,7 @@ fn computed_column_type(
                 "greatest" | "least" => combined(
                     function_arguments(f)
                         .iter()
-                        .map(|a| candidate_type(a, refs, input)),
+                        .map(|a| candidate_type(a, refs, input, sub)),
                 ),
                 // These keep the *kind* of what they were given but not its
                 // width — MySQL answers LONGLONG for every integer argument,
@@ -8148,7 +8574,7 @@ fn computed_column_type(
                 "abs" | "round" | "truncate" => numeric_answer(
                     function_arguments(f)
                         .first()
-                        .map(|a| computed_column_type(a, refs, input))
+                        .map(|a| computed_column_type(a, refs, input, sub))
                         .unwrap_or(ColumnType::Null),
                     false,
                 ),
@@ -8159,7 +8585,7 @@ fn computed_column_type(
                     let args = function_arguments(f);
                     let side = |i: usize| {
                         args.get(i)
-                            .map(|a| arithmetic_operand_type(a, refs, input))
+                            .map(|a| arithmetic_operand_type(a, refs, input, sub))
                             .unwrap_or(ColumnType::Null)
                     };
                     arithmetic_type(side(0), side(1))
@@ -8170,7 +8596,7 @@ fn computed_column_type(
                     combined(
                         function_arguments(f)
                             .iter()
-                            .map(|a| candidate_type(a, refs, input)),
+                            .map(|a| candidate_type(a, refs, input, sub)),
                     ),
                     true,
                 ),
@@ -8178,7 +8604,7 @@ fn computed_column_type(
                 // that argument's own width.
                 "nullif" => function_arguments(f)
                     .first()
-                    .map(|argument| computed_column_type(argument, refs, input))
+                    .map(|argument| computed_column_type(argument, refs, input, sub))
                     .unwrap_or(ColumnType::VarString),
                 "isnull" => ColumnType::LongLong,
                 // The ones whose answer does not depend on what they were
@@ -8225,7 +8651,7 @@ fn computed_column_type(
         // synonyms of, which is by their argument: whole, but a DOUBLE when
         // what it rounded was one.
         Expr::Floor { expr, .. } | Expr::Ceil { expr, .. } => {
-            numeric_answer(computed_column_type(expr, refs, input), true)
+            numeric_answer(computed_column_type(expr, refs, input, sub), true)
         }
         Expr::Substring { .. } | Expr::Trim { .. } | Expr::Overlay { .. } => ColumnType::VarString,
         // Anything that answers a yes-or-no question is an integer, which is
@@ -8252,7 +8678,7 @@ fn computed_column_type(
             // a decimal, and `doc->'$.b' = 6` is a boolean rather than a
             // document.
             if let Some(fixed) = crate::expr::reassociated(op, left, right) {
-                return computed_column_type(&fixed, refs, input);
+                return computed_column_type(&fixed, refs, input, sub);
             }
             match op {
                 // A comparison or a logical connective is 0 or 1. `<=>` is
@@ -8286,7 +8712,8 @@ fn computed_column_type(
                 //
                 // Asked of the operands directly rather than read off
                 // `arithmetic_type`, whose DOUBLE also means "I could not type
-                // this" — a subquery, an unrecognised function. Routed through
+                // this" — an unrecognised function, and a scalar subquery
+                // until #0104 gave it its column's type. Routed through
                 // it, `(SELECT 1)/2` was announced DOUBLE and `reconcile`
                 // then parsed the exact quotient back through an `f64`, so the
                 // same expression answered 0.5 as a column and 0.5000 inside a
@@ -8295,7 +8722,7 @@ fn computed_column_type(
                 // neither side is.
                 B::Divide => {
                     let approximate =
-                        |e| is_approximate_code(arithmetic_operand_type(e, refs, input));
+                        |e| is_approximate_code(arithmetic_operand_type(e, refs, input, sub));
                     if approximate(left) || approximate(right) {
                         ColumnType::Double
                     } else {
@@ -8304,8 +8731,8 @@ fn computed_column_type(
                 }
                 B::MyIntegerDivide => ColumnType::LongLong,
                 B::Plus | B::Minus | B::Multiply | B::Modulo => arithmetic_type(
-                    arithmetic_operand_type(left, refs, input),
-                    arithmetic_operand_type(right, refs, input),
+                    arithmetic_operand_type(left, refs, input, sub),
+                    arithmetic_operand_type(right, refs, input, sub),
                 ),
                 // Every bitwise operator answers 64 unsigned bits whatever it
                 // was given: `1.5 ^ 1` is a LONGLONG in MySQL and so is
@@ -8326,7 +8753,7 @@ fn computed_column_type(
             // As with the binary operators above, the corrected shape decides:
             // `~1 * 2` arrives as `~(1 * 2)` and is really a multiplication.
             if let Some(fixed) = crate::expr::reassociated_unary(op, expr) {
-                return computed_column_type(&fixed, refs, input);
+                return computed_column_type(&fixed, refs, input, sub);
             }
             match op {
                 U::Not | U::BitwiseNot => ColumnType::LongLong,
@@ -8340,14 +8767,14 @@ fn computed_column_type(
                 // widens to LONGLONG. Only reachable from inside another
                 // expression, since a plus over a column reference on its own
                 // is that column and never comes here.
-                U::Plus => computed_column_type(expr, refs, input),
+                U::Plus => computed_column_type(expr, refs, input, sub),
                 // Unary minus computes, and MySQL answers a DOUBLE for the
                 // negation of a temporal even though `d + 0` is a LONGLONG.
                 // Measured, not derived: `-d` is DOUBLE -20240105 on 8.3.
-                U::Minus if is_temporal(computed_column_type(expr, refs, input)) => {
+                U::Minus if is_temporal(computed_column_type(expr, refs, input, sub)) => {
                     ColumnType::Double
                 }
-                U::Minus => match computed_column_type(expr, refs, input) {
+                U::Minus => match computed_column_type(expr, refs, input, sub) {
                     t if is_integer(t) => ColumnType::LongLong,
                     // As with `ABS`: computing with a float widens it, and
                     // MySQL says so in the type as well as in the digits.
@@ -8392,9 +8819,22 @@ fn computed_column_type(
                 .iter()
                 .map(|w| &w.result)
                 .chain(else_result.as_deref())
-                .map(|r| candidate_type(r, refs, input)),
+                .map(|r| candidate_type(r, refs, input, sub)),
         ),
-        Expr::Nested(inner) => computed_column_type(inner, refs, input),
+        // A scalar subquery is the type of the subquery's own projection, not
+        // a type of its own: 8.3 answers LONG for `(SELECT sid FROM T)` over
+        // an `INT` column, LONGLONG for `(SELECT COUNT(*) FROM T)`, and
+        // `binary(0)` for the materialised all-NULL set operation, exactly as
+        // it does for the inner query on its own. Which is why this needs the
+        // engine — see `Sub` — and why the whole family of walkers here got a
+        // parameter for it.
+        //
+        // `VAR_STRING` where the subquery cannot be described, which is what
+        // every scalar subquery was answered before this arm existed.
+        Expr::Subquery(query) => subquery_column(sub, query, refs)
+            .map(|column| column.ty)
+            .unwrap_or(ColumnType::VarString),
+        Expr::Nested(inner) => computed_column_type(inner, refs, input, sub),
         _ => ColumnType::VarString,
     }
 }
@@ -9080,13 +9520,13 @@ fn resolve_projected_expr(e: &Expr, refs: &[ColumnRef]) -> EngineResult<()> {
 /// every one of them at once, and a clause the next statement form needs is a
 /// single line.
 ///
-/// `INSERT ... ON DUPLICATE KEY UPDATE` is the write this does *not* reach and
-/// the same hole is still open there: its assignments are read only for a row
-/// that actually collides, so `INSERT INTO Bare (id, k) VALUES (1, 1) ON
-/// DUPLICATE KEY UPDATE k = a.b` inserts and reports success where 8.3 raises
-/// 1054. Left rather than folded in, because that clause resolves `VALUES(x)`
-/// and the insert's own column list as well, and getting its scope wrong
-/// refuses legal SQL — the failure this whole mechanism is careful about.
+/// `INSERT ... ON DUPLICATE KEY UPDATE` is the write this does *not* reach,
+/// and it has no WHERE to reach: #0165 closed the same hole there with
+/// `resolve_assigned_values` alone, at the call site in `insert`, where the
+/// scope is written out. It stayed separate rather than being folded in
+/// because the scope is not this one — the clause resolves `VALUES(x)` too,
+/// and for an `INSERT ... SELECT` it sees the SELECT's FROM tables as well, so
+/// resolving it against the target table alone would refuse legal SQL.
 fn resolve_dml_where(selection: Option<&Expr>, refs: &[ColumnRef]) -> EngineResult<()> {
     let Some(predicate) = selection else {
         return Ok(());
@@ -9100,25 +9540,39 @@ fn resolve_dml_where(selection: Option<&Expr>, refs: &[ColumnRef]) -> EngineResu
     refuse_at_resolve([predicate])
 }
 
-/// Resolves the values an UPDATE assigns, before any row is considered.
+/// Resolves the values an assignment list writes, before any row is
+/// considered.
 ///
-/// The other half of the same hole, and the one the issue leads with: `UPDATE
-/// Bare SET k = a.b` over an empty table affected nought rows where 8.3 raises
+/// The other half of the same hole, and the one #0102 leads with: `UPDATE Bare
+/// SET k = a.b` over an empty table affected nought rows where 8.3 raises
 /// 1054. `'field list'`, measured — 8.3 names an assigned value's clause the
-/// same way it names a selected one's.
+/// same way it names a selected one's, and it names an `ON DUPLICATE KEY
+/// UPDATE` value's the same way again.
 ///
-/// Left where #0087 put the ESCAPE guard, which is ahead of the assignment
-/// *targets*. 8.3 settles the targets first, so a statement whose target and
-/// whose value are both unknown is reported here by its value where 8.3
-/// reports it by its target: `UPDATE Bare SET k = nope1, nope2 = 1` names
-/// `nope1` and 8.3 names `nope2`. Both are 1054 in the field list and the
-/// difference is which name the message carries, where moving this below the
-/// targets would trade it for a difference in *code* — the generated-column
-/// refusal lives in that loop, and `UPDATE Gn SET g = 1, k = nope` is 1054 on
-/// 8.3 and not 3105.
+/// Two call sites, and they place it on *opposite* sides of the assignment
+/// targets, because that is where 8.3 puts it in each:
+///
+/// - From `update`, above the targets, where #0087 put the ESCAPE guard. 8.3
+///   settles the targets first, so a statement whose target and whose value
+///   are both unknown is reported here by its value where 8.3 reports it by
+///   its target: `UPDATE Bare SET k = nope1, nope2 = 1` names `nope1` and 8.3
+///   names `nope2`. Both are 1054 in the field list and the difference is
+///   which name the message carries, where moving it below the targets would
+///   trade that for a difference in *code* — the generated-column refusal
+///   lives in that loop, and `UPDATE Gn SET g = 1, k = nope` is 1054 on 8.3
+///   and not 3105.
+/// - From `insert`, below them, which is 8.3's order for that clause and not
+///   the same trade: `INSERT INTO Bare (id, k) VALUES (1, 1) ON DUPLICATE KEY
+///   UPDATE k = zz2, zz1 = 1` names `zz1` there, and `... UPDATE g = 1, k =
+///   nope` names `nope` rather than answering 3105 — so nothing is given up by
+///   letting every target resolve first.
+///
 /// Per assignment rather than every name and then every ESCAPE, because that
 /// is how the select list settles the same pair: `SELECT ('a' LIKE 'b' ESCAPE
-/// '!!'), nope FROM t` is 1210 on 8.3 and the first item's problem wins.
+/// '!!'), nope FROM t` is 1210 on 8.3 and the first item's problem wins. Both
+/// clauses were measured for it — `SET label = ('a' LIKE 'b' ESCAPE '!!'), sid
+/// = nope` is 1210 and the same two assignments the other way round are 1054,
+/// and so are the two spellings of the `ON DUPLICATE KEY UPDATE` pair.
 fn resolve_assigned_values(assignments: &[Assignment], refs: &[ColumnRef]) -> EngineResult<()> {
     for assignment in assignments {
         // `SET k = DEFAULT` writes the column's declared default, and the
