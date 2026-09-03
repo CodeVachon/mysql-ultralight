@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-08-25T23:13:29Z
-updated: 2026-08-25T23:13:29Z
+updated: 2026-09-03T14:01:18Z
 ---
 
 ## Description
@@ -22,3 +22,9 @@ The type code agrees — both say DOUBLE — and so does the number. What differ
 Same mechanism as #0075 — a fixed number of places on an approximate column — so the two probably close together.
 
 Left out of the differential corpus's `decimal arithmetic` group for this reason, with a comment saying so. Found while measuring for #0070.
+
+## Notes
+
+### 2026-09-03T14:01:18Z — Christopher Vachon (user)
+
+VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed exactly. -dt3 mysql -20240105060708.500 (Decimals 3) engine -20240105060708.5 (Decimals 0); -tm3 mysql -20260102030405.250 engine -20260102030405.25. dt3+0 agrees, as the description says.

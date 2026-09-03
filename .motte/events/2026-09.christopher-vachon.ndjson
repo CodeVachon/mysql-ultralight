@@ -76,3 +76,25 @@
 {"at":"2026-09-03T10:30:29Z","id":169,"by":"Christopher Vachon","as":"user","type":"created","title":"A table reference longer than 64 characters is 1146, not 1059","state":"Todo"}
 {"at":"2026-09-03T11:12:06Z","id":107,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-09-03T11:12:06Z","id":164,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-09-03T11:38:49Z","id":99,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T11:38:50Z","id":150,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T11:41:31Z","id":110,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T11:41:31Z","id":133,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T11:41:32Z","id":94,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T12:29:35Z","id":178,"by":"Christopher Vachon","as":"user","type":"created","title":"ALTER TABLE DROP KEY and DROP CHECK do not parse","state":"Todo"}
+{"at":"2026-09-03T12:29:35Z","id":179,"by":"Christopher Vachon","as":"user","type":"created","title":"Dropping a column leaves its indexes behind","state":"Todo"}
+{"at":"2026-09-03T12:29:35Z","id":180,"by":"Christopher Vachon","as":"user","type":"created","title":"A column or index a foreign key needs can be dropped","state":"Todo"}
+{"at":"2026-09-03T12:30:06Z","id":181,"by":"Christopher Vachon","as":"user","type":"created","title":"information_schema omits CHECK constraints entirely","state":"Todo"}
+{"at":"2026-09-03T12:30:06Z","id":182,"by":"Christopher Vachon","as":"user","type":"created","title":"A duplicate CHECK constraint name is accepted","state":"Todo"}
+{"at":"2026-09-03T12:30:07Z","id":183,"by":"Christopher Vachon","as":"user","type":"created","title":"An unnamed foreign key's invented name can collide","state":"Todo"}
+{"at":"2026-09-03T12:30:07Z","id":184,"by":"Christopher Vachon","as":"user","type":"created","title":"RENAME TO mid-statement skips the operations after it","state":"Todo"}
+{"at":"2026-09-03T12:30:07Z","id":185,"by":"Christopher Vachon","as":"user","type":"created","title":"IF EXISTS is accepted on drops where MySQL refuses the syntax","state":"Todo"}
+{"at":"2026-09-03T12:51:10Z","id":133,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T12:52:36Z","id":186,"by":"Christopher Vachon","as":"user","type":"created","title":"EXTRACT of a DAY unit drops the day for a datetime-typed item","state":"Todo"}
+{"at":"2026-09-03T12:52:36Z","id":187,"by":"Christopher Vachon","as":"user","type":"created","title":"information_schema VIEW_DEFINITION is not the text MySQL stores","state":"Todo"}
+{"at":"2026-09-03T12:52:56Z","id":188,"by":"Christopher Vachon","as":"user","type":"created","title":"Integer functions with a narrow max_length are materialised wide","state":"Todo"}
+{"at":"2026-09-03T12:52:56Z","id":189,"by":"Christopher Vachon","as":"user","type":"created","title":"MySQL also materialises for DISTINCT, GROUP BY and LIMIT","state":"Todo"}
+{"at":"2026-09-03T12:52:56Z","id":190,"by":"Christopher Vachon","as":"user","type":"created","title":"Temporal and conditional expressions keep the wrong width or type","state":"Todo"}
+{"at":"2026-09-03T13:04:56Z","id":94,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T13:19:21Z","id":110,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T14:04:38Z","id":191,"by":"Christopher Vachon","as":"user","type":"created","title":"A system variable is returned as a string, not a number","state":"Todo"}

@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-09-01T06:09:09Z
-updated: 2026-09-01T07:46:39Z
+updated: 2026-09-03T14:05:52Z
 ---
 
 ## Description
@@ -34,3 +34,14 @@ Widened by 294e19c: the refusal now covers the TABLE-level clause as well as the
 The boundary is now measured rather than suffix-matched: 286 collation names read off 8.3, embedded sorted. A name outside that set is 1273 as MySQL writes it. A real MySQL collation this engine cannot compare in -- utf8mb4_bin, latin1_swedish_ci, binary -- is the unsupported refusal, which is what this issue tracks. The first cut conflated the two and answered 1273 for utf8mb4_bin, a false claim about a name MySQL has.
 
 So closing this issue means honouring those collations (#0129), and when it lands the refusal becomes an answer at both levels and the corpus can carry cases for them.
+
+### 2026-09-03T14:05:52Z — Christopher Vachon (user)
+
+VALIDATED 2026-09-03 against mysql:8.3. Premise holds, and the description's table shows the OLD engine behaviour -- worth updating before anyone works it.
+
+Today the engine refuses the DDL outright:
+    CREATE TABLE Cb (a VARCHAR(10) COLLATE utf8mb4_bin, UNIQUE KEY (a))
+    mysql   accepted; then 'a' and 'A' both store, and WHERE a='A' returns A
+    engine  1235 'does not yet support the utf8mb4_bin collation' -- so the table never exists
+
+The description's '1062 on the second INSERT' and 'WHERE a = A returned a' describe the behaviour before the refusal was added, which is what the title means by 'is now refused'. The current divergence is the refusal itself, not a wrong answer.

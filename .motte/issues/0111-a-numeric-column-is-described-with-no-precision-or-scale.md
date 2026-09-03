@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-08-25T23:12:44Z
-updated: 2026-08-28T17:00:29Z
+updated: 2026-09-03T14:03:11Z
 ---
 
 ## Description
@@ -39,3 +39,7 @@ Partly provable after #0126 (a2e3d47): a DECIMAL column's declared length is now
 Still not compared, and still this issue's subject: the decimals field itself (1148 divergences over 260 statements when it was measured), and the width of a computed column, which MySQL takes from Item::max_length and the engine does not model at all (2784 over 560).
 
 Both are named with those counts in compare.rs and in crates/differential/README.md. Turning either on is the first step of whoever takes this -- the counts above are what to expect.
+
+### 2026-09-03T14:03:11Z — Christopher Vachon (user)
+
+VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed. Over DECIMAL(10,2) and DECIMAL(7,3): 8.3 reports len 12 dec 2, len 10 dec 3, and len 14 dec 3 BINARY NUM for a+b; the engine reports len 20 dec 0 NUM for all three.

@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-08-25T23:29:12Z
-updated: 2026-08-25T23:29:12Z
+updated: 2026-09-03T14:01:18Z
 ---
 
 ## Description
@@ -36,3 +36,9 @@ Where it shows up:
 Left out of the differential corpus for the same reason: `crates/differential/src/cases.rs` covers division through what it prints, and the group says so.
 
 Found while cross-checking a 32768-row aggregate against 8.3 after #0070.
+
+## Notes
+
+### 2026-09-03T14:01:18Z — Christopher Vachon (user)
+
+VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed exactly, including the width pattern. JSON_ARRAY(1/3) mysql [0.333333333] engine [0.3333]; 1/3=0.3333 mysql 0 engine 1; (1/3)*3 mysql 1.0000 engine 0.9999. JSON_ARRAY(1.5/1, 1/1.5, 1.5/1.5, 1.000000/1) confirms 9/9/18/18 places on 8.3 against 5/4/5/10 here.

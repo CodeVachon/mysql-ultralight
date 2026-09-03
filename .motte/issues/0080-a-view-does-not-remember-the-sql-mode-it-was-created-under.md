@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-08-24T17:36:23Z
-updated: 2026-08-24T18:44:02Z
+updated: 2026-09-03T14:05:52Z
 ---
 
 ## Description
@@ -30,3 +30,7 @@ Only visible when a session changes sql_mode mid-connection. Under a fixed serve
 Confirmed again by review during #0081, and #0053 widened it: REAL inside a view body now resolves under the reading session's mode, so one view gives Float/1.23457 while REAL_AS_FLOAT is set and Double/1.234567890123 after it is cleared, where MySQL gives float both times. Before #0053 a REAL in a view was unconditionally double -- wrong against MySQL under the flag, but at least self-consistent between two reads.
 
 Narrow: only a REAL written inside a view body. A view over a REAL column is fine, because the column's type is baked at DDL time.
+
+### 2026-09-03T14:05:52Z — Christopher Vachon (user)
+
+VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed. A view of 'a' || 'b' created under PIPES_AS_CONCAT answers 'ab' on 8.3 after the mode is cleared, and 0 here -- the view is re-parsed under the session's current mode instead of the one it was created under.

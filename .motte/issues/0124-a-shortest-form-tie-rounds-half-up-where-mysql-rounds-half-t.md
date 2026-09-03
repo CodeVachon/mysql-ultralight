@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-08-26T07:20:32Z
-updated: 2026-08-26T07:20:32Z
+updated: 2026-09-03T14:01:18Z
 ---
 
 ## Description
@@ -23,3 +23,9 @@ Rate: 1.16% of 35669 mixed JSON literals; on the DOUBLE path 0.4-0.9% of random 
 Fixing it means a shortest-round-trip formatter with an even tie-break, shared by json::double and the engine's DOUBLE rendering. Fixing only one would make the engine disagree with itself, which is why #0072 did not fold it in.
 
 No differential case can exist for this while the baseline must stay empty -- every statement that exposes it diverges today. That is the argument for fixing it rather than recording it.
+
+## Notes
+
+### 2026-09-03T14:01:18Z — Christopher Vachon (user)
+
+VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed exactly, all three forms: CAST('694593818398461.3' AS DOUBLE), the 694593818398461.3e0 literal, and CAST('[...]' AS JSON) are ...461.2 on 8.3 and ...461.3 here.

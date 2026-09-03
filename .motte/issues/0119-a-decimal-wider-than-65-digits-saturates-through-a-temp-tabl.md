@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-08-25T23:42:34Z
-updated: 2026-08-25T23:42:34Z
+updated: 2026-09-03T14:01:18Z
 ---
 
 ## Description
@@ -25,3 +25,9 @@ This engine answers the 70 digits everywhere, which matches three of the five.
 Same family as #0110 — a value materialised differently from how it is computed — and it needs the same thing: somewhere that knows a temp column's declared type and rounds or saturates to it on the way in.
 
 Left out of the differential corpus's `decimal arithmetic` group, which keeps the 70-digit product to the four shapes that agree. Found while widening the collation key for #0070.
+
+## Notes
+
+### 2026-09-03T14:01:18Z — Christopher Vachon (user)
+
+VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed exactly. The plain, ORDER BY and derived-table forms all agree at 70 digits; only GROUP BY and DISTINCT diverge, where 8.3 saturates to 65 nines and the engine keeps all 70.

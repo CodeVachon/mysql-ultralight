@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-09-02T17:25:27Z
-updated: 2026-09-02T17:25:27Z
+updated: 2026-09-03T14:00:44Z
 ---
 
 ## Description
@@ -29,3 +29,19 @@ A column declared without COLLATE gets 0900_ai_ci; a literal takes the CONNECTIO
 The corpus asks those characters only through a column, with the reason recorded.
 
 Closing this needs the engine to know a literal's collation is the connection's, which is #0129/#0152 territory -- the same missing mechanism. Note it also means the answer depends on how the client connected, so a corpus case must pin the connection collation or it will drift.
+
+## Notes
+
+### 2026-09-03T14:00:44Z — Christopher Vachon (user)
+
+VALIDATED 2026-09-03 against mysql:8.3 with the connection collation pinned to utf8mb4_0900_ai_ci on BOTH sides (both servers report that value for @@collation_connection).
+
+Under that connection, of the three examples only one diverges:
+
+    HEX(UPPER('ȿ'))    mysql ''       engine C8BF     DIVERGES
+    HEX(LOWER('ẞ'))    agrees
+    HEX(UPPER('𐐨'))    agrees
+
+Which is the point of the issue, sharpened: the engine *reports* utf8mb4_0900_ai_ci and *behaves* as general_ci for case folding. The description's framing -- that the client negotiates 45/general_ci -- is not the only way to see it; pin the connection to 0900_ai_ci and the engine still gives the general_ci answer, so this is the engine's fold table, not the client's negotiation.
+
+Anyone measuring this must state the connection collation, or the measurement is unreproducible.

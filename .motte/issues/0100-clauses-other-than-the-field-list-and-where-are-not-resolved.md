@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-08-25T14:48:39Z
-updated: 2026-09-03T04:51:36Z
+updated: 2026-09-03T14:05:52Z
 ---
 
 ## Description
@@ -33,3 +33,7 @@ Measured on 8.3 while doing that work:
 So dml_row_order needs both a name check and an ESCAPE guard, and the clause name in the message is 'order clause' rather than the 'field list' it currently reports.
 
 The full DML error ordering #0102 measured, which this fits into: 1146 missing table, then 1066/1109 for a repeated or unknown multi-DELETE target, then the WHERE left to right with names and ESCAPE interleaved positionally, then SET targets, then SET values, then ORDER BY last.
+
+### 2026-09-03T14:05:52Z — Christopher Vachon (user)
+
+NOT re-measured in the 2026-09-03 validation pass. The claims involve resolution at PREPARE time, which the text-protocol probe used for that pass cannot reach -- it needs a client that prepares a statement without executing it. Same for #0109 (a bound parameter's column name) and #0131 (a binary-protocol f32 rendering). Those three need the differential harness's binary path or a mysql2 client rather than the mysql CLI.

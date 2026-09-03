@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [executor]
 created: 2026-09-01T02:16:09Z
-updated: 2026-09-01T02:16:09Z
+updated: 2026-09-03T14:02:15Z
 ---
 
 ## Description
@@ -20,3 +20,9 @@ Found by review during #0130, and a deliberate gap rather than a defect -- recor
 The ambiguity is real for a literal and not for a stored column, which has exactly one right answer. So the refusal is wider than it needs to be, and the narrower fix is available today: refuse only where the value came from a literal.
 
 Closing #0141 -- a hex or bit literal is not read as a number -- removes the ambiguity entirely and lets both cases answer. Either route works; this issue exists so the corpus's deliberate omission of BIN(b) has a reason attached to it.
+
+## Notes
+
+### 2026-09-03T14:02:15Z — Christopher Vachon (user)
+
+VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed exactly. BIN(bl) over a BLOB is 1235 'does not yet support BIN() over a binary string' here and 100010 on 8.3; BIN(t) over TEXT agrees at 100010.

@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [executor]
 created: 2026-09-03T02:20:16Z
-updated: 2026-09-03T02:20:16Z
+updated: 2026-09-03T14:01:19Z
 ---
 
 ## Description
@@ -22,3 +22,9 @@ So the decomposition a >= lo AND a <= hi only holds where the three operands alr
 Deliberately not half-fixed: getting it right is a rule per type family -- temporals, decimals, ENUM, JSON each aggregate differently -- and a partial version would make the gap depend on which types were mixed. No corpus case, because it would need a baseline line, and a baseline line without an issue is what the README forbids.
 
 Related: #0091 (BETWEEN's high operand does not take a predicate) got the same treatment in postfix_operands. Both are BETWEEN gaps recorded rather than guessed at.
+
+## Notes
+
+### 2026-09-03T14:01:19Z — Christopher Vachon (user)
+
+VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed. '2' BETWEEN 1 AND '10' and '10' BETWEEN '9' AND 100 are both 1 on 8.3 and 0 here.

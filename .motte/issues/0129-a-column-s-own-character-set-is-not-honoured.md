@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-08-26T11:18:03Z
-updated: 2026-09-02T14:02:43Z
+updated: 2026-09-03T14:04:20Z
 ---
 
 ## Description
@@ -22,3 +22,9 @@ Both are punctuation in latin1 and pass the engine's codepoint >= 0xC0 test.
 Two characters wide as measured, but the cause is general: the engine has no per-column character sets at all, so every text column behaves as utf8mb4. Anything charset-sensitive -- collation, LENGTH against CHAR_LENGTH, UPPER, comparison -- inherits it wherever a column is not utf8mb4.
 
 Worth scoping before taking: implementing per-column charsets properly is large, and the target schema may use only utf8mb4, in which case recording the limit is the honest outcome rather than building it.
+
+## Notes
+
+### 2026-09-03T14:04:20Z — Christopher Vachon (user)
+
+VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed exactly. A latin1 column holding 0xD7 ('x' multiply sign) and 0xF7 ('divide') gives A120 on 8.3 for both; the engine returns the raw byte followed by 120 for both.

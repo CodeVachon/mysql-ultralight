@@ -46,6 +46,44 @@ suggestions first, `--require-tools` turns a missing tool into a failure rather 
 skip. CI sets that automatically via the `CI` environment variable, so a tool that fails
 to install fails the build instead of quietly reducing coverage.
 
+### Measuring a premise before working it
+
+`scripts/ask.sh` asks MySQL 8.3 and this engine the same SQL, with the same
+client, and prints the two answers side by side.
+
+```sh
+scripts/ask.sh probe.sql             # compare rows
+COLINFO=1 scripts/ask.sh probe.sql   # compare column metadata too
+```
+
+It settles one question now, where `scripts/differential.sh` keeps every
+settled question settled. **Run it against an issue's claims before
+implementing them.** An issue body is prose somebody wrote once, and in this
+project that prose has been wrong often enough to be the main cost of a task:
+issues have turned out already fixed, half fixed, wrong about which side
+diverged, or right about the divergence and wrong about the value. A
+validation pass over Epic 9 found one ticket whose central example — a bit
+literal said to evaluate to `5` — describes something MySQL does not do, and
+implementing it as written would have produced a new wrong answer.
+
+Three ways a probe lies, each of which produced a false pass before the script
+guarded against it:
+
+- A probe made only of `INSERT`/`UPDATE`/DDL **compares nothing**, because the
+  client prints nothing for a statement with no result set. Ask `ROW_COUNT()`
+  or select the table back. Two empty outputs are reported `INCONCLUSIVE`
+  rather than as agreement.
+- A claim about a column's **type, collation, or flags is invisible in the
+  rows** — the values agree and the metadata still differs. Use `COLINFO=1`.
+- The probe must **exercise the claim**: a test of `INSERT IGNORE` skipping a
+  row is worthless if the conflicting row was deleted first, and it will
+  cheerfully report agreement.
+
+The client charset is pinned to `utf8mb4` because the container's client
+defaults to latin1 and reports `latin1_swedish_ci` for every string column.
+That is not a divergence, it is the client — and it is how #0074 came to be
+recorded against values a latin1 client had produced.
+
 ### Proving a test bites
 
 `scripts/mutate.sh` removes a piece of the implementation, runs a test, and puts it

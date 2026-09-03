@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [executor]
 created: 2026-09-02T14:02:23Z
-updated: 2026-09-02T14:02:23Z
+updated: 2026-09-03T14:01:18Z
 ---
 
 ## Description
@@ -27,3 +27,9 @@ Why it matters more than #0129: 305 columns in the conformance target are declar
 crates/engine/src/collation.rs documents the accent half as knowingly open; this issue is that record made trackable.
 
 Scoping note for whoever takes it: this is the one part of collation-aware comparison that needs collation DATA rather than dispatch. Deciding which collation applies is cheap and closes most of the cluster; comparing correctly under it needs weight tables (DUCET, or MySQL's own). Decide which of the two is in scope before starting -- see the staged plan recorded on #0129.
+
+## Notes
+
+### 2026-09-03T14:01:18Z — Christopher Vachon (user)
+
+VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed, all four: 'cafe'='café', 'CAFÉ'='cafe', 'ss'='ß' and 'café' LIKE 'cafe' are 1 on 8.3 and 0 here.

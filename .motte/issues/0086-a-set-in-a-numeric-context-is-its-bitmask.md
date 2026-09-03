@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [executor]
 created: 2026-08-25T03:02:00Z
-updated: 2026-08-31T16:12:58Z
+updated: 2026-09-03T14:01:17Z
 ---
 
 ## Description
@@ -33,3 +33,7 @@ Re-measured during #0087, confirming the bitmask rule with a wider declaration: 
 #0087 added a 'a set column' group to the differential corpus -- the corpus previously had no SET column at all, which is why half of #0087 had nothing to prove it. That group deliberately excludes the numeric context, since it would put a divergence in a run that must end empty. Those cases are the natural place for this issue's coverage to land once it is fixed.
 
 #0087 also established what a SET column's metadata is: MYSQL_TYPE_STRING with SET_FLAG, length (all members + commas) x 4, and the flag is kept through a derived table, CTE, view, generated column and CTAS copy but lost through a UNION.
+
+### 2026-09-03T14:01:17Z — Christopher Vachon (user)
+
+VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. SET bitmask confirmed: s+0 mysql 5 engine 0; s=5 mysql 1 engine 0; s='a,c' agrees. Wider declaration confirmed too: SET('a','bb','ccc') holding 'bb' is 2 and 'a,ccc' is 5 on 8.3, both 0 here. Also noticed: ORDER BY s orders by the mask on 8.3 and alphabetically here.

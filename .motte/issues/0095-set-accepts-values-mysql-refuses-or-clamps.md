@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-08-25T13:13:52Z
-updated: 2026-08-25T13:13:52Z
+updated: 2026-09-03T14:03:11Z
 ---
 
 ## Description
@@ -22,3 +22,20 @@ MySQL's rule for an integer variable, measured on default_week_format: an out-of
 #0057 implemented exactly that for default_week_format. The same rule needs applying to every other variable the engine accepts, with each one's own bounds read from the server rather than guessed.
 
 Related, same area: an overridden variable reads back as VAR_STRING where MySQL sends its real type -- @@default_week_format is UNSIGNED LONGLONG there -- which is why SELECT @@default_week_format is deliberately absent from the differential corpus.
+
+## Notes
+
+### 2026-09-03T14:03:11Z — Christopher Vachon (user)
+
+VALIDATED 2026-09-03 against mysql:8.3. Three of the four claims hold; one is STALE, and a new one turned up.
+
+    SET max_allowed_packet = 'abc'   mysql 1232   engine accepts silently   HOLDS
+    SET sql_mode = 'NOPE'            mysql 1231   engine accepts silently   HOLDS
+    SET max_execution_time = -5      mysql 0      engine -5                 HOLDS
+    SET group_concat_max_len = 3     mysql 4      engine 4                  STALE -- the engine clamps correctly now
+
+New, found while checking the last one: a system variable is the wrong TYPE here.
+    SELECT @@group_concat_max_len       renders right-aligned (a number) on 8.3, left-aligned (a string) here
+    SELECT @@group_concat_max_len + 1   mysql LONGLONG   engine DOUBLE
+
+So the clamping half of this issue is smaller than written, and there is a separate typing problem behind it.

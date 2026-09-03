@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [compat]
 created: 2026-09-01T23:47:05Z
-updated: 2026-09-01T23:47:05Z
+updated: 2026-09-03T14:04:20Z
 ---
 
 ## Description
@@ -23,3 +23,9 @@ The mysql:8.3 container runs lower_case_table_names=0, so database and table nam
 Distinct from #0148, which is about the collation of data in information_schema, not about identifier matching.
 
 Worth deciding rather than drifting: MySQL's own behaviour depends on the server variable and on the host filesystem, so 'match MySQL' has no single answer here. The options are to model lower_case_table_names, or to state the engine's choice in the README and keep it uniform. Note a case-sensitive engine would refuse schemas that work on macOS and Windows deployments, which is the direction that breaks things.
+
+## Notes
+
+### 2026-09-03T14:04:20Z — Christopher Vachon (user)
+
+VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed, and the container premise checks out: @@lower_case_table_names is 0 on the mysql:8.3 image, so SELECT j2.b FROM J2 is 1054 there and answers 1 here. Separately noticed: the engine returns @@lower_case_table_names as a string where 8.3 returns a number -- the same system-variable typing problem recorded on #0095.

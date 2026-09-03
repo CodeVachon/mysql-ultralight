@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [executor]
 created: 2026-08-31T13:34:50Z
-updated: 2026-08-31T13:34:50Z
+updated: 2026-09-03T14:01:18Z
 ---
 
 ## Description
@@ -22,3 +22,9 @@ Not fixable by folding LIKE unconditionally -- the engine answers BINARY 'A' LIK
 Every case in #0093's new corpus group is same-case ASCII on purpose, with that reason written above the group, so this gap is not hidden by the empty baseline -- it is simply not exercised.
 
 Likely to matter for the target schema: a case-insensitive LIKE is what a client gets from MySQL by default, so any filter written against real data will disagree here.
+
+## Notes
+
+### 2026-09-03T14:01:18Z — Christopher Vachon (user)
+
+VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed. 'ABC' LIKE 'a%' mysql 1 engine 0, while 'A'='a' is 1 on both -- the self-inconsistency the description names. Also seen: BINARY 'A' LIKE 'a' answers 0 on both but the engine returns it as a string where 8.3 returns a number.
