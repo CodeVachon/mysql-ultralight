@@ -1126,7 +1126,7 @@ pub fn from_value(value: &Value) -> Json {
         // MySQL's JSON number is a double, and `JSON_OBJECT('a', f)` over a
         // float holding 1.234567890123 gives `{"a": 1.2345678806304932}`.
         Value::Float32(f) => double_number(f64::from(*f)).map_or(Json::Null, Json::Number),
-        Value::Text(s) => Json::String(s.clone()),
+        Value::Text(s, _) => Json::String(s.clone()),
         // A string, like the text it renders as: MySQL gives
         // `JSON_OBJECT('a', d)` the value `"2024-01-05"` and not the packed
         // number it would read in arithmetic. The tag changes the *numeric*

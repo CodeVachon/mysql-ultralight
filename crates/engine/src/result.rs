@@ -651,8 +651,8 @@ mod tests {
         // Nothing else is touched: a wrongly tagged value elsewhere is a bug
         // to find, not one to paper over.
         assert_eq!(
-            mismatched(ColumnType::LongLong, Value::Text("7".to_owned())),
-            Value::Text("7".to_owned())
+            mismatched(ColumnType::LongLong, Value::text("7".to_owned())),
+            Value::text("7".to_owned())
         );
     }
 }

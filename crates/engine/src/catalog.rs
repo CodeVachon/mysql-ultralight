@@ -115,6 +115,29 @@ impl Table {
             .position(|c| c.name.eq_ignore_ascii_case(name))
     }
 
+    /// Puts each column's collation back onto the text already in its rows.
+    ///
+    /// The invariant the comparison rests on is that a string sitting in a
+    /// text column carries that column's collation —
+    /// [`crate::types::SqlType::coerce`] is what puts it there on the way in.
+    /// Two things bypass that: a state image, whose values are read before
+    /// anything says which column they belong to, and an `ALTER TABLE` that
+    /// changes a column's collation under rows that are already stored. Both
+    /// call this, so there is one rule rather than two that have to agree.
+    ///
+    /// By position, which is the shape of a row. A row wider than the table is
+    /// left alone rather than refused: nothing else here treats that as
+    /// corruption.
+    pub(crate) fn retag_text(&mut self) {
+        for row in &mut self.rows {
+            for (value, column) in row.iter_mut().zip(&self.columns) {
+                if let Value::Text(_, collated) = value {
+                    *collated = crate::collation::Collated::implicit(column.ty.collation);
+                }
+            }
+        }
+    }
+
     pub fn column(&self, name: &str) -> Option<&Column> {
         self.column_index(name).map(|i| &self.columns[i])
     }

@@ -30,15 +30,31 @@ pub struct SqlType {
     /// sending the text in the connection's character set. It is the only way
     /// a `MYSQL_TYPE_BLOB` carrying characters can carry that flag.
     ///
-    /// A DDL `COLLATE` clause does not set it, and cannot: `collation::named`
-    /// takes only a `_ci` collation and refuses the rest, rather than
-    /// recording a name and then comparing the column the way it compares
-    /// every other one. `collation::BINARY` is the name that goes with this
-    /// flag.
-    /// `information_schema` sets it: MySQL declares `COLUMN_TYPE`,
-    /// `COLUMN_DEFAULT` and their neighbours `utf8mb3_bin`, and a client
-    /// reading those columns is told they are binary.
+    /// Two different things set it, and only the second is
+    /// `collation::BINARY`. A DDL `COLLATE utf8mb4_bin` — at column, table or
+    /// database level — sets it through `ddl::resolve_collations`, and such a
+    /// column reports `utf8mb4_bin`; `information_schema` sets it for its own
+    /// columns, which MySQL declares `utf8mb3_bin` and which this engine
+    /// still compares case-insensitively (#0148). `collation` below is what
+    /// separates them, in `info_schema::collation_name` and nowhere else.
     pub binary_collation: bool,
+    /// The collation the column's text compares under.
+    ///
+    /// Resolved when the column is declared, so nothing downstream has to
+    /// consult the table or the database again: a `COLLATE` clause on the
+    /// column, else the table's, else the database's, else the server's
+    /// default. That is 8.3's own inheritance, and
+    /// `information_schema.COLUMNS.COLLATION_NAME` reports the *resolved*
+    /// answer there rather than the clause — `utf8mb4_0900_ai_ci` for a column
+    /// that names none.
+    ///
+    /// Not the same fact as `binary_collation` above, which is a *wire* flag.
+    /// A `utf8mb4_bin` column carries both; `information_schema`'s own text
+    /// columns carry the flag alone, because 8.3 declares them `utf8mb3_bin`
+    /// and this engine still compares their names case-insensitively — that
+    /// gap is #0148, and it stays open here rather than being closed by a
+    /// side effect of this field existing.
+    pub collation: crate::collation::Collation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +84,7 @@ impl SqlType {
             unsigned: false,
             variants: Vec::new(),
             binary_collation: false,
+            collation: crate::collation::Collation::Ai0900Ci,
         }
     }
 
@@ -231,6 +248,7 @@ impl SqlType {
             unsigned: false,
             variants: Vec::new(),
             binary_collation: false,
+            collation: crate::collation::Collation::Ai0900Ci,
         }
     }
 
@@ -266,6 +284,7 @@ impl SqlType {
             unsigned: false,
             variants: Vec::new(),
             binary_collation: false,
+            collation: crate::collation::Collation::Ai0900Ci,
         };
         match ty {
             ColumnType::Tiny => simple(TypeKind::Bool, "tinyint(1)"),
@@ -878,7 +897,7 @@ impl SqlType {
                     None => self
                         .variants
                         .iter()
-                        .position(|v| crate::value::collate_eq(v, &text))
+                        .position(|v| self.collation.same(v, &text))
                         .map(member)
                         // Not a member, so a string is read as an index — but
                         // only when it is a whole number, so `'2'` is the
@@ -964,7 +983,13 @@ impl SqlType {
                 let precision = self.length.unwrap_or(0) as u32;
                 Value::Temporal(crate::temporal::normalise(&text, shape, precision).unwrap_or(text))
             }
-            _ => Value::Text(value.as_text()),
+            // Tagged with the column's collation, for the same reason the
+            // unsigned integer and the ENUM ordinal above are tagged: this is
+            // the last place the declaration and the value are both in hand.
+            // An operand in a `WHERE` has no column left to ask, and whether
+            // `name = 'cafe'` finds `café` is entirely the column's answer.
+            // See #0129, #0134, #0152.
+            _ => Value::collated(value.as_text(), self.collation),
         })
     }
 }
@@ -1017,6 +1042,7 @@ fn int_type(name: &str, display: Option<u64>, unsigned: bool) -> SqlType {
         unsigned,
         variants: Vec::new(),
         binary_collation: false,
+        collation: crate::collation::Collation::Ai0900Ci,
     }
 }
 
@@ -1065,6 +1091,7 @@ fn decimal_type(info: &sqlparser::ast::ExactNumberInfo, unsigned: bool) -> SqlTy
         unsigned,
         variants: Vec::new(),
         binary_collation: false,
+        collation: crate::collation::Collation::Ai0900Ci,
     }
 }
 
@@ -1115,6 +1142,7 @@ fn float_type(name: &str, info: &sqlparser::ast::ExactNumberInfo, unsigned: bool
         unsigned,
         variants: Vec::new(),
         binary_collation: false,
+        collation: crate::collation::Collation::Ai0900Ci,
     }
 }
 
@@ -1235,6 +1263,7 @@ fn char_type(name: &str, length: Option<u64>) -> SqlType {
         unsigned: false,
         variants: Vec::new(),
         binary_collation: false,
+        collation: crate::collation::Collation::Ai0900Ci,
     }
 }
 
@@ -1256,6 +1285,7 @@ fn datetime_type(name: &str, precision: Option<u64>) -> SqlType {
         unsigned: false,
         variants: Vec::new(),
         binary_collation: false,
+        collation: crate::collation::Collation::Ai0900Ci,
     }
 }
 

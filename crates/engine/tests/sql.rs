@@ -8607,8 +8607,13 @@ fn on_duplicate_key_update_updates_instead_of_failing() {
     );
 }
 
+/// An explicit `COLLATE` decides the comparison, including against the column.
+///
+/// It used to be read for its name and thrown away, so every collation gave
+/// the same answer. Measured on 8.3: the `_ci` clause finds the row and the
+/// `_bin` one does not.
 #[test]
-fn a_case_insensitive_collate_is_the_comparison_the_engine_already_does() {
+fn an_explicit_collate_decides_the_comparison() {
     let (engine, mut session) = engine();
     widgets(&engine, &mut session);
 
@@ -8621,16 +8626,24 @@ fn a_case_insensitive_collate_is_the_comparison_the_engine_already_does() {
         vec![vec!["a"]]
     );
 
-    // A collation that would compare differently is refused rather than
-    // quietly ignored, which would answer the wrong question.
-    let err = engine
-        .execute(
+    // EXPLICIT beats the column's IMPLICIT collation, so the same row is gone
+    // under `utf8mb4_bin`.
+    assert_eq!(
+        rows(
+            &engine,
             &mut session,
-            "SELECT id FROM Widget WHERE name COLLATE utf8mb4_bin = 'ALPHA'",
-            &[],
-        )
-        .unwrap_err();
-    assert_eq!(err.code, 1235);
+            "SELECT id FROM Widget WHERE name COLLATE utf8mb4_bin = 'ALPHA'"
+        ),
+        Vec::<Vec<String>>::new()
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM Widget WHERE name COLLATE utf8mb4_bin = 'alpha'"
+        ),
+        vec![vec!["a"]]
+    );
 }
 
 #[test]
@@ -13524,10 +13537,10 @@ fn a_bound_parameter_column_is_named_after_its_value_where_mysql_says_question_m
     );
 
     for (bound, name) in [
-        (Value::Text("hello world".to_owned()), "hello world"),
+        (Value::text("hello world"), "hello world"),
         // The literal-naming rules reach a value nobody wrote as a literal:
         // this is the leading-whitespace trim applied to a bound string.
-        (Value::Text("  x".to_owned()), "x"),
+        (Value::text("  x"), "x"),
         (Value::Int(7), "7"),
         (Value::Null, "NULL"),
     ] {
@@ -13542,7 +13555,7 @@ fn a_bound_parameter_column_is_named_after_its_value_where_mysql_says_question_m
 
     // And the 255-byte cut lands on a bound value too.
     let Ok(Outcome::Rows(executed)) =
-        engine.execute(&mut session, "SELECT ?", &[Value::Text("z".repeat(300))])
+        engine.execute(&mut session, "SELECT ?", &[Value::text("z".repeat(300))])
     else {
         panic!("expected rows for a long bound string");
     };
@@ -13550,11 +13563,9 @@ fn a_bound_parameter_column_is_named_after_its_value_where_mysql_says_question_m
 
     // An alias is the one spelling that agrees with MySQL, because it never
     // looks at the value.
-    let Ok(Outcome::Rows(executed)) = engine.execute(
-        &mut session,
-        "SELECT ? AS lit",
-        &[Value::Text("q".to_owned())],
-    ) else {
+    let Ok(Outcome::Rows(executed)) =
+        engine.execute(&mut session, "SELECT ? AS lit", &[Value::text("q")])
+    else {
         panic!("expected rows for an aliased parameter");
     };
     assert_eq!(executed.columns[0].name, "lit");
@@ -21971,21 +21982,24 @@ fn a_collation_is_named_the_same_however_it_is_written() {
 /// Both measured on 8.3, against `VARCHAR(10) COLLATE utf8mb4_bin` under a
 /// UNIQUE key: it stores `'a'` and `'A'` side by side where this engine
 /// answered 1062, and `WHERE a = 'A'` returns `A` there and returned `a` here.
+/// `utf8mb4_bin` is honoured now rather than refused — the engine has that
+/// comparison — and the refusal moved to the names it still does not:
+/// `utf8mb4_0900_as_cs`, `utf8mb4_unicode_520_ci`, `latin1_swedish_ci`.
 ///
-/// So the two paths now share one reader. Refusing is the direction that
-/// cannot be silently wrong, and it turns nothing real away — the conformance
-/// target spells all 314 of its `COLLATE` clauses `_ci`.
+/// The two paths share one reader. Refusing is the direction that cannot be
+/// silently wrong, and it turns nothing real away — the conformance target
+/// spells all 314 of its `COLLATE` clauses `utf8mb4_unicode_ci`.
 #[test]
 fn a_collation_the_engine_cannot_honour_is_refused() {
     let (engine, mut session) = engine();
     for sql in [
-        "CREATE TABLE B (a VARCHAR(10) COLLATE utf8mb4_bin)",
-        "CREATE TABLE B (a VARCHAR(10) COLLATE `utf8mb4_bin`)",
         "CREATE TABLE B (a VARCHAR(10) COLLATE utf8mb4_0900_as_cs)",
-        "CREATE TABLE B (a VARCHAR(10)) COLLATE=utf8mb4_bin",
-        "CREATE TABLE B (a VARCHAR(10)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
-        "SELECT 'a' COLLATE utf8mb4_bin",
-        "SELECT 'a' COLLATE `utf8mb4_bin`",
+        "CREATE TABLE B (a VARCHAR(10) COLLATE `utf8mb4_0900_as_cs`)",
+        "CREATE TABLE B (a VARCHAR(10) COLLATE latin1_swedish_ci)",
+        "CREATE TABLE B (a VARCHAR(10)) COLLATE=utf8mb4_0900_as_cs",
+        "CREATE TABLE B (a VARCHAR(10)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_as_cs",
+        "SELECT 'a' COLLATE utf8mb4_0900_as_cs",
+        "SELECT 'a' COLLATE `utf8mb4_0900_as_cs`",
     ] {
         let err = engine.execute(&mut session, sql, &[]).unwrap_err();
         // Never 1273: these are collations 8.3 has, so calling them unknown
@@ -21995,8 +22009,8 @@ fn a_collation_the_engine_cannot_honour_is_refused() {
         // Named without its backticks, whichever path refused it: the message
         // has to name the collation, not the rendering it was written with.
         assert!(
-            err.to_string().contains("`utf8mb4_bin` collation")
-                || err.to_string().contains("`utf8mb4_0900_as_cs` collation"),
+            err.to_string().contains("`utf8mb4_0900_as_cs` collation")
+                || err.to_string().contains("`latin1_swedish_ci` collation"),
             "{sql} -> {err}"
         );
     }
@@ -26448,6 +26462,1027 @@ fn a_compound_extract_never_shows_a_client_the_call_it_was_rewritten_to() {
     assert_eq!(
         rows(&engine, &mut session, "SELECT a, b, c FROM Vc"),
         vec![vec!["5060708", "202401", "2024"]]
+    );
+}
+
+// ---------------------------------------------------------------- collations
+//
+// #0129, #0134 and #0152 are one missing mechanism seen from three sides: the
+// column's collation never reached the comparison, so `=`, `LIKE`, `ORDER BY`,
+// `GROUP BY`, `DISTINCT` and a unique key all answered under one rule whatever
+// the DDL said. Every expectation below is measured against `mysql:8.3` with
+// `scripts/ask.sh`, over the rows the issues use.
+
+/// The three rows the issues measure, in a column declared the way the target
+/// application declares all 1537 of its text columns.
+fn collated(engine: &Engine, session: &mut Session, collation: &str) {
+    run(
+        engine,
+        session,
+        &format!(
+            "CREATE TABLE C (id INT NOT NULL, name VARCHAR(50) \
+             CHARACTER SET utf8mb4 COLLATE {collation} NOT NULL, PRIMARY KEY (id))"
+        ),
+    );
+    run(
+        engine,
+        session,
+        "INSERT INTO C VALUES (1,'café'),(2,'Cafe'),(3,'Straße'),(4,'cafe'),(5,'STRASSE')",
+    );
+}
+
+/// The whole of #0152 on one column: equality under `utf8mb4_unicode_ci` folds
+/// case *and* accents, and reads `ß` as `ss`.
+#[test]
+fn a_columns_collation_decides_which_rows_equality_returns() {
+    let (engine, mut session) = engine();
+    collated(&engine, &mut session, "utf8mb4_unicode_ci");
+
+    // mysql 8.3: café + Cafe + cafe. The engine returned Cafe alone.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM C WHERE name = 'cafe' ORDER BY id"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["4"]]
+    );
+    // mysql 8.3: Straße + STRASSE. The engine returned no rows.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM C WHERE name = 'strasse' ORDER BY id"
+        ),
+        vec![vec!["3"], vec!["5"]]
+    );
+    // The literal's own collation loses to the column's, whichever side it is
+    // written on.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM C WHERE 'CAFÉ' = name ORDER BY id"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["4"]]
+    );
+}
+
+/// #0134: `LIKE` folds where `=` folds, and under the same collation.
+#[test]
+fn like_folds_case_and_accents_under_the_columns_collation() {
+    let (engine, mut session) = engine();
+    collated(&engine, &mut session, "utf8mb4_unicode_ci");
+
+    // mysql 8.3: café + Cafe + cafe. The engine returned café alone — the
+    // wrong result set on the target application's main read path, where 137
+    // searches are LIKE with no `mode: 'insensitive'` anywhere.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM C WHERE name LIKE 'caf%' ORDER BY id"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["4"]]
+    );
+    // The accent half, which `caf%` cannot show: an unaccented pattern has to
+    // reach the accented row and back again.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM C WHERE name LIKE 'cafe' ORDER BY id"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["4"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM C WHERE name LIKE 'CAFÉ' ORDER BY id"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["4"]]
+    );
+    // The self-inconsistency the issue names, gone: `=` and `LIKE` agree.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 'ABC' LIKE 'a%', 'A' = 'a'"),
+        vec![vec!["1", "1"]]
+    );
+    // `LIKE` does not apply the collation's *expansions*, which `=` does:
+    // `STRASSE` matches by the case fold and `Straße` does not match at all,
+    // where `= 'strasse'` finds both. Measured on 8.3 under all four
+    // collations.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM C WHERE name LIKE 'strasse'"
+        ),
+        vec![vec!["5"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM C WHERE name LIKE 'stra_e'"
+        ),
+        vec![vec!["3"]]
+    );
+}
+
+/// #0152's ordering half, plus the grouping that has to agree with it.
+#[test]
+fn ordering_grouping_and_distinct_read_the_same_collation() {
+    let (engine, mut session) = engine();
+    collated(&engine, &mut session, "utf8mb4_unicode_ci");
+
+    // mysql 8.3: café, Cafe, cafe, Straße, STRASSE — the first three tie, so
+    // `id` settles them. The engine sorted the accent after every ASCII
+    // letter and answered Cafe, cafe, café, STRASSE, Straße.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM C ORDER BY name, id"),
+        vec![vec!["1"], vec!["2"], vec!["4"], vec!["3"], vec!["5"]]
+    );
+    // Two groups, not five: DISTINCT and GROUP BY fold exactly what `=` folds.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(DISTINCT name) FROM C"),
+        vec![vec!["2"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT MIN(id), COUNT(*) FROM C GROUP BY name ORDER BY MIN(id)"
+        ),
+        vec![vec!["1", "3"], vec!["3", "2"]]
+    );
+    // `IN` reads the same rule as `=`.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM C WHERE name IN ('CAFE','strasse') ORDER BY id"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["3"], vec!["4"], vec!["5"]]
+    );
+}
+
+/// The four collations answer the same question four ways, which is what says
+/// the collation is being *read* rather than one rule being applied to all.
+#[test]
+fn each_collation_returns_its_own_rows() {
+    // `utf8mb4_general_ci` folds case and accents but has no expansions, so
+    // `ß` is a single `s`: it finds `Straße` for `strase` and not for
+    // `strasse`. `utf8mb4_bin` folds nothing. Both measured on 8.3.
+    for (collation, cafe, strasse, strase) in [
+        ("utf8mb4_0900_ai_ci", 3, 2, 0),
+        ("utf8mb4_unicode_ci", 3, 2, 0),
+        ("utf8mb4_general_ci", 3, 1, 1),
+        ("utf8mb4_bin", 1, 0, 0),
+    ] {
+        let (engine, mut session) = engine();
+        collated(&engine, &mut session, collation);
+        for (needle, want) in [("cafe", cafe), ("strasse", strasse), ("strase", strase)] {
+            assert_eq!(
+                rows(
+                    &engine,
+                    &mut session,
+                    &format!("SELECT COUNT(*) FROM C WHERE name = '{needle}'")
+                ),
+                vec![vec![want.to_string()]],
+                "{collation} = '{needle}'"
+            );
+        }
+    }
+}
+
+/// `utf8mb4_bin` compares the characters exactly, which is the negative case
+/// the whole mechanism is checked against: a fold applied unconditionally
+/// passes every assertion above and fails every one here.
+#[test]
+fn a_bin_collation_stays_exact_everywhere() {
+    let (engine, mut session) = engine();
+    collated(&engine, &mut session, "utf8mb4_bin");
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM C WHERE name = 'cafe'"
+        ),
+        vec![vec!["4"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM C WHERE name LIKE 'caf%' ORDER BY id"
+        ),
+        vec![vec!["1"], vec!["4"]]
+    );
+    // Five groups where the `_ci` collations give two.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(DISTINCT name) FROM C"),
+        vec![vec!["5"]]
+    );
+    // Codepoint order: upper case first, and the accent after every ASCII
+    // letter. Measured on 8.3.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM C ORDER BY name"),
+        vec![vec!["2"], vec!["5"], vec!["3"], vec!["4"], vec!["1"]]
+    );
+    // And a unique key over it holds a pair the `_ci` collations refuse.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Ub (s VARCHAR(20) COLLATE utf8mb4_bin, UNIQUE KEY (s))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Ub VALUES ('café'),('CAFE')",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Ub"),
+        vec![vec!["2"]]
+    );
+}
+
+/// A unique key refuses under the column's collation, not under a fixed one.
+#[test]
+fn a_unique_key_refuses_what_its_collation_calls_equal() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Uc (s VARCHAR(20) COLLATE utf8mb4_unicode_ci, UNIQUE KEY (s))",
+    );
+    run(&engine, &mut session, "INSERT INTO Uc VALUES ('Straße')");
+    // 1062 on 8.3: `STRASSE` is the same value as `Straße` under a collation
+    // that reads `ß` as `ss`, which the engine had no way to know.
+    let err = engine
+        .execute(&mut session, "INSERT INTO Uc VALUES ('STRASSE')", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1062);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Uc"),
+        vec![vec!["1"]]
+    );
+    // And the same key takes a value the collation calls different.
+    run(&engine, &mut session, "INSERT INTO Uc VALUES ('STRASE')");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Uc"),
+        vec![vec!["2"]]
+    );
+}
+
+/// The `PAD SPACE` half, which separates the server default from the collation
+/// the target application declares.
+///
+/// Measured on 8.3 over a column holding `'a  '`: `= 'a'` is 0 under
+/// `utf8mb4_0900_ai_ci` and 1 under the other three. `LIKE` pads for none of
+/// them, and a tab pads for none of them either.
+#[test]
+fn only_the_default_collation_refuses_to_pad_a_trailing_space() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE P (a VARCHAR(20) COLLATE utf8mb4_0900_ai_ci, \
+         b VARCHAR(20) COLLATE utf8mb4_unicode_ci, \
+         c VARCHAR(20) COLLATE utf8mb4_general_ci, \
+         d VARCHAR(20) COLLATE utf8mb4_bin)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO P VALUES ('a  ','a  ','a  ','a  ')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT a = 'a', b = 'a', c = 'a', d = 'a' FROM P"
+        ),
+        vec![vec!["0", "1", "1", "1"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT a LIKE 'a', b LIKE 'a', c LIKE 'a', d LIKE 'a' FROM P"
+        ),
+        vec![vec!["0", "0", "0", "0"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT b = 'a\t' FROM P"),
+        vec![vec!["0"]]
+    );
+}
+
+/// Which operand's collation a comparison is made under, and when MySQL
+/// refuses to pick.
+///
+/// All measured on 8.3 against a table declared with four collations: a column
+/// beats a literal, an explicit `COLLATE` beats a column, a `_bin` collation
+/// beats a `_ci` one of the same character set at equal strength, and two
+/// disagreeing `_ci` collations at equal strength are 1267.
+#[test]
+fn the_stronger_operands_collation_decides_and_a_tie_is_1267() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE M (a VARCHAR(20) COLLATE utf8mb4_0900_ai_ci, \
+         b VARCHAR(20) COLLATE utf8mb4_unicode_ci, \
+         c VARCHAR(20) COLLATE utf8mb4_general_ci, \
+         d VARCHAR(20) COLLATE utf8mb4_bin)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO M VALUES ('a ','a ','a ','a ')",
+    );
+
+    // A column beats a literal: the pad is the column's answer, not the
+    // connection's.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a = 'a', b = 'a' FROM M"),
+        vec![vec!["0", "1"]]
+    );
+    // A `_bin` column beats a `_ci` one, so the pair answers rather than
+    // raising.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT b = d, a = d FROM M"),
+        vec![vec!["1", "1"]]
+    );
+    // Two `_ci` columns that disagree are 1267, with 8.3's wording.
+    let err = engine
+        .execute(&mut session, "SELECT a = b FROM M", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1267);
+    assert!(
+        err.to_string().contains(
+            "Illegal mix of collations (utf8mb4_0900_ai_ci,IMPLICIT) and \
+             (utf8mb4_unicode_ci,IMPLICIT) for operation '='"
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        engine
+            .execute(&mut session, "SELECT a = c FROM M", &[])
+            .unwrap_err()
+            .code,
+        1267
+    );
+    // Two explicit clauses that disagree, likewise.
+    assert_eq!(
+        engine
+            .execute(
+                &mut session,
+                "SELECT a COLLATE utf8mb4_unicode_ci = b COLLATE utf8mb4_general_ci FROM M",
+                &[]
+            )
+            .unwrap_err()
+            .code,
+        1267
+    );
+    // An explicit clause beats a column, which is how a `_bin` literal makes
+    // a `_ci` column compare exactly.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT b = 'A ', b = 'A ' COLLATE utf8mb4_bin FROM M"
+        ),
+        vec![vec!["1", "0"]]
+    );
+    // The refusal reaches `LIKE` and `IN` too, which resolve the same pair.
+    assert_eq!(
+        engine
+            .execute(&mut session, "SELECT a LIKE b FROM M", &[])
+            .unwrap_err()
+            .code,
+        1267
+    );
+    assert_eq!(
+        engine
+            .execute(&mut session, "SELECT a IN (b) FROM M", &[])
+            .unwrap_err()
+            .code,
+        1267
+    );
+}
+
+/// A `BINARY` prefix belongs to the operand, not to the predicate around it.
+///
+/// The parser reads it as a prefix over everything to its right, so
+/// `BINARY 'A' = 'a'` arrived as `CAST('A' = 'a' AS BINARY)` and the
+/// comparison happened under the default collation. It answered 1 where 8.3
+/// answers 0 — and `BINARY 'A' LIKE 'a'` was right only by accident, because
+/// `LIKE` folded nothing at all. #0134 names that case as the one a blanket
+/// fold would break.
+#[test]
+fn a_binary_prefix_binds_to_its_operand_and_compares_exactly() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT BINARY 'A' = 'a', BINARY 'A' LIKE 'a', BINARY 'A' < 'a', \
+             BINARY 'A' IN ('a'), BINARY 'a' = 'a'"
+        ),
+        vec![vec!["0", "0", "1", "0", "1"]]
+    );
+    // The `CAST` spelling reaches the same comparison, and bytes from any
+    // other source do too.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('A' AS BINARY) LIKE 'a', X'41' LIKE 'a', \
+             CAST('A' AS BINARY) LIKE 'A'"
+        ),
+        vec![vec!["0", "0", "1"]]
+    );
+    // A VARBINARY column, where the comparison is the column's and not a
+    // cast's.
+    run(&engine, &mut session, "CREATE TABLE Vb (v VARBINARY(10))");
+    run(&engine, &mut session, "INSERT INTO Vb VALUES ('A')");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT v LIKE 'a', v LIKE 'A' FROM Vb"
+        ),
+        vec![vec!["0", "1"]]
+    );
+}
+
+/// A decomposed accent is ignored where the collation's name says `ai`.
+///
+/// A client can hand over NFD text without meaning to — macOS filenames are —
+/// and 8.3 folds the combining mark away under both UCA collations and under
+/// neither of the others. Measured.
+#[test]
+fn a_combining_mark_folds_away_under_the_uca_collations_only() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Nf (a VARCHAR(20) COLLATE utf8mb4_0900_ai_ci, \
+         b VARCHAR(20) COLLATE utf8mb4_unicode_ci, \
+         c VARCHAR(20) COLLATE utf8mb4_general_ci, \
+         d VARCHAR(20) COLLATE utf8mb4_bin)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Nf VALUES ('cafe\u{301}','cafe\u{301}','cafe\u{301}','cafe\u{301}')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT a = 'cafe', b = 'cafe', c = 'cafe', d = 'cafe' FROM Nf"
+        ),
+        vec![vec!["1", "1", "0", "0"]]
+    );
+}
+
+/// A letter with no base of its own sorts where MySQL puts it, which is not
+/// where its codepoint would.
+///
+/// `utf8mb4_unicode_ci` treats `æ`, `ø` and `ł` as letters in their own right
+/// and sorts each beside the letter it belongs with; `utf8mb4_general_ci` puts
+/// every one of them after `z`. Both measured on 8.3, and neither is the
+/// codepoint order a fold to lower case would give.
+#[test]
+fn a_letter_with_no_ascii_base_still_sorts_where_mysql_puts_it() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Ord (id INT, u VARCHAR(20) COLLATE utf8mb4_unicode_ci, \
+         g VARCHAR(20) COLLATE utf8mb4_general_ci)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Ord VALUES (1,'æ','æ'),(2,'ae','ae'),(3,'ad','ad'),(4,'af','af'),\
+         (5,'z','z'),(6,'ø','ø'),(7,'o','o'),(8,'p','p')",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Ord ORDER BY u, id"),
+        vec![
+            vec!["3"],
+            vec!["2"],
+            vec!["4"],
+            vec!["1"],
+            vec!["7"],
+            vec!["6"],
+            vec!["8"],
+            vec!["5"]
+        ]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Ord ORDER BY g, id"),
+        vec![
+            vec!["3"],
+            vec!["2"],
+            vec!["4"],
+            vec!["7"],
+            vec!["8"],
+            vec!["5"],
+            vec!["1"],
+            vec!["6"]
+        ]
+    );
+    // The default collation has the expansions the older UCA table does not,
+    // so `æ` is `ae` there and a letter of its own here.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 'æ' COLLATE utf8mb4_0900_ai_ci = 'ae', \
+             'æ' COLLATE utf8mb4_unicode_ci = 'ae'"
+        ),
+        vec![vec!["1", "0"]]
+    );
+}
+
+/// The collation survives a save and a reload, which is the half a
+/// `FORMAT_VERSION` bump exists for.
+#[test]
+fn a_columns_collation_survives_the_state_image() {
+    let (engine, mut session) = engine();
+    collated(&engine, &mut session, "utf8mb4_unicode_ci");
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Cb (id INT, name VARCHAR(50) COLLATE utf8mb4_bin)",
+    );
+    run(&engine, &mut session, "INSERT INTO Cb VALUES (1,'café')");
+
+    let bytes = mysql_ultralight_engine::image::encode(&engine.catalog_snapshot().unwrap());
+    let reloaded = mysql_ultralight_engine::image::decode(&bytes).unwrap();
+    let engine = Engine::from_catalog(reloaded, ServerConfig::default()).unwrap();
+    let mut session = Session::new(ServerConfig::default(), 2);
+    session.current_database = Some("testdb".to_owned());
+
+    // The same three answers as before the round trip. A reload that guessed
+    // `utf8mb4_0900_ai_ci` would give the first two and get the last two
+    // wrong.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM C WHERE name = 'cafe' ORDER BY id"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["4"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM C WHERE name = 'strasse' ORDER BY id"
+        ),
+        vec![vec!["3"], vec!["5"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM Cb WHERE name = 'CAFE'"
+        ),
+        Vec::<Vec<String>>::new()
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM Cb WHERE name = 'café'"
+        ),
+        vec![vec!["1"]]
+    );
+}
+
+/// A table-level `COLLATE` reaches the columns that declare none, and an
+/// `ALTER` that changes one re-reads the rows already stored under it.
+#[test]
+fn a_collation_is_inherited_and_can_be_altered_under_stored_rows() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (a VARCHAR(20), b VARCHAR(20) COLLATE utf8mb4_bin) \
+         DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO T VALUES ('Straße','Straße')",
+    );
+    // `a` took the table's `utf8mb4_general_ci`, which has no expansions, so
+    // it finds `strase` and not `strasse`. `b` kept its own and finds neither.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT a = 'strase', a = 'strasse', b = 'Straße', b = 'strasse' FROM T"
+        ),
+        vec![vec!["1", "0", "1", "0"]]
+    );
+    // What the column *reports* is the same answer, resolved the same way.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_NAME = 'T' ORDER BY ORDINAL_POSITION"
+        ),
+        vec![vec!["a", "utf8mb4_general_ci"], vec!["b", "utf8mb4_bin"]]
+    );
+    // A row already stored compares under the collation the column has *now*:
+    // `ß` stops being a single `s` and becomes `ss`.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE T MODIFY COLUMN a VARCHAR(20) COLLATE utf8mb4_unicode_ci",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT a = 'strase', a = 'strasse' FROM T"
+        ),
+        vec![vec!["0", "1"]]
+    );
+    // And again to a collation that folds nothing, which is the change the
+    // two `_ci` collations above cannot show: they agree about `Straße`.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE T MODIFY COLUMN a VARCHAR(20) COLLATE utf8mb4_bin",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT a = 'Straße', a = 'strasse', a = 'straße' FROM T"
+        ),
+        vec![vec!["1", "0", "0"]]
+    );
+}
+
+/// A collation has to be settled before any row is written under it.
+///
+/// The three ways a value reaches a column without an `INSERT ... VALUES`
+/// naming it, each of which ran before the collation was resolved and so
+/// compared under the default afterwards. All measured on 8.3.
+#[test]
+fn a_collation_is_settled_before_the_rows_that_go_under_it() {
+    let (engine, mut session) = engine();
+
+    // A `CREATE TABLE ... AS SELECT` checks its unique keys as it fills, so
+    // the key has to know its collation by then: `'a'` and `'A'` are two rows
+    // under `utf8mb4_bin` and this answered 1062.
+    run(&engine, &mut session, "CREATE TABLE Src (v VARCHAR(20))");
+    run(&engine, &mut session, "INSERT INTO Src VALUES ('a'),('A')");
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Dst (v VARCHAR(20) COLLATE utf8mb4_bin, UNIQUE KEY (v)) \
+         AS SELECT v FROM Src",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM Dst"),
+        vec![vec!["2"]]
+    );
+
+    // A stored DEFAULT is coerced where the column is declared, before the
+    // table's own clause has been read.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Df (id INT, s VARCHAR(20) COLLATE utf8mb4_bin DEFAULT 'A')",
+    );
+    run(&engine, &mut session, "INSERT INTO Df (id) VALUES (1)");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM Df WHERE s = 'a'"
+        ),
+        vec![vec!["0"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM Df WHERE s = 'A'"
+        ),
+        vec![vec!["1"]]
+    );
+
+    // And an `ALTER TABLE ... ADD COLUMN` back-fills every existing row from
+    // that same default.
+    run(&engine, &mut session, "CREATE TABLE A1 (id INT)");
+    run(&engine, &mut session, "INSERT INTO A1 VALUES (1)");
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE A1 ADD COLUMN s VARCHAR(20) COLLATE utf8mb4_bin DEFAULT 'A'",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM A1 WHERE s = 'a'"
+        ),
+        vec![vec!["0"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM A1 WHERE s = 'A'"
+        ),
+        vec![vec!["1"]]
+    );
+}
+
+/// A table-level `COLLATE` is a column's collation for reporting as well as
+/// for comparing, and the two have to be the same answer.
+///
+/// It reported `utf8mb3_bin` — the name `information_schema` gives its own
+/// binary columns — while comparing the column as `utf8mb4_bin`, which is one
+/// column describing itself two ways. 8.3 reports `utf8mb4_bin`.
+#[test]
+fn a_table_level_bin_collation_is_reported_as_it_is_compared() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Tb (a VARCHAR(10)) COLLATE=utf8mb4_bin",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_NAME = 'Tb'"
+        ),
+        vec![vec!["a", "utf8mb4_bin"]]
+    );
+    run(&engine, &mut session, "INSERT INTO Tb VALUES ('a')");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM Tb WHERE a = 'A'"
+        ),
+        vec![vec!["0"]]
+    );
+    // The other thing that sets the same flag keeps the name 8.3 gives it: a
+    // copy of an `information_schema` column, which is declared `utf8mb3_bin`
+    // there and here. Measured.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Cp AS SELECT COLUMN_TYPE FROM information_schema.COLUMNS \
+         WHERE TABLE_NAME = 'nosuchtable'",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_NAME = 'Cp'"
+        ),
+        vec![vec!["COLUMN_TYPE", "utf8mb3_bin"]]
+    );
+}
+
+/// `BETWEEN` and `CASE` resolve a collation too, and each refuses its own way.
+///
+/// Measured on 8.3: `BETWEEN` is 1270 and names all three operands, `CASE` is
+/// 1267 and names two. `GREATEST` over the same pair does *not* refuse — it
+/// answers — so this is not a blanket rule about mixing.
+#[test]
+fn between_and_case_refuse_a_mix_the_way_8_3_does() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Mx (u VARCHAR(20) COLLATE utf8mb4_unicode_ci, \
+         g VARCHAR(20) COLLATE utf8mb4_general_ci)",
+    );
+    run(&engine, &mut session, "INSERT INTO Mx VALUES ('a','a')");
+
+    let err = engine
+        .execute(&mut session, "SELECT u BETWEEN g AND g FROM Mx", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1270);
+    assert!(
+        err.to_string().contains(
+            "Illegal mix of collations (utf8mb4_unicode_ci,IMPLICIT), \
+             (utf8mb4_general_ci,IMPLICIT), (utf8mb4_general_ci,IMPLICIT) \
+             for operation 'between'"
+        ),
+        "{err}"
+    );
+
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT CASE u WHEN g THEN 1 ELSE 0 END FROM Mx",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1267);
+    assert!(err.to_string().contains("for operation 'case'"), "{err}");
+
+    // A `BETWEEN` whose operands agree is not refused, which is what says the
+    // check reads the collations rather than the shape.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT u BETWEEN 'a' AND 'z' FROM Mx"
+        ),
+        vec![vec!["1"]]
+    );
+}
+
+/// A derived column keeps the collation of what produced it, and the table's
+/// own `COLLATE` does not reach it.
+///
+/// Measured on 8.3, and the second half is the surprising one: `CREATE TABLE d
+/// COLLATE=utf8mb4_general_ci AS SELECT s FROM src` over a `utf8mb4_bin`
+/// column reports `utf8mb4_bin` for `d.s`. Reading such a column as one with
+/// no clause let the table's collation overwrite the copied one — while the
+/// BINARY wire flag, which rides on the same type, survived.
+#[test]
+fn a_derived_column_keeps_the_collation_it_was_copied_from() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE S1 (s VARCHAR(20) COLLATE utf8mb4_bin, \
+         u VARCHAR(20) COLLATE utf8mb4_unicode_ci)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO S1 VALUES ('A','Straße')",
+    );
+
+    for (table, sql) in [
+        ("D1", "CREATE TABLE D1 AS SELECT s, u FROM S1"),
+        (
+            "D2",
+            "CREATE TABLE D2 COLLATE=utf8mb4_general_ci AS SELECT s, u FROM S1",
+        ),
+    ] {
+        run(&engine, &mut session, sql);
+        assert_eq!(
+            rows(
+                &engine,
+                &mut session,
+                &format!(
+                    "SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.COLUMNS \
+                     WHERE TABLE_NAME = '{table}' ORDER BY ORDINAL_POSITION"
+                )
+            ),
+            vec![vec!["s", "utf8mb4_bin"], vec!["u", "utf8mb4_unicode_ci"]],
+            "{sql}"
+        );
+        // And compared that way, not only reported: `s` is exact and `u`
+        // reads `ß` as `ss`.
+        assert_eq!(
+            rows(
+                &engine,
+                &mut session,
+                &format!("SELECT COUNT(*) FROM {table} WHERE s = 'a'")
+            ),
+            vec![vec!["0"]],
+            "{sql}"
+        );
+        assert_eq!(
+            rows(
+                &engine,
+                &mut session,
+                &format!("SELECT COUNT(*) FROM {table} WHERE u = 'strasse'")
+            ),
+            vec![vec!["1"]],
+            "{sql}"
+        );
+    }
+
+    // A view reports what its base column *compares* under, which can have
+    // come from the table rather than from the column's own clause. Measured
+    // on 8.3.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Tb2 (a VARCHAR(10)) COLLATE=utf8mb4_bin",
+    );
+    run(&engine, &mut session, "INSERT INTO Tb2 VALUES ('a')");
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Vb2 AS SELECT a FROM Tb2",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_NAME = 'Vb2'"
+        ),
+        vec![vec!["a", "utf8mb4_bin"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM Vb2 WHERE a = 'A'"
+        ),
+        vec![vec!["0"]]
+    );
+}
+
+/// A `COLLATE` clause over an operand in the binary character set is refused.
+///
+/// 1253 on 8.3, and which operands reach it is measured rather than guessed:
+/// a bare `NULL` and a `CAST(... AS BINARY)` are refused, while a number is
+/// not. Read off the *expression* for the NULL half, because a NULL sitting in
+/// a VARCHAR column carries that column's character set and must not refuse.
+#[test]
+fn collate_over_a_binary_operand_is_1253() {
+    let (engine, mut session) = engine();
+    for sql in [
+        "SELECT NULL COLLATE utf8mb4_bin",
+        "SELECT CAST('a' AS BINARY) COLLATE utf8mb4_bin",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1253, "{sql}");
+        assert!(
+            err.to_string()
+                .contains("COLLATION 'utf8mb4_bin' is not valid for CHARACTER SET 'binary'"),
+            "{sql} -> {err}"
+        );
+    }
+    // A number takes the clause and answers.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 1 COLLATE utf8mb4_bin"),
+        vec![vec!["1"]]
+    );
+    // And a NULL *value* out of a text column does too, which is why the NULL
+    // refusal reads the expression rather than the value.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N (c VARCHAR(10) COLLATE utf8mb4_unicode_ci)",
+    );
+    run(&engine, &mut session, "INSERT INTO N VALUES (NULL)");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT c COLLATE utf8mb4_bin IS NULL FROM N"
+        ),
+        vec![vec!["1"]]
+    );
+}
+
+/// `LIKE` counts a combining mark as a character where `=` folds it away.
+///
+/// Not a gap: 8.3 does the same. Measured over a `utf8mb4_unicode_ci` column
+/// holding the decomposed spelling of `café` — `= 'café'` written the
+/// precomposed way is 1 and `LIKE 'café'` is 0, because the pattern has four
+/// characters and the subject five. `LIKE 'caf__'` finds it.
+#[test]
+fn like_counts_a_combining_mark_that_equality_folds_away() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Nd (v VARCHAR(20) COLLATE utf8mb4_unicode_ci)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Nd VALUES ('cafe\u{301}')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT v = 'café', v LIKE 'café', v LIKE 'caf_', v LIKE 'caf__' FROM Nd"
+        ),
+        vec![vec!["1", "0", "0", "1"]]
     );
 }
 

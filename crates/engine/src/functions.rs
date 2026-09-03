@@ -5,6 +5,7 @@
 
 use sqlparser::ast::DataType;
 
+use crate::collation::Collation;
 use crate::error::{unsupported, EngineError, EngineResult};
 use crate::json;
 use crate::session::Session;
@@ -1165,7 +1166,7 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
             if args.iter().any(Value::is_null) {
                 Value::Null
             } else {
-                Value::Text(args.iter().map(Value::as_text).collect())
+                Value::text(args.iter().map(Value::as_text).collect::<String>())
             }
         }
         "concat_ws" => {
@@ -1183,7 +1184,7 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
                 .filter(|v| !v.is_null())
                 .map(Value::as_text)
                 .collect();
-            Value::Text(joined.join(&sep))
+            Value::text(joined.join(&sep))
         }
         "length" | "octet_length" => Value::Int(text(0).len() as i64),
         "char_length" | "character_length" => Value::Int(text(0).chars().count() as i64),
@@ -1206,23 +1207,23 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         // decoded and nothing left says it was bytes. It does narrow the gap
         // by accident -- a `\u{df}` in a VARBINARY now survives, where the
         // full mapping used to turn it into `SS`.
-        "upper" | "ucase" => Value::Text(crate::casefold::upper(&text(0))),
-        "lower" | "lcase" => Value::Text(crate::casefold::lower(&text(0))),
-        "trim" => Value::Text(text(0).trim().to_owned()),
-        "ltrim" => Value::Text(text(0).trim_start().to_owned()),
-        "rtrim" => Value::Text(text(0).trim_end().to_owned()),
-        "reverse" => Value::Text(text(0).chars().rev().collect()),
-        "space" => Value::Text(" ".repeat(arg(0).as_int().unwrap_or(0).max(0) as usize)),
-        "replace" => Value::Text(text(0).replace(&text(1), &text(2))),
+        "upper" | "ucase" => Value::text(crate::casefold::upper(&text(0))),
+        "lower" | "lcase" => Value::text(crate::casefold::lower(&text(0))),
+        "trim" => Value::text(text(0).trim().to_owned()),
+        "ltrim" => Value::text(text(0).trim_start().to_owned()),
+        "rtrim" => Value::text(text(0).trim_end().to_owned()),
+        "reverse" => Value::text(text(0).chars().rev().collect::<String>()),
+        "space" => Value::text(" ".repeat(arg(0).as_int().unwrap_or(0).max(0) as usize)),
+        "replace" => Value::text(text(0).replace(&text(1), &text(2))),
         "left" => {
             let n = arg(1).as_int().unwrap_or(0).max(0) as usize;
-            Value::Text(text(0).chars().take(n).collect())
+            Value::text(text(0).chars().take(n).collect::<String>())
         }
         "right" => {
             let s = text(0);
             let n = arg(1).as_int().unwrap_or(0).max(0) as usize;
             let skip = s.chars().count().saturating_sub(n);
-            Value::Text(s.chars().skip(skip).collect())
+            Value::text(s.chars().skip(skip).collect::<String>())
         }
         "substring" | "substr" | "mid" => {
             let s: Vec<char> = text(0).chars().collect();
@@ -1238,7 +1239,7 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
                 Some(v) => v.as_int().unwrap_or(0).max(0) as usize,
                 None => s.len(),
             };
-            Value::Text(s.into_iter().skip(from).take(take).collect())
+            Value::text(s.into_iter().skip(from).take(take).collect::<String>())
         }
         "instr" | "locate" | "position" => {
             let (haystack, needle) = if name == "instr" {
@@ -1262,7 +1263,7 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
             } else {
                 " ".to_owned()
             };
-            Value::Text(pad_to(&s, width, &pad, name == "lpad"))
+            Value::text(pad_to(&s, width, &pad, name == "lpad"))
         }
 
         // -- numbers -------------------------------------------------------
@@ -1426,14 +1427,14 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
 
         // -- session and server --------------------------------------------
         "database" | "schema" => match &session.current_database {
-            Some(db) => Value::Text(db.clone()),
+            Some(db) => Value::text(db.clone()),
             None => Value::Null,
         },
-        "version" => Value::Text(session.config.version.clone()),
+        "version" => Value::text(session.config.version.clone()),
         "connection_id" => Value::Int(session.connection_id as i64),
         "last_insert_id" => Value::Int(session.last_insert_id as i64),
         "user" | "current_user" | "session_user" | "system_user" => {
-            Value::Text("root@localhost".to_owned())
+            Value::text("root@localhost".to_owned())
         }
         "row_count" => Value::Int(session.affected_rows as i64),
 
@@ -1496,7 +1497,7 @@ fn untag_mixed_temporal(args: &[Value], chosen: Option<Value>) -> Option<Value> 
         .iter()
         .any(|v| !v.is_null() && !matches!(v, Value::Temporal(_)));
     Some(if mixed {
-        Value::Text(chosen.as_text())
+        Value::text(chosen.as_text())
     } else {
         chosen
     })
@@ -1756,7 +1757,7 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
             Value::Decimal(crate::types::decimal_digits(&source, scale))
         }
         D::Char(_) | D::Varchar(_) | D::Text | D::CharacterVarying(_) | D::Character(_) => {
-            Value::Text(value.as_text())
+            Value::text(value.as_text())
         }
         // Tagged, exactly as the DECIMAL cast above is and for the same
         // reason: the cast declares the type, and without the tag the result
@@ -1870,13 +1871,28 @@ fn check_cast_precision(target: &crate::types::SqlType, source: &str) -> EngineR
 ///
 /// Backtracking rather than regex, so there is no dependency and no pattern
 /// compilation cost on a per-row call.
-pub fn like(text: &str, pattern: &str, escape: Option<char>) -> bool {
+///
+/// Under `collation`, which is the whole of #0134: this folded nothing while
+/// `=` beside it folded case, so `'ABC' LIKE 'a%'` was 0 here and 1 on 8.3
+/// — one engine giving two answers to the same question. Every comparison
+/// below goes through [`Collation::chars_match`] rather than `==` for that
+/// reason, including the one behind the escape: `'CAFÉ' LIKE 'caf!é' ESCAPE
+/// '!'` is 1 on 8.3, so an escaped character is still matched under the
+/// collation rather than by its codepoint.
+pub fn like(text: &str, pattern: &str, escape: Option<char>, collation: Collation) -> bool {
     let t: Vec<char> = text.chars().collect();
     let p: Vec<char> = pattern.chars().collect();
-    like_at(&t, 0, &p, 0, escape)
+    like_at(&t, 0, &p, 0, escape, collation)
 }
 
-fn like_at(t: &[char], mut ti: usize, p: &[char], mut pi: usize, escape: Option<char>) -> bool {
+fn like_at(
+    t: &[char],
+    mut ti: usize,
+    p: &[char],
+    mut pi: usize,
+    escape: Option<char>,
+    collation: Collation,
+) -> bool {
     while pi < p.len() {
         let ch = p[pi];
 
@@ -1889,7 +1905,7 @@ fn like_at(t: &[char], mut ti: usize, p: &[char], mut pi: usize, escape: Option<
             // `'a%' LIKE 'a%' ESCAPE '%'` — the wildcard reading is off even
             // in the position where the escaping cannot apply.
             let next = p.get(pi + 1).unwrap_or(&ch);
-            if ti >= t.len() || t[ti] != *next {
+            if ti >= t.len() || !collation.chars_match(t[ti], *next) {
                 return false;
             }
             ti += 1;
@@ -1901,7 +1917,7 @@ fn like_at(t: &[char], mut ti: usize, p: &[char], mut pi: usize, escape: Option<
             '%' => {
                 // Try every split point; the shortest match wins first.
                 for skip in ti..=t.len() {
-                    if like_at(t, skip, p, pi + 1, escape) {
+                    if like_at(t, skip, p, pi + 1, escape, collation) {
                         return true;
                     }
                 }
@@ -1915,7 +1931,7 @@ fn like_at(t: &[char], mut ti: usize, p: &[char], mut pi: usize, escape: Option<
                 pi += 1;
             }
             literal => {
-                if ti >= t.len() || t[ti] != literal {
+                if ti >= t.len() || !collation.chars_match(t[ti], literal) {
                     return false;
                 }
                 ti += 1;
@@ -2012,7 +2028,7 @@ fn digit_integer(value: &Value) -> i128 {
         // 8.3 — an exponent is not part of an integer — and `CAST('inf' AS
         // SIGNED)` is 0. Through a float parse those were 10^30 and an
         // infinity, and the unsigned boundary below then turned both into -1.
-        Value::Text(_) | Value::Bytes(_) => leading_integer(&value.as_text()),
+        Value::Text(_, _) | Value::Bytes(_) => leading_integer(&value.as_text()),
         // A document is not a string, and 8.3 says so: a JSON *number*
         // converts as the number it is, so `CAST(CAST('1e30' AS JSON) AS
         // SIGNED)` is 9223372036854775807 where the JSON string `"1e30"`
@@ -2331,30 +2347,30 @@ mod tests {
 
     #[test]
     fn like_handles_wildcards_and_anchoring() {
-        assert!(like("hello", "hello", None));
-        assert!(like("hello", "h%", None));
-        assert!(like("hello", "%o", None));
-        assert!(like("hello", "h_llo", None));
-        assert!(like("hello", "%ell%", None));
-        assert!(!like("hello", "h_lo", None));
+        assert!(like("hello", "hello", None, Collation::Ai0900Ci));
+        assert!(like("hello", "h%", None, Collation::Ai0900Ci));
+        assert!(like("hello", "%o", None, Collation::Ai0900Ci));
+        assert!(like("hello", "h_llo", None, Collation::Ai0900Ci));
+        assert!(like("hello", "%ell%", None, Collation::Ai0900Ci));
+        assert!(!like("hello", "h_lo", None, Collation::Ai0900Ci));
         // A pattern with no wildcard must match the whole string.
-        assert!(!like("hello world", "hello", None));
-        assert!(like("", "%", None));
+        assert!(!like("hello world", "hello", None, Collation::Ai0900Ci));
+        assert!(like("", "%", None, Collation::Ai0900Ci));
     }
 
     #[test]
     fn like_escape_makes_a_wildcard_literal() {
-        assert!(like("100%", "100\\%", Some('\\')));
-        assert!(!like("1000", "100\\%", Some('\\')));
-        assert!(like("a_b", "a\\_b", Some('\\')));
-        assert!(!like("axb", "a\\_b", Some('\\')));
+        assert!(like("100%", "100\\%", Some('\\'), Collation::Ai0900Ci));
+        assert!(!like("1000", "100\\%", Some('\\'), Collation::Ai0900Ci));
+        assert!(like("a_b", "a\\_b", Some('\\'), Collation::Ai0900Ci));
+        assert!(!like("axb", "a\\_b", Some('\\'), Collation::Ai0900Ci));
     }
 
     /// Backtracking must not give up after the first `%` placement fails.
     #[test]
     fn like_backtracks_across_multiple_wildcards() {
-        assert!(like("aaa", "%a%a%", None));
-        assert!(!like("a", "%a%a%", None));
+        assert!(like("aaa", "%a%a%", None, Collation::Ai0900Ci));
+        assert!(!like("a", "%a%a%", None, Collation::Ai0900Ci));
     }
 
     #[test]

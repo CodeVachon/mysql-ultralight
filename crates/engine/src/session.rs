@@ -359,10 +359,10 @@ impl Session {
     pub fn system_variable(&self, name: &str) -> Option<Value> {
         let name = normalize_scope(name);
         if let Some(value) = self.overrides.get(&name) {
-            return Some(Value::Text(value.clone()));
+            return Some(Value::text(value.clone()));
         }
 
-        let text = |s: &str| Some(Value::Text(s.to_owned()));
+        let text = |s: &str| Some(Value::text(s.to_owned()));
         let int = |v: i64| Some(Value::Int(v));
 
         match name.as_str() {
@@ -622,14 +622,14 @@ mod tests {
         let s = Session::new(first.clone(), 1);
         assert_eq!(
             s.system_variable("ultralight_instance"),
-            Some(Value::Text(first.instance.clone()))
+            Some(Value::text(first.instance.clone()))
         );
         // Every connection to one server must answer the same, or the harness
         // would be checking the connection rather than the server.
         let other_connection = Session::new(first.clone(), 2);
         assert_eq!(
             other_connection.system_variable("@@ultralight_instance"),
-            Some(Value::Text(first.instance))
+            Some(Value::text(first.instance))
         );
     }
 
@@ -649,7 +649,7 @@ mod tests {
         assert_eq!(s.config.sql_mode, "ANSI_QUOTES");
         assert_eq!(
             s.system_variable("sql_mode"),
-            Some(Value::Text("ANSI_QUOTES".to_owned()))
+            Some(Value::text("ANSI_QUOTES".to_owned()))
         );
     }
 }

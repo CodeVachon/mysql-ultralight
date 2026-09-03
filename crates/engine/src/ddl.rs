@@ -99,12 +99,21 @@ pub fn create_table(
     // filled in: a CHECK constraint or an expression default may hold a
     // subquery, which runs against the catalog, and holding the writer's lock
     // across that would deadlock the statement against itself.
-    let (unselected, coerced) = {
+    let (unselected, coerced, database_collation) = {
         let catalog = engine.catalog_public()?;
-        match &selected {
+        // Read here rather than under the write guard below, because a
+        // column's collation has to be settled before any row is coerced into
+        // it and that happens while this guard is the only one held.
+        let database_collation = catalog
+            .database(&db)
+            .ok_or_else(|| EngineError::unknown_database(&db))?
+            .collation
+            .clone();
+        let (unselected, coerced) = match &selected {
             Some(result) => merge_selected_columns(&catalog, &db, &mut table, result)?,
             None => (0, Vec::new()),
-        }
+        };
+        (unselected, coerced, database_collation)
     };
 
     // Two columns of one name is not a table: every reference to the name
@@ -195,6 +204,14 @@ pub fn create_table(
             },
         )?;
     }
+
+    // Before the rows, and that is the point: `fill_new_table` below coerces
+    // every value into its column and checks the unique keys as it goes, so a
+    // column whose collation had not been worked out yet was compared under
+    // the default. Measured on 8.3, `CREATE TABLE d (v VARCHAR(20) COLLATE
+    // utf8mb4_bin, UNIQUE KEY (v)) AS SELECT v FROM src` over `'a'` and `'A'`
+    // keeps both rows; resolving afterwards made it 1062.
+    resolve_collations(&mut table, &database_collation);
 
     // The first AUTO_INCREMENT value the rows generated, which is what
     // `LAST_INSERT_ID()` answers after a CTAS — measured on 8.3, where a
@@ -368,6 +385,21 @@ fn derived_column(catalog: &Catalog, database: &str, column: &OutColumn) -> Colu
     let ty = column.sql_type();
     let mut built = Column::new(column.name.clone(), ty.clone());
     built.nullable = column.nullable;
+    // Recorded as though the statement had written the clause, because to the
+    // table it is one: a derived column takes the collation of what produced
+    // it and the table's own `COLLATE` does not reach it. Measured on 8.3 —
+    // `CREATE TABLE d COLLATE=utf8mb4_general_ci AS SELECT s FROM src` over a
+    // `utf8mb4_bin` column reports `utf8mb4_bin` for `d.s`, not the clause.
+    // Left unrecorded, `resolve_collations` read it as a column with no clause
+    // and overwrote the copied collation with the table's — while
+    // `binary_collation`, which rides on the same `SqlType`, survived. The
+    // column then carried the BINARY wire flag and compared case-insensitively.
+    if matches!(
+        ty.kind,
+        crate::types::TypeKind::Text | crate::types::TypeKind::Enum | crate::types::TypeKind::Set
+    ) {
+        built.collation = Some(ty.collation.name().to_owned());
+    }
     // By the *source* column's name and the *source* table, neither of which
     // an alias changes.
     //
@@ -487,10 +519,62 @@ fn create_table_like(
         }
         return Err(EngineError::table_exists(name));
     }
+    resolve_collations(&mut table, &database.collation);
     database.tables.insert(name.to_owned(), table);
     drop(catalog);
     engine.mark_modified_public(session, db, name);
     Ok(Outcome::ok())
+}
+
+/// Fills in each column's effective collation, and puts it on the rows.
+///
+/// Over the whole table rather than inside `build_column`, because a column's
+/// collation is not a property of its own definition: `CREATE TABLE t (a
+/// VARCHAR(10)) COLLATE=utf8mb4_bin` puts the table's clause on `a`, and the
+/// table option is parsed after the columns are. This is the only point where
+/// all three clauses — the column's, the table's, the database's — are in hand
+/// at once.
+///
+/// Run after `ALTER TABLE` too, which is what re-tags rows already stored when
+/// a `MODIFY` changes the collation under them.
+pub(crate) fn resolve_collations(table: &mut Table, database_collation: &str) {
+    let table_collation = table.collation.clone();
+    for column in &mut table.columns {
+        let name = crate::collation::inherited(
+            column.collation.as_deref(),
+            table_collation.as_deref(),
+            database_collation,
+        );
+        // Every clause has been through `collation::named`, and the database's
+        // is this engine's own, so an unknown name here is not reachable from
+        // SQL. Falling back to the default rather than refusing keeps that
+        // unreachable case from being a way to fail a `CREATE TABLE`.
+        column.ty.collation = crate::collation::Collation::from_name(name).unwrap_or_default();
+        // A `_bin` collation is what puts the BINARY flag on a text column's
+        // wire definition — measured on 8.3, a `VARCHAR(10) COLLATE
+        // utf8mb4_bin` is `VAR_STRING` with `Flags: BINARY` while the columns
+        // beside it carry none.
+        if column.ty.collation == crate::collation::Collation::Bin
+            && matches!(
+                column.ty.kind,
+                crate::types::TypeKind::Text
+                    | crate::types::TypeKind::Enum
+                    | crate::types::TypeKind::Set
+            )
+        {
+            column.ty.binary_collation = true;
+        }
+        // The stored default too, which is a value of this column and is
+        // written into rows verbatim — an `ALTER TABLE ... ADD COLUMN`
+        // back-fills with it, and an `INSERT` that omits the column copies it.
+        // It was coerced in `build_column`, before the table's own clause had
+        // been read, so it carried the wrong collation into every row that
+        // took it.
+        if let Some(crate::value::Value::Text(_, collated)) = &mut column.default {
+            *collated = crate::collation::Collated::implicit(column.ty.collation);
+        }
+    }
+    table.retag_text();
 }
 
 fn build_column(def: &ColumnDef, position: usize) -> EngineResult<Column> {
@@ -1439,6 +1523,7 @@ pub fn alter_table(
         .find(|k| k.eq_ignore_ascii_case(&table_name))
         .cloned();
     if let Some(key) = key {
+        resolve_collations(table, &database.collation);
         database.tables.insert(key, table.clone());
     }
 

@@ -5,6 +5,8 @@ use std::fmt::Write as _;
 
 use mysql_ultralight_protocol::Value as WireValue;
 
+use crate::collation::{Collated, Collation};
+
 /// A value as the engine holds it.
 ///
 /// Narrower than the wire type on purpose: MySQL transmits decimals and dates
@@ -15,7 +17,25 @@ pub enum Value {
     Null,
     Int(i64),
     Float(f64),
-    Text(String),
+    /// Text, and the collation it compares under.
+    ///
+    /// The tag rides on the value for the same reason `Temporal` and `Enum`
+    /// below carry theirs: the value is the only thing that reaches the
+    /// comparison. By the time `WHERE name = 'cafe'` is deciding a row, the
+    /// column that said `COLLATE utf8mb4_unicode_ci` is out of reach, and
+    /// without the tag every string in the engine compared under one rule —
+    /// which is #0129, #0134 and #0152 together.
+    ///
+    /// It carries *how firmly* the collation is held as well as which one,
+    /// because MySQL resolves a comparison from both sides and a literal loses
+    /// to a column. See [`crate::collation::resolve`].
+    ///
+    /// [`Value::text`] builds the coercible kind, which is what a literal and
+    /// anything computed from one carries;
+    /// [`crate::types::SqlType::coerce`] is where a column's own collation
+    /// goes on, since that is the last place the declaration and the value are
+    /// both in hand.
+    Text(String, Collated),
     Bytes(Vec<u8>),
     /// A JSON document, held as its serialised text.
     ///
@@ -151,8 +171,53 @@ impl Value {
         matches!(self, Value::Null)
     }
 
+    /// Text with no collation of its own: a literal, or anything built from
+    /// one. It takes the collation of whatever it is compared against.
     pub fn text(s: impl Into<String>) -> Self {
-        Value::Text(s.into())
+        Value::Text(s.into(), Collated::COERCIBLE)
+    }
+
+    /// Text carrying a column's declared collation.
+    pub fn collated(s: impl Into<String>, collation: Collation) -> Self {
+        Value::Text(s.into(), Collated::implicit(collation))
+    }
+
+    /// The collation this value brings to a comparison.
+    ///
+    /// Everything that is not text is coercible: MySQL types a number's
+    /// collation NUMERIC at coercibility 5, weaker than a literal's, and this
+    /// engine never compares two of those as strings anyway — the numeric
+    /// paths in [`Value::compare`] take that pairing first. Collapsing them
+    /// keeps one rule rather than a second ladder that has to agree with it.
+    pub(crate) fn collated_as(&self) -> Collated {
+        match self {
+            Value::Text(_, collated) => *collated,
+            // Bytes compare exactly, and they say so at IMPLICIT strength so
+            // one binary operand decides the pair — MySQL's own rule, and the
+            // one `compare` below already applies by sending any pairing with
+            // a `Bytes` in it to a byte comparison. Saying it here as well is
+            // what makes `LIKE` agree with `=` about them: measured on 8.3,
+            // `CAST('A' AS BINARY) LIKE 'a'` is 0, and without this the
+            // pattern's coercible `utf8mb4_0900_ai_ci` decided the match and
+            // folded the case. `utf8mb4_bin` rather than the `binary`
+            // character set, because the two ask for the same comparison and
+            // only one of them is a comparison this engine has.
+            Value::Bytes(_) => Collated::implicit(Collation::Bin),
+            _ => Collated::COERCIBLE,
+        }
+    }
+
+    /// This value with `collation` named explicitly, as `x COLLATE c` does.
+    ///
+    /// Only text carries one. `1 COLLATE utf8mb4_bin` is 1253 on 8.3 —
+    /// "COLLATION 'utf8mb4_bin' is not valid for CHARACTER SET 'binary'" — and
+    /// that refusal is raised where the clause is read, so anything reaching
+    /// here is already text.
+    pub(crate) fn with_collation(self, collation: Collation) -> Value {
+        match self {
+            Value::Text(text, _) => Value::Text(text, Collated::explicit(collation)),
+            other => other,
+        }
     }
 
     /// The value as an integer, where that is meaningful.
@@ -181,7 +246,7 @@ impl Value {
             Value::Unsigned(v) => Some(*v as i64),
             Value::Float(v) => Some(*v as i64),
             Value::Float32(v) => Some(*v as i64),
-            Value::Text(v) | Value::Json(v) | Value::Decimal(v) => {
+            Value::Text(v, _) | Value::Json(v) | Value::Decimal(v) => {
                 let t = v.trim();
                 t.parse::<i64>()
                     .ok()
@@ -215,7 +280,7 @@ impl Value {
             // Parsed at the full width before falling back to a float, so
             // `'18446744073709551615'` into a `BIGINT UNSIGNED` is the number
             // it spells and not the nearest double to it.
-            Value::Text(v) | Value::Json(v) | Value::Decimal(v) => {
+            Value::Text(v, _) | Value::Json(v) | Value::Decimal(v) => {
                 let t = v.trim();
                 t.parse::<i128>()
                     .ok()
@@ -247,7 +312,7 @@ impl Value {
             Value::Int(v) => Some(*v as f64),
             Value::Float(v) => Some(*v),
             Value::Float32(v) => Some(*v as f64),
-            Value::Text(v) | Value::Json(v) | Value::Decimal(v) => v.trim().parse().ok(),
+            Value::Text(v, _) | Value::Json(v) | Value::Decimal(v) => v.trim().parse().ok(),
             // A binary string is still a *string*: MySQL reads a `BINARY`
             // value, a `VARBINARY` column and a `BLOB` in a numeric context
             // exactly as it reads text, and only the collation differs.
@@ -289,7 +354,7 @@ impl Value {
             Value::Int(v) => *v as f64,
             Value::Float(v) => *v,
             Value::Float32(v) => *v as f64,
-            Value::Text(v) | Value::Json(v) | Value::Decimal(v) => numeric_prefix(v),
+            Value::Text(v, _) | Value::Json(v) | Value::Decimal(v) => numeric_prefix(v),
             Value::Bytes(v) => numeric_prefix(&String::from_utf8_lossy(v)),
             Value::Enum { ordinal, .. } => f64::from(*ordinal),
             Value::Bool(b) => f64::from(u8::from(*b)),
@@ -316,7 +381,7 @@ impl Value {
                 *v as f64,
                 Some(mysql_ultralight_protocol::value::FLOAT_DIGITS),
             ),
-            Value::Text(v) => v.clone(),
+            Value::Text(v, _) => v.clone(),
             Value::Bytes(v) => String::from_utf8_lossy(v).into_owned(),
             // The text it was stored as: only the *numeric* reading of a
             // temporal is packed, and `SELECT d` still shows `2024-01-05`.
@@ -366,7 +431,7 @@ impl Value {
             // way: treating it as "true when non-empty" made `WHERE BINARY x`
             // true for the byte '0', which is how a filter over a cast
             // comparison silently kept every row.
-            Value::Text(v) => Some(numeric_prefix(v) != 0.0),
+            Value::Text(v, _) => Some(numeric_prefix(v) != 0.0),
             Value::Bytes(v) => Some(numeric_prefix(&String::from_utf8_lossy(v)) != 0.0),
             // Read like the text it used to be, so tagging a value changed
             // nothing about how a WHERE clause treats it.
@@ -481,8 +546,24 @@ impl Value {
             (Value::Bytes(_), _) | (_, Value::Bytes(_)) => {
                 Some(self.as_bytes().cmp(&other.as_bytes()))
             }
-            _ => Some(collate(&self.as_text(), &other.as_text())),
+            _ => Some(
+                self.collation_with(other)
+                    .compare(&self.as_text(), &other.as_text()),
+            ),
         }
+    }
+
+    /// The collation a comparison of these two operands is made under.
+    ///
+    /// Lenient where MySQL raises 1267, and deliberately: `compare` answers
+    /// `Option<Ordering>` for the three-valued logic and has nowhere to put an
+    /// error, and it is reached from sorting, grouping and foreign-key
+    /// matching as well as from `=`. The refusal is raised where a statement
+    /// can carry it — [`crate::expr`] checks the pair before comparing it — so
+    /// the fallback here is only ever reached by a path 8.3 does not refuse.
+    pub(crate) fn collation_with(&self, other: &Value) -> Collation {
+        crate::collation::resolve(self.collated_as(), other.collated_as())
+            .unwrap_or(Collation::Ai0900Ci)
     }
 
     /// The order MySQL *sorts* this value in, which for an ENUM is not the
@@ -526,7 +607,7 @@ impl Value {
     /// not a mixture of types that does it. All measured on 8.3.
     pub fn untag_enum(self) -> Value {
         match self {
-            Value::Enum { member, .. } => Value::Text(member),
+            Value::Enum { member, .. } => Value::text(member),
             other => other,
         }
     }
@@ -768,7 +849,12 @@ impl Value {
                 // A `Decimal` whose text is not one, which nothing validates.
                 None => text.to_lowercase(),
             },
-            other => other.as_text().to_lowercase(),
+            // Under the column's own collation, which is what makes DISTINCT,
+            // GROUP BY and a unique key agree with `=` about `café` and
+            // `Cafe`. It used to be `to_lowercase` for every column alike,
+            // which is the same one-rule-for-four the comparison had.
+            Value::Text(text, collated) => collated.collation.key(text),
+            other => Collation::Ai0900Ci.key(&other.as_text()),
         }
     }
 
@@ -781,7 +867,7 @@ impl Value {
             // Four bytes on the wire as well as in the column, which is the
             // other half of the same promise.
             Value::Float32(v) => WireValue::F32(*v),
-            Value::Text(v) => WireValue::Str(v.clone()),
+            Value::Text(v, _) => WireValue::Str(v.clone()),
             Value::Bytes(v) => WireValue::Bytes(v.clone()),
             // JSON crosses the wire as text, which is how MySQL transmits it.
             // A decimal travels as its text, which is how MySQL sends one.
@@ -823,7 +909,7 @@ impl Value {
             },
             WireValue::F32(v) => Value::Float(*v as f64),
             WireValue::F64(v) => Value::Float(*v),
-            WireValue::Str(v) => Value::Text(v.clone()),
+            WireValue::Str(v) => Value::text(v.clone()),
             WireValue::Bytes(v) => Value::Bytes(v.clone()),
         }
     }
@@ -842,39 +928,6 @@ impl Value {
 /// with this marker. Without that, bytes spelling `\0NULL` keyed as the NULL
 /// sentinel itself.
 const BYTES_KEY_MARKER: &str = "\u{0}X";
-
-/// Whether two strings are the same under the server's collation.
-///
-/// Shared with `collate` so that matching an ENUM member on the way into a
-/// column and comparing one on the way out cannot disagree: MySQL stores
-/// `INSERT ... VALUES ('A')` into `ENUM('a')` as `a`, which is the same
-/// case-insensitive rule `e = 'A'` answers by.
-pub(crate) fn collate_eq(a: &str, b: &str) -> bool {
-    collate(a, b) == Ordering::Equal
-}
-
-/// Compares two strings under the server's advertised collation.
-///
-/// `utf8mb4_0900_ai_ci` is case-insensitive, which is MySQL's default and what
-/// clients expect: `WHERE email = 'Foo@Bar.com'` must find `foo@bar.com`, and a
-/// unique index must reject that pair. The accent-insensitive half of the
-/// collation is not implemented.
-fn collate(a: &str, b: &str) -> Ordering {
-    let mut left = a.chars().flat_map(char::to_lowercase);
-    let mut right = b.chars().flat_map(char::to_lowercase);
-
-    loop {
-        match (left.next(), right.next()) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(x), Some(y)) => match x.cmp(&y) {
-                Ordering::Equal => continue,
-                ord => return ord,
-            },
-        }
-    }
-}
 
 /// Renders a float the way MySQL does: no trailing `.0`, no exponent for
 /// ordinary magnitudes.

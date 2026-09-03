@@ -6468,4 +6468,278 @@ pub const GROUPS: &[Group] = &[
             same("ALTER TABLE DrNoPk DROP COLUMN A, ADD COLUMN a INT NULL"),
         ],
     },
+    Group {
+        // #0152, #0134 and #0129 are one gap: the collation a column declares
+        // never reached the comparison, so `=`, `LIKE`, `ORDER BY`, `GROUP BY`,
+        // `DISTINCT` and a unique key all answered under one rule.
+        //
+        // Declared exactly as the conformance target declares every one of its
+        // 1537 text columns -- `CHARACTER SET utf8mb4 COLLATE
+        // utf8mb4_unicode_ci` -- because that is the collation the wrong
+        // answers were measured under, and because `mode: 'insensitive'`
+        // appears nowhere in that codebase: all 137 of its searches depend on
+        // this.
+        //
+        // The rows are the three from the issue notes. `café` against `cafe`
+        // is the accent fold, `Cafe` the case fold, and `Straße` against
+        // `strasse` the expansion -- three different mechanisms, and an engine
+        // that had only case folding answered the first two wrongly and the
+        // third with no rows at all.
+        //
+        // Every case orders by `id` rather than by the column, because under
+        // this collation `café`, `Cafe` and `cafe` tie and a tie has no order
+        // to compare.
+        name: "the collation a column declares",
+        setup: &[
+            "CREATE TABLE Coll (id INT NOT NULL, name VARCHAR(50) CHARACTER SET utf8mb4 \
+             COLLATE utf8mb4_unicode_ci NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Coll VALUES (1,'café'),(2,'Cafe'),(3,'Straße'),(4,'cafe'),\
+             (5,'STRASSE')",
+            // A unique key under the same collation, which refuses a pair the
+            // codepoints call different.
+            "CREATE TABLE CollU (s VARCHAR(20) COLLATE utf8mb4_unicode_ci, UNIQUE KEY (s))",
+            "INSERT INTO CollU VALUES ('Straße')",
+        ],
+        cases: &[
+            same("SELECT id FROM Coll WHERE name = 'cafe' ORDER BY id"),
+            same("SELECT id FROM Coll WHERE name = 'strasse' ORDER BY id"),
+            same("SELECT id FROM Coll WHERE 'CAFÉ' = name ORDER BY id"),
+            same("SELECT id FROM Coll WHERE name LIKE 'caf%' ORDER BY id"),
+            same("SELECT id FROM Coll WHERE name LIKE 'cafe' ORDER BY id"),
+            // `LIKE` folds character by character and does not expand, so
+            // `STRASSE` matches and `Straße` does not -- where `=` above finds
+            // both.
+            same("SELECT id FROM Coll WHERE name LIKE 'strasse' ORDER BY id"),
+            same("SELECT id FROM Coll WHERE name LIKE 'stra_e' ORDER BY id"),
+            // An escaped character is matched under the collation too, not by
+            // its codepoint -- the one comparison in the matcher that is not
+            // reached by a pattern without an `ESCAPE` clause.
+            same("SELECT 'CAFÉ' LIKE 'caf!é' ESCAPE '!', '100%' LIKE '100!%' ESCAPE '!'"),
+            same("SELECT id, name FROM Coll ORDER BY name, id"),
+            same("SELECT COUNT(DISTINCT name) FROM Coll"),
+            same("SELECT MIN(id), COUNT(*) FROM Coll GROUP BY name ORDER BY MIN(id)"),
+            same("SELECT id FROM Coll WHERE name IN ('CAFE','strasse') ORDER BY id"),
+            same("SELECT MIN(name), MAX(name) FROM Coll"),
+            // The unique key, asked as the refusal rather than as a count: the
+            // row is already there, so the case leaves the table as it found
+            // it.
+            same("INSERT INTO CollU VALUES ('STRASSE')"),
+            same("INSERT INTO CollU VALUES ('straße')"),
+            // And a value the same collation calls different, which is what
+            // says the refusal is the collation's and not a blanket one.
+            same("SELECT COUNT(*) FROM CollU WHERE s = 'STRASE'"),
+        ],
+    },
+    Group {
+        // The same rows and the same questions under all four collations this
+        // engine has. One rule applied to every column passes the group above
+        // and fails this one, which is what it is for.
+        //
+        // `utf8mb4_general_ci` folds case and the precomposed accents and has
+        // no expansions at all, so `ß` is a single `s`; `utf8mb4_bin` folds
+        // nothing. Both measured on 8.3.
+        name: "four collations, four answers",
+        setup: &[
+            "CREATE TABLE C4 (id INT NOT NULL, \
+             a VARCHAR(50) COLLATE utf8mb4_0900_ai_ci NOT NULL, \
+             u VARCHAR(50) COLLATE utf8mb4_unicode_ci NOT NULL, \
+             g VARCHAR(50) COLLATE utf8mb4_general_ci NOT NULL, \
+             b VARCHAR(50) COLLATE utf8mb4_bin NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO C4 VALUES (1,'café','café','café','café'),\
+             (2,'Cafe','Cafe','Cafe','Cafe'),(3,'Straße','Straße','Straße','Straße'),\
+             (4,'cafe','cafe','cafe','cafe'),(5,'STRASSE','STRASSE','STRASSE','STRASSE')",
+            // The `PAD SPACE` half. Only the `_0900_` collations do not pad,
+            // which is the one place the server default and the collation the
+            // target application declares disagree.
+            "CREATE TABLE Pad (a VARCHAR(20) COLLATE utf8mb4_0900_ai_ci, \
+             u VARCHAR(20) COLLATE utf8mb4_unicode_ci, \
+             g VARCHAR(20) COLLATE utf8mb4_general_ci, \
+             b VARCHAR(20) COLLATE utf8mb4_bin)",
+            "INSERT INTO Pad VALUES ('a  ','a  ','a  ','a  ')",
+            // A decomposed accent, which the two UCA collations ignore and
+            // the other two do not. A client can produce one without meaning
+            // to: macOS filenames are NFD.
+            "CREATE TABLE Nfd (a VARCHAR(20) COLLATE utf8mb4_0900_ai_ci, \
+             u VARCHAR(20) COLLATE utf8mb4_unicode_ci, \
+             g VARCHAR(20) COLLATE utf8mb4_general_ci, \
+             b VARCHAR(20) COLLATE utf8mb4_bin)",
+            "INSERT INTO Nfd VALUES ('cafe\u{301}','cafe\u{301}','cafe\u{301}','cafe\u{301}')",
+            // Letters with no ASCII base of their own. `utf8mb4_unicode_ci`
+            // sorts each beside the letter it belongs with and
+            // `utf8mb4_general_ci` puts every one of them after `z`; neither
+            // is the codepoint order.
+            // A collation has to be settled before any row goes under it. Each
+            // of these puts a value into a column without an `INSERT ...
+            // VALUES` naming it: a `CTAS` that checks a unique key as it
+            // fills, a stored DEFAULT coerced where the column was declared,
+            // and the back-fill an `ADD COLUMN` writes.
+            "CREATE TABLE Fill (v VARCHAR(20))",
+            "INSERT INTO Fill VALUES ('a'),('A')",
+            "CREATE TABLE FillB (v VARCHAR(20) COLLATE utf8mb4_bin, UNIQUE KEY (v)) \
+             AS SELECT v FROM Fill",
+            "CREATE TABLE Deflt (id INT, s VARCHAR(20) COLLATE utf8mb4_bin DEFAULT 'A')",
+            "INSERT INTO Deflt (id) VALUES (1)",
+            "CREATE TABLE Added (id INT)",
+            "INSERT INTO Added VALUES (1)",
+            "ALTER TABLE Added ADD COLUMN s VARCHAR(20) COLLATE utf8mb4_bin DEFAULT 'A'",
+            // A table-level clause, which reaches the column that declares
+            // none — and which has to be the collation the column *reports*
+            // as well as the one it compares under.
+            "CREATE TABLE Tbl (a VARCHAR(10)) COLLATE=utf8mb4_bin",
+            "INSERT INTO Tbl VALUES ('a')",
+            // A view over it, which reports what its base column *compares*
+            // under -- and that came from the table, so reading the column's
+            // own clause found none and reported the database's.
+            "CREATE VIEW TblV AS SELECT a FROM Tbl",
+            // A *derived* column, which takes the collation of what produced
+            // it — and which a table-level clause does not reach, unlike the
+            // declared column above.
+            "CREATE TABLE Cpy (s VARCHAR(20) COLLATE utf8mb4_bin, \
+             u VARCHAR(20) COLLATE utf8mb4_unicode_ci)",
+            "INSERT INTO Cpy VALUES ('A','Straße')",
+            "CREATE TABLE CpyD AS SELECT s, u FROM Cpy",
+            "CREATE TABLE CpyT COLLATE=utf8mb4_general_ci AS SELECT s, u FROM Cpy",
+            "CREATE VIEW CpyV AS SELECT s, u FROM Cpy",
+            // The decomposed spelling, which `=` folds and `LIKE` does not --
+            // on 8.3 as much as here, which is the half worth pinning.
+            "CREATE TABLE Decomp (v VARCHAR(20) COLLATE utf8mb4_unicode_ci)",
+            "INSERT INTO Decomp VALUES ('cafe\u{301}')",
+            "CREATE TABLE Ltr (id INT NOT NULL, u VARCHAR(20) COLLATE utf8mb4_unicode_ci, \
+             g VARCHAR(20) COLLATE utf8mb4_general_ci, PRIMARY KEY (id))",
+            "INSERT INTO Ltr VALUES (1,'æ','æ'),(2,'ae','ae'),(3,'ad','ad'),(4,'af','af'),\
+             (5,'z','z'),(6,'ø','ø'),(7,'o','o'),(8,'p','p'),(9,'ł','ł'),(10,'l','l'),\
+             (11,'m','m')",
+        ],
+        cases: &[
+            same("SELECT id FROM C4 WHERE a = 'cafe' ORDER BY id"),
+            same("SELECT id FROM C4 WHERE u = 'cafe' ORDER BY id"),
+            same("SELECT id FROM C4 WHERE g = 'cafe' ORDER BY id"),
+            same("SELECT id FROM C4 WHERE b = 'cafe' ORDER BY id"),
+            same("SELECT id FROM C4 WHERE a = 'strasse' ORDER BY id"),
+            same("SELECT id FROM C4 WHERE u = 'strasse' ORDER BY id"),
+            same("SELECT id FROM C4 WHERE g = 'strasse' ORDER BY id"),
+            same("SELECT id FROM C4 WHERE b = 'strasse' ORDER BY id"),
+            // `ß` as a single `s`, which only `utf8mb4_general_ci` reads.
+            same("SELECT id FROM C4 WHERE a = 'strase' ORDER BY id"),
+            same("SELECT id FROM C4 WHERE g = 'strase' ORDER BY id"),
+            same("SELECT id FROM C4 WHERE a LIKE 'caf%' ORDER BY id"),
+            same("SELECT id FROM C4 WHERE g LIKE 'caf%' ORDER BY id"),
+            same("SELECT id FROM C4 WHERE b LIKE 'caf%' ORDER BY id"),
+            same("SELECT id, b FROM C4 ORDER BY b"),
+            same("SELECT COUNT(DISTINCT a), COUNT(DISTINCT u), COUNT(DISTINCT g), \
+                  COUNT(DISTINCT b) FROM C4"),
+            same("SELECT MIN(id), COUNT(*) FROM C4 GROUP BY g ORDER BY MIN(id)"),
+            same("SELECT MIN(id), COUNT(*) FROM C4 GROUP BY b ORDER BY MIN(id)"),
+            same("SELECT a = 'a', u = 'a', g = 'a', b = 'a' FROM Pad"),
+            same("SELECT a LIKE 'a', u LIKE 'a', g LIKE 'a', b LIKE 'a' FROM Pad"),
+            same("SELECT a LIKE 'a  ', u LIKE 'a  ' FROM Pad"),
+            same("SELECT a = 'cafe', u = 'cafe', g = 'cafe', b = 'cafe' FROM Nfd"),
+            same("SELECT id FROM Ltr ORDER BY u, id"),
+            same("SELECT id FROM Ltr ORDER BY g, id"),
+            same("SELECT COUNT(*) FROM FillB"),
+            same("SELECT COUNT(*) FROM Deflt WHERE s = 'a'"),
+            same("SELECT COUNT(*) FROM Deflt WHERE s = 'A'"),
+            same("SELECT COUNT(*) FROM Added WHERE s = 'a'"),
+            same("SELECT COUNT(*) FROM Added WHERE s = 'A'"),
+            same("SELECT COUNT(*) FROM Tbl WHERE a = 'A'"),
+            same("SELECT COUNT(*) FROM TblV WHERE a = 'A'"),
+            same("SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'TblV' \
+                  ORDER BY ORDINAL_POSITION"),
+            same("SELECT COUNT(*) FROM CpyD WHERE s = 'a'"),
+            same("SELECT COUNT(*) FROM CpyD WHERE u = 'strasse'"),
+            same("SELECT COUNT(*) FROM CpyT WHERE s = 'a'"),
+            same("SELECT COUNT(*) FROM CpyV WHERE s = 'a'"),
+            same("SELECT v = 'café', v LIKE 'café', v LIKE 'caf_', v LIKE 'caf__' FROM Decomp"),
+            // A `COLLATE` clause over an operand in the binary character set,
+            // which 8.3 refuses rather than ignoring — and over one that is
+            // not, which it takes.
+            same("SELECT NULL COLLATE utf8mb4_bin"),
+            same("SELECT CAST('a' AS BINARY) COLLATE utf8mb4_bin"),
+            same("SELECT 1 COLLATE utf8mb4_bin"),
+            // The expansions the two UCA tables disagree about, asked with the
+            // collation written down so the connection's own cannot decide it.
+            same("SELECT 'æ' COLLATE utf8mb4_0900_ai_ci = 'ae', \
+                  'æ' COLLATE utf8mb4_unicode_ci = 'ae', \
+                  'ø' COLLATE utf8mb4_0900_ai_ci = 'o', \
+                  'ø' COLLATE utf8mb4_unicode_ci = 'o'"),
+            same("SELECT 'ß' COLLATE utf8mb4_0900_ai_ci = 'ss', \
+                  'ß' COLLATE utf8mb4_unicode_ci = 'ss', \
+                  'ß' COLLATE utf8mb4_general_ci = 'ss', \
+                  'ß' COLLATE utf8mb4_general_ci = 's'"),
+            // The collation a column reports, which has to be the one it
+            // compares under or the schema describes a database that is not
+            // there.
+            same("SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'C4' \
+                  ORDER BY ORDINAL_POSITION"),
+            same("SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Tbl' \
+                  ORDER BY ORDINAL_POSITION"),
+            same("SELECT TABLE_NAME, COLUMN_NAME, COLLATION_NAME \
+                  FROM information_schema.columns WHERE TABLE_SCHEMA = DATABASE() \
+                  AND TABLE_NAME IN ('CpyD','CpyT','CpyV') \
+                  ORDER BY TABLE_NAME, ORDINAL_POSITION"),
+            // Named rather than listed whole: 8.3 has 286 collations and this
+            // engine offers the four it can compare in plus `binary`, which is
+            // a deliberate difference and not one to re-report per column
+            // here. What this asks is that each of the four it *does* offer
+            // carries the id, default flag and sort length 8.3 gives it —
+            // `utf8mb4_bin` among them, which was refused outright until the
+            // engine had a comparison to put behind the name.
+            same("SELECT COLLATION_NAME, ID, IS_DEFAULT, SORTLEN, CHARACTER_SET_NAME \
+                  FROM information_schema.collations \
+                  WHERE COLLATION_NAME IN ('utf8mb4_0900_ai_ci','utf8mb4_unicode_ci',\
+                  'utf8mb4_general_ci','utf8mb4_bin','binary') ORDER BY COLLATION_NAME"),
+        ],
+    },
+    Group {
+        // Which operand decides, and when MySQL refuses to pick. A comparison
+        // has one collation and both sides have a claim on it: measured on
+        // 8.3, a column beats a literal, an explicit `COLLATE` beats a column,
+        // a `_bin` collation beats a `_ci` one of the same character set at
+        // equal strength, and two `_ci` collations at equal strength are 1267.
+        //
+        // The columns hold `'a '` so the *pad* answers which collation won:
+        // `'a ' = 'a'` is 0 under `utf8mb4_0900_ai_ci` and 1 under the other
+        // three, which no case-folding difference could show.
+        name: "which operand's collation a comparison is made under",
+        setup: &[
+            "CREATE TABLE Mix (a VARCHAR(20) COLLATE utf8mb4_0900_ai_ci, \
+             u VARCHAR(20) COLLATE utf8mb4_unicode_ci, \
+             g VARCHAR(20) COLLATE utf8mb4_general_ci, \
+             b VARCHAR(20) COLLATE utf8mb4_bin)",
+            "INSERT INTO Mix VALUES ('a ','a ','a ','a ')",
+        ],
+        cases: &[
+            same("SELECT a = 'a', u = 'a' FROM Mix"),
+            same("SELECT u = b, a = b FROM Mix"),
+            same("SELECT u = 'A ', u = 'A ' COLLATE utf8mb4_bin FROM Mix"),
+            // 1267, from either kind of tie.
+            same("SELECT a = u FROM Mix"),
+            same("SELECT a = g FROM Mix"),
+            same("SELECT u = g FROM Mix"),
+            same("SELECT a LIKE u FROM Mix"),
+            same("SELECT a IN (u) FROM Mix"),
+            same("SELECT a COLLATE utf8mb4_unicode_ci = u COLLATE utf8mb4_general_ci FROM Mix"),
+            // `BETWEEN` refuses with a code of its own and names all three
+            // operands; `CASE` names two and uses the `=` code. `GREATEST`
+            // over the same pair does not refuse at all, which is what says
+            // this is per construct rather than a rule about mixing.
+            same("SELECT u BETWEEN g AND g FROM Mix"),
+            same("SELECT u BETWEEN 'a' AND 'z' FROM Mix"),
+            same("SELECT CASE u WHEN g THEN 1 ELSE 0 END FROM Mix"),
+            same("SELECT GREATEST(u, g) FROM Mix"),
+            // A `BINARY` prefix binds to its operand and not to the predicate
+            // around it, which is the highest precedence MySQL has and which
+            // sqlparser reads as a prefix over everything to the right. Three
+            // of these were the wrong answer here and the fourth was right
+            // only because `LIKE` folded nothing at all -- see #0134.
+            same("SELECT BINARY 'A' = 'a', BINARY 'A' LIKE 'a', BINARY 'A' < 'a', \
+                  BINARY 'A' IN ('a'), BINARY 'a' = 'a'"),
+            same("SELECT CAST('A' AS BINARY) LIKE 'a', X'41' LIKE 'a', \
+                  CAST('A' AS BINARY) LIKE 'A'"),
+            same("SELECT b LIKE 'A ', b LIKE 'a ' FROM Mix"),
+        ],
+    },
 ];

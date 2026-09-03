@@ -394,10 +394,24 @@ fn collation_name(
 ) -> Value {
     match ty.kind {
         TypeKind::Text | TypeKind::Enum | TypeKind::Set => {
-            if ty.binary_collation {
+            // `binary_collation` is the *wire* flag, and two different things
+            // set it: `information_schema` declares its own text columns
+            // `utf8mb3_bin`, which this engine reports and cannot compare in,
+            // and a resolved `utf8mb4_bin` puts the same flag on a user
+            // column. Only the first is this name — 8.3 reports
+            // `utf8mb4_bin` for the second — so the flag alone cannot decide
+            // it and the resolved collation is what separates them. Asked of
+            // the resolution rather than of the clause, because the clause can
+            // be on the *table*: `CREATE TABLE t (a VARCHAR(10))
+            // COLLATE=utf8mb4_bin` reported `utf8mb3_bin` while comparing `a`
+            // as bytes, which is one column describing itself two ways.
+            if ty.binary_collation && ty.collation != crate::collation::Collation::Bin {
                 return text(crate::collation::BINARY);
             }
-            text(declared.or(table).unwrap_or(database))
+            // The same reader `SqlType::collation` resolved the *comparison*
+            // through, so what a column reports and what it compares as
+            // cannot drift apart.
+            text(crate::collation::inherited(declared, table, database))
         }
         _ => Value::Null,
     }
@@ -460,6 +474,7 @@ fn spec_type(spelling: &str) -> Option<SqlType> {
         unsigned,
         variants,
         binary_collation,
+        collation: crate::collation::Collation::Ai0900Ci,
     })
 }
 
@@ -472,6 +487,7 @@ fn integer_type() -> SqlType {
         unsigned: false,
         variants: Vec::new(),
         binary_collation: false,
+        collation: crate::collation::Collation::Ai0900Ci,
     }
 }
 
@@ -488,11 +504,12 @@ fn text_type() -> SqlType {
         unsigned: false,
         variants: Vec::new(),
         binary_collation: false,
+        collation: crate::collation::Collation::Ai0900Ci,
     }
 }
 
 fn text(s: impl Into<String>) -> Value {
-    Value::Text(s.into())
+    Value::text(s.into())
 }
 
 fn schemata(catalog: &Catalog) -> Table {
@@ -612,8 +629,8 @@ fn columns(catalog: &Catalog) -> Table {
                     // COLUMN_DEFAULT distinguishes "no default" (NULL) from a
                     // default of the string "NULL".
                     match (&column.default, &column.default_expr) {
-                        (Some(v), _) => Value::Text(v.as_text()),
-                        (None, Some(e)) => Value::Text(e.clone()),
+                        (Some(v), _) => Value::text(v.as_text()),
+                        (None, Some(e)) => Value::text(e.clone()),
                         (None, None) => Value::Null,
                     },
                     text(if column.nullable { "YES" } else { "NO" }),
@@ -1187,7 +1204,7 @@ fn processlist(session: &Session) -> Table {
             session
                 .current_database
                 .clone()
-                .map(Value::Text)
+                .map(Value::text)
                 .unwrap_or(Value::Null),
             text("Query"),
             Value::Int(0),

@@ -3965,7 +3965,7 @@ impl Engine {
             let value = match parts.len() {
                 1 => parts.remove(0),
                 _ if parts.iter().any(Value::is_null) => Value::Null,
-                _ => Value::Text(parts.iter().map(Value::as_text).collect()),
+                _ => Value::text(parts.iter().map(Value::as_text).collect::<String>()),
             };
             if value.is_null() {
                 continue;
@@ -4002,7 +4002,7 @@ impl Engine {
             .map(|(value, _)| value.as_text())
             .collect::<Vec<_>>()
             .join(&call.separator);
-        Ok(Value::Text(truncate_bytes(
+        Ok(Value::text(truncate_bytes(
             joined,
             session.group_concat_max_len(),
         )))
@@ -5459,7 +5459,7 @@ impl Engine {
         for (name, value) in session.known_system_variables() {
             result
                 .rows
-                .push(vec![Value::Text(name), Value::Text(value)]);
+                .push(vec![Value::text(name), Value::text(value)]);
         }
         result
     }
@@ -5468,7 +5468,7 @@ impl Engine {
         let mut result = ResultSet::new(vec![OutColumn::new("Database", ColumnType::VarString)]);
         result.rows.push(vec![Value::text(INFORMATION_SCHEMA)]);
         for name in self.catalog()?.database_names() {
-            result.rows.push(vec![Value::Text(name)]);
+            result.rows.push(vec![Value::text(name)]);
         }
         Ok(result)
     }
@@ -5489,7 +5489,7 @@ impl Engine {
             .collect();
         names.sort();
         for name in names {
-            result.rows.push(vec![Value::Text(name.clone())]);
+            result.rows.push(vec![Value::text(name.clone())]);
         }
         Ok(result)
     }
@@ -5511,8 +5511,8 @@ impl Engine {
         if let Some(view) = database.view(table) {
             for column in &view.shape {
                 result.rows.push(vec![
-                    Value::Text(column.name.clone()),
-                    Value::Text(column.ty.declared.clone()),
+                    Value::text(column.name.clone()),
+                    Value::text(column.ty.declared.clone()),
                     Value::text(if column.nullable { "YES" } else { "NO" }),
                     Value::text(""),
                     Value::Null,
@@ -5528,8 +5528,8 @@ impl Engine {
 
         for column in &table.columns {
             result.rows.push(vec![
-                Value::Text(column.name.clone()),
-                Value::Text(column.ty.declared.clone()),
+                Value::text(column.name.clone()),
+                Value::text(column.ty.declared.clone()),
                 Value::text(if column.nullable { "YES" } else { "NO" }),
                 Value::text(if column.primary_key {
                     "PRI"
@@ -5948,21 +5948,33 @@ impl Engine {
     }
 }
 
-/// The collation the stored column behind a projected one was declared with.
+/// The collation of the stored column behind a projected one.
+///
+/// The *resolved* one rather than the clause the column was written with,
+/// because a view reports what its base column compares under and that can
+/// come from the table: measured on 8.3, a view over `CREATE TABLE tb (a
+/// VARCHAR(10)) COLLATE=utf8mb4_bin` reports `utf8mb4_bin` for its column,
+/// where reading the column's own clause found none and reported the
+/// database's.
 ///
 /// `None` unless the projection names a real column of a real table, which is
 /// what `origin` and `origin_table` record.
 fn base_collation(catalog: &Catalog, column: &OutColumn) -> Option<String> {
     let table = column.origin_table.as_deref()?;
     let name = column.origin.as_deref()?;
-    catalog
+    let source = catalog
         .database(&column.schema)?
         .table(table)?
         .columns
         .iter()
-        .find(|c| c.name.eq_ignore_ascii_case(name))?
-        .collation
-        .clone()
+        .find(|c| c.name.eq_ignore_ascii_case(name))?;
+    // Only for a column that has one at all: `collation_name` answers NULL for
+    // an INT, and handing it a name here would make a view claim one.
+    matches!(
+        source.ty.kind,
+        crate::types::TypeKind::Text | crate::types::TypeKind::Enum | crate::types::TypeKind::Set
+    )
+    .then(|| source.ty.collation.name().to_owned())
 }
 
 /// Builds the equality condition a `USING (a, b)` join clause implies.
@@ -8814,6 +8826,7 @@ fn merged_approximate(
         unsigned: false,
         variants: Vec::new(),
         binary_collation: false,
+        collation: crate::collation::Collation::Ai0900Ci,
     })
 }
 
@@ -9306,7 +9319,12 @@ fn computed_column_type(
     // holds that, not luck: see the note in `unsigned_answer`. The walkers
     // over these trees have to agree with the shape `eval` reads, and
     // `never_null` already does.
-    if let Some(fixed) = crate::expr::reassociated_postfix(e) {
+    // Through the same door `eval` uses, which also carries the `BINARY`
+    // prefix back to the operand it belongs to. That one *does* change the
+    // answer here — `SELECT BINARY 'A' LIKE 'a'` is a LONGLONG on 8.3 and was
+    // a VAR_STRING — and describing a column one way while evaluating it
+    // another is how a value gets rendered as the type it is not.
+    if let Some(fixed) = crate::expr::corrected_root(e) {
         return computed_column_type(&fixed, refs, input, sub);
     }
     match e {

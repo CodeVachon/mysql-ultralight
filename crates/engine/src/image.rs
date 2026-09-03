@@ -27,6 +27,16 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// not fail cleanly, it would silently produce a catalog with the wrong shape,
 /// and every test running against it would be wrong in a way nothing reports.
 ///
+/// v10 adds another to a column's type: the collation its text compares
+/// under. A v9 image has no place to put one, so every column in it would
+/// reload as `utf8mb4_0900_ai_ci` whatever it was declared — and the whole
+/// point of the field is that the four collations return different rows for
+/// the same `WHERE`. Measured over `café`, `Cafe`, `Straße`: `= 'strasse'`
+/// finds one row under `utf8mb4_unicode_ci`, none under
+/// `utf8mb4_general_ci` and none under `utf8mb4_bin`. A reload that guessed
+/// would answer a search differently on either side of a snapshot. See #0129,
+/// #0134, #0152.
+///
 /// v9 adds a field to a column's type: whether its text sorts as bytes. A
 /// `_bin` collation is what puts the BINARY flag on a text column's wire
 /// definition, and `CREATE TABLE t AS SELECT COLUMN_TYPE FROM
@@ -66,7 +76,7 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// answering it, which is the wrong answer the version check exists to
 /// prevent. An image is a file a user keeps and boots from with `--state`, so
 /// the stale one has to fail rather than mislead.
-pub const FORMAT_VERSION: u32 = 9;
+pub const FORMAT_VERSION: u32 = 10;
 
 /// Writes the whole catalog.
 pub fn encode(catalog: &Catalog) -> Vec<u8> {
@@ -277,7 +287,7 @@ fn read_table(r: &mut Reader<'_>) -> EngineResult<Table> {
     let comment = r.opt_str()?;
     let next_auto_increment = r.i64()?;
 
-    Ok(Table {
+    let mut table = Table {
         name,
         columns,
         rows,
@@ -287,7 +297,14 @@ fn read_table(r: &mut Reader<'_>) -> EngineResult<Table> {
         collation,
         comment,
         next_auto_increment,
-    })
+    };
+    // A value is read before anything says which column it belongs to, and a
+    // string's collation is a property of that column — the same problem the
+    // ENUM ordinal has, solved the other way round. The ordinal cannot be
+    // recovered from the value, so it is written per row; every string under
+    // one column shares its collation, so it is put back on here instead.
+    table.retag_text();
+    Ok(table)
 }
 
 fn write_view(w: &mut Writer, view: &View) {
@@ -400,6 +417,11 @@ fn write_type(w: &mut Writer, ty: &SqlType) {
     // loses the flag across a save and a reload describes itself differently
     // than it did before.
     w.bool(ty.binary_collation);
+    // Appended in turn: v10. The column's resolved collation, which decides
+    // which rows `=` and `LIKE` return over it. Written as its name rather
+    // than an ordinal so adding a collation cannot renumber the ones already
+    // in a baked image, exactly as `type_tag` below does for the kind.
+    w.str(ty.collation.name());
 }
 
 fn read_type(r: &mut Reader<'_>) -> EngineResult<SqlType> {
@@ -410,6 +432,13 @@ fn read_type(r: &mut Reader<'_>) -> EngineResult<SqlType> {
     let unsigned = r.bool()?;
     let variants = r.strs()?;
     let binary_collation = r.bool()?;
+    let collation_name = r.str()?;
+    // A name this build has no comparison for is refused rather than
+    // defaulted: loading it as `utf8mb4_0900_ai_ci` would answer `WHERE name
+    // = 'strasse'` differently before and after a snapshot, which is the
+    // silent difference the version check exists to stop.
+    let collation = crate::collation::Collation::from_name(&collation_name)
+        .ok_or_else(|| malformed(format!("state image names collation {collation_name}")))?;
 
     Ok(SqlType {
         kind,
@@ -419,6 +448,7 @@ fn read_type(r: &mut Reader<'_>) -> EngineResult<SqlType> {
         unsigned,
         variants,
         binary_collation,
+        collation,
     })
 }
 
@@ -474,7 +504,7 @@ fn write_value(w: &mut Writer, value: &Value) {
             w.u8(2);
             w.u64(f.to_bits());
         }
-        Value::Text(s) => {
+        Value::Text(s, _) => {
             w.u8(3);
             w.str(s);
         }
@@ -549,7 +579,7 @@ fn read_value(r: &mut Reader<'_>) -> EngineResult<Value> {
         0 => Value::Null,
         1 => Value::Int(r.i64()?),
         2 => Value::Float(f64::from_bits(r.u64()?)),
-        3 => Value::Text(r.str()?),
+        3 => Value::text(r.str()?),
         4 => {
             let len = r.u32()?;
             Value::Bytes(r.bytes(len as usize)?.to_vec())

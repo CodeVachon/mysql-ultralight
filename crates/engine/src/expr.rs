@@ -402,7 +402,7 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
     // is corrected before it is read. Ahead of the match rather than in each
     // of the arms, because there are eighteen of them and one left out is a
     // wrong answer with nothing to show for it.
-    if let Some(fixed) = reassociated_postfix(expr) {
+    if let Some(fixed) = corrected_root(expr) {
         return eval(&fixed, ctx);
     }
     // Bound before the match, because two arms below shadow `expr` with the
@@ -533,6 +533,11 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             let v = eval(expr, ctx)?;
             let lo = eval(low, ctx)?;
             let hi = eval(high, ctx)?;
+            // All three at once, and a code of its own: 8.3 answers a
+            // `BETWEEN` whose operands disagree with 1270 and a message
+            // naming three collations, where the same disagreement across `=`
+            // is 1267 and names two. Measured.
+            check_three_collations(&v, &lo, &hi, "between")?;
             // `a BETWEEN lo AND hi` is two comparisons joined by `AND`, and it
             // is the *AND* that decides a NULL bound rather than the bound
             // itself: one false side settles the conjunction whatever the other
@@ -605,6 +610,9 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
                     saw_null = true;
                     continue;
                 }
+                // `=`, not `in`: 8.3 names the *comparison* an `IN` list is
+                // made of rather than the construct. Measured.
+                check_collations(&needle, &value, &"=")?;
                 if needle.compare(&value) == Some(std::cmp::Ordering::Equal) {
                     return Ok(bool_value(!*negated));
                 }
@@ -632,7 +640,17 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             if value.is_null() || pattern.is_null() {
                 return Ok(Value::Null);
             }
-            let matched = functions::like(&value.as_text(), &pattern.as_text(), escape);
+            // Under the pair's own collation, which is what makes a search
+            // against a `utf8mb4_unicode_ci` column fold case and accents the
+            // way MySQL's does. `LIKE` used to fold neither, while `=` beside
+            // it folded case — the self-inconsistency #0134 names.
+            check_collations(&value, &pattern, &"like")?;
+            let matched = functions::like(
+                &value.as_text(),
+                &pattern.as_text(),
+                escape,
+                value.collation_with(&pattern),
+            );
             Ok(bool_value(matched != *negated))
         }
 
@@ -650,7 +668,14 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             for CaseWhen { condition, result } in conditions {
                 let hit = match &subject {
                     // `CASE x WHEN y` compares; `CASE WHEN c` tests truthiness.
-                    Some(s) => s.compare(&eval(condition, ctx)?) == Some(std::cmp::Ordering::Equal),
+                    Some(s) => {
+                        let arm = eval(condition, ctx)?;
+                        // 1267 named `case`, measured on 8.3: the comparison
+                        // is a comparison and resolves a collation like any
+                        // other, and it is the construct that gets named.
+                        check_collations(s, &arm, &"case")?;
+                        s.compare(&arm) == Some(std::cmp::Ordering::Equal)
+                    }
                     None => eval(condition, ctx)?.truthy() == Some(true),
                 };
                 if hit {
@@ -872,8 +897,38 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
         // table-level clauses read the same one, so the three cannot drift
         // apart again.
         Expr::Collate { expr, collation } => {
-            crate::collation::read(collation)?;
-            eval(expr, ctx)
+            let name = crate::collation::read(collation)?;
+            // EXPLICIT, which outranks a column's own: measured on 8.3,
+            // `unicode_col = 'A' COLLATE utf8mb4_bin` is 0 where
+            // `unicode_col = 'A'` is 1. `named` above has already refused
+            // anything this engine cannot compare in, so the name resolves.
+            let collation = crate::collation::Collation::from_name(&name).unwrap_or_default();
+            let operand = eval(expr, ctx)?;
+            // An operand in the *binary* character set takes no utf8mb4
+            // collation, and 8.3 refuses the clause rather than ignoring it:
+            // `SELECT NULL COLLATE utf8mb4_bin` and `SELECT CAST('a' AS BINARY)
+            // COLLATE utf8mb4_bin` are both 1253 there, while `SELECT 1 COLLATE
+            // utf8mb4_bin` and the same over a DATE answer. Measured, and not
+            // what "not a string" would predict.
+            //
+            // The NULL half is read off the *expression* and not the value,
+            // because it is the bare literal that is typed binary: a NULL in a
+            // VARCHAR column carries the column's character set, and refusing
+            // on the value would make `c COLLATE utf8mb4_bin` fail for the rows
+            // where `c` happens to be NULL.
+            let binary_operand = matches!(operand, Value::Bytes(_))
+                || matches!(
+                    expr.as_ref(),
+                    Expr::Value(v) if matches!(v.value, AstValue::Null)
+                );
+            if binary_operand {
+                return Err(EngineError::new(
+                    1253,
+                    "42000",
+                    format!("COLLATION '{name}' is not valid for CHARACTER SET 'binary'"),
+                ));
+            }
+            Ok(operand.with_collation(collation))
         }
 
         Expr::Function(f) => {
@@ -1153,7 +1208,7 @@ pub fn literal(value: &AstValue) -> EngineResult<Value> {
         | AstValue::TripleSingleQuotedString(s)
         | AstValue::TripleDoubleQuotedString(s)
         | AstValue::EscapedStringLiteral(s)
-        | AstValue::NationalStringLiteral(s) => Value::Text(s.clone()),
+        | AstValue::NationalStringLiteral(s) => Value::text(s.clone()),
         AstValue::HexStringLiteral(s) => {
             let bytes = (0..s.len())
                 .step_by(2)
@@ -1232,6 +1287,137 @@ pub fn bool_value(b: bool) -> Value {
     Value::Bool(b)
 }
 
+/// Puts a `BINARY` prefix back on the operand it belongs to.
+///
+/// `BINARY x` is the highest-precedence operator MySQL has, and the parser
+/// reads it as a prefix over everything to its right instead: `BINARY 'A' =
+/// 'a'` arrives as `CAST('A' = 'a' AS BINARY)`, so the comparison happened
+/// under the *default* collation and the binary reading was applied to its
+/// answer. Measured on 8.3, all four of these are 0 there and were 1 here:
+/// `BINARY 'A' = 'a'`, `BINARY 'A' LIKE 'a'`, `BINARY 'A' IN ('a')` — and
+/// `BINARY 'A' < 'a'` is 1 there and was 0.
+///
+/// Only over a *predicate*, which is the trade rather than a free win. The AST
+/// keeps no record of which spelling produced the cast, so
+/// `CAST('A' LIKE 'a' AS BINARY)` — the binary string `1` on 8.3 — is
+/// re-associated too and answers 0. Written by nobody, against an idiom
+/// MySQL's own manual gives for case-sensitive comparison; arithmetic is left
+/// alone because both readings agree there.
+/// The shape a walker should read, where the parse is not it.
+///
+/// Both corrections behind one call, and one call site per walker rather than
+/// two, because an `Option<Expr>` is a wide local in a function that recurses
+/// once per node: holding two of them per frame cost enough stack to abort
+/// `a_deep_nest_of_scalar_subqueries_still_answers` — twenty nested subqueries
+/// against the thread's stack — where holding one does not.
+pub(crate) fn corrected_root(e: &Expr) -> Option<Expr> {
+    reassociated_postfix(e).or_else(|| binary_prefix_over_predicate(e))
+}
+
+fn binary_prefix_over_predicate(e: &Expr) -> Option<Expr> {
+    use sqlparser::ast::{CastKind, DataType};
+
+    let Expr::Cast {
+        kind: CastKind::Cast,
+        data_type: DataType::Binary(None),
+        expr: inner,
+        ..
+    } = e
+    else {
+        return None;
+    };
+    let rebind = |target: &Expr| Expr::Cast {
+        kind: CastKind::Cast,
+        expr: Box::new(target.clone()),
+        data_type: DataType::Binary(None),
+        array: false,
+        format: None,
+    };
+    let mut moved = (**inner).clone();
+    match &mut moved {
+        // Through `precedence` rather than a list of its own: a second
+        // spelling of "these operators compare" is a second thing to keep in
+        // step with the first.
+        Expr::BinaryOp { left, op, .. } if precedence(op) == COMPARISON => **left = rebind(left),
+        Expr::Like { expr, .. }
+        | Expr::ILike { expr, .. }
+        | Expr::RLike { expr, .. }
+        | Expr::InList { expr, .. }
+        | Expr::Between { expr, .. } => **expr = rebind(expr),
+        _ => return None,
+    }
+    Some(moved)
+}
+
+/// Refuses a pair of operands MySQL will not pick a collation for.
+///
+/// 1267, raised where a statement can carry it rather than inside
+/// [`Value::compare`], which answers `Option<Ordering>` and has nowhere to put
+/// an error — and which sorting, grouping and foreign-key matching also reach,
+/// none of which can mix two collations in the first place.
+///
+/// Only where both sides are text, because that is the only pairing MySQL
+/// resolves a collation for: a string beside a number is a numeric comparison
+/// there, and `CAST('AB' AS BINARY) = 'ab'` is a byte comparison rather than
+/// 1267. Measured on 8.3 — two IMPLICIT columns of different `_ci` collations
+/// raise, and so do two EXPLICIT `COLLATE` clauses that disagree, while a
+/// `_bin` column against a `_ci` one answers.
+///
+/// Per *row* rather than per statement, which is the shape of the gap that
+/// remains. 8.3 resolves collations while it resolves the statement and
+/// refuses it whether or not there is a row to evaluate; this runs where the
+/// values are, so the same query is silent over an empty table and raises once
+/// a row exists. Closing that needs the collation of an *expression* — which
+/// this engine derives from values rather than from a schema — and it is the
+/// same thing #0154 needs to give a literal the connection's collation. Set
+/// operations are the other side of it: a `UNION` across two collations is
+/// 1271 on 8.3 and answers here, and its de-duplication keys are each side's
+/// own.
+pub(crate) fn check_collations(
+    left: &Value,
+    right: &Value,
+    operation: &impl std::fmt::Display,
+) -> EngineResult<()> {
+    if !matches!((left, right), (Value::Text(..), Value::Text(..))) {
+        return Ok(());
+    }
+    let (a, b) = (left.collated_as(), right.collated_as());
+    if crate::collation::resolve(a, b).is_none() {
+        return Err(crate::collation::illegal_mix(a, b, &operation.to_string()));
+    }
+    Ok(())
+}
+
+/// The same refusal over three operands, which `BETWEEN` answers differently.
+///
+/// 1270 rather than 1267, and the message names all three collations rather
+/// than a pair — both measured on 8.3, over `u BETWEEN g AND g` across two
+/// `_ci` columns.
+fn check_three_collations(
+    subject: &Value,
+    low: &Value,
+    high: &Value,
+    operation: &str,
+) -> EngineResult<()> {
+    if !matches!(
+        (subject, low, high),
+        (Value::Text(..), Value::Text(..), Value::Text(..))
+    ) {
+        return Ok(());
+    }
+    let (a, b, c) = (subject.collated_as(), low.collated_as(), high.collated_as());
+    // Resolved pairwise and then against the winner, which is how MySQL folds
+    // an operand list down to one collation. Any step that cannot pick one
+    // refuses the whole construct.
+    let resolved = crate::collation::resolve(a, b)
+        .and_then(|_| crate::collation::resolve(b, c))
+        .and_then(|_| crate::collation::resolve(a, c));
+    if resolved.is_none() {
+        return Err(crate::collation::illegal_mix_of_three(a, b, c, operation));
+    }
+    Ok(())
+}
+
 fn binary(
     op: &BinaryOperator,
     left: Value,
@@ -1243,25 +1429,29 @@ fn binary(
 
     // Comparison against NULL is unknown, not false. Getting this wrong makes
     // `WHERE x <> 'a'` silently drop rows where x is NULL.
-    let cmp = |ord: &[Ordering]| -> Value {
-        match left.compare(&right) {
+    let cmp = |ord: &[Ordering]| -> EngineResult<Value> {
+        check_collations(&left, &right, op)?;
+        Ok(match left.compare(&right) {
             Some(o) => bool_value(ord.contains(&o)),
             None => Value::Null,
-        }
+        })
     };
 
     Ok(match op {
-        B::Eq => cmp(&[Ordering::Equal]),
-        B::NotEq => cmp(&[Ordering::Less, Ordering::Greater]),
-        B::Lt => cmp(&[Ordering::Less]),
-        B::LtEq => cmp(&[Ordering::Less, Ordering::Equal]),
-        B::Gt => cmp(&[Ordering::Greater]),
-        B::GtEq => cmp(&[Ordering::Greater, Ordering::Equal]),
+        B::Eq => cmp(&[Ordering::Equal])?,
+        B::NotEq => cmp(&[Ordering::Less, Ordering::Greater])?,
+        B::Lt => cmp(&[Ordering::Less])?,
+        B::LtEq => cmp(&[Ordering::Less, Ordering::Equal])?,
+        B::Gt => cmp(&[Ordering::Greater])?,
+        B::GtEq => cmp(&[Ordering::Greater, Ordering::Equal])?,
 
         // `<=>` is MySQL's NULL-safe equality: two NULLs are equal.
         B::Spaceship => match (left.is_null(), right.is_null()) {
             (true, true) => bool_value(true),
-            (false, false) => bool_value(left.compare(&right) == Some(Ordering::Equal)),
+            (false, false) => {
+                check_collations(&left, &right, op)?;
+                bool_value(left.compare(&right) == Some(Ordering::Equal))
+            }
             _ => bool_value(false),
         },
 
@@ -1304,7 +1494,7 @@ fn binary(
                 if left.is_null() || right.is_null() {
                     Value::Null
                 } else {
-                    Value::Text(format!("{}{}", left.as_text(), right.as_text()))
+                    Value::text(format!("{}{}", left.as_text(), right.as_text()))
                 }
             } else {
                 match (left.truthy(), right.truthy()) {
@@ -2462,7 +2652,7 @@ fn bit_operand(v: &Value) -> EngineResult<u64> {
         // MySQL and 4503599627370496 through a double, which lands on the
         // wrong side of every bit it is then masked with.
         Value::Decimal(text) => decimal_bits(text),
-        Value::Text(s) | Value::Json(s) => integer_prefix(s),
+        Value::Text(s, _) | Value::Json(s) => integer_prefix(s),
         // Its ordinal, through the same number arithmetic uses, so `e | 0` and
         // `e + 0` cannot disagree about what a member is worth. It is a whole
         // number already, so neither reading below would round it.

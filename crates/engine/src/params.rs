@@ -99,11 +99,11 @@ pub fn literal(value: &Value) -> String {
         // Quoted, because SQL has no temporal literal without a keyword in
         // front of it — so this round trip loses the tag, exactly as the JSON
         // one below does. A bound parameter has no declared type to lose.
-        Value::Temporal(v) => literal(&Value::Text(v.clone())),
+        Value::Temporal(v) => literal(&Value::text(v.clone())),
         // Quoted as its member, which loses the ordinal — the same round trip
         // the temporal above makes, and for the same reason: SQL has no
         // literal that spells an ENUM.
-        Value::Enum { member, .. } => literal(&Value::Text(member.clone())),
+        Value::Enum { member, .. } => literal(&Value::text(member.clone())),
         // The keyword, which is the one tag here that SQL *can* spell — so
         // this round trip keeps it where the two above lose theirs. Writing
         // `1` would turn a bound boolean into a number, and against a JSON
@@ -122,7 +122,7 @@ pub fn literal(value: &Value) -> String {
                 "NULL".to_owned()
             }
         }
-        Value::Text(v) => quote(v),
+        Value::Text(v, _) => quote(v),
         // Quoted like text, because that is the only literal syntax MySQL has
         // for a document. A JSON column coerces it back on the way in.
         Value::Json(v) => quote(v),

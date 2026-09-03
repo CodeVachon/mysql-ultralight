@@ -800,7 +800,7 @@ fn a_document_survives_as_a_document() {
         table.rows[0][1]
     );
     assert!(
-        matches!(&table.rows[0][2], Value::Text(s) if s == "[9,9]"),
+        matches!(&table.rows[0][2], Value::Text(s, _) if s == "[9,9]"),
         "{:?}",
         table.rows[0][2]
     );
@@ -984,10 +984,11 @@ fn a_boolean_never_reaches_the_image_and_is_written_as_its_integer_if_it_does() 
     );
 
     // And the boolean did not move the version: 7 was #0068's ENUM tag, 8 was
-    // #0069's unsigned one and 9 is #0126's binary collation, none of them
-    // this. Pinned rather than derived, so the day something *does* give a
-    // boolean a tag of its own it has to come back here and say so.
-    assert_eq!(image::FORMAT_VERSION, 9);
+    // #0069's unsigned one, 9 is #0126's binary collation and 10 is the
+    // column collation #0129/#0134/#0152 needed, none of them this. Pinned
+    // rather than derived, so the day something *does* give a boolean a tag of
+    // its own it has to come back here and say so.
+    assert_eq!(image::FORMAT_VERSION, 10);
 }
 
 #[test]
