@@ -2077,6 +2077,7 @@ impl Engine {
             rows,
             sources: left.sources,
             base_tables: left.base_tables,
+            source_databases: left.source_databases,
             origins,
         })
     }
@@ -2188,11 +2189,14 @@ impl Engine {
         sources.extend(right.sources.iter().cloned());
         let mut base_tables = left.base_tables.clone();
         base_tables.extend(right.base_tables.iter().cloned());
+        let mut source_databases = left.source_databases.clone();
+        source_databases.extend(right.source_databases.iter().cloned());
         Ok(Relation {
             columns,
             rows,
             sources,
             base_tables,
+            source_databases,
             origins,
         })
     }
@@ -2252,6 +2256,11 @@ impl Engine {
                     .as_ref()
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| table_name.clone());
+                // An alias also takes the item *out* of its database as far
+                // as the *name* of a DELETE target is concerned, which is the
+                // opposite of what it does to a column reference.
+                // `SourceDatabase` has the statements that settle it.
+                let addressable = alias.is_none();
 
                 // Describing a statement reads the shape and leaves the rows
                 // behind. The table still has to be found, so preparing a
@@ -2269,7 +2278,13 @@ impl Engine {
                     } else {
                         info_schema::shape(session, &table_name)?
                     };
-                    return Ok(Relation::from_table_named(&db, &table, &shown, with_rows));
+                    return Ok(Relation::from_table_named(
+                        &db,
+                        addressable,
+                        &table,
+                        &shown,
+                        with_rows,
+                    ));
                 }
                 let catalog = self.catalog()?;
                 let stored = catalog
@@ -2277,7 +2292,13 @@ impl Engine {
                     .ok_or_else(|| EngineError::unknown_database(&db))?
                     .table(&table_name)
                     .ok_or_else(|| EngineError::no_such_table(&table_name))?;
-                Ok(Relation::from_table_named(&db, stored, &shown, with_rows))
+                Ok(Relation::from_table_named(
+                    &db,
+                    addressable,
+                    stored,
+                    &shown,
+                    with_rows,
+                ))
             }
             // `JSON_TABLE(doc, '$[*]' COLUMNS(...))` turns a document into
             // rows. The migrations use it to unpack a stored configuration
@@ -2320,6 +2341,7 @@ impl Engine {
                     rows: untagged_booleans(inner.rows),
                     sources: Vec::new(),
                     base_tables: Vec::new(),
+                    source_databases: Vec::new(),
                 })
             }
             other => Err(unsupported(format!("FROM item `{other}`"))),
@@ -4529,6 +4551,21 @@ impl Engine {
             let source = relation
                 .source_index(&relation.columns[index].table)
                 .ok_or_else(|| unsupported("updating a derived table or view"))?;
+            // The same wrong write `delete_joined` refuses, on the sibling
+            // path: the row is written back into `db`'s copy under the table's
+            // *name*, so `UPDATE other.T JOIN K ON other.T.a = K.a SET
+            // other.T.z = 42` changed `db`.`T` and reported one row affected —
+            // 8.3 changes `other`.`T` and leaves this database alone. One
+            // database is copied and committed per statement, so this refuses
+            // rather than writing to whichever one shares the name.
+            let holds = relation
+                .source_holds(source)
+                .ok_or_else(|| unsupported("a write to this FROM item"))?;
+            if !holds.eq_ignore_ascii_case(&db) {
+                return Err(unsupported(format!(
+                    "a multi-table UPDATE of `{holds}` while `{db}` is the current database"
+                )));
+            }
             targets.push(Target {
                 source,
                 column: relation.columns[index].name.clone(),
@@ -4694,15 +4731,19 @@ impl Engine {
             }
             let targets = from
                 .iter()
-                .map(target_name)
-                .collect::<EngineResult<Vec<String>>>()?;
+                .map(target_written)
+                .collect::<EngineResult<Vec<DeleteTarget>>>()?;
             return self.delete_joined(session, delete, using, &targets);
         }
         // A comma list is a cross join here as it is anywhere else, so
         // `DELETE t1 FROM t1, t2 WHERE t1.id = t2.id` — the commoner spelling
         // of a multi-table delete — takes the same path as the JOIN form.
         if from.len() > 1 || !from[0].joins.is_empty() || !delete.tables.is_empty() {
-            let targets = delete.tables.iter().map(name::tail).collect::<Vec<_>>();
+            let targets = delete
+                .tables
+                .iter()
+                .map(DeleteTarget::written)
+                .collect::<EngineResult<Vec<DeleteTarget>>>()?;
             return self.delete_joined(session, delete, from, &targets);
         }
         let TableFactor::Table { name, alias, .. } = &from[0].relation else {
@@ -4805,14 +4846,14 @@ impl Engine {
     /// `DELETE a FROM a JOIN b ON ...`, where the named tables are the ones
     /// rows are removed from and the join only decides which.
     ///
-    /// `targets` is that list of names, already pulled from whichever half of
-    /// the statement the spelling put it in.
+    /// `targets` is that list of names as they were written, already pulled
+    /// from whichever half of the statement the spelling put it in.
     fn delete_joined(
         &self,
         session: &mut Session,
         delete: &sqlparser::ast::Delete,
         from: &[TableWithJoins],
-        targets: &[String],
+        targets: &[DeleteTarget],
     ) -> EngineResult<Outcome> {
         // Neither is defined across a join, and MySQL refuses both here too.
         if !delete.order_by.is_empty() || delete.limit.is_some() {
@@ -4840,19 +4881,58 @@ impl Engine {
         }
         reject_duplicate_sources(&relation)?;
 
-        let mut sources: Vec<usize> = Vec::with_capacity(targets.len());
-        for name in targets {
-            let source = relation
-                .source_index(name)
-                .ok_or_else(|| EngineError::no_such_table(name))?;
-            // `DELETE t, t FROM ...` names one table twice; MySQL refuses it
-            // rather than deleting from it twice.
-            if sources.contains(&source) {
+        // `DELETE t, t FROM ...` names one table twice; MySQL refuses it rather
+        // than deleting from it twice.
+        //
+        // Over the whole list before any of it is resolved, because that is
+        // 8.3's order: `DELETE nodb.A, nodb.A FROM A JOIN B ON A.id = B.id` is
+        // 1066 there, not the 1109 that resolving the first target would give,
+        // and `DELETE A, Nope, A` is 1066 on the third target rather than 1109
+        // on the second. Two spellings of one table count as the same target —
+        // in a session on `db`, `DELETE db.A, A` is 1066 — so the comparison
+        // is against the database each one *means* rather than the one it
+        // wrote, which is `same_as`.
+        for (i, target) in targets.iter().enumerate() {
+            if targets[..i]
+                .iter()
+                .any(|earlier| earlier.same_as(target, &db))
+            {
                 return Err(EngineError::new(
                     1066,
                     "42000",
-                    format!("Not unique table/alias: '{name}'"),
+                    format!("Not unique table/alias: '{}'", target.name),
                 ));
+            }
+        }
+
+        let mut sources: Vec<usize> = Vec::with_capacity(targets.len());
+        for target in targets {
+            // 1109 rather than 1146, measured: the catalog holds a table by
+            // this name and the failure is that the FROM clause does not put
+            // *that* one in scope. The qualifier is the reason it may not —
+            // `DELETE nodb.A FROM A JOIN B ON A.id = B.id` used to delete from
+            // the current schema, a write aimed at another one landing here.
+            let source = relation
+                .delete_target(target.database.as_deref(), &db, &target.name)
+                .ok_or_else(|| EngineError::unknown_multi_delete_target(&target.name))?;
+            // The rows come out of `db`'s copy below, keyed by table name
+            // alone, so a target whose FROM item is in another database would
+            // have rows removed from *this* one — the same wrong write the
+            // qualifier check exists to stop, in the direction the name cannot
+            // see because both halves are spelled correctly. 8.3 deletes from
+            // the other database and this engine commits one at a time, so it
+            // refuses rather than guessing which.
+            //
+            // Reading across databases is untouched: only a target is checked,
+            // and `DELETE J2 FROM J2 JOIN other.T ON J2.a = other.T.a` still
+            // deletes from `J2`.
+            let holds = relation
+                .source_holds(source)
+                .ok_or_else(|| unsupported("a write to this FROM item"))?;
+            if !holds.eq_ignore_ascii_case(&db) {
+                return Err(unsupported(format!(
+                    "a multi-table DELETE from `{holds}` while `{db}` is the current database"
+                )));
             }
             sources.push(source);
         }
@@ -5245,6 +5325,7 @@ impl Engine {
             rows: untagged_booleans(rows.rows),
             sources: Vec::new(),
             base_tables: Vec::new(),
+            source_databases: Vec::new(),
         })
     }
 
@@ -5373,6 +5454,7 @@ impl Engine {
             rows,
             sources: Vec::new(),
             base_tables: Vec::new(),
+            source_databases: Vec::new(),
         })
     }
 
@@ -5451,6 +5533,7 @@ impl Engine {
             rows: rows.rows,
             sources: Vec::new(),
             base_tables: Vec::new(),
+            source_databases: Vec::new(),
         })
     }
 
@@ -5875,11 +5958,74 @@ fn restore_tables(catalog: &mut Catalog, snapshot: &Catalog, tables: &[(String, 
     }
 }
 
-/// The name a `DELETE FROM a, b USING ...` target is addressed by.
+/// A table a multi-table DELETE removes rows from, as the statement wrote it.
 ///
-/// An alias wins over the table name, because that is what the USING clause
-/// will have called it and what a qualified column reference resolves against.
-fn target_name(item: &TableWithJoins) -> EngineResult<String> {
+/// The database is kept rather than dropped, which is the whole of #0153: both
+/// readers took the last part of the name and looked at nothing in front of it,
+/// so `DELETE nodb.A FROM A JOIN B ON A.id = B.id` deleted from the current
+/// schema where 8.3 raises 1109 — the same shape as the column reference #0098
+/// fixed, on a write, and answering rather than refusing.
+struct DeleteTarget {
+    /// The database written in front of the table, `None` where none was.
+    ///
+    /// Not defaulted to the session's here: an absent database and one spelled
+    /// out are the same thing against an unaliased FROM item and *different*
+    /// things against an aliased one, so the fallback belongs where the
+    /// comparison is rather than at the point of reading.
+    database: Option<String>,
+    name: String,
+}
+
+impl DeleteTarget {
+    /// A target from the `DELETE a, b FROM ...` spelling.
+    ///
+    /// Read through [`name::qualifier`] rather than by splitting a rendering,
+    /// so a table spelled `` `my.table` `` is one part carrying a dot. A name
+    /// with more parts than that has no meaning in the grammar — 8.3 answers
+    /// `DELETE a.b.c FROM A JOIN B ON A.id = B.id` with 1064 — and this is the
+    /// same code rather than a silent read of the last two parts.
+    fn written(name: &ObjectName) -> EngineResult<Self> {
+        let (database, table) = name::qualifier(name).ok_or_else(|| {
+            EngineError::parse(format!(
+                "a DELETE target is written `table` or `database.table`, not `{}`",
+                name::dotted(name)
+            ))
+        })?;
+        Ok(Self {
+            database,
+            name: table,
+        })
+    }
+
+    /// Whether two targets name the same table, for the 1066 that a repeated
+    /// one raises.
+    ///
+    /// `current` is the session's database, which an absent qualifier means:
+    /// `DELETE db.A, A FROM ...` is 1066 on 8.3 while the session is in `db`,
+    /// and not two targets.
+    fn same_as(&self, other: &Self, current: &str) -> bool {
+        let mine = self.database.as_deref().unwrap_or(current);
+        let theirs = other.database.as_deref().unwrap_or(current);
+        self.name.eq_ignore_ascii_case(&other.name) && mine.eq_ignore_ascii_case(theirs)
+    }
+}
+
+/// The target a `DELETE FROM a, b USING ...` writes before its USING clause.
+///
+/// Read exactly as the other spelling reads one, database and all. The parser
+/// accepts a *table reference* here, which is wider than MySQL's grammar: the
+/// targets before `USING` are names, and the relation — with its aliases — is
+/// what the `USING` clause describes. 8.3 answers `DELETE FROM A a USING A a
+/// JOIN B ON a.id = B.id` with 1064, and with the same 1064 when the database
+/// is spelled correctly in front of it.
+///
+/// Refused rather than read, because reading it is how the qualifier went
+/// missing: taking the alias as the whole target discarded the database with
+/// it, so `DELETE FROM nodb.A a USING A a JOIN B ON a.id = B.id` deleted from
+/// the current schema and reported the rows affected — the bug this module's
+/// `DeleteTarget` exists to stop, surviving in the one spelling that never
+/// reached the comparison.
+fn target_written(item: &TableWithJoins) -> EngineResult<DeleteTarget> {
     let TableFactor::Table { name, alias, .. } = &item.relation else {
         return Err(unsupported("this DELETE target"));
     };
@@ -5890,10 +6036,14 @@ fn target_name(item: &TableWithJoins) -> EngineResult<String> {
             "a join among the targets of a DELETE ... USING",
         ));
     }
-    Ok(alias
-        .as_ref()
-        .map(|a| a.name.value.clone())
-        .unwrap_or_else(|| name::tail(name)))
+    if let Some(alias) = alias {
+        return Err(EngineError::parse(format!(
+            "a DELETE ... USING names its targets as tables and cannot rename one: \
+             drop the alias `{}`, which belongs in the USING clause",
+            alias.name.value
+        )));
+    }
+    DeleteTarget::written(name)
 }
 
 /// The narrowest type that can hold what either branch of a set operation

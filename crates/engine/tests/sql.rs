@@ -16458,6 +16458,12 @@ fn delete_using_takes_several_targets_and_aliases() {
     );
 
     // A target that is not in the USING relation is an error, not a no-op.
+    //
+    // 1109 rather than the 1146 this used to assert, measured: the catalog not
+    // holding a table is one refusal and the FROM clause not naming it is
+    // another, and 8.3 answers `DELETE FROM Nope USING Md JOIN Mk ON Md.a =
+    // Mk.a` with `Unknown table 'Nope' in MULTI DELETE`. Same code and same
+    // message as a target the qualifier puts out of scope, which is #0153.
     let err = engine
         .execute(
             &mut session,
@@ -16465,7 +16471,7 @@ fn delete_using_takes_several_targets_and_aliases() {
             &[],
         )
         .unwrap_err();
-    assert_eq!(err.code, 1146);
+    assert_eq!(err.code, 1109);
 }
 
 #[test]
@@ -22678,6 +22684,337 @@ fn a_write_qualified_by_the_wrong_database_is_refused() {
             "DELETE FROM J2 WHERE testdb.J2.a = 10"
         ),
         1
+    );
+}
+
+/// A multi-table DELETE target is compared through its database qualifier.
+///
+/// The write #0098 missed, and the worst spelling of the same bug: `DELETE
+/// nodb.J2 FROM J2 JOIN K ON J2.a = K.a` removed rows from the current schema
+/// and reported them affected exactly as a correct statement would, because
+/// both readers of a target took the last part of the name and looked at
+/// nothing in front of it. A DELETE aimed at another schema silently emptied
+/// this one.
+///
+/// The code differs from the column case: 8.3 answers 1109 `Unknown table 'J2'
+/// in MULTI DELETE`, not 1054, and it answers the same 1109 for a target with
+/// no qualifier at all that the FROM clause does not name — where this engine
+/// used to say 1146.
+///
+/// The rule 8.3 applies is *not* the one a column reference gets, which is why
+/// this does not reuse `in_source`. An alias keeps its database for a column
+/// and loses it for a target, measured either way over the same FROM item:
+/// `SELECT testdb.x.* FROM J2 x` answers and `DELETE testdb.x FROM J2 x JOIN K
+/// ON x.a = K.a` is 1109 — and so is the same target where the alias is
+/// spelled identically to the table it renames.
+#[test]
+fn a_multi_table_delete_target_must_name_the_database_the_table_is_in() {
+    let (engine, mut session) = engine();
+    two_databases(&engine, &mut session);
+
+    // The join matches exactly the one row `a = 1`, so a statement that got
+    // through would leave one row behind rather than two.
+    let intact = |engine: &Engine, session: &mut Session| {
+        assert_eq!(
+            rows(engine, session, "SELECT a FROM J2 ORDER BY a"),
+            vec![vec!["1"], vec!["3"]],
+            "a refused DELETE removed rows"
+        );
+    };
+
+    for sql in [
+        // The statement the issue was written from, and the same target
+        // naming a database that exists and is not the one in the FROM.
+        "DELETE nodb.J2 FROM J2 JOIN K ON J2.a = K.a",
+        "DELETE otherdb.J2 FROM J2 JOIN K ON J2.a = K.a",
+        // A database may not qualify an alias at all, even the right one.
+        "DELETE testdb.x FROM J2 x JOIN K ON x.a = K.a",
+        "DELETE nodb.x FROM J2 x JOIN K ON x.a = K.a",
+        // ... including where the alias is spelled the same as the table, so
+        // this cannot be read as the alias merely renaming the table part.
+        "DELETE testdb.J2 FROM J2 J2 JOIN K ON J2.a = K.a",
+        // The cross-database direction: a bare target means *this* database,
+        // so it does not reach a FROM item that named another one.
+        "DELETE T FROM otherdb.T JOIN K ON otherdb.T.a = K.a",
+        "DELETE testdb.T FROM otherdb.T JOIN K ON otherdb.T.a = K.a",
+        // Which of several targets is wrong, and which one gets reported.
+        "DELETE nodb.J2, K FROM J2 JOIN K ON J2.a = K.a",
+        "DELETE nodb.J2, nodb.K FROM J2 JOIN K ON J2.a = K.a",
+        "DELETE nodb.J2, otherdb.K FROM J2 JOIN K ON J2.a = K.a",
+        // Not a repeated target: two different databases are two targets, so
+        // the first one's 1109 wins rather than the 1066 below.
+        "DELETE nodb.J2, otherdb.J2 FROM J2 JOIN K ON J2.a = K.a",
+        // The `USING` spelling names its targets in the other half of the
+        // statement and read them through the other dropped qualifier.
+        "DELETE FROM nodb.J2 USING J2 JOIN K ON J2.a = K.a",
+        "DELETE FROM nodb.J2, K USING J2 JOIN K ON J2.a = K.a",
+        // `a.*` is the canonical spelling; the star is stripped before the
+        // parser sees it, and what is left still carries a database.
+        "DELETE nodb.J2.* FROM J2 JOIN K ON J2.a = K.a",
+        // A qualifier that is not a database at all, and one carrying a dot
+        // inside its own name — read as a value, not as two parts.
+        "DELETE Nope FROM J2 JOIN K ON J2.a = K.a",
+        "DELETE `my.db`.J2 FROM J2 JOIN K ON J2.a = K.a",
+        // Nothing evaluates a row in any of these, which is where a check
+        // living in the row path stops running: an empty relation, a WHERE
+        // nothing satisfies, a CASE branch nothing takes. 8.3 settles the
+        // targets when it resolves them, before it looks at the predicate.
+        "DELETE nodb.E FROM E JOIN K ON E.a = K.a",
+        "DELETE nodb.J2 FROM J2 JOIN K ON J2.a = K.a WHERE 1 = 0",
+        "DELETE nodb.J2 FROM J2 JOIN K ON J2.a = K.a WHERE CASE WHEN 0 THEN 1 ELSE 0 END",
+        // Before the WHERE's own refusal, which is 1054 and is not what 8.3
+        // reports for a statement wrong both ways.
+        "DELETE nodb.J2 FROM J2 JOIN K ON J2.a = K.a WHERE nope = 1",
+        // A target list over a single table is a multi-table DELETE too.
+        "DELETE nodb.J2 FROM J2",
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, 1109, "expected ER_UNKNOWN_TABLE for: {sql}");
+        intact(&engine, &mut session);
+    }
+
+    // The table part alone, without the database written in front of it, which
+    // is how 8.3 prints this one.
+    assert_eq!(
+        refusal_of(
+            &engine,
+            &mut session,
+            "DELETE nodb.J2 FROM J2 JOIN K ON J2.a = K.a"
+        )
+        .message,
+        "Unknown table 'J2' in MULTI DELETE"
+    );
+    assert_eq!(
+        refusal_of(
+            &engine,
+            &mut session,
+            "DELETE J2, nodb.K FROM J2 JOIN K ON J2.a = K.a"
+        )
+        .message,
+        "Unknown table 'K' in MULTI DELETE"
+    );
+
+    // A repeated target is settled over the whole list before any of it is
+    // resolved, which is 8.3's order: the first two are 1066 there rather than
+    // the 1109 that resolving the first target would give, and the third is
+    // 1066 on its *last* target rather than 1109 on its middle one. Two
+    // spellings of one database are one target, so an absent qualifier is
+    // compared as the session's rather than as nothing.
+    for sql in [
+        "DELETE nodb.J2, nodb.J2 FROM J2 JOIN K ON J2.a = K.a",
+        "DELETE testdb.J2, J2 FROM J2 JOIN K ON J2.a = K.a",
+        "DELETE J2, Nope, testdb.J2 FROM J2 JOIN K ON J2.a = K.a",
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, 1066, "expected ER_NONUNIQ_TABLE for: {sql}");
+        intact(&engine, &mut session);
+    }
+
+    // More parts than the grammar has levels for. 8.3 answers 1064 here, and
+    // what matters is that it stops reading the last two parts and deleting.
+    assert_eq!(
+        refusal_of(
+            &engine,
+            &mut session,
+            "DELETE a.b.c FROM J2 JOIN K ON J2.a = K.a"
+        )
+        .code,
+        1064
+    );
+    intact(&engine, &mut session);
+
+    // The right database still deletes, which is the half a fix breaks by
+    // refusing everything. Each removes the single joined row and puts it
+    // back, so the next one starts from the same two rows.
+    for sql in [
+        "DELETE J2 FROM J2 JOIN K ON J2.a = K.a",
+        "DELETE testdb.J2 FROM J2 JOIN K ON J2.a = K.a",
+        "DELETE J2 FROM testdb.J2 JOIN K ON testdb.J2.a = K.a",
+        "DELETE testdb.J2 FROM testdb.J2 JOIN K ON testdb.J2.a = K.a",
+        "DELETE x FROM J2 x JOIN K ON x.a = K.a",
+        "DELETE J2 FROM J2 J2 JOIN K ON J2.a = K.a",
+        "DELETE FROM testdb.J2 USING J2 JOIN K ON J2.a = K.a",
+        "DELETE testdb.J2.* FROM J2 JOIN K ON J2.a = K.a",
+        "DELETE testdb.J2 FROM J2",
+    ] {
+        let removed = affected(&engine, &mut session, sql);
+        assert_eq!(
+            removed,
+            if sql.ends_with("FROM J2") { 2 } else { 1 },
+            "expected a delete from: {sql}"
+        );
+        run(&engine, &mut session, "DELETE FROM J2");
+        run(
+            &engine,
+            &mut session,
+            "INSERT INTO J2 VALUES (1, 2), (3, 4)",
+        );
+    }
+
+    // An alias on a *target* of the USING spelling is not a target this
+    // engine reads at all. The parser accepts a whole table reference there,
+    // which is wider than MySQL's grammar — every one of these is 1064 on 8.3,
+    // including the two where the database is spelled correctly — and reading
+    // the alias as the target is what took the database off it, so
+    // `DELETE FROM nodb.J2 j USING J2 j JOIN K` deleted from this schema and
+    // reported the row affected.
+    for sql in [
+        "DELETE FROM J2 j USING J2 j JOIN K ON j.a = K.a",
+        "DELETE FROM testdb.J2 j USING J2 j JOIN K ON j.a = K.a",
+        "DELETE FROM nodb.J2 j USING J2 j JOIN K ON j.a = K.a",
+        "DELETE FROM otherdb.J2 j USING J2 j JOIN K ON j.a = K.a",
+        "DELETE FROM J2 AS j USING J2 j JOIN K ON j.a = K.a",
+        "DELETE FROM a.b.c x USING J2 x JOIN K ON x.a = K.a",
+        "DELETE FROM J2, K k USING J2 JOIN K ON J2.a = K.a",
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, 1064, "expected ER_PARSE_ERROR for: {sql}");
+        intact(&engine, &mut session);
+    }
+
+    // The asymmetry this comparison exists for, in one place: the same alias
+    // over the same FROM item takes the database in a column reference and
+    // refuses it in a DELETE target. Both measured on 8.3.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT testdb.x.a FROM J2 x ORDER BY 1"
+        ),
+        vec![vec!["1"], vec!["3"]]
+    );
+    assert_eq!(
+        refusal_of(
+            &engine,
+            &mut session,
+            "DELETE testdb.x FROM J2 x JOIN K ON x.a = K.a"
+        )
+        .code,
+        1109
+    );
+}
+
+/// A multi-table write to another database is refused, not aimed at this one.
+///
+/// The direction the qualifier check above cannot see, because both halves are
+/// spelled *correctly*: `DELETE otherdb.T FROM otherdb.T JOIN K ON otherdb.T.a
+/// = K.a` names a target the FROM clause really does hold, and then the write
+/// went looking for `T` in the session's database and emptied that one — one
+/// row affected, exactly what a correct statement reports. `UPDATE otherdb.T
+/// JOIN K ... SET otherdb.T.z = 42` is the same bug on the sibling path, and
+/// was measured setting `testdb`.`T` while `otherdb`.`T` kept its value.
+///
+/// 8.3 writes to `otherdb`. This engine copies, mutates and commits a single
+/// database per statement, so it refuses rather than guessing which — the gap
+/// is real either way and an error is the half a caller can act on.
+///
+/// Only a *target* is checked. Reading across databases in the join is what
+/// makes a cross-database write worth writing at all, and it still answers.
+#[test]
+fn a_multi_table_write_to_another_database_is_refused() {
+    let (engine, mut session) = engine();
+    two_databases(&engine, &mut session);
+    // A `T` in this database as well, which is what the wrong write found.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE T (a INT NULL, z INT NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO T VALUES (1, 100), (2, 200)",
+    );
+
+    for sql in [
+        "DELETE otherdb.T FROM otherdb.T JOIN K ON otherdb.T.a = K.a",
+        "DELETE t FROM otherdb.T t JOIN K ON t.a = K.a",
+        "DELETE FROM otherdb.T USING otherdb.T JOIN K ON otherdb.T.a = K.a",
+        "DELETE otherdb.T, K FROM otherdb.T JOIN K ON otherdb.T.a = K.a",
+        // The same write through UPDATE, which resolves its target the same
+        // way and commits into the same single database.
+        "UPDATE otherdb.T JOIN K ON otherdb.T.a = K.a SET otherdb.T.z = 42",
+        "UPDATE otherdb.T JOIN K ON otherdb.T.a = K.a SET T.z = 42",
+        "UPDATE otherdb.T t JOIN K ON t.a = K.a SET t.z = 42",
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, 1235, "expected a clear refusal for: {sql}");
+        assert_eq!(
+            rows(&engine, &mut session, "SELECT z FROM T ORDER BY a"),
+            vec![vec!["100"], vec!["200"]],
+            "the refused write reached this database's table instead: {sql}"
+        );
+        assert_eq!(
+            rows(&engine, &mut session, "SELECT z FROM otherdb.T ORDER BY a"),
+            vec![vec!["7"]]
+        );
+    }
+
+    // The join may still read the other database; only the target is checked.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "UPDATE T JOIN otherdb.T o ON T.a = o.a SET T.z = 101"
+        ),
+        1
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "DELETE J2 FROM J2 JOIN otherdb.T ON J2.a = otherdb.T.a"
+        ),
+        1
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a FROM J2 ORDER BY a"),
+        vec![vec!["3"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT z FROM T ORDER BY a"),
+        vec![vec!["101"], vec!["200"]]
+    );
+}
+
+/// A multi-table DELETE through a view or a derived table says so is unknown.
+///
+/// Neither is right and both are recorded rather than guessed at. 8.3 deletes
+/// through an updatable view — `DELETE Vd FROM Vd JOIN K ON Vd.a = K.a` removes
+/// the base table's row, and `differential.Vd` in front of it works too — while
+/// a derived table is `1288 The target table d of the DELETE is not updatable`.
+///
+/// This engine materialises both, so neither contributes a join source at all
+/// and a target naming one resolves against nothing. That was 1146 before
+/// #0153 and is 1109 now, which is the code 8.3 gives a target the FROM clause
+/// does not name; here the FROM clause does name it and what it is not is
+/// *writable*. A missing feature either way, refused rather than answered, and
+/// its own issue rather than this one — the point of the assertions is that
+/// the qualifier still decides nothing it should not.
+#[test]
+fn a_multi_table_delete_through_a_view_or_a_derived_table_is_refused() {
+    let (engine, mut session) = engine();
+    two_databases(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Vd AS SELECT a, b FROM J2",
+    );
+
+    for sql in [
+        "DELETE Vd FROM Vd JOIN K ON Vd.a = K.a",
+        "DELETE testdb.Vd FROM Vd JOIN K ON Vd.a = K.a",
+        "DELETE nodb.Vd FROM Vd JOIN K ON Vd.a = K.a",
+        "DELETE d FROM (SELECT a FROM J2) d JOIN K ON d.a = K.a",
+        "DELETE nodb.d FROM (SELECT a FROM J2) d JOIN K ON d.a = K.a",
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, 1109, "expected ER_UNKNOWN_TABLE for: {sql}");
+    }
+    // Nothing was removed by any of them, which is the half that matters.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a FROM J2 ORDER BY a"),
+        vec![vec!["1"], vec!["3"]]
     );
 }
 

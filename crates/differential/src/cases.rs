@@ -872,6 +872,131 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // The write the group above missed. A multi-table DELETE read its
+        // target by the last part of the name, so `DELETE nodb.Md FROM Md JOIN
+        // Mk ON Md.a = Mk.a` removed rows from the current schema and reported
+        // them affected exactly as a correct statement would — a DELETE aimed
+        // at another schema emptying this one.
+        //
+        // 8.3's code here is 1109 `Unknown table 'Md' in MULTI DELETE`, not
+        // the 1054 the column reference gets, and it is the same 1109 for a
+        // target the FROM clause simply does not name — where this engine said
+        // 1146.
+        //
+        // One database again, for the reason the group above gives: the reset
+        // drops `differential` and nothing else, so a case naming a second one
+        // would leave it behind for every group after it.
+        name: "a multi-table DELETE target's database",
+        setup: &[
+            "CREATE TABLE Md (a INT NULL, b INT NULL)",
+            "INSERT INTO Md VALUES (1,2),(3,4)",
+            "CREATE TABLE Mk (a INT NULL, c INT NULL)",
+            "INSERT INTO Mk VALUES (1,9)",
+            // Empty on purpose, as `Qe` is above: a refusal raised while a row
+            // is evaluated is not raised at all when there are none.
+            "CREATE TABLE Me (a INT NULL, b INT NULL)",
+            // Its own table for the deletes that succeed, so the refusals
+            // above them can be read without tracking what is left in `Md`.
+            "CREATE TABLE Mg (a INT NULL)",
+            "INSERT INTO Mg VALUES (1),(2),(3),(4),(5),(6),(7)",
+            "CREATE TABLE Mh (a INT NULL)",
+            "INSERT INTO Mh VALUES (1),(2),(3),(4),(5),(6),(7)",
+        ],
+        cases: &[
+            // The statement the issue was written from. A database that
+            // *exists* and is not the one the FROM clause names belongs in the
+            // engine's own tests rather than here, because the only other
+            // database this harness can name is `information_schema` — and
+            // 8.3 answers 1044 for a DELETE aimed at that one, checking the
+            // privilege before it resolves the target.
+            same("DELETE nodb.Md FROM Md JOIN Mk ON Md.a = Mk.a"),
+            // An alias takes the item out of its database here, which is the
+            // opposite of what it does to a column reference: `SELECT
+            // differential.x.b FROM Qt x` answers in the group above and the
+            // right database in front of an alias is 1109 in this one.
+            same("DELETE differential.x FROM Md x JOIN Mk ON x.a = Mk.a"),
+            same("DELETE nodb.x FROM Md x JOIN Mk ON x.a = Mk.a"),
+            // ... including where the alias is spelled the same as the table
+            // it renames, so this is not the alias merely replacing the table
+            // part of the name.
+            same("DELETE differential.Md FROM Md Md JOIN Mk ON Md.a = Mk.a"),
+            // Which of several targets is wrong, and which one is reported.
+            same("DELETE nodb.Md, Mk FROM Md JOIN Mk ON Md.a = Mk.a"),
+            same("DELETE Md, nodb.Mk FROM Md JOIN Mk ON Md.a = Mk.a"),
+            same("DELETE nodb.Md, nodb2.Mk FROM Md JOIN Mk ON Md.a = Mk.a"),
+            // A repeated target is settled over the whole list before any of
+            // it is resolved: the first two are 1066 rather than the 1109 that
+            // resolving the first target would give, and the third is 1066 on
+            // its last target rather than 1109 on its middle one. Two
+            // spellings of one database are one target, and two different
+            // databases are two — so the last of these is 1109 again.
+            same("DELETE nodb.Md, nodb.Md FROM Md JOIN Mk ON Md.a = Mk.a"),
+            same("DELETE differential.Md, Md FROM Md JOIN Mk ON Md.a = Mk.a"),
+            same("DELETE Md, Nope, differential.Md FROM Md JOIN Mk ON Md.a = Mk.a"),
+            same("DELETE nodb.Md, nodb2.Md FROM Md JOIN Mk ON Md.a = Mk.a"),
+            // A target with no qualifier at all that the FROM clause does not
+            // name is the same 1109, which this engine answered 1146.
+            same("DELETE Nope FROM Md JOIN Mk ON Md.a = Mk.a"),
+            // A dot inside a name is not a qualifier, so this names one
+            // database called `my.db` rather than a table in `my`.
+            same("DELETE `my.db`.Md FROM Md JOIN Mk ON Md.a = Mk.a"),
+            // More parts than the grammar has levels for: 1064 on both, rather
+            // than the last two parts being read and the rows deleted.
+            same("DELETE a.b.c FROM Md JOIN Mk ON Md.a = Mk.a"),
+            // The `USING` spelling puts its targets in the other half of the
+            // statement, and read them through the other dropped qualifier.
+            same("DELETE FROM nodb.Md USING Md JOIN Mk ON Md.a = Mk.a"),
+            same("DELETE FROM nodb.Md, Mk USING Md JOIN Mk ON Md.a = Mk.a"),
+            // A target of that spelling may not be renamed: the names come
+            // before USING and the relation with its aliases comes after, so
+            // all of these are 1064 on 8.3 — the two with the database spelled
+            // *right* included. This engine's parser takes a whole table
+            // reference there, and reading the alias as the target is what
+            // took the database off it: the third of these deleted from the
+            // current schema and reported the row affected.
+            same("DELETE FROM Md m USING Md m JOIN Mk ON m.a = Mk.a"),
+            same("DELETE FROM differential.Md m USING Md m JOIN Mk ON m.a = Mk.a"),
+            same("DELETE FROM nodb.Md m USING Md m JOIN Mk ON m.a = Mk.a"),
+            same("DELETE FROM Md AS m USING Md m JOIN Mk ON m.a = Mk.a"),
+            same("DELETE FROM a.b.c x USING Md x JOIN Mk ON x.a = Mk.a"),
+            same("DELETE FROM Md, Mk k USING Md JOIN Mk ON Md.a = Mk.a"),
+            // `a.*` is the canonical spelling of a target; the star carries no
+            // meaning the name does not, and what is left still has a database
+            // in front of it.
+            same("DELETE nodb.Md.* FROM Md JOIN Mk ON Md.a = Mk.a"),
+            // A target list over a single table is a multi-table DELETE too.
+            same("DELETE nodb.Md FROM Md"),
+            // Nothing evaluates a row in any of these, which is where a check
+            // living in the row path stops running.
+            same("DELETE nodb.Me FROM Me JOIN Mk ON Me.a = Mk.a"),
+            same("DELETE nodb.Md FROM Md JOIN Mk ON Md.a = Mk.a WHERE 1 = 0"),
+            same("DELETE nodb.Md FROM Md JOIN Mk ON Md.a = Mk.a WHERE CASE WHEN 0 THEN 1 ELSE 0 END"),
+            // The targets before the predicate, which is 8.3's order: this is
+            // 1109 there and not the WHERE's own 1054.
+            same("DELETE nodb.Md FROM Md JOIN Mk ON Md.a = Mk.a WHERE nope = 1"),
+            // Nothing above has written, so `Md` is still as the setup left it
+            // — the half of this that a refusal cannot show.
+            same("SELECT a, b FROM Md ORDER BY a, b"),
+            // The spellings that must keep deleting, each taking one row of
+            // its own so the count is 1 rather than whatever is left. Each
+            // case runs twice, so the second pass finds its row already gone
+            // and affects none — on both servers.
+            same("DELETE differential.Mg FROM Mg JOIN Mh ON Mg.a = Mh.a WHERE Mg.a = 1"),
+            same("DELETE Mg FROM differential.Mg JOIN Mh ON differential.Mg.a = Mh.a WHERE Mg.a = 2"),
+            same("DELETE differential.Mg FROM differential.Mg JOIN Mh ON Mg.a = Mh.a WHERE Mg.a = 3"),
+            same("DELETE x FROM Mg x JOIN Mh ON x.a = Mh.a WHERE x.a = 4"),
+            same("DELETE Mg FROM Mg Mg JOIN Mh ON Mg.a = Mh.a WHERE Mg.a = 5"),
+            same("DELETE FROM differential.Mg USING Mg JOIN Mh ON Mg.a = Mh.a WHERE Mg.a = 6"),
+            // The star spelling, over the row the six above left alone — a
+            // seventh, because a join whose other side has been emptied
+            // deletes nothing however the target is written, which would make
+            // this case agree without asking anything.
+            same("DELETE differential.Mh.* FROM Mg JOIN Mh ON Mg.a = Mh.a WHERE Mh.a = 7"),
+            same("SELECT a FROM Mg ORDER BY a"),
+            same("SELECT a FROM Mh ORDER BY a"),
+        ],
+    },
+    Group {
         // Everything here is about what the *binary* protocol sends, which the
         // harness could not see until it started asking both ways. Each case
         // is one where a declared type code narrower than the value it carries

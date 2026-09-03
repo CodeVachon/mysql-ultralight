@@ -60,11 +60,6 @@ pub(crate) fn dotted(name: &ObjectName) -> String {
     parts(name).join(".")
 }
 
-/// The last part of a name — the object itself, without its qualifier.
-pub(crate) fn tail(name: &ObjectName) -> String {
-    name.0.last().map(part).unwrap_or_default()
-}
-
 /// A name written back *as SQL*: wrapped in backticks, with any backtick
 /// inside it doubled.
 ///
@@ -211,7 +206,7 @@ mod tests {
         let name = table_name("`we``ird`");
         assert_eq!(name.to_string(), "`we``ird`");
         assert_eq!(parts(&name), vec!["we`ird"]);
-        assert_eq!(tail(&name), "we`ird");
+        assert_eq!(qualifier(&name), Some((None, "we`ird".to_owned())));
     }
 
     #[test]
@@ -221,7 +216,6 @@ mod tests {
             parts(&table_name("`my.db`.`my.table`")),
             vec!["my.db", "my.table"]
         );
-        assert_eq!(tail(&table_name("`my.db`.`my.table`")), "my.table");
     }
 
     #[test]

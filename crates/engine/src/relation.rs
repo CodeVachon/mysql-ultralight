@@ -42,6 +42,30 @@ impl RelColumn {
     }
 }
 
+/// Where one join source's rows live, and how a name can reach it.
+///
+/// Two facts rather than one, because a multi-table DELETE asks both and an
+/// alias separates them: which database a *target* may write in front of the
+/// source's name, and which database the rows would actually come out of.
+/// Measured on 8.3, over a `T` in `other` while the session is on `probe`:
+/// `DELETE other.a FROM other.T a JOIN K ON a.a = K.a` is 1109 — the database
+/// spelled right and the alias will not take it — while `DELETE a FROM other.T
+/// a JOIN K ON a.a = K.a` deletes from `other`.`T`. So an alias hides the
+/// database from the name and not from the write, and one field could not be
+/// both.
+///
+/// Neither of them is `RelColumn::qualifier_database`, which is the same
+/// question asked about a *column* and has the opposite answer again: `SELECT
+/// probe.x.b FROM T x` answers, and so does `SELECT probe.x.*`.
+#[derive(Debug, Clone)]
+pub struct SourceDatabase {
+    /// The database this source's rows live in, which is the one a write to
+    /// them has to reach.
+    pub holds: String,
+    /// Whether `holds` may be written in front of this source's name.
+    pub addressable: bool,
+}
+
 /// Rows plus their column metadata.
 #[derive(Debug, Clone, Default)]
 pub struct Relation {
@@ -53,6 +77,9 @@ pub struct Relation {
     /// The catalog tables behind those names, in the same order. A self-join is
     /// only expressible with aliases, so writing back needs both.
     pub base_tables: Vec<String>,
+    /// Where each source's rows live and how a name reaches it, in the same
+    /// order. See [`SourceDatabase`].
+    pub source_databases: Vec<SourceDatabase>,
     /// For each row, where it came from in each source table.
     ///
     /// A multi-table UPDATE has to write back to the row a join produced, and
@@ -69,7 +96,16 @@ impl Relation {
     /// renaming a cloned table means describing a statement never copies the
     /// rows it is not going to read — which is the whole reason preparing a
     /// query no longer costs as much as running it.
-    pub fn from_table_named(schema: &str, table: &Table, shown: &str, with_rows: bool) -> Self {
+    ///
+    /// `addressable` is whether a DELETE target may write `schema` in front of
+    /// `shown`, which an alias makes false. See [`SourceDatabase`].
+    pub fn from_table_named(
+        schema: &str,
+        addressable: bool,
+        table: &Table,
+        shown: &str,
+        with_rows: bool,
+    ) -> Self {
         let rows = if with_rows {
             table.rows.clone()
         } else {
@@ -96,6 +132,10 @@ impl Relation {
             rows,
             sources: vec![shown.to_owned()],
             base_tables: vec![table.name.clone()],
+            source_databases: vec![SourceDatabase {
+                holds: schema.to_owned(),
+                addressable,
+            }],
         }
     }
 
@@ -104,6 +144,65 @@ impl Relation {
         self.sources
             .iter()
             .position(|s| s.eq_ignore_ascii_case(table))
+    }
+
+    /// The source a multi-table DELETE target names, if the FROM clause has
+    /// one.
+    ///
+    /// `database` is what the statement wrote in front of the target and
+    /// `current` the session's database, which an absent one falls back to:
+    /// `DELETE A FROM other.A JOIN B ON other.A.id = B.id` is 1109 on 8.3
+    /// rather than a delete from `other`, because the bare `A` means
+    /// `current.A` and the FROM clause holds no such item.
+    ///
+    /// Kept apart from [`ColumnRef::in_source`], which answers the same shape
+    /// of question for a `db.table.*` and answers it differently — an alias
+    /// keeps its database there and loses it here. One comparer serving both
+    /// would have to be told which rule to apply, which is the argument that
+    /// gave the database part two readers and no comparison at all.
+    pub(crate) fn delete_target(
+        &self,
+        database: Option<&str>,
+        current: &str,
+        table: &str,
+    ) -> Option<usize> {
+        // Zipped rather than indexed, so the two vectors being parallel is
+        // what the code does rather than something it assumes.
+        self.sources
+            .iter()
+            .zip(&self.source_databases)
+            .position(|(source, in_database)| {
+                source.eq_ignore_ascii_case(table)
+                    && match database {
+                        // A database written in front of the name reaches only
+                        // an item that answers to one, and only its own.
+                        Some(written) => {
+                            in_database.addressable
+                                && in_database.holds.eq_ignore_ascii_case(written)
+                        }
+                        // No database means the session's, against an item
+                        // that could have carried one — and means nothing at
+                        // all against an alias, which answers to itself.
+                        None => {
+                            !in_database.addressable
+                                || in_database.holds.eq_ignore_ascii_case(current)
+                        }
+                    }
+            })
+    }
+
+    /// The database one source's rows live in, for the write that has to
+    /// reach them.
+    ///
+    /// `None` only where the index names no source, which the callers'
+    /// indices — all of them from `source_index` or `delete_target` — cannot
+    /// produce today. It is an `Option` rather than an index so that a future
+    /// FROM item pushing a source without a [`SourceDatabase`] is a refusal
+    /// rather than a panic in the middle of a user's DELETE.
+    pub(crate) fn source_holds(&self, index: usize) -> Option<&str> {
+        self.source_databases
+            .get(index)
+            .map(|source| source.holds.as_str())
     }
 
     /// Column references in the shape the expression evaluator wants.

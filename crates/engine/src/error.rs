@@ -136,6 +136,28 @@ impl EngineError {
         Self::new(1051, "42S02", format!("Unknown table '{name}'"))
     }
 
+    /// ER_UNKNOWN_TABLE, for a multi-table DELETE target the FROM clause does
+    /// not name.
+    ///
+    /// The third "Unknown table" and the second code: 1146 is a table the
+    /// catalog does not hold and 1051 a qualifier the statement does not put
+    /// in scope, and this is 8.3's answer for `DELETE nodb.A FROM A JOIN B ON
+    /// A.id = B.id`, where the catalog does hold an `A` and the FROM clause
+    /// does name it — under a different database. It is the same refusal for a
+    /// target written with no database at all: `DELETE Nope FROM A JOIN B` is
+    /// 1109 there too, not 1146.
+    ///
+    /// `name` is the table part alone, without the database written in front
+    /// of it, which is how 8.3 prints it: `DELETE nodb.A FROM A` reports
+    /// `Unknown table 'A' in MULTI DELETE`.
+    pub fn unknown_multi_delete_target(name: &str) -> Self {
+        Self::new(
+            1109,
+            "42S02",
+            format!("Unknown table '{name}' in MULTI DELETE"),
+        )
+    }
+
     /// ER_TABLE_EXISTS_ERROR.
     pub fn table_exists(name: &str) -> Self {
         Self::new(1050, "42S01", format!("Table '{name}' already exists"))
