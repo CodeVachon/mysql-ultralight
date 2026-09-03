@@ -16037,6 +16037,174 @@ fn every_yes_or_no_answer_is_a_boolean() {
     assert_eq!(nullable("SELECT REGEXP_LIKE(NULL, 'a')"), vec![true]);
 }
 
+/// `a BETWEEN lo AND hi` is `a >= lo AND a <= hi`, and it is the AND that
+/// decides a NULL bound: one false side settles a conjunction whatever the
+/// other side is, so a NULL bound only makes the answer NULL when the known
+/// comparison is *true*. Every expectation here was read off 8.3.
+///
+/// The table is asserted in both directions on purpose. Answering NULL
+/// wherever a bound is NULL is the bug this covers, and answering 0 wherever
+/// one is is the same mistake mirrored — so the rows that expect 0 and the
+/// rows that expect NULL both have to be here, or half of the table would pass
+/// under an implementation that had simply picked the other constant.
+#[test]
+fn a_null_bound_of_a_between_is_settled_by_the_other_comparison() {
+    let (engine, mut session) = engine();
+    for (sql, expected) in [
+        // The two that were wrong: the known comparison is false, so the
+        // conjunction is false and the unknown side never gets a say.
+        ("SELECT 3 BETWEEN 4 AND NULL", "0"),
+        ("SELECT 5 BETWEEN NULL AND 4", "0"),
+        // And the ones that genuinely are unknown, on either side.
+        ("SELECT 3 BETWEEN NULL AND 4", "NULL"),
+        ("SELECT 3 BETWEEN 2 AND NULL", "NULL"),
+        // The range is inclusive, so an equal bound is the *true* side and
+        // leaves the answer unknown rather than settling it. These two are
+        // what an off-by-one in the boundary would show up in.
+        ("SELECT 3 BETWEEN 3 AND NULL", "NULL"),
+        ("SELECT 4 BETWEEN NULL AND 4", "NULL"),
+        ("SELECT 3 BETWEEN NULL AND NULL", "NULL"),
+        // A NULL subject is unknown against both bounds however they are
+        // placed — including a range no value at all could be inside, which
+        // is the one case where a shortcut on the bounds alone would answer 0.
+        ("SELECT NULL BETWEEN 1 AND 2", "NULL"),
+        ("SELECT NULL BETWEEN 2 AND 1", "NULL"),
+        ("SELECT NULL BETWEEN NULL AND NULL", "NULL"),
+        // `NOT BETWEEN` negates the two decided rows and leaves the unknown
+        // one alone, so it is not the complement of the table above it.
+        ("SELECT 3 NOT BETWEEN 4 AND NULL", "1"),
+        ("SELECT 5 NOT BETWEEN NULL AND 4", "1"),
+        ("SELECT 3 NOT BETWEEN NULL AND 4", "NULL"),
+        ("SELECT 3 NOT BETWEEN 2 AND NULL", "NULL"),
+        ("SELECT 3 NOT BETWEEN 3 AND NULL", "NULL"),
+        ("SELECT NULL NOT BETWEEN 1 AND 2", "NULL"),
+        // Two known bounds are unchanged, an inverted range included.
+        ("SELECT 3 BETWEEN 2 AND 4", "1"),
+        ("SELECT 1 BETWEEN 2 AND 4", "0"),
+        ("SELECT 5 BETWEEN 2 AND 4", "0"),
+        ("SELECT 3 BETWEEN 4 AND 2", "0"),
+        ("SELECT 3 NOT BETWEEN 2 AND 4", "0"),
+        ("SELECT 1 NOT BETWEEN 2 AND 4", "1"),
+        // The same rule under each family of comparison rules, because which
+        // side is false is decided by the comparison and not by the operator.
+        // Strings collate: `'10' >= '9'` is false where the numbers say the
+        // opposite, so the string pair is 0 and the numeric pair is NULL.
+        ("SELECT 'a' BETWEEN 'b' AND NULL", "0"),
+        ("SELECT 'b' BETWEEN 'a' AND NULL", "NULL"),
+        ("SELECT 'c' BETWEEN NULL AND 'b'", "0"),
+        ("SELECT 'a' BETWEEN NULL AND 'b'", "NULL"),
+        ("SELECT '10' BETWEEN '9' AND NULL", "0"),
+        ("SELECT 10 BETWEEN 9 AND NULL", "NULL"),
+        ("SELECT '10' BETWEEN NULL AND '9'", "NULL"),
+        // Decimals compare as numbers, and a number beside a numeric string
+        // drags the string onto the numeric side.
+        ("SELECT 1.5 BETWEEN 2.5 AND NULL", "0"),
+        ("SELECT 1.5 BETWEEN 0.5 AND NULL", "NULL"),
+        ("SELECT 3.5 BETWEEN NULL AND 2.5", "0"),
+        ("SELECT 1.5 BETWEEN NULL AND 2.5", "NULL"),
+        ("SELECT '3' BETWEEN 4 AND NULL", "0"),
+        ("SELECT 3 BETWEEN '4' AND NULL", "0"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // Off the literals, so the answer is evaluated per row rather than folded
+    // once, and over a DATE and a DECIMAL where the comparison is neither an
+    // integer's nor a string's.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Range3 (
+            id INTEGER NOT NULL,
+            s BIGINT NULL,
+            lo BIGINT NULL,
+            hi BIGINT NULL,
+            d DATE NULL,
+            dlo DATE NULL,
+            m DECIMAL(10,2) NULL,
+            mhi DECIMAL(10,2) NULL,
+            PRIMARY KEY (id)
+        )",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Range3 VALUES
+            (1, 3, 4, NULL, '2020-01-01', '2021-01-01', 3.50, 2.50),
+            (2, 3, 2, NULL, '2022-01-01', '2021-01-01', 1.50, 2.50),
+            (3, 5, NULL, 4, '2020-01-01', '2021-01-01', 3.50, 2.50),
+            (4, 3, NULL, 4, '2022-01-01', '2021-01-01', 1.50, 2.50),
+            (5, NULL, 2, 1, '2020-01-01', '2021-01-01', 3.50, 2.50)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, s BETWEEN lo AND hi, s NOT BETWEEN lo AND hi, \
+             d BETWEEN dlo AND NULL, m BETWEEN NULL AND mhi FROM Range3 ORDER BY id",
+        ),
+        vec![
+            // The low bound is false for the DATE and the high bound is false
+            // for the DECIMAL on rows 1 and 3, and true on rows 2 and 4.
+            vec!["1", "0", "1", "0", "0"],
+            vec!["2", "NULL", "NULL", "NULL", "NULL"],
+            vec!["3", "0", "1", "0", "0"],
+            vec!["4", "NULL", "NULL", "NULL", "NULL"],
+            vec!["5", "NULL", "NULL", "0", "0"],
+        ]
+    );
+
+    // Where the difference is visible at all. A WHERE clause rejects a row on
+    // NULL exactly as it rejects one on 0, so the whole divergence hides
+    // there — every shape that can tell the two apart has to read the value.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT (3 BETWEEN 4 AND NULL) IS NULL, IF(3 BETWEEN 4 AND NULL, 'y', 'n'), \
+             CASE WHEN 3 BETWEEN 4 AND NULL THEN 'y' ELSE 'n' END, \
+             COALESCE(3 BETWEEN 4 AND NULL, 9)",
+        ),
+        vec![vec!["0", "n", "n", "0"]]
+    );
+    // An aggregate over it counts a 0 and skips a NULL, so the same statement
+    // separates the two without ever projecting the value.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(s BETWEEN lo AND hi), SUM(s NOT BETWEEN lo AND hi) FROM Range3",
+        ),
+        vec![vec!["2", "2"]]
+    );
+    // And the clause where it does not: both ids are filtered out either way.
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT id FROM Range3 WHERE s BETWEEN lo AND hi ORDER BY id"
+    )
+    .is_empty());
+
+    // Nullability is not read off the answer. 8.3 describes
+    // `3 BETWEEN 4 AND NULL` nullable even though it answers 0, because the
+    // flag follows the operands and only the value follows the conjunction.
+    let nullable = |sql: &str| -> Vec<bool> {
+        engine
+            .describe(&session, sql, 0)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .map(|c| c.nullable)
+            .collect()
+    };
+    assert_eq!(nullable("SELECT 3 BETWEEN 4 AND NULL"), vec![true]);
+    assert_eq!(nullable("SELECT 3 BETWEEN 2 AND 4"), vec![false]);
+}
+
 #[test]
 fn a_boolean_reads_as_one_or_zero_everywhere_but_a_document() {
     // The tag changes the *document* reading and nothing else, which is what

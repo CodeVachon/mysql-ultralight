@@ -472,13 +472,60 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             let v = eval(expr, ctx)?;
             let lo = eval(low, ctx)?;
             let hi = eval(high, ctx)?;
-            match (v.compare(&lo), v.compare(&hi)) {
-                (Some(a), Some(b)) => {
-                    let inside = a != std::cmp::Ordering::Less && b != std::cmp::Ordering::Greater;
-                    Ok(bool_value(inside != *negated))
-                }
-                _ => Ok(Value::Null),
-            }
+            // `a BETWEEN lo AND hi` is two comparisons joined by `AND`, and it
+            // is the *AND* that decides a NULL bound rather than the bound
+            // itself: one false side settles the conjunction whatever the other
+            // side is. So on 8.3 `SELECT 3 BETWEEN 4 AND NULL` is 0 — 3 >= 4 is
+            // false — and `SELECT 5 BETWEEN NULL AND 4` is 0, while
+            // `3 BETWEEN NULL AND 4` is NULL, because there the known side is
+            // true and the answer really is unknown. Answering NULL for all
+            // three, which is what taking `None` from either comparison did, is
+            // a wrong answer in two of them.
+            //
+            // Two comparisons, but *one* comparison type: MySQL aggregates the
+            // type across all three operands and then compares each side under
+            // it, where the two `compare` calls below each aggregate over their
+            // own pair. It is the same answer wherever the three agree, and a
+            // different one where they do not — measured on 8.3,
+            // `SELECT '2' BETWEEN 1 AND '10'` is 1 there and 0 here, because
+            // the integer bound makes all three numeric while the pair
+            // `'2' <= '10'` collates and is 0 on both servers. That is a
+            // pre-existing gap of its own and not this one; it is written down
+            // rather than guessed at, because aggregating three operands is a
+            // rule per type family — temporals, decimals and ENUM included —
+            // and half of it would be worse than none.
+            //
+            // Both bounds are evaluated whichever way the first comparison
+            // goes, because MySQL evaluates both too: measured on 8.3,
+            // `SELECT 3 BETWEEN 4 AND (@b := 1)` leaves `@b` at 1, and a high
+            // bound that overflows a BIGINT still raises 1690 under a low bound
+            // that has already answered false. There is no short-circuit
+            // between the two comparisons to reproduce — only in the truth
+            // table above them.
+            //
+            // The one place MySQL does skip an operand is a NULL *subject*: it
+            // answers NULL without reading either bound, so
+            // `SELECT NULL BETWEEN 1 AND (9223372036854775807 + 1)` is NULL on
+            // 8.3 where this raises 1690. Not reproduced, deliberately — the
+            // bounds are where an unsupported construct in them would announce
+            // itself, and swallowing that to match an overflow is trading a
+            // clear error for a silent wrong answer. It is a refusal where
+            // MySQL answers, which is the safe direction, and it is written
+            // down here so it is a known gap rather than a forgotten one.
+            let at_least_lo = v.compare(&lo).map(|o| o != std::cmp::Ordering::Less);
+            let at_most_hi = v.compare(&hi).map(|o| o != std::cmp::Ordering::Greater);
+            let inside = match (at_least_lo, at_most_hi) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            };
+            // `NOT BETWEEN` is the negation of that and nothing more: NULL
+            // stays NULL through it, so it is not the complement of the truth
+            // table but the complement of its two decided rows.
+            Ok(match inside {
+                Some(b) => bool_value(b != *negated),
+                None => Value::Null,
+            })
         }
 
         Expr::InList {

@@ -2779,6 +2779,71 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // `BETWEEN` is two comparisons joined by `AND`, and the `AND` is what
+        // decides a NULL bound: a single false side settles the conjunction,
+        // so a NULL bound only makes the answer unknown when the *other* side
+        // is true. A WHERE clause cannot ask any of it, because a NULL and a 0
+        // both reject a row, so the cases are projections, aggregates and
+        // wrappers — with one WHERE at the end to hold the filtering the rest
+        // of them cannot see.
+        name: "between and NULL",
+        setup: &[
+            "CREATE TABLE Btw (id INT NOT NULL, s BIGINT NULL, lo BIGINT NULL, hi BIGINT NULL, \
+             d DATE NULL, dlo DATE NULL, m DECIMAL(10,2) NULL, mhi DECIMAL(10,2) NULL, \
+             txt VARCHAR(10) NULL, PRIMARY KEY (id))",
+            "INSERT INTO Btw VALUES \
+             (1, 3, 4, NULL, '2020-01-01', '2021-01-01', 3.50, 2.50, 'a'), \
+             (2, 3, 2, NULL, '2022-01-01', '2021-01-01', 1.50, 2.50, 'c'), \
+             (3, 5, NULL, 4, '2020-01-01', '2021-01-01', 3.50, 2.50, 'a'), \
+             (4, 3, NULL, 4, '2022-01-01', '2021-01-01', 1.50, 2.50, 'c'), \
+             (5, NULL, 2, 1, '2020-01-01', '2021-01-01', 3.50, 2.50, NULL)",
+        ],
+        cases: &[
+            // The four that separate the truth table from "any NULL bound
+            // makes it NULL": the first two are 0 and the last two are NULL.
+            same("SELECT 3 BETWEEN 4 AND NULL, 5 BETWEEN NULL AND 4, \
+                  3 BETWEEN NULL AND 4, 3 BETWEEN 2 AND NULL"),
+            // The bound is inclusive, so an equal one is the true side and
+            // leaves the answer unknown rather than settling it.
+            same("SELECT 3 BETWEEN 3 AND NULL, 4 BETWEEN NULL AND 4, 3 BETWEEN NULL AND NULL"),
+            // A NULL subject is unknown against both bounds however they are
+            // placed, an empty range included.
+            same("SELECT NULL BETWEEN 1 AND 2, NULL BETWEEN 2 AND 1, NULL BETWEEN NULL AND NULL"),
+            // `NOT BETWEEN` negates the decided rows only — it is not the
+            // complement of the table above.
+            same("SELECT 3 NOT BETWEEN 4 AND NULL, 5 NOT BETWEEN NULL AND 4, \
+                  3 NOT BETWEEN NULL AND 4, NULL NOT BETWEEN 1 AND 2"),
+            // Which side is false is the comparison's business, so the same
+            // rule runs under each family of them. Strings collate, and
+            // `'10' >= '9'` is false where the numbers say the opposite.
+            same("SELECT 'a' BETWEEN 'b' AND NULL, 'b' BETWEEN 'a' AND NULL, \
+                  'c' BETWEEN NULL AND 'b', 'a' BETWEEN NULL AND 'b'"),
+            same("SELECT '10' BETWEEN '9' AND NULL, 10 BETWEEN 9 AND NULL, \
+                  '10' BETWEEN NULL AND '9'"),
+            same("SELECT 1.5 BETWEEN 2.5 AND NULL, 1.5 BETWEEN 0.5 AND NULL, \
+                  3.5 BETWEEN NULL AND 2.5, 1.5 BETWEEN NULL AND 2.5"),
+            same("SELECT '3' BETWEEN 4 AND NULL, 3 BETWEEN '4' AND NULL"),
+            // Off the literals, so it is evaluated per row rather than folded
+            // once, and over a DATE and a DECIMAL as well as an integer.
+            same("SELECT id, s BETWEEN lo AND hi, s NOT BETWEEN lo AND hi FROM Btw ORDER BY id"),
+            same("SELECT id, d BETWEEN dlo AND NULL, m BETWEEN NULL AND mhi, \
+                  txt BETWEEN 'b' AND NULL FROM Btw ORDER BY id"),
+            // An aggregate tells 0 from NULL without projecting either: COUNT
+            // counts the false rows and skips the unknown ones.
+            same("SELECT COUNT(s BETWEEN lo AND hi), SUM(s NOT BETWEEN lo AND hi) FROM Btw"),
+            // The wrappers that read the value back, and the document reading,
+            // where NULL and false are two different tokens.
+            same("SELECT (3 BETWEEN 4 AND NULL) IS NULL, IF(3 BETWEEN 4 AND NULL, 'y', 'n'), \
+                  CASE WHEN 3 BETWEEN 4 AND NULL THEN 'y' ELSE 'n' END, \
+                  COALESCE(3 BETWEEN 4 AND NULL, 9)"),
+            same("SELECT JSON_ARRAY(3 BETWEEN 4 AND NULL, 3 BETWEEN NULL AND 4, \
+                  3 NOT BETWEEN 4 AND NULL)"),
+            // And the clause that cannot see any of it, kept so the fix is
+            // held to leaving filtering alone.
+            same("SELECT id FROM Btw WHERE s BETWEEN lo AND hi ORDER BY id"),
+        ],
+    },
+    Group {
         // The compound spelling, which is the one route to REAL_AS_FLOAT that
         // does not name it. `ANSI` is set on its own rather than added to the
         // mode in force, because that is what it means: MySQL replaces the

@@ -1,11 +1,11 @@
 ---
 id: 92
 title: BETWEEN is not three-valued
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-08-25T10:59:33Z
-updated: 2026-08-25T10:59:33Z
+updated: 2026-09-03T01:51:05Z
 ---
 
 ## Description

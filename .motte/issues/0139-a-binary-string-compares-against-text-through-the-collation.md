@@ -1,11 +1,11 @@
 ---
 id: 139
 title: A binary string compares against text through the collation
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-08-31T20:28:05Z
-updated: 2026-08-31T20:28:05Z
+updated: 2026-09-03T01:51:05Z
 ---
 
 ## Description
