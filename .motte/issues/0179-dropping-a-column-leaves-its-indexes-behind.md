@@ -1,11 +1,11 @@
 ---
 id: 179
 title: Dropping a column leaves its indexes behind
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-09-03T12:29:35Z
-updated: 2026-09-03T14:20:32Z
+updated: 2026-09-03T16:32:40Z
 ---
 
 ## Description

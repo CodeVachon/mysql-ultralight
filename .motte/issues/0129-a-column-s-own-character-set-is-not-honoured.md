@@ -1,11 +1,11 @@
 ---
 id: 129
 title: A column's own character set is not honoured
-state: Todo
+state: Done
 parent: 9
 labels: [compat, app-priority-1]
 created: 2026-08-26T11:18:03Z
-updated: 2026-09-03T14:21:05Z
+updated: 2026-09-03T16:32:22Z
 ---
 
 ## Description
@@ -36,3 +36,7 @@ APP PRIORITY 1 for application-mono-repo -- as the mechanism behind #0152 and #0
 The target declares CHARACTER SET on 288 sites and COLLATE on 1537, every one utf8mb4 / utf8mb4_unicode_ci. The engine accepts the DDL (measured: CREATE TABLE with that clause agrees) but does not honour the collation in comparison, LIKE or ORDER BY. So the declaration is stored and ignored, which is what makes #0152 and #0134 wrong-row bugs rather than curiosities.
 
 Note the app uses no BINARY, VARBINARY or BLOB column and no non-utf8mb4 charset, so the latin1/binary examples in the description are not the pressing part -- the pressing part is that utf8mb4_unicode_ci is not applied.
+
+### 2026-09-03T16:32:22Z — Christopher Vachon (user)
+
+Landed in 44df38b, gate green. The collation half is fixed: a column's declared collation now decides equality, LIKE, ORDER BY, DISTINCT, GROUP BY and unique keys, and survives the state image (v9 -> v10). Per-column CHARACTER SET is deliberately NOT done -- the engine still has one charset -- which is why the SOUNDEX/latin1 example in the description is untouched. The target application uses only utf8mb4, so the collation half is what produced its wrong rows. Filed the residue as separate issues.

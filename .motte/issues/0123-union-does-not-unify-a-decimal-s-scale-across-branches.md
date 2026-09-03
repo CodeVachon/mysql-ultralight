@@ -1,11 +1,11 @@
 ---
 id: 123
 title: UNION does not unify a decimal's scale across branches
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-08-26T03:49:12Z
-updated: 2026-09-03T14:20:28Z
+updated: 2026-09-03T16:32:41Z
 ---
 
 ## Description

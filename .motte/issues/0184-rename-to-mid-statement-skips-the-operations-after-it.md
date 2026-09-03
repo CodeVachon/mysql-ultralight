@@ -1,11 +1,11 @@
 ---
 id: 184
 title: RENAME TO mid-statement skips the operations after it
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-09-03T12:30:07Z
-updated: 2026-09-03T14:20:33Z
+updated: 2026-09-03T16:32:40Z
 ---
 
 ## Description

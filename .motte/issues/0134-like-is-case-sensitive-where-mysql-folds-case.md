@@ -1,11 +1,11 @@
 ---
 id: 134
 title: LIKE is case-sensitive where MySQL folds case
-state: Todo
+state: Done
 parent: 9
 labels: [executor, app-priority-1]
 created: 2026-08-31T13:34:50Z
-updated: 2026-09-03T14:21:05Z
+updated: 2026-09-03T16:32:22Z
 ---
 
 ## Description
@@ -40,3 +40,7 @@ Measured under that exact declaration:
     WHERE name LIKE 'caf%'   mysql café + Cafe    engine café only
 
 So a search box that finds two rows against MySQL finds one here. This is a wrong result set on the app's main read path, not a metadata difference.
+
+### 2026-09-03T16:32:22Z — Christopher Vachon (user)
+
+Landed in 44df38b as part of the collation mechanism, gate green. Verified against the exact probe that exposed it: rows café/Cafe/Straße under utf8mb4_unicode_ci, WHERE name LIKE 'caf%' now returns café AND Cafe, matching 8.3. LIKE folds per character but applies no expansions and no padding -- 'Straße' LIKE 'strasse' is 0 under every collation while = 'strasse' is 1 under two of them, so the two paths are separate by design. BINARY 'A' LIKE 'a' still answers 0.

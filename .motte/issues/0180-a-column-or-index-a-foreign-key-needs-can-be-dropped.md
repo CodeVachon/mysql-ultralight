@@ -1,11 +1,11 @@
 ---
 id: 180
 title: A column or index a foreign key needs can be dropped
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-09-03T12:29:35Z
-updated: 2026-09-03T14:20:33Z
+updated: 2026-09-03T16:32:40Z
 ---
 
 ## Description

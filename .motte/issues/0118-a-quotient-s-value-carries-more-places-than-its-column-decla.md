@@ -1,11 +1,11 @@
 ---
 id: 118
 title: A quotient's value carries more places than its column declares
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-08-25T23:29:12Z
-updated: 2026-09-03T14:20:27Z
+updated: 2026-09-03T16:32:40Z
 ---
 
 ## Description

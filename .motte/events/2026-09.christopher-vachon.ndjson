@@ -99,3 +99,27 @@
 {"at":"2026-09-03T13:19:21Z","id":110,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-09-03T14:04:38Z","id":191,"by":"Christopher Vachon","as":"user","type":"created","title":"A system variable is returned as a string, not a number","state":"Todo"}
 {"at":"2026-09-03T14:17:42Z","id":192,"by":"Christopher Vachon","as":"user","type":"created","title":"WITH RECURSIVE is refused, and the app uses it","state":"Todo"}
+{"at":"2026-09-03T14:25:11Z","id":192,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T14:25:11Z","id":129,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T14:25:11Z","id":134,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T14:25:11Z","id":152,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T14:25:11Z","id":89,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T15:12:58Z","id":193,"by":"Christopher Vachon","as":"user","type":"created","title":"ON DUPLICATE KEY UPDATE does not restamp ON UPDATE CURRENT_TIMESTAMP","state":"Todo"}
+{"at":"2026-09-03T15:34:24Z","id":89,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T15:50:34Z","id":194,"by":"Christopher Vachon","as":"user","type":"created","title":"A string longer than the column declares is stored whole","state":"Todo"}
+{"at":"2026-09-03T15:50:35Z","id":195,"by":"Christopher Vachon","as":"user","type":"created","title":"A fractional value is truncated into an integer column, not rounded","state":"Todo"}
+{"at":"2026-09-03T15:50:35Z","id":196,"by":"Christopher Vachon","as":"user","type":"created","title":"A computed column carries no declared type, so CAST loses its scale","state":"Todo"}
+{"at":"2026-09-03T15:50:35Z","id":197,"by":"Christopher Vachon","as":"user","type":"created","title":"CTE column metadata names a database and table MySQL leaves empty","state":"Todo"}
+{"at":"2026-09-03T16:06:10Z","id":192,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T16:15:47Z","id":198,"by":"Christopher Vachon","as":"user","type":"created","title":"CAST(<predicate> AS BINARY) answers the predicate exactly, not its result","state":"Todo"}
+{"at":"2026-09-03T16:32:21Z","id":129,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T16:32:21Z","id":134,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T16:32:21Z","id":152,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T16:32:40Z","id":194,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T16:32:40Z","id":195,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T16:32:40Z","id":179,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T16:32:40Z","id":180,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T16:32:40Z","id":184,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T16:32:40Z","id":118,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T16:32:40Z","id":122,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T16:32:41Z","id":123,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
