@@ -3,9 +3,9 @@ id: 191
 title: A system variable is returned as a string, not a number
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-03T14:04:38Z
-updated: 2026-09-03T14:04:38Z
+updated: 2026-09-03T14:20:34Z
 ---
 
 ## Description

@@ -3,9 +3,9 @@ id: 134
 title: LIKE is case-sensitive where MySQL folds case
 state: Todo
 parent: 9
-labels: [executor]
+labels: [executor, app-priority-1]
 created: 2026-08-31T13:34:50Z
-updated: 2026-09-03T14:01:18Z
+updated: 2026-09-03T14:21:05Z
 ---
 
 ## Description
@@ -28,3 +28,15 @@ Likely to matter for the target schema: a case-insensitive LIKE is what a client
 ### 2026-09-03T14:01:18Z — Christopher Vachon (user)
 
 VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed. 'ABC' LIKE 'a%' mysql 1 engine 0, while 'A'='a' is 1 on both -- the self-inconsistency the description names. Also seen: BINARY 'A' LIKE 'a' answers 0 on both but the engine returns it as a string where 8.3 returns a number.
+
+### 2026-09-03T14:21:05Z — Christopher Vachon (user)
+
+APP PRIORITY 1 for application-mono-repo. Measured against the real conformance surface on 2026-09-03.
+
+The app runs ~137 LIKE-based searches -- 72 raw LIKE in apps/api/src and 65 Prisma contains/startsWith/endsWith filters, which Prisma compiles to LIKE. `mode: 'insensitive'` appears ZERO times, so every one of them depends on the column collation to fold case. Every text column is declared utf8mb4_unicode_ci (1537 COLLATE clauses, all the same one).
+
+Measured under that exact declaration:
+    rows: 'café', 'Cafe', 'Straße'
+    WHERE name LIKE 'caf%'   mysql café + Cafe    engine café only
+
+So a search box that finds two rows against MySQL finds one here. This is a wrong result set on the app's main read path, not a metadata difference.

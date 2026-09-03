@@ -3,9 +3,9 @@ id: 100
 title: Clauses other than the field list and WHERE are not resolved at prepare
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-2]
 created: 2026-08-25T14:48:39Z
-updated: 2026-09-03T14:05:52Z
+updated: 2026-09-03T14:20:27Z
 ---
 
 ## Description

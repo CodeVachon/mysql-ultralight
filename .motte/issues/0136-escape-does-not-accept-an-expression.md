@@ -3,9 +3,9 @@ id: 136
 title: ESCAPE does not accept an expression
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-08-31T13:34:50Z
-updated: 2026-09-03T14:03:11Z
+updated: 2026-09-03T14:20:29Z
 ---
 
 ## Description

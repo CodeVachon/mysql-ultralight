@@ -3,9 +3,9 @@ id: 141
 title: A hex or bit literal is not read as a number
 state: Todo
 parent: 9
-labels: [executor]
+labels: [executor, app-priority-3]
 created: 2026-08-31T20:28:05Z
-updated: 2026-09-03T14:00:44Z
+updated: 2026-09-03T14:20:29Z
 ---
 
 ## Description

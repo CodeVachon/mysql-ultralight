@@ -3,9 +3,9 @@ id: 168
 title: A cut alias raises no warning, and no statement ever does
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-03T10:09:34Z
-updated: 2026-09-03T10:09:34Z
+updated: 2026-09-03T14:20:31Z
 ---
 
 ## Description

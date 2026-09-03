@@ -3,9 +3,9 @@ id: 159
 title: A non-numeric string compared to a number answers wrongly
 state: Todo
 parent: 9
-labels: [executor]
+labels: [executor, app-priority-3]
 created: 2026-09-03T03:22:29Z
-updated: 2026-09-03T14:01:19Z
+updated: 2026-09-03T14:20:30Z
 ---
 
 ## Description

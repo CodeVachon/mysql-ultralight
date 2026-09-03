@@ -3,9 +3,9 @@ id: 97
 title: String functions clamp a huge count to zero
 state: Todo
 parent: 9
-labels: [executor]
+labels: [executor, app-priority-3]
 created: 2026-08-25T13:45:18Z
-updated: 2026-09-03T14:01:17Z
+updated: 2026-09-03T14:20:26Z
 ---
 
 ## Description

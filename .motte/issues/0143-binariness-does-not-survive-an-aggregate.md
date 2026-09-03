@@ -3,9 +3,9 @@ id: 143
 title: Binariness does not survive an aggregate
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-08-31T20:28:22Z
-updated: 2026-09-03T14:04:20Z
+updated: 2026-09-03T14:20:29Z
 ---
 
 ## Description

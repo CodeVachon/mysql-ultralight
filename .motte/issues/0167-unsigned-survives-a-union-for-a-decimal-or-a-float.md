@@ -3,9 +3,9 @@ id: 167
 title: UNSIGNED survives a UNION for a decimal or a float
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-03T09:05:53Z
-updated: 2026-09-03T14:03:11Z
+updated: 2026-09-03T14:20:31Z
 ---
 
 ## Description

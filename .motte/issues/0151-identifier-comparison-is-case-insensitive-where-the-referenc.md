@@ -3,9 +3,9 @@ id: 151
 title: Identifier comparison is case-insensitive where the reference server is not
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-01T23:47:05Z
-updated: 2026-09-03T14:04:20Z
+updated: 2026-09-03T14:20:30Z
 ---
 
 ## Description

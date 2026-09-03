@@ -3,9 +3,9 @@ id: 109
 title: A bound parameter column is named after its value
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-2]
 created: 2026-08-25T19:32:31Z
-updated: 2026-08-25T21:50:56Z
+updated: 2026-09-03T14:20:27Z
 ---
 
 ## Description

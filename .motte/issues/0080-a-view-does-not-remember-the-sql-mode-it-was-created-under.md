@@ -3,9 +3,9 @@ id: 80
 title: A view does not remember the sql_mode it was created under
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-2]
 created: 2026-08-24T17:36:23Z
-updated: 2026-09-03T14:05:52Z
+updated: 2026-09-03T14:20:25Z
 ---
 
 ## Description

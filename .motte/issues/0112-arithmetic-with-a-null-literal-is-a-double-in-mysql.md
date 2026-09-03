@@ -3,9 +3,9 @@ id: 112
 title: Arithmetic with a NULL literal is a DOUBLE in MySQL
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-08-25T23:13:03Z
-updated: 2026-09-03T14:00:24Z
+updated: 2026-09-03T14:20:27Z
 ---
 
 ## Description

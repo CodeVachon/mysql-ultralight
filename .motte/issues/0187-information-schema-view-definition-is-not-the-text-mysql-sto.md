@@ -3,9 +3,9 @@ id: 187
 title: information_schema VIEW_DEFINITION is not the text MySQL stores
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-03T12:52:36Z
-updated: 2026-09-03T12:52:36Z
+updated: 2026-09-03T14:20:33Z
 ---
 
 ## Description

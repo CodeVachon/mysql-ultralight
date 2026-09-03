@@ -3,9 +3,9 @@ id: 146
 title: BIN over a stored binary column refuses where MySQL answers
 state: Todo
 parent: 9
-labels: [executor]
+labels: [executor, app-priority-3]
 created: 2026-09-01T02:16:09Z
-updated: 2026-09-03T14:02:15Z
+updated: 2026-09-03T14:20:29Z
 ---
 
 ## Description

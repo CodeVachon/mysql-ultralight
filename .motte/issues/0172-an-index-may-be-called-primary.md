@@ -3,9 +3,9 @@ id: 172
 title: An index may be called PRIMARY
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-03T10:19:46Z
-updated: 2026-09-03T10:37:49Z
+updated: 2026-09-03T14:20:32Z
 ---
 
 ## Description

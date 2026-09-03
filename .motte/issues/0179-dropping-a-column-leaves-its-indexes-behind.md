@@ -3,9 +3,9 @@ id: 179
 title: Dropping a column leaves its indexes behind
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-2]
 created: 2026-09-03T12:29:35Z
-updated: 2026-09-03T12:29:35Z
+updated: 2026-09-03T14:20:32Z
 ---
 
 ## Description

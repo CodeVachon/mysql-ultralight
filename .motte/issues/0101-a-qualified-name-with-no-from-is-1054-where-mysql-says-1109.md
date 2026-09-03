@@ -3,9 +3,9 @@ id: 101
 title: A qualified name with no FROM is 1054 where MySQL says 1109
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-08-25T14:48:58Z
-updated: 2026-09-03T14:00:24Z
+updated: 2026-09-03T14:20:27Z
 ---
 
 ## Description

@@ -3,9 +3,9 @@ id: 155
 title: A supplementary character survives in a generated column name
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-02T17:25:27Z
-updated: 2026-09-03T14:02:15Z
+updated: 2026-09-03T14:20:30Z
 ---
 
 ## Description

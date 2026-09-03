@@ -3,9 +3,9 @@ id: 119
 title: A decimal wider than 65 digits saturates through a temp table
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-08-25T23:42:34Z
-updated: 2026-09-03T14:01:18Z
+updated: 2026-09-03T14:20:28Z
 ---
 
 ## Description

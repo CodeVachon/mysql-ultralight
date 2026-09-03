@@ -3,9 +3,9 @@ id: 95
 title: SET accepts values MySQL refuses or clamps
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-08-25T13:13:52Z
-updated: 2026-09-03T14:03:11Z
+updated: 2026-09-03T14:20:26Z
 ---
 
 ## Description

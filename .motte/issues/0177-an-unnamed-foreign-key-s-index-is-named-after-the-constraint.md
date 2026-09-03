@@ -3,9 +3,9 @@ id: 177
 title: An unnamed foreign key's index is named after the constraint, not its first column
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-03T10:37:35Z
-updated: 2026-09-03T10:37:35Z
+updated: 2026-09-03T14:20:32Z
 ---
 
 ## Description

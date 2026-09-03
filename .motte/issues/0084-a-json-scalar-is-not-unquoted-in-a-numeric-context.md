@@ -3,9 +3,9 @@ id: 84
 title: A JSON scalar is not unquoted in a numeric context
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-2]
 created: 2026-08-24T20:58:12Z
-updated: 2026-09-03T14:00:23Z
+updated: 2026-09-03T14:20:26Z
 ---
 
 ## Description

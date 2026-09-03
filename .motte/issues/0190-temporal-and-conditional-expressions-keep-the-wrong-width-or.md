@@ -3,9 +3,9 @@ id: 190
 title: Temporal and conditional expressions keep the wrong width or type
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-03T12:52:56Z
-updated: 2026-09-03T12:52:56Z
+updated: 2026-09-03T14:20:34Z
 ---
 
 ## Description

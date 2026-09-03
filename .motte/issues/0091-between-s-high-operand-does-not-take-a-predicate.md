@@ -3,9 +3,9 @@ id: 91
 title: BETWEEN's high operand does not take a predicate
 state: Todo
 parent: 9
-labels: [executor]
+labels: [executor, app-priority-3]
 created: 2026-08-25T10:59:33Z
-updated: 2026-09-03T14:01:17Z
+updated: 2026-09-03T14:20:26Z
 ---
 
 ## Description

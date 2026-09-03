@@ -3,9 +3,9 @@ id: 152
 title: The engine's default collation is not utf8mb4_0900_ai_ci
 state: Todo
 parent: 9
-labels: [executor]
+labels: [executor, app-priority-1]
 created: 2026-09-02T14:02:23Z
-updated: 2026-09-03T14:01:18Z
+updated: 2026-09-03T14:21:05Z
 ---
 
 ## Description
@@ -33,3 +33,16 @@ Scoping note for whoever takes it: this is the one part of collation-aware compa
 ### 2026-09-03T14:01:18Z — Christopher Vachon (user)
 
 VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed, all four: 'cafe'='café', 'CAFÉ'='cafe', 'ss'='ß' and 'café' LIKE 'cafe' are 1 on 8.3 and 0 here.
+
+### 2026-09-03T14:21:05Z — Christopher Vachon (user)
+
+APP PRIORITY 1 for application-mono-repo. Measured 2026-09-03 under the app's own declared collation, not the engine default.
+
+Every text column in the target is CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci (1537 clauses, no other collation appears). utf8mb4_unicode_ci folds case AND accents. The engine folds case but not accents:
+
+    rows: 'café', 'Cafe', 'Straße'
+    WHERE name = 'cafe'      mysql café + Cafe   engine Cafe only
+    WHERE name = 'strasse'   mysql Straße        engine no rows
+    ORDER BY name            mysql café,Cafe,Straße   engine Cafe,café,Straße
+
+2359 VARCHAR and 122 TEXT columns are declared with it. Wrong rows and wrong order on ordinary equality and sorting.

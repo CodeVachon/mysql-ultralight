@@ -3,9 +3,9 @@ id: 82
 title: information_schema nullability is conditioned on sql_mode in MySQL
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-08-24T18:02:26Z
-updated: 2026-08-24T18:02:26Z
+updated: 2026-09-03T14:20:26Z
 ---
 
 ## Description

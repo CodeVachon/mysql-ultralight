@@ -3,9 +3,9 @@ id: 149
 title: A DDL COLLATE the engine cannot honour is now refused
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-01T06:09:09Z
-updated: 2026-09-03T14:05:52Z
+updated: 2026-09-03T14:20:30Z
 ---
 
 ## Description

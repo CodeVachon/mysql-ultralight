@@ -3,9 +3,9 @@ id: 161
 title: A skipped row still consumes an auto-increment id
 state: Todo
 parent: 9
-labels: [executor]
+labels: [executor, app-priority-3]
 created: 2026-09-03T03:40:02Z
-updated: 2026-09-03T14:01:19Z
+updated: 2026-09-03T14:20:31Z
 ---
 
 ## Description

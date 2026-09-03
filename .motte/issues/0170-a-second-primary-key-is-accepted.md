@@ -3,9 +3,9 @@ id: 170
 title: A second PRIMARY KEY is accepted
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-03T10:19:28Z
-updated: 2026-09-03T10:19:28Z
+updated: 2026-09-03T14:20:31Z
 ---
 
 ## Description

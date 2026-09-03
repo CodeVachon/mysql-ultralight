@@ -3,9 +3,9 @@ id: 174
 title: An inline PRIMARY KEY UNIQUE column loses its unique index, and a functional index is named after its expression
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-03T10:20:07Z
-updated: 2026-09-03T10:20:27Z
+updated: 2026-09-03T14:20:32Z
 ---
 
 ## Description

@@ -3,9 +3,9 @@ id: 96
 title: SHOW VARIABLES ignores its LIKE pattern
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-08-25T13:13:52Z
-updated: 2026-09-03T14:04:20Z
+updated: 2026-09-03T14:20:26Z
 ---
 
 ## Description

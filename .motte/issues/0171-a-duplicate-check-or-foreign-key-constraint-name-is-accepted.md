@@ -3,9 +3,9 @@ id: 171
 title: A duplicate CHECK or FOREIGN KEY constraint name is accepted
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-03T10:19:37Z
-updated: 2026-09-03T10:19:37Z
+updated: 2026-09-03T14:20:32Z
 ---
 
 ## Description

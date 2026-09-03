@@ -3,9 +3,9 @@ id: 163
 title: FROM DUAL is not a one-row table
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-03T04:07:42Z
-updated: 2026-09-03T14:01:19Z
+updated: 2026-09-03T14:20:31Z
 ---
 
 ## Description

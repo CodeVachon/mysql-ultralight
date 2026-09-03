@@ -3,9 +3,9 @@ id: 181
 title: information_schema omits CHECK constraints entirely
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-03T12:30:06Z
-updated: 2026-09-03T12:30:06Z
+updated: 2026-09-03T14:20:33Z
 ---
 
 ## Description

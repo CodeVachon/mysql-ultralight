@@ -3,9 +3,9 @@ id: 86
 title: A SET in a numeric context is its bitmask
 state: Todo
 parent: 9
-labels: [executor]
+labels: [executor, app-priority-3]
 created: 2026-08-25T03:02:00Z
-updated: 2026-09-03T14:01:17Z
+updated: 2026-09-03T14:20:26Z
 ---
 
 ## Description

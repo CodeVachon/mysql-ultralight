@@ -3,9 +3,9 @@ id: 118
 title: A quotient's value carries more places than its column declares
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-2]
 created: 2026-08-25T23:29:12Z
-updated: 2026-09-03T14:01:18Z
+updated: 2026-09-03T14:20:27Z
 ---
 
 ## Description

@@ -3,9 +3,9 @@ id: 115
 title: GREATEST and LEAST do not coerce their answer to the aggregated type
 state: Todo
 parent: 9
-labels: [executor]
+labels: [executor, app-priority-3]
 created: 2026-08-25T23:13:29Z
-updated: 2026-09-03T14:01:18Z
+updated: 2026-09-03T14:20:27Z
 ---
 
 ## Description

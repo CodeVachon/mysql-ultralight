@@ -3,9 +3,9 @@ id: 111
 title: A numeric column is described with no precision or scale
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-2]
 created: 2026-08-25T23:12:44Z
-updated: 2026-09-03T14:03:11Z
+updated: 2026-09-03T14:20:27Z
 ---
 
 ## Description

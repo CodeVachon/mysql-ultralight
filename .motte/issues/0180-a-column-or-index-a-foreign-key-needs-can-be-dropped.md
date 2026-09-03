@@ -3,9 +3,9 @@ id: 180
 title: A column or index a foreign key needs can be dropped
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-2]
 created: 2026-09-03T12:29:35Z
-updated: 2026-09-03T12:29:35Z
+updated: 2026-09-03T14:20:33Z
 ---
 
 ## Description

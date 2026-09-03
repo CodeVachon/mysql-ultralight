@@ -3,9 +3,9 @@ id: 186
 title: EXTRACT of a DAY unit drops the day for a datetime-typed item
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-03T12:52:35Z
-updated: 2026-09-03T12:52:35Z
+updated: 2026-09-03T14:20:33Z
 ---
 
 ## Description

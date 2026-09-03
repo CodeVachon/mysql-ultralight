@@ -98,3 +98,4 @@
 {"at":"2026-09-03T13:04:56Z","id":94,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-09-03T13:19:21Z","id":110,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-09-03T14:04:38Z","id":191,"by":"Christopher Vachon","as":"user","type":"created","title":"A system variable is returned as a string, not a number","state":"Todo"}
+{"at":"2026-09-03T14:17:42Z","id":192,"by":"Christopher Vachon","as":"user","type":"created","title":"WITH RECURSIVE is refused, and the app uses it","state":"Todo"}

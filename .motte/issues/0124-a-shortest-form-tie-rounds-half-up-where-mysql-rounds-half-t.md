@@ -3,9 +3,9 @@ id: 124
 title: A shortest-form tie rounds half up where MySQL rounds half to even
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-08-26T07:20:32Z
-updated: 2026-09-03T14:01:18Z
+updated: 2026-09-03T14:20:28Z
 ---
 
 ## Description

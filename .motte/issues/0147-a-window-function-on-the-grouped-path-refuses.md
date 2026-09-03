@@ -3,9 +3,9 @@ id: 147
 title: A window function on the grouped path refuses
 state: Todo
 parent: 9
-labels: [executor]
+labels: [executor, app-priority-3]
 created: 2026-09-01T03:03:30Z
-updated: 2026-09-03T14:02:15Z
+updated: 2026-09-03T14:20:29Z
 ---
 
 ## Description

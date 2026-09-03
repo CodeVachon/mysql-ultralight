@@ -3,9 +3,9 @@ id: 145
 title: A string function mangles non-UTF-8 bytes through a lossy decode
 state: Todo
 parent: 9
-labels: [executor]
+labels: [executor, app-priority-3]
 created: 2026-09-01T02:16:09Z
-updated: 2026-09-03T14:05:52Z
+updated: 2026-09-03T14:20:29Z
 ---
 
 ## Description

@@ -3,9 +3,9 @@ id: 173
 title: DROP INDEX never reports a name that matches nothing
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-03T10:19:56Z
-updated: 2026-09-03T10:38:06Z
+updated: 2026-09-03T14:20:32Z
 ---
 
 ## Description

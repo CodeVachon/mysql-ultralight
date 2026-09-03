@@ -3,9 +3,9 @@ id: 176
 title: RENAME INDEX does not check the name it renames to
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-03T10:37:23Z
-updated: 2026-09-03T10:37:23Z
+updated: 2026-09-03T14:20:32Z
 ---
 
 ## Description

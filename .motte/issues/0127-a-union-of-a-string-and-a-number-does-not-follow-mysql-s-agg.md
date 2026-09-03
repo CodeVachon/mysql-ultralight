@@ -3,9 +3,9 @@ id: 127
 title: A union of a string and a number does not follow MySQL's aggregate string rule
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-08-26T08:49:10Z
-updated: 2026-09-03T14:03:11Z
+updated: 2026-09-03T14:20:28Z
 ---
 
 ## Description

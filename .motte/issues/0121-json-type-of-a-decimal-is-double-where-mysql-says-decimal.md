@@ -3,9 +3,9 @@ id: 121
 title: JSON_TYPE of a decimal is DOUBLE where MySQL says DECIMAL
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-2]
 created: 2026-08-26T03:49:12Z
-updated: 2026-09-03T14:01:18Z
+updated: 2026-09-03T14:20:28Z
 ---
 
 ## Description

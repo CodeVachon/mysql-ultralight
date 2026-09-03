@@ -3,9 +3,9 @@ id: 169
 title: A table reference longer than 64 characters is 1146, not 1059
 state: Todo
 parent: 9
-labels: [compat]
+labels: [compat, app-priority-3]
 created: 2026-09-03T10:30:29Z
-updated: 2026-09-03T10:30:29Z
+updated: 2026-09-03T14:20:31Z
 ---
 
 ## Description
