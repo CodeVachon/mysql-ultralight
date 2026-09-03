@@ -5724,6 +5724,101 @@ pub const GROUPS: &[Group] = &[
             same("CREATE VIEW Idv AS SELECT COALESCE((SELECT 1 AS `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`), 1) AS y"),
             same("CREATE VIEW Idv2 AS SELECT 1 AS y FROM Idok WHERE 1 IN (SELECT 1 AS `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`)"),
             same("CREATE VIEW Idv3 AS SELECT 1 AS y FROM Idok WHERE EXISTS (SELECT 1 AS `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`)"),
-            same("SELECT 1 AS y FROM Idok WHERE 1 IN (SELECT 1 AS `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`)"),        ],
+            same("SELECT 1 AS y FROM Idok WHERE 1 IN (SELECT 1 AS `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`)"),
+        ],
+    },
+    Group {
+        // An index name is scoped to its table, so the setup below claiming
+        // `ix_one` on two of them is itself a case: if either server refused
+        // it, the run says so as a failed setup rather than as agreement.
+        // `IxAuto` is the same kind of claim about the names MySQL invents for
+        // an index the statement did not name — two indexes on one column are
+        // legal there because the second is called `a_2`.
+        name: "an index name the table already carries",
+        setup: &[
+            // `c` is in no index, which is what makes the foreign key case
+            // below create one: 8.3 gives a foreign key an index of its own
+            // only where none already covers its columns, and one that creates
+            // no index cannot collide with a name.
+            "CREATE TABLE Ix (a INT NOT NULL, b INT NOT NULL, c INT NOT NULL, PRIMARY KEY (a))",
+            "CREATE INDEX ix_one ON Ix (b)",
+            "CREATE TABLE IxOther (a INT NOT NULL, PRIMARY KEY (a), INDEX ix_one (a))",
+            "CREATE TABLE IxAuto (a INT NULL, b INT NULL, INDEX (a, b), INDEX (a), INDEX (a))",
+            // `b` holds duplicates, so a unique index over it is refusable on
+            // its rows as well as on its name — which is what the pair of
+            // cases below asks the order of.
+            "INSERT INTO Ix VALUES (1, 1, 1), (2, 1, 1)",
+            // A primary key with a constraint name beside an index under that
+            // same name, which 8.3 accepts because it does not call its key
+            // that: another claim the setup makes by not failing.
+            "CREATE TABLE IxPk (a INT NOT NULL, b INT NULL, CONSTRAINT mypk PRIMARY KEY (a), \
+             INDEX mypk (b))",
+            "CREATE TABLE IxDrop (a INT NULL, b INT NULL, INDEX ix (a))",
+        ],
+        cases: &[
+            // The names both servers invented, and the one place the corpus
+            // asks what an unnamed index is called: the first column, then a
+            // suffix counted until it is free.
+            same("SELECT TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME \
+                  FROM information_schema.statistics WHERE TABLE_SCHEMA = DATABASE() \
+                  AND TABLE_NAME = 'IxAuto' ORDER BY INDEX_NAME, SEQ_IN_INDEX"),
+            same("SELECT TABLE_NAME, INDEX_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND INDEX_NAME = 'ix_one' \
+                  ORDER BY TABLE_NAME"),
+            // A duplicate inside one CREATE TABLE, in each of the spellings.
+            // Every one of these is refused, so none of them leaves a table
+            // behind for the next case to trip over.
+            same("CREATE TABLE IxDup (a INT, INDEX i (a), INDEX i (a))"),
+            same("CREATE TABLE IxDupKey (a INT, KEY i (a), KEY i (a))"),
+            same("CREATE TABLE IxDupUnique (a INT, UNIQUE u (a), UNIQUE u (a))"),
+            // A unique and a plain index share one name space, not two.
+            same("CREATE TABLE IxDupMixed (a INT, INDEX i (a), UNIQUE i (a))"),
+            // Compared case-insensitively.
+            same("CREATE TABLE IxDupCase (a INT, INDEX i (a), INDEX I (a))"),
+            // A column-level UNIQUE takes the column's name, and an index
+            // written under that name collides with it.
+            same("CREATE TABLE IxDupColumn (a INT UNIQUE, b INT, INDEX a (b))"),
+            // An invented name is in the same space as a written one.
+            same("CREATE TABLE IxDupAuto (a INT, b INT, INDEX (a, b), INDEX a (b))"),
+            // Two foreign keys of one name, where it is the index each of them
+            // creates that collides.
+            same("CREATE TABLE IxDupFk (a INT NOT NULL, b INT NOT NULL, \
+                  CONSTRAINT fk FOREIGN KEY (a) REFERENCES IxOther(a), \
+                  CONSTRAINT fk FOREIGN KEY (b) REFERENCES IxOther(a))"),
+            // A second CREATE INDEX under a name the table already carries.
+            same("CREATE INDEX ix_one ON Ix (a)"),
+            same("CREATE INDEX IX_ONE ON Ix (a)"),
+            // The name is answered before the rows: 1061 for the taken name,
+            // and 1062 for the same statement under a free one.
+            same("CREATE UNIQUE INDEX ix_one ON Ix (b)"),
+            same("CREATE UNIQUE INDEX ix_free ON Ix (b)"),
+            // The same refusal reached through ALTER TABLE, which is where
+            // Prisma's migrations write it.
+            same("ALTER TABLE Ix ADD INDEX ix_one (a)"),
+            same("ALTER TABLE Ix ADD UNIQUE INDEX ix_one (a)"),
+            same("ALTER TABLE Ix ADD CONSTRAINT ix_one UNIQUE (a)"),
+            same("ALTER TABLE Ix ADD CONSTRAINT ix_one FOREIGN KEY (c) REFERENCES IxOther(a)"),
+            // The collision between two operations of one statement, which no
+            // stored index is involved in at all.
+            same("ALTER TABLE Ix ADD INDEX ix_two (a), ADD INDEX ix_two (b)"),
+            // Nothing above was applied: the table still carries the two
+            // indexes the setup gave it.
+            same("SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Ix' \
+                  ORDER BY INDEX_NAME"),
+            // The primary key's index is `PRIMARY` and not the constraint's
+            // name, which is why the index beside it could take that name.
+            same("SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'IxPk' \
+                  ORDER BY INDEX_NAME"),
+            // A drop matches the name the way the duplicate check does, so
+            // freeing a name under another spelling and reusing it in the same
+            // statement works. Idempotent, which a case that changes anything
+            // has to be: it runs once per protocol.
+            same("ALTER TABLE IxDrop DROP INDEX IX, ADD INDEX ix (b)"),
+            same("SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'IxDrop' \
+                  ORDER BY INDEX_NAME"),
+        ],
     },
 ];

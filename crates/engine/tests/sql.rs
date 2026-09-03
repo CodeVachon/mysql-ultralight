@@ -24906,3 +24906,348 @@ fn the_identifier_limit_counts_characters_and_not_bytes() {
         assert_eq!(err.code, 1059, "{label}: {sql}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// An index name the table already carries. Every claim below was measured
+// against mysql:8.3 rather than remembered.
+
+/// Runs a statement expecting a refusal, and returns it.
+fn fails(
+    engine: &Engine,
+    session: &mut Session,
+    sql: &str,
+) -> mysql_ultralight_engine::EngineError {
+    engine
+        .execute(session, sql, &[])
+        .err()
+        .unwrap_or_else(|| panic!("expected a refusal from: {sql}"))
+}
+
+/// Asserts a statement is refused as ER_DUP_KEYNAME naming `name`.
+fn duplicate_key(engine: &Engine, session: &mut Session, sql: &str, name: &str) {
+    let err = fails(engine, session, sql);
+    assert_eq!(err.code, 1061, "{sql}");
+    assert_eq!(err.sql_state, "42000", "{sql}");
+    assert_eq!(err.message, format!("Duplicate key name '{name}'"), "{sql}");
+}
+
+/// The index names a table carries, in the order it carries them.
+fn index_names(engine: &Engine, session: &mut Session, table: &str) -> Vec<String> {
+    rows(
+        engine,
+        session,
+        &format!(
+            "SELECT DISTINCT INDEX_NAME FROM information_schema.statistics \
+             WHERE TABLE_NAME = '{table}'"
+        ),
+    )
+    .into_iter()
+    .map(|r| r[0].clone())
+    .collect()
+}
+
+#[test]
+fn a_duplicate_index_name_in_one_create_table_is_refused() {
+    let (engine, mut session) = engine();
+
+    duplicate_key(
+        &engine,
+        &mut session,
+        "CREATE TABLE D1 (a INT, INDEX i (a), INDEX i (a))",
+        "i",
+    );
+    duplicate_key(
+        &engine,
+        &mut session,
+        "CREATE TABLE D2 (a INT, KEY i (a), KEY i (a))",
+        "i",
+    );
+    duplicate_key(
+        &engine,
+        &mut session,
+        "CREATE TABLE D3 (a INT, UNIQUE u (a), UNIQUE u (a))",
+        "u",
+    );
+    // A unique and a plain index share one name space, not two.
+    duplicate_key(
+        &engine,
+        &mut session,
+        "CREATE TABLE D4 (a INT, INDEX i (a), UNIQUE i (a))",
+        "i",
+    );
+    // Case-insensitive, and the name reported is the later spelling — 8.3
+    // answers this one `Duplicate key name 'I'`.
+    duplicate_key(
+        &engine,
+        &mut session,
+        "CREATE TABLE D5 (a INT, INDEX i (a), INDEX I (a))",
+        "I",
+    );
+    // A column-level UNIQUE takes the column's name, so an index written under
+    // that name collides with it.
+    duplicate_key(
+        &engine,
+        &mut session,
+        "CREATE TABLE D6 (a INT UNIQUE, b INT, INDEX a (b))",
+        "a",
+    );
+    // The index a foreign key creates for itself is in the same name space.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE D7 (id INT NOT NULL, PRIMARY KEY (id))",
+    );
+    duplicate_key(
+        &engine,
+        &mut session,
+        "CREATE TABLE D8 (a INT NOT NULL, b INT NOT NULL, \
+         CONSTRAINT fk FOREIGN KEY (a) REFERENCES D7(id), \
+         CONSTRAINT fk FOREIGN KEY (b) REFERENCES D7(id))",
+        "fk",
+    );
+
+    // None of the refused statements left a table behind.
+    let tables = rows(
+        &engine,
+        &mut session,
+        "SELECT TABLE_NAME FROM information_schema.tables \
+         WHERE TABLE_SCHEMA = 'testdb' ORDER BY TABLE_NAME",
+    );
+    assert_eq!(tables, vec![vec!["D7"]]);
+}
+
+#[test]
+fn creating_an_index_twice_is_refused() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE X (a INT, b INT)");
+    run(&engine, &mut session, "CREATE INDEX i ON X (a)");
+    // `b` holds duplicates, which the unique case below turns on.
+    run(&engine, &mut session, "INSERT INTO X VALUES (1, 1), (2, 1)");
+
+    duplicate_key(&engine, &mut session, "CREATE INDEX i ON X (b)", "i");
+    duplicate_key(&engine, &mut session, "CREATE INDEX I ON X (b)", "I");
+    // The name is answered before anything the index would cover: on 8.3 this
+    // is 1061 and not the 1062 those two rows raise for the same statement
+    // under a free name, nor an error about a column that does not exist.
+    duplicate_key(&engine, &mut session, "CREATE UNIQUE INDEX i ON X (b)", "i");
+    duplicate_key(&engine, &mut session, "CREATE INDEX i ON X (nope)", "i");
+    let err = fails(&engine, &mut session, "CREATE UNIQUE INDEX free ON X (b)");
+    assert_eq!(err.code, 1062);
+
+    assert_eq!(index_names(&engine, &mut session, "X"), vec!["i"]);
+}
+
+#[test]
+fn an_index_name_is_scoped_to_its_table() {
+    // Unlike a foreign key's name or a check's, which are scoped to the schema.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE S1 (a INT, INDEX i (a))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE S2 (a INT, INDEX i (a))",
+    );
+    run(&engine, &mut session, "CREATE TABLE S3 (a INT)");
+    run(&engine, &mut session, "CREATE INDEX i ON S3 (a)");
+
+    assert_eq!(index_names(&engine, &mut session, "S1"), vec!["i"]);
+    assert_eq!(index_names(&engine, &mut session, "S2"), vec!["i"]);
+    assert_eq!(index_names(&engine, &mut session, "S3"), vec!["i"]);
+}
+
+#[test]
+fn altering_a_table_into_a_duplicate_index_name_is_refused() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE A1 (a INT NOT NULL, b INT NOT NULL, INDEX i (a))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE A2 (id INT NOT NULL, PRIMARY KEY (id))",
+    );
+
+    duplicate_key(&engine, &mut session, "ALTER TABLE A1 ADD INDEX i (b)", "i");
+    duplicate_key(
+        &engine,
+        &mut session,
+        "ALTER TABLE A1 ADD UNIQUE INDEX i (b)",
+        "i",
+    );
+    duplicate_key(
+        &engine,
+        &mut session,
+        "ALTER TABLE A1 ADD CONSTRAINT i UNIQUE (b)",
+        "i",
+    );
+    // The foreign key's implicit index is what collides, which is why this is
+    // 1061 and not the 1826 a constraint name reused across tables gets.
+    duplicate_key(
+        &engine,
+        &mut session,
+        "ALTER TABLE A1 ADD CONSTRAINT i FOREIGN KEY (b) REFERENCES A2(id)",
+        "i",
+    );
+    // Two operations in one statement, the second colliding with the first:
+    // the whole ALTER is refused rather than half applied.
+    duplicate_key(
+        &engine,
+        &mut session,
+        "ALTER TABLE A1 ADD INDEX j (a), ADD INDEX j (b)",
+        "j",
+    );
+    assert_eq!(index_names(&engine, &mut session, "A1"), vec!["i"]);
+
+    // Dropping the name in the same statement frees it, which 8.3 accepts —
+    // under either spelling, since the drop matches the name the way the
+    // duplicate check does.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE A1 DROP INDEX i, ADD INDEX i (b)",
+    );
+    assert_eq!(index_names(&engine, &mut session, "A1"), vec!["i"]);
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE A1 DROP INDEX I, ADD INDEX i (a)",
+    );
+    assert_eq!(index_names(&engine, &mut session, "A1"), vec!["i"]);
+}
+
+#[test]
+fn a_named_primary_key_constraint_still_calls_its_index_primary() {
+    // 8.3 does not keep a primary key's constraint name: the index is
+    // `PRIMARY`, and `DROP CONSTRAINT mypk` afterwards is 3940. Storing it
+    // under `mypk` instead put the key in the name space of ordinary indexes,
+    // where `DROP INDEX mypk` would have taken it away with them.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE PK (a INT NOT NULL, b INT, CONSTRAINT mypk PRIMARY KEY (a), \
+         INDEX mypk (b))",
+    );
+    let mut names = index_names(&engine, &mut session, "PK");
+    names.sort();
+    assert_eq!(names, vec!["PRIMARY", "mypk"]);
+
+    run(&engine, &mut session, "ALTER TABLE PK DROP INDEX mypk");
+    assert_eq!(index_names(&engine, &mut session, "PK"), vec!["PRIMARY"]);
+
+    // The key is still enforced, which is the part a shared name cost.
+    run(&engine, &mut session, "INSERT INTO PK VALUES (1, 1)");
+    let err = fails(&engine, &mut session, "INSERT INTO PK VALUES (1, 2)");
+    assert_eq!(err.code, 1062);
+}
+
+#[test]
+fn a_foreign_key_covered_by_an_existing_index_may_reuse_its_name() {
+    // 8.3 creates no index for a foreign key whose columns an index already
+    // covers, so there is no name to collide: the refusal belongs on the index
+    // and not on the constraint.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE F0 (id INT NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE F1 (a INT NOT NULL, b INT NOT NULL, INDEX b (b), INDEX fk9 (a))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE F1 ADD CONSTRAINT fk9 FOREIGN KEY (b) REFERENCES F0(id)",
+    );
+
+    let mut names = index_names(&engine, &mut session, "F1");
+    names.sort();
+    assert_eq!(names, vec!["b", "fk9"]);
+}
+
+#[test]
+fn an_unnamed_index_is_named_after_its_first_column() {
+    let (engine, mut session) = engine();
+    // The first column and not all of them joined, and a name already taken
+    // gets `_2`, `_3` … until one is free.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N1 (a INT, b INT, INDEX (a, b), INDEX (a), INDEX (a))",
+    );
+    assert_eq!(
+        index_names(&engine, &mut session, "N1"),
+        vec!["a", "a_2", "a_3"]
+    );
+
+    // The suffix counts candidates rather than indexes, so an explicit name
+    // holding one of them is skipped over.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N2 (a INT, b INT, INDEX a_2 (b), INDEX (a), INDEX (a))",
+    );
+    assert_eq!(
+        index_names(&engine, &mut session, "N2"),
+        vec!["a_2", "a", "a_3"]
+    );
+
+    // An auto-generated name shares the name space with an explicit one, so
+    // the two colliding is 1061.
+    duplicate_key(
+        &engine,
+        &mut session,
+        "CREATE TABLE N3 (a INT, b INT, INDEX (a, b), INDEX a (b))",
+        "a",
+    );
+
+    // A column-level UNIQUE is created before the table-level constraints, so
+    // it is the one that gets the plain name.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N4 (a INT UNIQUE, INDEX (a))",
+    );
+    let unique = rows(
+        &engine,
+        &mut session,
+        "SELECT INDEX_NAME, NON_UNIQUE FROM information_schema.statistics \
+         WHERE TABLE_NAME = 'N4'",
+    );
+    assert_eq!(unique, vec![vec!["a", "0"], vec!["a_2", "1"]]);
+}
+
+#[test]
+fn a_row_that_violates_several_keys_reports_the_primary_one() {
+    // The order the keys are walked in is observable, and creating a
+    // column-level UNIQUE index where none used to exist made it reachable.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE K1 (a INT NOT NULL, UNIQUE ua (a), PRIMARY KEY (a))",
+    );
+    run(&engine, &mut session, "INSERT INTO K1 VALUES (1)");
+    let err = fails(&engine, &mut session, "INSERT INTO K1 VALUES (1)");
+    assert_eq!(err.code, 1062);
+    assert_eq!(err.message, "Duplicate entry '1' for key 'PRIMARY'");
+
+    // Two secondary keys report whichever was declared first.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE K2 (a INT NOT NULL, b INT NOT NULL, UNIQUE ub (b), UNIQUE uc (a))",
+    );
+    run(&engine, &mut session, "INSERT INTO K2 VALUES (1, 1)");
+    let err = fails(&engine, &mut session, "INSERT INTO K2 VALUES (1, 1)");
+    assert_eq!(err.message, "Duplicate entry '1' for key 'ub'");
+}

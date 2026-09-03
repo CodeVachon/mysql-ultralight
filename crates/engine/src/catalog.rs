@@ -124,24 +124,15 @@ impl Table {
         self.columns.iter().filter(|c| c.primary_key).collect()
     }
 
-    /// Checks a candidate row against unique and primary key constraints.
-    ///
-    /// `skip` excludes a row from the check, so an UPDATE does not collide
-    /// with the row it is updating.
     /// The row a candidate would collide with, if any.
     ///
     /// `ON DUPLICATE KEY UPDATE` needs the row itself rather than the error,
     /// because it updates that row instead of failing. The primary key is
-    /// checked first, as MySQL does: a candidate colliding on both the primary
-    /// and a secondary key updates the row the primary key names.
+    /// checked first, as MySQL does — see `keys` — so a candidate colliding on
+    /// both the primary and a secondary key updates the row the primary key
+    /// names.
     pub fn conflicting_row(&self, candidate: &[Value]) -> Option<usize> {
-        let by_priority = self
-            .indexes
-            .iter()
-            .filter(|i| i.primary)
-            .chain(self.indexes.iter().filter(|i| i.unique && !i.primary));
-
-        for index in by_priority {
+        for index in self.keys() {
             let positions: Vec<usize> = index
                 .columns
                 .iter()
@@ -173,12 +164,26 @@ impl Table {
         None
     }
 
+    /// The keys a row is checked against, primary one first.
+    ///
+    /// The order matters because a row that violates several of them reports
+    /// only the first, and MySQL reports the primary key wherever it was
+    /// declared: measured on 8.3, `UNIQUE ub (b), PRIMARY KEY (a)` names
+    /// `PRIMARY` and not `ub`, while two secondary keys name whichever was
+    /// declared first.
+    fn keys(&self) -> impl Iterator<Item = &Index> {
+        self.indexes
+            .iter()
+            .filter(|i| i.primary)
+            .chain(self.indexes.iter().filter(|i| i.unique && !i.primary))
+    }
+
     /// Refuses a candidate row that would duplicate a unique or primary key.
     ///
     /// `skip` excludes one row, which is what an UPDATE needs: a row does not
     /// collide with itself.
     pub fn check_unique(&self, candidate: &[Value], skip: Option<usize>) -> EngineResult<()> {
-        for index in self.indexes.iter().filter(|i| i.unique || i.primary) {
+        for index in self.keys() {
             let positions: Vec<usize> = index
                 .columns
                 .iter()

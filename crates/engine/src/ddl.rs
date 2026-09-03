@@ -132,13 +132,27 @@ pub fn create_table(
         }
     }
 
-    for constraint in &create.constraints {
-        apply_constraint(&mut table, constraint)?;
-    }
-
     // A column-level UNIQUE needs a real index entry, not just the metadata
     // flag: uniqueness is enforced by walking the indexes, so without one the
     // column reports UNI in information_schema while admitting duplicates.
+    //
+    // Before the table-level constraints, because the order is what decides
+    // which of two colliding names gets the plain one: `(a INT UNIQUE, INDEX
+    // (a))` on 8.3 is a unique `a` beside a non-unique `a_2`, and this loop
+    // running second would have swapped them. It is also what makes
+    // `(a INT UNIQUE, INDEX a (b))` the 1061 it is on 8.3 rather than an `a`
+    // and an `a_2`, which is the whole point of getting the order right.
+    //
+    // 8.3 follows the statement's own order, and a table constraint may be
+    // written before a column — `(INDEX (a), a INT UNIQUE)` is legal there and
+    // names them the other way round. The parse hands columns and constraints
+    // over as two lists with the interleaving gone, so the order they were
+    // written in is not recoverable here; columns first is the spelling
+    // everything writes.
+    //
+    // The `unique` flag can only have come from a column option here, since
+    // `TableConstraint::Unique` has not run yet — which is why this no longer
+    // has to guess whether a table-level UNIQUE already covered the column.
     for name in table
         .columns
         .iter()
@@ -146,18 +160,20 @@ pub fn create_table(
         .map(|c| c.name.clone())
         .collect::<Vec<_>>()
     {
-        if !table
-            .indexes
-            .iter()
-            .any(|i| i.unique && i.columns == [name.clone()])
-        {
-            table.indexes.push(Index {
-                name: name.clone(),
+        let index_name = auto_index_name(&table, std::slice::from_ref(&name));
+        add_index(
+            &mut table,
+            Index {
+                name: index_name,
                 columns: vec![name],
                 unique: true,
                 primary: false,
-            });
-        }
+            },
+        )?;
+    }
+
+    for constraint in &create.constraints {
+        apply_constraint(&mut table, constraint)?;
     }
 
     // A column-level PRIMARY KEY needs the same index entry a table-level one
@@ -169,12 +185,15 @@ pub fn create_table(
         .map(|c| c.name.clone())
         .collect();
     if !inline_pk.is_empty() && !table.indexes.iter().any(|i| i.primary) {
-        table.indexes.push(Index {
-            name: "PRIMARY".to_owned(),
-            columns: inline_pk,
-            unique: true,
-            primary: true,
-        });
+        add_index(
+            &mut table,
+            Index {
+                name: "PRIMARY".to_owned(),
+                columns: inline_pk,
+                unique: true,
+                primary: true,
+            },
+        )?;
     }
 
     // The first AUTO_INCREMENT value the rows generated, which is what
@@ -609,29 +628,97 @@ fn build_column_with_checks(
     Ok(column)
 }
 
+/// Whether `table` already carries an index under `name`.
+///
+/// Case-insensitive, as MySQL compares them: `INDEX i (a), INDEX I (a)` is a
+/// duplicate on 8.3.
+///
+/// The primary key is not in this name space. MySQL calls its index `PRIMARY`
+/// whatever the constraint was named, refuses a second one with 1068
+/// `Multiple primary key defined` rather than 1061, and refuses an index
+/// explicitly named `PRIMARY` with 1280 `Incorrect index name` — three answers
+/// this engine does not give yet, and folding them into this one would trade
+/// an accepted statement for a wrongly numbered refusal.
+fn index_name_taken(table: &Table, name: &str) -> bool {
+    table
+        .indexes
+        .iter()
+        .any(|i| !i.primary && i.name.eq_ignore_ascii_case(name))
+}
+
+/// Adds an index, refusing a name the table already carries.
+///
+/// An index name is scoped to its table, so the same name on two tables is
+/// legal and nothing outside `table` is consulted. Measured on 8.3, where 1061
+/// is the answer for a duplicate inside one CREATE TABLE, for a second CREATE
+/// INDEX, and for ALTER TABLE ADD INDEX and ADD CONSTRAINT alike — including
+/// the index a foreign key creates for itself, which is why
+/// `ADD CONSTRAINT c FOREIGN KEY` reports 1061 and not the 1826 a constraint
+/// name reused across *tables* gets.
+fn add_index(table: &mut Table, index: Index) -> EngineResult<()> {
+    if !index.primary && index_name_taken(table, &index.name) {
+        return Err(EngineError::duplicate_key_name(&index.name));
+    }
+    table.indexes.push(index);
+    Ok(())
+}
+
+/// The name MySQL gives an index the statement did not name.
+///
+/// The first column, and then `_2`, `_3` … until one is free. The suffix
+/// counts candidates rather than indexes, so an explicit name already holding
+/// one of them is skipped over: measured on 8.3,
+/// `INDEX a_2 (b), INDEX (a), INDEX (a)` names them `a_2`, `a` and `a_3`.
+///
+/// The first column alone, not all of them joined: `INDEX (a, b)` is `a` there.
+/// The difference is not cosmetic now that the name decides what collides —
+/// `INDEX (a, b), INDEX a (b)` is 1061 on 8.3.
+fn auto_index_name(table: &Table, columns: &[String]) -> String {
+    let base = columns.first().cloned().unwrap_or_default();
+    if !index_name_taken(table, &base) {
+        return base;
+    }
+    // Terminates: the table holds finitely many indexes, so some suffix is free.
+    let mut suffix = 2u32;
+    loop {
+        let candidate = format!("{base}_{suffix}");
+        if !index_name_taken(table, &candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
 fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineResult<()> {
     for written in constraint_names(constraint) {
         name::check_identifier(&written.value)?;
     }
     match constraint {
         TableConstraint::PrimaryKey(pk) => {
-            let (columns, name) = (&pk.columns, &pk.name);
-            let names = index_column_names(columns);
+            let names = index_column_names(&pk.columns);
             for column in &mut table.columns {
                 if names.iter().any(|n| n.eq_ignore_ascii_case(&column.name)) {
                     column.primary_key = true;
                     column.nullable = false;
                 }
             }
-            table.indexes.push(Index {
-                name: name
-                    .as_ref()
-                    .map(|n| n.value.clone())
-                    .unwrap_or_else(|| "PRIMARY".to_owned()),
-                columns: names,
-                unique: true,
-                primary: true,
-            });
+            // `PRIMARY`, and never `pk.name`. MySQL does not keep a primary
+            // key's constraint name at all: `CONSTRAINT mypk PRIMARY KEY (a)`
+            // reports its index as `PRIMARY` on 8.3, and
+            // `DROP CONSTRAINT mypk` afterwards is 3940 `Constraint 'mypk'
+            // does not exist.` Storing it under `mypk` put the key in the name
+            // space of ordinary indexes, where an `INDEX mypk (b)` beside it
+            // was accepted — as it is on 8.3, whose key is not called that —
+            // and a later `DROP INDEX mypk` then took the primary key with it.
+            add_index(
+                table,
+                Index {
+                    name: "PRIMARY".to_owned(),
+                    columns: names,
+                    unique: true,
+                    primary: true,
+                },
+            )?;
         }
         TableConstraint::Unique(unique) => {
             let (columns, name) = (&unique.columns, &unique.name);
@@ -650,29 +737,37 @@ fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineRe
             // in `index_name`. Reading only the first left every inline unique
             // index stored under an invented name, which DROP INDEX and
             // information_schema then could not find.
-            table.indexes.push(Index {
-                name: name
-                    .as_ref()
-                    .or(unique.index_name.as_ref())
-                    .map(|n| n.value.clone())
-                    .unwrap_or_else(|| names.join("_")),
-                columns: names,
-                unique: true,
-                primary: false,
-            });
+            let index_name = name
+                .as_ref()
+                .or(unique.index_name.as_ref())
+                .map(|n| n.value.clone())
+                .unwrap_or_else(|| auto_index_name(table, &names));
+            add_index(
+                table,
+                Index {
+                    name: index_name,
+                    columns: names,
+                    unique: true,
+                    primary: false,
+                },
+            )?;
         }
         TableConstraint::Index(index) => {
             let (columns, name) = (&index.columns, &index.name);
             let names = index_column_names(columns);
-            table.indexes.push(Index {
-                name: name
-                    .as_ref()
-                    .map(|n| n.value.clone())
-                    .unwrap_or_else(|| names.join("_")),
-                columns: names,
-                unique: false,
-                primary: false,
-            });
+            let index_name = name
+                .as_ref()
+                .map(|n| n.value.clone())
+                .unwrap_or_else(|| auto_index_name(table, &names));
+            add_index(
+                table,
+                Index {
+                    name: index_name,
+                    columns: names,
+                    unique: false,
+                    primary: false,
+                },
+            )?;
         }
         TableConstraint::ForeignKey(fk) => {
             let (name, columns, foreign_table, referred_columns, on_delete, on_update) = (
@@ -701,13 +796,22 @@ fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineRe
                 .indexes
                 .iter()
                 .any(|i| i.columns.starts_with(key_columns.as_slice()));
+            // The name is checked only where an index is actually created:
+            // measured on 8.3, a foreign key whose columns an existing index
+            // already covers takes no index of its own and so may reuse that
+            // index's name — `INDEX b (b), INDEX fk9 (a)` accepts
+            // `ADD CONSTRAINT fk9 FOREIGN KEY (b)`, while the same statement
+            // against an uncovered column is 1061.
             if !covered {
-                table.indexes.push(Index {
-                    name: constraint_name.clone(),
-                    columns: key_columns.clone(),
-                    unique: false,
-                    primary: false,
-                });
+                add_index(
+                    table,
+                    Index {
+                        name: constraint_name.clone(),
+                        columns: key_columns.clone(),
+                        unique: false,
+                        primary: false,
+                    },
+                )?;
             }
 
             table.foreign_keys.push(ForeignKey {
@@ -1005,12 +1109,27 @@ pub fn alter_table(
             AlterTableOperation::AddConstraint { constraint, .. } => {
                 apply_constraint(table, constraint)?
             }
+            // The three drops below and the rename under them match the name
+            // case-insensitively, as every other identifier comparison here
+            // does and as MySQL does: `DROP INDEX IX` drops `ix` on 8.3.
+            // Matching exactly made a drop under another spelling a silent
+            // no-op, which the duplicate-name check turned into a refusal —
+            // `DROP INDEX I, ADD INDEX i (a)` dropped nothing and then
+            // collided with what it had failed to remove. Reporting the name
+            // that matches nothing at all is 1091 on 8.3 and still missing
+            // here; that is its own gap.
             AlterTableOperation::DropConstraint { name, .. } => {
-                table.indexes.retain(|i| i.name != name.value);
-                table.foreign_keys.retain(|f| f.name != name.value);
+                table
+                    .indexes
+                    .retain(|i| !i.name.eq_ignore_ascii_case(&name.value));
+                table
+                    .foreign_keys
+                    .retain(|f| !f.name.eq_ignore_ascii_case(&name.value));
             }
             AlterTableOperation::DropForeignKey { name, .. } => {
-                table.foreign_keys.retain(|f| f.name != name.value);
+                table
+                    .foreign_keys
+                    .retain(|f| !f.name.eq_ignore_ascii_case(&name.value));
             }
             AlterTableOperation::DropPrimaryKey { .. } => {
                 table.indexes.retain(|i| !i.primary);
@@ -1019,19 +1138,25 @@ pub fn alter_table(
                 }
             }
             AlterTableOperation::DropIndex { name } => {
-                table.indexes.retain(|i| i.name != name.value);
+                table
+                    .indexes
+                    .retain(|i| !i.name.eq_ignore_ascii_case(&name.value));
             }
             // sqlparser has no ALTER TABLE ... RENAME INDEX, which is one of
             // the five parser gaps the conformance survey found. Renaming a
             // constraint is the form it does parse.
             AlterTableOperation::RenameConstraint { old_name, new_name } => {
-                if let Some(index) = table.indexes.iter_mut().find(|i| i.name == old_name.value) {
+                if let Some(index) = table
+                    .indexes
+                    .iter_mut()
+                    .find(|i| i.name.eq_ignore_ascii_case(&old_name.value))
+                {
                     index.name = new_name.value.clone();
                 }
                 if let Some(fk) = table
                     .foreign_keys
                     .iter_mut()
-                    .find(|f| f.name == old_name.value)
+                    .find(|f| f.name.eq_ignore_ascii_case(&old_name.value))
                 {
                     fk.name = new_name.value.clone();
                 }
@@ -1139,7 +1264,7 @@ pub fn create_index(
         .map(name::dotted)
         .unwrap_or_else(|| format!("{table_name}_idx"));
 
-    if create.if_not_exists && table.indexes.iter().any(|i| i.name == name) {
+    if create.if_not_exists && index_name_taken(table, &name) {
         return Ok(Outcome::ok());
     }
 
@@ -1150,6 +1275,16 @@ pub fn create_index(
         unique: create.unique,
         primary: false,
     };
+
+    // Before the data is walked, which is the order 8.3 answers in: a
+    // `CREATE UNIQUE INDEX` under a name the table already carries, over a
+    // column that already holds duplicates, is 1061 there and not the 1062 the
+    // rows would raise. A duplicate name also beats a column that does not
+    // exist at all, so nothing about what the index covers can be the first
+    // answer.
+    if index_name_taken(table, &index.name) {
+        return Err(EngineError::duplicate_key_name(&index.name));
+    }
 
     // A unique index over data that already violates it would leave the table
     // permanently inconsistent with its own constraint.
@@ -1163,6 +1298,9 @@ pub fn create_index(
         }
     }
 
-    table.indexes.push(index);
+    // Through `add_index`, whose check the statement has already passed, so
+    // that it stays the only place an index is appended: a name invented
+    // between here and there would otherwise reach the table unchecked.
+    add_index(table, index)?;
     Ok(Outcome::ok())
 }

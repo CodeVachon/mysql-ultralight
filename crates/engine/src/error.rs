@@ -182,6 +182,17 @@ impl EngineError {
         )
     }
 
+    /// ER_DUP_KEYNAME.
+    ///
+    /// An index name is scoped to its table — the same name on two tables is
+    /// legal, unlike a foreign key's or a check's, which are scoped to the
+    /// schema and refused with 1826 and 3822 instead. `name` is spelled as the
+    /// statement wrote it rather than as the table stored it: on 8.3,
+    /// `INDEX i (a), INDEX I (a)` reports `Duplicate key name 'I'`.
+    pub fn duplicate_key_name(name: &str) -> Self {
+        Self::new(1061, "42000", format!("Duplicate key name '{name}'"))
+    }
+
     /// ER_BAD_NULL_ERROR.
     pub fn null_not_allowed(column: &str) -> Self {
         Self::new(1048, "23000", format!("Column '{column}' cannot be null"))
