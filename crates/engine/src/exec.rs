@@ -3702,9 +3702,29 @@ impl Engine {
         };
 
         let mut inserted = 0u64;
-        let mut last_id = 0u64;
+        // The *first* id the statement generated, which is what MySQL reports
+        // — measured on 8.3, where a three-row insert into an empty
+        // AUTO_INCREMENT table answers `LAST_INSERT_ID()` with 1 and not 3, and
+        // the same for a two-row `INSERT ... SELECT`. This had been the last
+        // one, which put the engine at odds with its own CTAS path: #0125 gave
+        // `fill_new_table` the first-id rule and deliberately left INSERT
+        // alone, so the two disagreed with each other. #0132.
+        //
+        // Zero is the "nothing generated" sentinel rather than an `Option`,
+        // because it is also the value the OK packet carries in that case;
+        // `assign_auto_increment` counts from one and can never produce it.
+        let mut first_id = 0u64;
 
-        for values in &source_rows {
+        // The two things 8.3 settles about the *statement* before it writes
+        // anything, rather than about a row as it reaches one. Measured: an
+        // insert whose second value list is the wrong length, or whose second
+        // value list writes to a generated column, stores nothing and leaves
+        // `LAST_INSERT_ID()` exactly as it found it — where a row refused
+        // during execution (a value the column cannot take, a NOT NULL, a
+        // duplicate key) does report the id the rows before it were given.
+        // Left in the row loop, they consumed a counter value and reported an
+        // id on the way to failing.
+        for (n, values) in source_rows.iter().enumerate() {
             // MySQL rejects a row whose value count does not match the column
             // list. Truncating instead stores corrupt data for a client bug
             // that would have failed loudly against the real server.
@@ -3712,168 +3732,193 @@ impl Engine {
                 return Err(EngineError::new(
                     1136,
                     "21S01",
-                    format!(
-                        "Column count doesn't match value count at row {}",
-                        inserted + 1
-                    ),
+                    format!("Column count doesn't match value count at row {}", n + 1),
                 ));
             }
-
-            let ctx = Context::rowless(&session_snapshot).with_executor(self);
-            let mut row = default_row(table, &ctx)?;
-
             for (slot, source) in targets.iter().zip(values.iter()) {
-                if table.columns[*slot].generated.is_some() {
-                    // DEFAULT and NULL are the only values MySQL accepts in a
-                    // generated column's position.
-                    let permitted = match source {
-                        SourceValue::Expr(e) => match e.as_ref() {
-                            Expr::Identifier(i) => i.value.eq_ignore_ascii_case("default"),
-                            Expr::Value(v) => matches!(v.value, sqlparser::ast::Value::Null),
-                            _ => false,
-                        },
-                        SourceValue::Value(v) => v.is_null(),
-                    };
-                    if !permitted {
-                        return Err(EngineError::new(
-                            3105,
-                            "HY000",
-                            format!(
-                                "The value specified for generated column '{}' in table '{}' \
-                                 is not allowed.",
-                                table.columns[*slot].name, table.name
-                            ),
-                        ));
-                    }
-                    continue;
+                let column = &table.columns[*slot];
+                if column.generated.is_some() && !writes_nothing(source) {
+                    return Err(EngineError::new(
+                        3105,
+                        "HY000",
+                        format!(
+                            "The value specified for generated column '{}' in table '{}' \
+                             is not allowed.",
+                            column.name, table.name
+                        ),
+                    ));
                 }
-                // DEFAULT in a VALUES list keeps the column's default.
-                if matches!(source, SourceValue::Expr(e)
+            }
+        }
+
+        // Immediately invoked so that a row refused halfway through still
+        // reaches the two lines below it: 8.3 keeps the id a statement
+        // generated even when a later row makes it store nothing, and a `?`
+        // out of the middle of a loop cannot run anything on its way past.
+        // The borrows it takes end at the semicolon, which is what gives
+        // `session` and `working` back.
+        let stored = (|| -> EngineResult<()> {
+            for values in &source_rows {
+                let ctx = Context::rowless(&session_snapshot).with_executor(self);
+                let mut row = default_row(table, &ctx)?;
+
+                for (slot, source) in targets.iter().zip(values.iter()) {
+                    if table.columns[*slot].generated.is_some() {
+                        // Anything that writes a value here was refused above, and
+                        // what is left keeps the expression's own answer.
+                        continue;
+                    }
+                    // DEFAULT in a VALUES list keeps the column's default.
+                    if matches!(source, SourceValue::Expr(e)
                     if matches!(e.as_ref(), Expr::Identifier(i)
                         if i.value.eq_ignore_ascii_case("default")))
-                {
-                    continue;
+                    {
+                        continue;
+                    }
+                    let value = match source {
+                        SourceValue::Expr(e) => expr::eval(e, &ctx)?,
+                        SourceValue::Value(v) => v.clone(),
+                    };
+                    let column = &table.columns[*slot];
+                    row[*slot] = column.ty.coerce(value, &column.name)?;
                 }
-                let value = match source {
-                    SourceValue::Expr(e) => expr::eval(e, &ctx)?,
-                    SourceValue::Value(v) => v.clone(),
-                };
-                let column = &table.columns[*slot];
-                row[*slot] = column.ty.coerce(value, &column.name)?;
-            }
 
-            let generated_id = assign_auto_increment(table, &mut row)?;
+                let generated_id = assign_auto_increment(table, &mut row)?;
 
-            // IGNORE downgrades a strict-mode error to a warning, so a NOT
-            // NULL column left out of the statement takes its type's implicit
-            // default rather than failing. The real migrations rely on this:
-            // they omit `NOT NULL` columns that have no DEFAULT.
-            if ignore {
-                for (slot, column) in table.columns.iter().enumerate() {
-                    if !column.nullable && row[slot].is_null() && column.generated.is_none() {
-                        row[slot] = column.ty.implicit_default();
+                // IGNORE downgrades a strict-mode error to a warning, so a NOT
+                // NULL column left out of the statement takes its type's implicit
+                // default rather than failing. The real migrations rely on this:
+                // they omit `NOT NULL` columns that have no DEFAULT.
+                if ignore {
+                    for (slot, column) in table.columns.iter().enumerate() {
+                        if !column.nullable && row[slot].is_null() && column.generated.is_none() {
+                            row[slot] = column.ty.implicit_default();
+                        }
                     }
                 }
-            }
 
-            // Generated columns, NOT NULL and CHECK are all validated here, on
-            // the same path UPDATE uses.
-            let row = self.finalise_row(table, row, &session_snapshot)?;
+                // Generated columns, NOT NULL and CHECK are all validated here, on
+                // the same path UPDATE uses.
+                let row = self.finalise_row(table, row, &session_snapshot)?;
 
-            // `ON DUPLICATE KEY UPDATE` turns a collision into an update of
-            // the row that was already there, rather than an error. Checked
-            // before the constraints below, because a collision is the
-            // expected case for it rather than a failure.
-            if let Some(assignments) = duplicate_key_update {
-                if let Some(existing) = table.conflicting_row(&row) {
-                    let before = table.rows[existing].clone();
-                    let mut updated = before.clone();
-                    let updated_refs: Vec<ColumnRef> = table
-                        .columns
-                        .iter()
-                        .map(|c| ColumnRef::in_database(&db, &table.name, &c.name))
-                        .collect();
+                // `ON DUPLICATE KEY UPDATE` turns a collision into an update of
+                // the row that was already there, rather than an error. Checked
+                // before the constraints below, because a collision is the
+                // expected case for it rather than a failure.
+                if let Some(assignments) = duplicate_key_update {
+                    if let Some(existing) = table.conflicting_row(&row) {
+                        let before = table.rows[existing].clone();
+                        let mut updated = before.clone();
+                        let updated_refs: Vec<ColumnRef> = table
+                            .columns
+                            .iter()
+                            .map(|c| ColumnRef::in_database(&db, &table.name, &c.name))
+                            .collect();
 
-                    for (assignment, slot) in assignments.iter().zip(&duplicate_targets) {
-                        let slot = *slot;
-                        let column_name = table.columns[slot].name.clone();
-                        // The right-hand side sees the row as it stands, which
-                        // is what `c = c + 1` means here — while `VALUES(c)`
-                        // names the value the insert would have written, which
-                        // is the ordinary way to spell an upsert.
-                        let ctx = Context {
-                            row: Some(Row {
-                                schema: &updated_refs,
-                                values: &updated,
-                            }),
-                            session: &session_snapshot,
-                            executor: Some(self),
-                        };
-                        let value = match values_reference(&assignment.value) {
-                            Some(referenced) => {
-                                let from = table.column_index(&referenced).ok_or_else(|| {
-                                    EngineError::unknown_column(&referenced, "field list")
-                                })?;
-                                row[from].clone()
-                            }
-                            None => expr::eval(&assignment.value, &ctx)?,
-                        };
-                        updated[slot] = table.columns[slot].ty.coerce(value, &column_name)?;
+                        for (assignment, slot) in assignments.iter().zip(&duplicate_targets) {
+                            let slot = *slot;
+                            let column_name = table.columns[slot].name.clone();
+                            // The right-hand side sees the row as it stands, which
+                            // is what `c = c + 1` means here — while `VALUES(c)`
+                            // names the value the insert would have written, which
+                            // is the ordinary way to spell an upsert.
+                            let ctx = Context {
+                                row: Some(Row {
+                                    schema: &updated_refs,
+                                    values: &updated,
+                                }),
+                                session: &session_snapshot,
+                                executor: Some(self),
+                            };
+                            let value = match values_reference(&assignment.value) {
+                                Some(referenced) => {
+                                    let from =
+                                        table.column_index(&referenced).ok_or_else(|| {
+                                            EngineError::unknown_column(&referenced, "field list")
+                                        })?;
+                                    row[from].clone()
+                                }
+                                None => expr::eval(&assignment.value, &ctx)?,
+                            };
+                            updated[slot] = table.columns[slot].ty.coerce(value, &column_name)?;
+                        }
+
+                        let updated = self.finalise_row(table, updated, &session_snapshot)?;
+                        foreign_keys::check(&fk_parents, &updated, &table_name)?;
+                        // Against the table's own rows, skipping the one being
+                        // updated — cloning them here would copy the whole table
+                        // once per conflicting row of a multi-row insert.
+                        table.check_unique(&updated, Some(existing))?;
+
+                        // MySQL reports two affected rows for a row it updated this
+                        // way, and one for a row it inserted.
+                        if updated != before {
+                            table.rows[existing] = updated;
+                            inserted += 2;
+                        }
+                        continue;
                     }
-
-                    let updated = self.finalise_row(table, updated, &session_snapshot)?;
-                    foreign_keys::check(&fk_parents, &updated, &table_name)?;
-                    // Against the table's own rows, skipping the one being
-                    // updated — cloning them here would copy the whole table
-                    // once per conflicting row of a multi-row insert.
-                    table.check_unique(&updated, Some(existing))?;
-
-                    // MySQL reports two affected rows for a row it updated this
-                    // way, and one for a row it inserted.
-                    if updated != before {
-                        table.rows[existing] = updated;
-                        inserted += 2;
-                    }
-                    continue;
                 }
-            }
 
-            // IGNORE covers a foreign key violation as well as a duplicate
-            // key; MySQL downgrades both to a warning and skips the row.
-            let admissible = foreign_keys::check(&fk_parents, &row, &table_name)
-                .and_then(|()| table.check_unique(&row, None));
-            match admissible {
-                Ok(()) => {}
-                Err(_) if ignore => continue,
-                Err(e) => return Err(e),
-            }
+                // IGNORE covers a foreign key violation as well as a duplicate
+                // key; MySQL downgrades both to a warning and skips the row.
+                let admissible = foreign_keys::check(&fk_parents, &row, &table_name)
+                    .and_then(|()| table.check_unique(&row, None));
+                match admissible {
+                    Ok(()) => {}
+                    Err(_) if ignore => continue,
+                    Err(e) => return Err(e),
+                }
 
-            // A self-referencing constraint must see this row when the next
-            // one in the same statement is checked.
-            for parent in &mut fk_parents {
-                parent.note_inserted(&row);
-            }
+                // A self-referencing constraint must see this row when the next
+                // one in the same statement is checked.
+                for parent in &mut fk_parents {
+                    parent.note_inserted(&row);
+                }
 
-            table.rows.push(row);
-            if let Some(id) = generated_id {
-                last_id = id;
+                table.rows.push(row);
+                // After the row is stored, so a row the statement did not keep
+                // does not report an id: an `INSERT IGNORE` whose first row
+                // collides answers with the id of the first row it actually
+                // inserted, and an `ON DUPLICATE KEY UPDATE` that only updated
+                // reports nothing at all. Both measured on 8.3.
+                if let Some(id) = generated_id {
+                    if first_id == 0 {
+                        first_id = id;
+                    }
+                }
+                inserted += 1;
             }
-            inserted += 1;
+            Ok(())
+        })();
+
+        // Reported even though nothing was stored, and measured that way:
+        // `INSERT INTO F (k) VALUES (2), (1), (3)` against a unique `k`
+        // already holding 1 answers 1062, leaves the table as it was, and
+        // still answers `LAST_INSERT_ID()` with the id row one was given. A
+        // ROLLBACK does not take it back either.
+        if let Err(e) = stored {
+            if first_id != 0 {
+                session.last_insert_id = first_id;
+            }
+            return Err(e);
         }
 
         self.commit_database(&db, working)?;
         mark_modified(session, &db, std::slice::from_ref(&table_name));
-        // `LAST_INSERT_ID()` keeps its previous value when a statement
-        // generated none — an upsert that updated rather than inserted has no
-        // id to report, but it has not erased the one before it either. The
-        // OK packet still carries 0, which is what MySQL sends.
-        if last_id != 0 {
-            session.last_insert_id = last_id;
-        }
         session.affected_rows = inserted;
+        // After the commit, so an engine that could not store the rows does
+        // not report an id for them. The session is left alone when the
+        // statement generated no id at all — an upsert that updated rather
+        // than inserted, or an insert that supplied every id itself, has none
+        // to report but has not erased the one before it either. The OK packet
+        // still carries 0, which is what MySQL sends.
+        if first_id != 0 {
+            session.last_insert_id = first_id;
+        }
         Ok(Outcome::Affected {
             rows: inserted,
-            last_insert_id: last_id,
+            last_insert_id: first_id,
         })
     }
 
@@ -5616,6 +5661,21 @@ enum SourceValue {
     // and every value of every inserted row is one of these.
     Expr(Box<Expr>),
     Value(Value),
+}
+
+/// Whether a value list leaves this column to work itself out.
+///
+/// DEFAULT and NULL are the only two things MySQL accepts in a generated
+/// column's position, and both mean "compute it"; anything else is 3105.
+fn writes_nothing(source: &SourceValue) -> bool {
+    match source {
+        SourceValue::Expr(e) => match e.as_ref() {
+            Expr::Identifier(i) => i.value.eq_ignore_ascii_case("default"),
+            Expr::Value(v) => matches!(v.value, sqlparser::ast::Value::Null),
+            _ => false,
+        },
+        SourceValue::Value(v) => v.is_null(),
+    }
 }
 
 /// Names the file and what was being done to it.

@@ -7025,6 +7025,395 @@ fn an_upsert_reports_no_insert_id_and_takes_the_values_it_would_have_written() {
     );
 }
 
+/// The id `LAST_INSERT_ID()` and the OK packet report for a statement that
+/// generated several.
+///
+/// MySQL answers with the *first* of them, which is what lets a client that
+/// inserted a batch work out the whole range it was given. Every number below
+/// was measured against 8.3.
+///
+/// This engine answered with the last until #0132, which put it at odds with
+/// its own `CREATE TABLE ... AS SELECT`: #0125 gave that path the first-id rule
+/// and deliberately left INSERT alone, so the two disagreed with each other.
+#[test]
+fn an_insert_reports_the_first_id_it_generated_and_not_the_last() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Batch (id INTEGER NOT NULL AUTO_INCREMENT, a INTEGER NULL, PRIMARY KEY (id))",
+    );
+
+    // Three rows in one statement: 1, and not the 3 the last row was given.
+    // The OK packet carries the same number, because a client that reads the
+    // insert id off the packet rather than by asking must not get a different
+    // answer from the one the function gives.
+    match run(
+        &engine,
+        &mut session,
+        "INSERT INTO Batch (a) VALUES (10), (20), (30)",
+    ) {
+        Outcome::Affected {
+            rows,
+            last_insert_id,
+        } => {
+            assert_eq!(rows, 3);
+            assert_eq!(last_insert_id, 1);
+        }
+        Outcome::Rows(_) => panic!("expected an affected count"),
+    }
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id FROM Batch ORDER BY id"),
+        vec![vec!["1"], vec!["2"], vec!["3"]]
+    );
+
+    // A second statement reports its own first id rather than the table's.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "INSERT INTO Batch (a) VALUES (40), (50)"
+        ),
+        2
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        vec![vec!["4"]]
+    );
+
+    // The same through `INSERT ... SELECT`, which reaches the counter by a
+    // different route into the same loop.
+    run(&engine, &mut session, "CREATE TABLE Src (a INTEGER NULL)");
+    run(&engine, &mut session, "INSERT INTO Src VALUES (1), (2)");
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Copied (id INTEGER NOT NULL AUTO_INCREMENT, a INTEGER NULL, \
+         PRIMARY KEY (id))",
+    );
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "INSERT INTO Copied (a) SELECT a FROM Src"
+        ),
+        2
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        vec![vec!["1"]]
+    );
+}
+
+/// What leaves `LAST_INSERT_ID()` alone.
+///
+/// A statement that generated no id at all does not erase the one before it —
+/// measured on 8.3 for an insert that supplied every id itself, for one over a
+/// table with no AUTO_INCREMENT column, for one that inserted no rows, and for
+/// an upsert that only updated. The OK packet still carries 0 for all four.
+#[test]
+fn a_statement_that_generated_no_id_leaves_the_last_one_standing() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Kept (id INTEGER NOT NULL AUTO_INCREMENT, a INTEGER NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Kept (a) VALUES (1), (2)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        vec![vec!["1"]]
+    );
+
+    // Every id supplied by the statement.
+    match run(
+        &engine,
+        &mut session,
+        "INSERT INTO Kept (id, a) VALUES (100, 3), (101, 4)",
+    ) {
+        Outcome::Affected { last_insert_id, .. } => assert_eq!(last_insert_id, 0),
+        Outcome::Rows(_) => panic!("expected an affected count"),
+    }
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        vec![vec!["1"]]
+    );
+
+    // No rows at all. The counter is not touched either, so the next generated
+    // id follows the last one stored.
+    run(&engine, &mut session, "CREATE TABLE Empty (a INTEGER NULL)");
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "INSERT INTO Kept (a) SELECT a FROM Empty"
+        ),
+        0
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        vec![vec!["1"]]
+    );
+
+    // A table with no AUTO_INCREMENT column at all.
+    assert_eq!(
+        affected(&engine, &mut session, "INSERT INTO Empty VALUES (7)"),
+        1
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        vec![vec!["1"]]
+    );
+}
+
+/// An `INSERT IGNORE` reports the first id of a row it actually kept.
+///
+/// Measured on 8.3: against a unique key already holding 1,
+/// `INSERT IGNORE INTO Ig (k) VALUES (1), (2), (3)` skips the first row and
+/// answers with the id the second row was given, not with the one the skipped
+/// row would have had.
+///
+/// Asserted against the table's own smallest surviving id rather than against a
+/// literal, because the two servers do not agree on what that id *is*: 8.3
+/// reserves a batch for the statement and hands values only to rows it writes,
+/// so the skipped row costs nothing and the survivors are 2 and 3, while this
+/// engine takes a value per row as it goes and leaves them at 3 and 4. That gap
+/// is its own defect and not this one; what belongs here is that the id
+/// reported is the first one a *stored* row was given.
+#[test]
+fn an_ignored_row_does_not_report_an_id() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Ig (id INTEGER NOT NULL AUTO_INCREMENT, k INTEGER NOT NULL, \
+         PRIMARY KEY (id), UNIQUE INDEX Ig_k_key (k))",
+    );
+    run(&engine, &mut session, "INSERT INTO Ig (k) VALUES (1)");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        vec![vec!["1"]]
+    );
+
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            "INSERT IGNORE INTO Ig (k) VALUES (1), (2), (3)"
+        ),
+        2
+    );
+    // The first row was skipped, so the id reported is the first *stored* one
+    // and never the one the skipped row consumed.
+    let reported = rows(&engine, &mut session, "SELECT LAST_INSERT_ID()");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT MIN(id) FROM Ig WHERE k IN (2, 3)"
+        ),
+        reported
+    );
+    assert_ne!(reported, vec![vec!["1"]]);
+}
+
+/// A statement that fails partway keeps the id it had already generated.
+///
+/// Measured on 8.3: against a unique key already holding 1,
+/// `INSERT INTO F (k) VALUES (2), (1), (3)` stores nothing — the whole
+/// statement is rolled back — and still answers `LAST_INSERT_ID()` with the id
+/// row one was given. A statement that fails on its *first* row leaves the
+/// previous value alone, because it generated nothing before it stopped.
+#[test]
+fn an_insert_that_fails_partway_keeps_the_id_it_generated() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE F (id INTEGER NOT NULL AUTO_INCREMENT, k INTEGER NOT NULL, \
+         PRIMARY KEY (id), UNIQUE INDEX F_k_key (k))",
+    );
+    run(&engine, &mut session, "INSERT INTO F (k) VALUES (1)");
+
+    let err = engine
+        .execute(&mut session, "INSERT INTO F (k) VALUES (2), (1), (3)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1062);
+    // Nothing was stored, and the id row one was given is still reported.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM F"),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        vec![vec!["2"]]
+    );
+
+    // A failure on the first row generated nothing, so the 2 above stands.
+    let err = engine
+        .execute(&mut session, "INSERT INTO F (k) VALUES (1), (9)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1062);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        vec![vec!["2"]]
+    );
+}
+
+/// A statement 8.3 refuses before it runs generates no id at all.
+///
+/// The other side of the line drawn by
+/// `an_insert_that_fails_partway_keeps_the_id_it_generated`. MySQL settles a
+/// value list's length and whether it writes to a generated column while
+/// preparing the statement, before any row is written, so a *second* value
+/// list that is wrong stores nothing and leaves `LAST_INSERT_ID()` exactly as
+/// it found it — measured on 8.3 for both 1136 and 3105, against a row refused
+/// during execution, which reports the ids the rows before it were given.
+///
+/// Checked here rather than assumed, because the natural place to write both
+/// of these is inside the row loop, where they fire only after an earlier row
+/// has already taken a counter value and reported it.
+#[test]
+fn a_statement_refused_before_it_runs_generates_no_id() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE P (id INTEGER NOT NULL AUTO_INCREMENT, a INTEGER NULL, \
+         g INTEGER AS (a + 1), PRIMARY KEY (id))",
+    );
+    run(&engine, &mut session, "INSERT INTO P (a) VALUES (1)");
+    let before = rows(&engine, &mut session, "SELECT LAST_INSERT_ID()");
+    assert_eq!(before, vec![vec!["1"]]);
+
+    // A value list of the wrong length, and not the first one.
+    let err = engine
+        .execute(&mut session, "INSERT INTO P (a) VALUES (5), (6, 7)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1136);
+    assert!(err.message.ends_with("at row 2"), "{}", err.message);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM P"),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        before
+    );
+
+    // A generated column written to, and again not by the first row. Through
+    // the implicit column list, because naming the column is settled where the
+    // targets are resolved and never reaches a value list at all.
+    let err = engine
+        .execute(
+            &mut session,
+            "INSERT INTO P VALUES (DEFAULT, 5, DEFAULT), (DEFAULT, 6, 7)",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 3105);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM P"),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        before
+    );
+
+    // And the counter is where it was, so the next insert follows the row
+    // that is actually there.
+    run(&engine, &mut session, "INSERT INTO P (a) VALUES (9)");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        vec![vec!["2"]]
+    );
+}
+
+/// INSERT and `CREATE TABLE ... AS SELECT` answer the same question the same
+/// way.
+///
+/// The two paths share `assign_auto_increment` but not the code that records
+/// what to report, and this is the assertion that keeps them from drifting
+/// apart again — which is how #0132 was found.
+#[test]
+fn a_ctas_and_an_insert_report_their_first_id_the_same_way() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE Rows2 (a INTEGER NULL)");
+    run(&engine, &mut session, "INSERT INTO Rows2 VALUES (1), (2)");
+
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE FromQuery (s INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY) \
+         AS SELECT a FROM Rows2",
+    );
+    let after_ctas = rows(&engine, &mut session, "SELECT LAST_INSERT_ID()");
+
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE FromInsert (s INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY, a INTEGER NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO FromInsert (a) SELECT a FROM Rows2",
+    );
+    let after_insert = rows(&engine, &mut session, "SELECT LAST_INSERT_ID()");
+
+    // Both tables were filled from the same two rows into an empty counter, so
+    // both statements generated 1 and 2 and both must report 1.
+    assert_eq!(after_ctas, vec![vec!["1"]]);
+    assert_eq!(after_insert, after_ctas);
+}
+
+/// `LAST_INSERT_ID()` is per connection.
+///
+/// Measured on 8.3: a second connection sees 0 while the first sees the id it
+/// generated, and a fresh connection starts at 0 whatever the server has been
+/// doing.
+#[test]
+fn the_last_insert_id_belongs_to_one_connection() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Own (id INTEGER NOT NULL AUTO_INCREMENT, a INTEGER NULL, PRIMARY KEY (id))",
+    );
+    run(&engine, &mut session, "INSERT INTO Own (a) VALUES (1), (2)");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        vec![vec!["1"]]
+    );
+
+    let mut other = Session::new(ServerConfig::default(), 2);
+    other.current_database = Some("testdb".to_owned());
+    assert_eq!(
+        rows(&engine, &mut other, "SELECT LAST_INSERT_ID()"),
+        vec![vec!["0"]]
+    );
+
+    // And the second connection's own insert does not disturb the first's.
+    run(&engine, &mut other, "INSERT INTO Own (a) VALUES (3)");
+    assert_eq!(
+        rows(&engine, &mut other, "SELECT LAST_INSERT_ID()"),
+        vec![vec!["3"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT LAST_INSERT_ID()"),
+        vec![vec!["1"]]
+    );
+}
+
 #[test]
 fn an_upsert_updates_the_row_the_primary_key_names() {
     // Colliding on both the primary key and a secondary one, MySQL updates the

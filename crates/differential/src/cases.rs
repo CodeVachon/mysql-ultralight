@@ -4602,4 +4602,69 @@ pub const GROUPS: &[Group] = &[
             same("SELECT SUM(id) OVER (ORDER BY SIGN(1, 2)) FROM Sg"),
         ],
     },
+    Group {
+        // The id an insert hands back. MySQL reports the *first* id a
+        // statement generated, and this engine reported the last -- while its
+        // own `CREATE TABLE ... AS SELECT` path, written later, reported the
+        // first. Two paths disagreeing with each other. #0132.
+        //
+        // Every case here is ordered against the ones before it, because
+        // `LAST_INSERT_ID()` is per-connection state and the two connections
+        // outlive every group. The group is made immune to what ran before it
+        // by ending its setup with an insert, so the first case reads a value
+        // this group put there; and nothing outside it reads the value, which
+        // is what makes leaving one behind harmless. Any group added later that
+        // asks the same question needs the same treatment.
+        //
+        // What this group deliberately cannot ask: the *next* id after a
+        // statement whose row count MySQL does not know in advance. InnoDB
+        // reserves a batch for those and discards what it did not use, so the
+        // id after a two-row `INSERT ... SELECT` is 4 on 8.3 and 3 here. That
+        // is the storage engine's allocator rather than SQL, so no case reads a
+        // generated id out of `LiSel` after its setup. `Li` is the one table
+        // whose ids are asked about, and every statement that touches it is a
+        // VALUES list of a length both servers know before they start.
+        name: "the id an insert generated",
+        setup: &[
+            "CREATE TABLE Li (id INT NOT NULL AUTO_INCREMENT, a INT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE LiUp (id INT NOT NULL AUTO_INCREMENT, k INT NOT NULL, v INT NULL, \
+             PRIMARY KEY (id), UNIQUE KEY uk_liup_k (k))",
+            "INSERT INTO LiUp (k, v) VALUES (1, 10)",
+            "CREATE TABLE LiOwn (id INT NOT NULL AUTO_INCREMENT, a INT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE LiSrc (a INT NULL)",
+            "INSERT INTO LiSrc VALUES (1), (2)",
+            "CREATE TABLE LiNone (a INT NULL)",
+            "CREATE TABLE LiSel (id INT NOT NULL AUTO_INCREMENT, a INT NULL, PRIMARY KEY (id))",
+            // Last, and the value the first case reads: two rows in, and the
+            // answer is the first of the two ids rather than the second.
+            "INSERT INTO LiSel (a) SELECT a FROM LiSrc",
+        ],
+        cases: &[
+            same("SELECT LAST_INSERT_ID() AS from_a_two_row_insert_select"),
+            // Run once per protocol, so this fills `Li` twice: ids 1 to 3 and
+            // then 4 to 6, and the case below reads 4. A multi-row VALUES list
+            // is a row count MySQL knows in advance, so neither server leaves
+            // a gap and the second batch starts where the first ended.
+            same("INSERT INTO Li (a) VALUES (10), (20), (30)"),
+            same("SELECT LAST_INSERT_ID() AS from_a_three_row_values_insert"),
+            // An upsert that only ever updates -- `v` moves on both runs, so
+            // both report two rows affected. It generates no id, and must not
+            // erase the one before it.
+            same("INSERT INTO LiUp (k, v) VALUES (1, 99) ON DUPLICATE KEY UPDATE v = v + 1"),
+            same("SELECT LAST_INSERT_ID() AS after_an_upsert_that_only_updated"),
+            // A row that supplies its own id generates none. IGNORE rather
+            // than a bare insert because the second protocol runs it again and
+            // would otherwise collide; skipping the row is the same answer on
+            // both servers, and still no id.
+            same("INSERT IGNORE INTO LiOwn (id, a) VALUES (100, 1)"),
+            same("SELECT LAST_INSERT_ID() AS after_an_insert_that_supplied_its_own_id"),
+            // No rows at all, which generates nothing and moves no counter.
+            same("INSERT INTO LiSel (a) SELECT a FROM LiNone"),
+            same("SELECT LAST_INSERT_ID() AS after_an_insert_of_no_rows"),
+            // Back to `Li`, where the counter has not been disturbed by any of
+            // the above: the two runs take 7 and 8, and the answer is 8.
+            same("INSERT INTO Li (a) VALUES (40)"),
+            same("SELECT LAST_INSERT_ID() AS from_a_single_row_insert"),
+        ],
+    },
 ];
