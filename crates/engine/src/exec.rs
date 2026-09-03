@@ -5107,11 +5107,11 @@ impl Engine {
                         .indexes
                         .retain(|i| !i.name.eq_ignore_ascii_case(&index));
                     if table.indexes.len() == before && !if_exists {
-                        return Err(EngineError::new(
-                            1091,
-                            "42000",
-                            format!("Can't DROP '{index}'; check that it exists"),
-                        ));
+                        // The same message the ALTER TABLE form gives, which
+                        // is what 8.3 prints here too: `check that column/key
+                        // exists`, not the `check that it exists` this used to
+                        // invent.
+                        return Err(EngineError::cant_drop(&index));
                     }
                 }
                 mark_modified(session, &db, std::slice::from_ref(&table_name));

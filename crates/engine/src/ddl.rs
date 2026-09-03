@@ -646,6 +646,135 @@ fn index_name_taken(table: &Table, name: &str) -> bool {
         .any(|i| !i.primary && i.name.eq_ignore_ascii_case(name))
 }
 
+/// How many kinds of constraint the table carries under one name.
+///
+/// The name space `DROP CONSTRAINT` reads is the one
+/// `information_schema.TABLE_CONSTRAINTS` lists: primary key, unique, foreign
+/// key and check. It is not "every index" and not "not indexes" — it is
+/// *unique* indexes and the primary key, and never an ordinary non-unique one.
+/// Measured on 8.3, all on fresh tables:
+///
+/// - `INDEX ix (a)` — `DROP CONSTRAINT ix` is 3940 and `KEY ix (a)` is still
+///   there afterwards, where `DROP INDEX ix` would have taken it.
+/// - `CONSTRAINT uq UNIQUE (a)`, `UNIQUE INDEX uq (a)`, `UNIQUE KEY uq (a)`,
+///   and the index a column-level `a INT UNIQUE` creates under the column's
+///   own name — `DROP CONSTRAINT` drops every one of them.
+/// - `PRIMARY KEY (a)` — `` DROP CONSTRAINT `PRIMARY` `` drops it, and on a
+///   table with no primary key the same statement is 3940. Never under the
+///   constraint name it was written with: `CONSTRAINT mypk PRIMARY KEY (a)`
+///   then `DROP CONSTRAINT mypk` is 3940, because 8.3 keeps no such name.
+/// - the index a foreign key made for itself is non-unique, so after
+///   `DROP CONSTRAINT fk1` has taken the key the leftover `KEY fk1 (pid)`
+///   answers a second `DROP CONSTRAINT fk1` with 3940.
+///
+/// A count of *kinds* rather than a yes/no, because one name can be in two of
+/// them at once and 8.3 refuses that with 3939 rather than dropping both:
+/// `CONSTRAINT n UNIQUE (a), CONSTRAINT n CHECK (b > 0)` and `CONSTRAINT n
+/// UNIQUE (a), CONSTRAINT n FOREIGN KEY (a) REFERENCES R(id)` are both
+/// reachable there, as is a primary key beside a `` CONSTRAINT `PRIMARY`
+/// CHECK (...) ``. At most one of each kind can match, since an index name, a
+/// foreign key's and a check's are each unique within a table.
+///
+/// Kept beside `drop_constraint_named`, which must remove exactly what this
+/// counts: a name this accepted and that could not remove would report success
+/// having dropped nothing.
+fn constraint_kinds_named(table: &Table, name: &str) -> usize {
+    let unique_index = table
+        .indexes
+        .iter()
+        .any(|i| i.unique && i.name.eq_ignore_ascii_case(name));
+    let foreign_key = table
+        .foreign_keys
+        .iter()
+        .any(|f| f.name.eq_ignore_ascii_case(name));
+    let check = table
+        .checks
+        .iter()
+        .any(|c| c.name.eq_ignore_ascii_case(name));
+    usize::from(unique_index) + usize::from(foreign_key) + usize::from(check)
+}
+
+/// Removes the one constraint `constraint_kinds_named` found under this name.
+fn drop_constraint_named(table: &mut Table, name: &str) {
+    drop_indexes(table, |i| i.unique && i.name.eq_ignore_ascii_case(name));
+    drop_named(&mut table.foreign_keys, |f| {
+        f.name.eq_ignore_ascii_case(name)
+    });
+    drop_named(&mut table.checks, |c| c.name.eq_ignore_ascii_case(name));
+}
+
+/// Removes every item a drop names, reporting whether it named any.
+///
+/// `Vec::retain` cannot say whether it removed anything, and every `DROP` here
+/// has to know: the difference between having dropped something and having
+/// dropped nothing is the difference between success and 1091.
+fn drop_named<T>(items: &mut Vec<T>, matches: impl Fn(&T) -> bool) -> bool {
+    let before = items.len();
+    items.retain(|item| !matches(item));
+    items.len() != before
+}
+
+/// The same, for indexes, clearing the primary-key flags along with the key.
+///
+/// The flags are what `information_schema.COLUMNS.COLUMN_KEY` reports from, so
+/// an index removed without them leaves a column still described as `PRI`
+/// after its key is gone. 8.3 reports it empty, measured through both
+/// `DROP PRIMARY KEY` and `` DROP INDEX `PRIMARY` ``.
+fn drop_indexes(table: &mut Table, matches: impl Fn(&Index) -> bool) -> bool {
+    let was_primary = table.indexes.iter().any(|i| i.primary && matches(i));
+    let dropped = drop_named(&mut table.indexes, matches);
+    if was_primary {
+        for column in &mut table.columns {
+            column.primary_key = false;
+        }
+    }
+    dropped
+}
+
+/// Whether the table has a primary key at all.
+///
+/// Both halves, because `ALTER TABLE t ADD COLUMN id INT PRIMARY KEY` sets the
+/// column's flag without adding the index that `CREATE TABLE` would — a gap of
+/// its own, and one that must not turn into a wrong refusal here: 8.3 accepts
+/// `DROP PRIMARY KEY` after that ALTER, so reading `indexes` alone would
+/// answer 1091 where MySQL succeeds.
+fn has_primary_key(table: &Table) -> bool {
+    table.indexes.iter().any(|i| i.primary) || table.columns.iter().any(|c| c.primary_key)
+}
+
+/// The name MySQL gives a check the statement did not name.
+///
+/// `<table>_chk_<n>`, where `n` is one past the highest suffix the table
+/// already carries — not one past how many checks it has. The two agree until
+/// a check is *dropped*, and then they do not: measured on 8.3, a table with
+/// `C_chk_1` and `C_chk_2` that loses `C_chk_1` names its next check
+/// `C_chk_3`, where counting would have said `C_chk_2` and put a second check
+/// under a name the table already used. One `DROP CONSTRAINT C_chk_2` would
+/// then have taken both away, and checks here are enforced, so that is a
+/// constraint silently stopping.
+///
+/// Nothing could reach this before: `DROP CHECK` does not parse and
+/// `DROP CONSTRAINT` did not touch `checks`, so the count only ever grew.
+///
+/// Derived from the names present rather than from a stored counter, which is
+/// what 8.3 does too — a table whose checks have all been dropped starts again
+/// at `_chk_1`, and one whose only check was *written* as `E2_chk_5` names the
+/// next one `E2_chk_6`.
+fn auto_check_name(table: &Table) -> String {
+    let prefix = format!("{}_chk_", table.name);
+    let highest = table
+        .checks
+        .iter()
+        // `get` rather than a slice: the prefix length need not fall on a
+        // character boundary of a name that merely happens to be that long.
+        .filter_map(|c| Some((c.name.get(..prefix.len())?, c.name.get(prefix.len()..)?)))
+        .filter(|(head, _)| head.eq_ignore_ascii_case(&prefix))
+        .filter_map(|(_, suffix)| suffix.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    format!("{prefix}{}", highest + 1)
+}
+
 /// Adds an index, refusing a name the table already carries.
 ///
 /// An index name is scoped to its table, so the same name on two tables is
@@ -830,12 +959,12 @@ fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineRe
             });
         }
         TableConstraint::Check(check) => {
+            let name = match check.name.as_ref() {
+                Some(written) => written.value.clone(),
+                None => auto_check_name(table),
+            };
             table.checks.push(crate::catalog::Check {
-                name: check
-                    .name
-                    .as_ref()
-                    .map(|n| n.value.clone())
-                    .unwrap_or_else(|| format!("{}_chk_{}", table.name, table.checks.len() + 1)),
+                name,
                 expr: check.expr.to_string(),
             });
         }
@@ -988,6 +1117,37 @@ pub fn alter_table(
     let mut table = stored.clone();
     let table = &mut table;
 
+    // `DROP CONSTRAINT` is settled ahead of every operation in the loop below,
+    // whichever order they were written in: on 8.3 both `DROP COLUMN nosuch1,
+    // DROP CONSTRAINT nosuch2` and the same pair reversed report the
+    // constraint, where two drops from the loop report whichever came first.
+    //
+    // Ahead of the loop and not ahead of the whole statement — the two
+    // refusals above it win on 8.3 as they do here. `ADD COLUMN <65 chars>
+    // INT, DROP CONSTRAINT nosuch` is 1059 there and `ALTER TABLE nosuchtable
+    // DROP CONSTRAINT nosuch` is 1146, both measured.
+    //
+    // Against the table as it stands rather than as the statement leaves it,
+    // which is why this reads `table` before the loop has touched it:
+    // `ADD CONSTRAINT c2 CHECK (b > 1), DROP CONSTRAINT c2` is 3940 on 8.3,
+    // the ADD being invisible to it.
+    for operation in operations {
+        if let AlterTableOperation::DropConstraint {
+            name, if_exists, ..
+        } = operation
+        {
+            match constraint_kinds_named(table, &name.value) {
+                // Ambiguity is refused whether or not `IF EXISTS` was written:
+                // the name is there, and what is missing is which of the two
+                // constraints carrying it was meant.
+                0 if *if_exists => {}
+                0 => return Err(EngineError::constraint_not_found(&name.value)),
+                1 => {}
+                _ => return Err(EngineError::multiple_constraints(&name.value)),
+            }
+        }
+    }
+
     for operation in operations {
         match operation {
             AlterTableOperation::AddColumn {
@@ -1060,12 +1220,17 @@ pub fn alter_table(
                             }
                         }
                         None if *if_exists => {}
-                        None => {
-                            return Err(EngineError::unknown_column(
-                                &column_name.value,
-                                &table_name,
-                            ))
-                        }
+                        // 1091 and not the 1054 a *reference* to a missing
+                        // column gets. 8.3 draws the line at the operation
+                        // rather than at the name: `MODIFY nosuch INT` and
+                        // `RENAME COLUMN nosuch TO z` on the same table are
+                        // 1054 `Unknown column 'nosuch' in 't'` there, and
+                        // this one is `Can't DROP 'nosuch'`.
+                        //
+                        // Asked of the copy like the 1090 above, which is what
+                        // makes `DROP COLUMN a, DROP COLUMN a` 1091 on the
+                        // second `a` — 8.3 answers that too.
+                        None => return Err(EngineError::cant_drop(&column_name.value)),
                     }
                 }
             }
@@ -1083,6 +1248,16 @@ pub fn alter_table(
             } => {
                 // The kind's Display renders "TO Gadget"; the name is inside
                 // it, and using the rendered form names the table "TO Gadget".
+                //
+                // This arm writes to the catalog and returns, so it is the one
+                // place the copy-then-swap rule above is bypassed and every
+                // operation written *after* the rename is skipped in silence.
+                // 8.3 disagrees — `RENAME TO T4b, DROP INDEX nosuch` is 1091
+                // there and leaves the table called `T4` — so this is a gap of
+                // its own, and not one the drop refusals below can close from
+                // where they sit. Reordered the other way it now agrees:
+                // `DROP INDEX nosuch, RENAME TO T4b` refuses before the rename
+                // is reached.
                 let target = match new_name {
                     RenameTableNameKind::To(name) | RenameTableNameKind::As(name) => name,
                 };
@@ -1111,40 +1286,69 @@ pub fn alter_table(
             }
             // The three drops below and the rename under them match the name
             // case-insensitively, as every other identifier comparison here
-            // does and as MySQL does: `DROP INDEX IX` drops `ix` on 8.3.
+            // does and as MySQL does: `DROP INDEX IX` drops `ix` on 8.3, and
+            // so do `DROP FOREIGN KEY FK1` and `DROP CONSTRAINT FK1`.
             // Matching exactly made a drop under another spelling a silent
             // no-op, which the duplicate-name check turned into a refusal —
             // `DROP INDEX I, ADD INDEX i (a)` dropped nothing and then
-            // collided with what it had failed to remove. Reporting the name
-            // that matches nothing at all is 1091 on 8.3 and still missing
-            // here; that is its own gap.
+            // collided with what it had failed to remove.
+            //
+            // The name that matches nothing is 1091 on all three, and
+            // `drop_named` reporting whether it took anything is how that is
+            // noticed: `retain` alone cannot say. Each is asked of the copy,
+            // so `DROP INDEX ix, DROP INDEX ix` is 1091 on the second — 8.3
+            // answers that, and the doubled `DROP FOREIGN KEY` too.
+            //
+            // `DROP CONSTRAINT` is the exception below, on both counts.
             AlterTableOperation::DropConstraint { name, .. } => {
-                table
-                    .indexes
-                    .retain(|i| !i.name.eq_ignore_ascii_case(&name.value));
-                table
-                    .foreign_keys
-                    .retain(|f| !f.name.eq_ignore_ascii_case(&name.value));
+                // No count and no refusal: the pre-pass owns both, having
+                // already answered 3940 for a name in none of the constraint
+                // name spaces and 3939 for one in two of them. That is also
+                // why `DROP CONSTRAINT ck1, DROP CONSTRAINT ck1` is accepted
+                // where the doubled drops below are not — the pre-pass asks
+                // the table as it stands, so both see `ck1`.
+                drop_constraint_named(table, &name.value);
             }
             AlterTableOperation::DropForeignKey { name, .. } => {
-                table
-                    .foreign_keys
-                    .retain(|f| !f.name.eq_ignore_ascii_case(&name.value));
+                if !drop_named(&mut table.foreign_keys, |f| {
+                    f.name.eq_ignore_ascii_case(&name.value)
+                }) {
+                    return Err(EngineError::cant_drop(&name.value));
+                }
             }
             AlterTableOperation::DropPrimaryKey { .. } => {
-                table.indexes.retain(|i| !i.primary);
+                // Asked of `has_primary_key` rather than of what the drop
+                // removed, because a primary key added by `ALTER TABLE ... ADD
+                // COLUMN id INT PRIMARY KEY` reaches the column's flag without
+                // reaching `indexes`. 8.3 accepts `DROP PRIMARY KEY` after
+                // that ALTER, so counting removed indexes would refuse a
+                // statement MySQL answers.
+                if !has_primary_key(table) {
+                    // The literal `PRIMARY` and not the table's name: the
+                    // statement wrote no name at all, and 8.3 reports the one
+                    // it keeps a primary key's index under.
+                    return Err(EngineError::cant_drop("PRIMARY"));
+                }
+                drop_indexes(table, |i| i.primary);
+                // Again, for the flag-only case above, which `drop_indexes`
+                // cannot have cleared because it found no index to remove.
                 for column in &mut table.columns {
                     column.primary_key = false;
                 }
             }
             AlterTableOperation::DropIndex { name } => {
-                table
-                    .indexes
-                    .retain(|i| !i.name.eq_ignore_ascii_case(&name.value));
+                if !drop_indexes(table, |i| i.name.eq_ignore_ascii_case(&name.value)) {
+                    return Err(EngineError::cant_drop(&name.value));
+                }
             }
             // sqlparser has no ALTER TABLE ... RENAME INDEX, which is one of
-            // the five parser gaps the conformance survey found. Renaming a
-            // constraint is the form it does parse.
+            // the five parser gaps the conformance survey found — and no
+            // MySQL-dialect `RENAME CONSTRAINT` either, so this arm is
+            // unreachable as things stand: `RenameConstraint` is gated behind
+            // the PostgreSQL dialect there, and everything here parses with
+            // `MySqlDialect`. `RENAME INDEX` is instead intercepted before the
+            // parser, in `rewrite.rs`, and executed in `exec.rs` — which is
+            // where its 1176 for a name the table has not got lives.
             AlterTableOperation::RenameConstraint { old_name, new_name } => {
                 if let Some(index) = table
                     .indexes

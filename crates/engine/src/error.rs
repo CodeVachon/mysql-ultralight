@@ -34,6 +34,102 @@ impl EngineError {
         )
     }
 
+    /// ER_CANT_DROP_FIELD_OR_KEY.
+    ///
+    /// The one answer MySQL gives an `ALTER TABLE ... DROP` that names
+    /// something the table does not carry, whichever name space the operation
+    /// reads: `DROP COLUMN`, `DROP INDEX`, `DROP KEY`, `DROP FOREIGN KEY` and
+    /// `DROP PRIMARY KEY` are all 1091 on 8.3, as is the standalone
+    /// `DROP INDEX nosuch ON t`.
+    ///
+    /// Not 1054, which is what a *reference* to a missing column is. 8.3 keeps
+    /// the two apart on the same statement: `ALTER TABLE t MODIFY nosuch INT`
+    /// and `RENAME COLUMN nosuch TO z` are 1054 `Unknown column 'nosuch' in
+    /// 't'` there, while `DROP nosuch` is this.
+    ///
+    /// The name spaces do not leak into one another either, so the shared code
+    /// is not a shared lookup: with `INDEX ix (a)` on the table, 8.3 answers
+    /// both `DROP COLUMN ix` and `DROP INDEX a` with 1091.
+    ///
+    /// `DROP PRIMARY KEY` on a table with no primary key reports the literal
+    /// `PRIMARY`, which is the name MySQL keeps a primary key's index under.
+    ///
+    /// `DROP KEY` is 1091 on 8.3 and never reaches here: sqlparser reads no
+    /// `KEY` spelling of the operation, so this engine answers that one 1064.
+    /// A parser gap and not a missing code — worth knowing before someone
+    /// concludes from the tests that the spelling is covered.
+    pub fn cant_drop(name: &str) -> Self {
+        Self::new(
+            1091,
+            "42000",
+            format!("Can't DROP '{name}'; check that column/key exists"),
+        )
+    }
+
+    /// ER_CONSTRAINT_NOT_FOUND.
+    ///
+    /// `DROP CONSTRAINT` misses with its own code rather than the 1091 the
+    /// drops beside it share, because it reads a different name space: the one
+    /// `information_schema.TABLE_CONSTRAINTS` lists, which is primary key,
+    /// unique, foreign key and check — and no ordinary non-unique index.
+    /// Measured on 8.3, where a table carrying `INDEX ix (a)` answers
+    /// `DROP CONSTRAINT ix` with this and leaves the index standing, though
+    /// `DROP INDEX ix` would take it.
+    ///
+    /// A *unique* index is in it, under every spelling — `CONSTRAINT uq UNIQUE
+    /// (a)`, `UNIQUE INDEX uq (a)`, `UNIQUE KEY uq (a)` and the index a
+    /// column-level `a INT UNIQUE` creates under the column's own name are all
+    /// dropped by `DROP CONSTRAINT` on 8.3. So is the primary key, under the
+    /// literal `PRIMARY` and never under the constraint name it was written
+    /// with: `CONSTRAINT mypk PRIMARY KEY (a)` then `DROP CONSTRAINT mypk` is
+    /// this, while `` DROP CONSTRAINT `PRIMARY` `` on the same table succeeds.
+    ///
+    /// The trailing full stop is MySQL's, and the message has none of the
+    /// advice 1091's carries.
+    ///
+    /// Not the code for `DROP CHECK`, which is a fourth answer again: 8.3
+    /// gives that one 3821 `Check constraint 'nosuch' is not found in the
+    /// table.` even though a check is in the name space this reads. sqlparser
+    /// does not read that operation either, so nothing here can reach 3821 —
+    /// a gap, and not one to paper over by widening this.
+    pub fn constraint_not_found(name: &str) -> Self {
+        Self::new(
+            3940,
+            "HY000",
+            format!("Constraint '{name}' does not exist."),
+        )
+    }
+
+    /// 3939: one name, more than one kind of constraint.
+    ///
+    /// Named by its code rather than by a symbol, because the code and the
+    /// message are what was measured — the 8.3 image carries no error-symbol
+    /// table to read the name out of, and guessing one would be a claim
+    /// nothing here checked.
+    ///
+    /// The name spaces `DROP CONSTRAINT` reads across are separate from each
+    /// other, so one name can be in two of them at once and the statement no
+    /// longer says which is meant. 8.3 refuses rather than dropping both:
+    /// `CONSTRAINT n UNIQUE (a), CONSTRAINT n CHECK (b > 0)` and `CONSTRAINT n
+    /// UNIQUE (a), CONSTRAINT n FOREIGN KEY (a) REFERENCES R(id)` are both
+    /// this, as is a table with a primary key beside a check written as
+    /// `` CONSTRAINT `PRIMARY` CHECK (...) ``. The advice is to reach for
+    /// `DROP INDEX`, `DROP FOREIGN KEY` or `DROP CHECK` instead, which each
+    /// read one space.
+    ///
+    /// Two of a *kind* cannot happen and this is not about that: two indexes
+    /// of one name are 1061, and two foreign keys are 1826.
+    pub fn multiple_constraints(name: &str) -> Self {
+        Self::new(
+            3939,
+            "HY000",
+            format!(
+                "Table has multiple constraints with the name '{name}'. \
+                 Please use constraint specific 'DROP' clause."
+            ),
+        )
+    }
+
     /// ER_NON_UNIQ_ERROR.
     ///
     /// The clause is spelled into the message without quotes, which is how

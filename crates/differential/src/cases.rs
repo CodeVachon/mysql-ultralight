@@ -5821,4 +5821,133 @@ pub const GROUPS: &[Group] = &[
                   ORDER BY INDEX_NAME"),
         ],
     },
+    Group {
+        // `Dr` carries one of everything a DROP can name -- a column, a plain
+        // index, a *unique* index, a foreign key, a check and a primary key --
+        // because the question these cases ask is which name space each drop
+        // reads, and a table with only columns on it cannot tell a shared
+        // lookup from five separate ones. The unique index is the one that
+        // separates `DROP CONSTRAINT` from `DROP INDEX`: it is in both spaces
+        // where `ix` is in only one, and a corpus without it let this engine
+        // ship a `DROP CONSTRAINT` that refused every UNIQUE.
+        //
+        // `DrChk` is built by the setup rather than declared, because what it
+        // is for is the state only a *drop* can reach: a table whose check
+        // suffixes have a hole in them.
+        name: "a drop that names nothing",
+        setup: &[
+            "CREATE TABLE DrP (id INT NOT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE Dr (id INT NOT NULL, a INT NULL, b INT NULL, u INT NULL, \
+             pid INT NULL, PRIMARY KEY (id), INDEX ix (a), CONSTRAINT uq UNIQUE (u), \
+             CONSTRAINT fk1 FOREIGN KEY (pid) REFERENCES DrP(id), \
+             CONSTRAINT ck1 CHECK (b > 0))",
+            "CREATE TABLE DrNoPk (a INT NULL, b INT NULL)",
+            "CREATE TABLE DrPk (id INT NOT NULL, a INT NULL, PRIMARY KEY (id))",
+            // One name on two kinds of constraint, which 8.3 accepts making
+            // and then refuses to drop by that name.
+            "CREATE TABLE DrAmb (a INT NULL, b INT NULL, CONSTRAINT n UNIQUE (a), \
+             CONSTRAINT n CHECK (b > 0))",
+            "CREATE TABLE DrChk (a INT NULL, b INT NULL)",
+            "ALTER TABLE DrChk ADD CHECK (a > 0)",
+            "ALTER TABLE DrChk ADD CHECK (b > 0)",
+            "ALTER TABLE DrChk DROP CONSTRAINT DrChk_chk_1",
+            // `DrChk_chk_3` on 8.3, because the suffix counts past the highest
+            // name present and not past how many checks there are. An engine
+            // that counted would call this one `DrChk_chk_2` as well, and the
+            // case below would not find a `_chk_3` to drop.
+            "ALTER TABLE DrChk ADD CHECK (a > 5)",
+        ],
+        cases: &[
+            // One code for every drop that names nothing, whichever name
+            // space it reads. This engine used to answer the first two with
+            // 1054 and to accept the next three in silence.
+            same("ALTER TABLE Dr DROP COLUMN nosuch"),
+            same("ALTER TABLE Dr DROP nosuch"),
+            same("ALTER TABLE Dr DROP INDEX nosuch"),
+            same("ALTER TABLE Dr DROP FOREIGN KEY nosuch"),
+            // The standalone statement, which reaches a different code path
+            // here than the ALTER TABLE form does.
+            same("DROP INDEX nosuch ON Dr"),
+            // No name is written, so the one reported is the one MySQL keeps a
+            // primary key's index under.
+            same("ALTER TABLE DrNoPk DROP PRIMARY KEY"),
+            // The name spaces do not leak: `ix` is an index and `a` a column,
+            // and each drop is blind to the other's.
+            same("ALTER TABLE Dr DROP COLUMN ix"),
+            same("ALTER TABLE Dr DROP INDEX a"),
+            same("ALTER TABLE Dr DROP FOREIGN KEY ix"),
+            same("ALTER TABLE Dr DROP FOREIGN KEY ck1"),
+            // `DROP CONSTRAINT` reads a different space -- the one
+            // TABLE_CONSTRAINTS lists, which holds no ordinary non-unique
+            // index -- and misses with a code of its own rather than the one
+            // above. `ix` is a plain index and `a` a column.
+            same("ALTER TABLE Dr DROP CONSTRAINT nosuch"),
+            same("ALTER TABLE Dr DROP CONSTRAINT ix"),
+            same("ALTER TABLE Dr DROP CONSTRAINT a"),
+            // A table with no primary key, so `PRIMARY` names nothing here
+            // either -- unlike on `DrPk` below, where the same statement works.
+            same("ALTER TABLE DrNoPk DROP CONSTRAINT `PRIMARY`"),
+            // One name on two kinds of constraint: refused rather than
+            // dropping both, and with a third code again.
+            same("ALTER TABLE DrAmb DROP CONSTRAINT n"),
+            // The line the drop code does not cross. An operation that *reads*
+            // a column rather than removing one keeps the field-list code, on
+            // the same table and the same absent name.
+            same("ALTER TABLE Dr MODIFY COLUMN nosuch INT"),
+            same("ALTER TABLE Dr RENAME COLUMN nosuch TO z"),
+            // Which of two bad operations is reported. `DROP CONSTRAINT` is
+            // settled in a phase ahead of the rest, so it wins from either
+            // side; two operations from the same phase go in written order.
+            same("ALTER TABLE Dr DROP COLUMN nosuch1, DROP CONSTRAINT nosuch2"),
+            same("ALTER TABLE Dr DROP CONSTRAINT nosuch2, DROP COLUMN nosuch1"),
+            same("ALTER TABLE Dr DROP COLUMN nosuch1, DROP INDEX nosuch2"),
+            same("ALTER TABLE Dr DROP INDEX nosuch2, DROP COLUMN nosuch1"),
+            // That phase is settled against the table as it stands, so an ADD
+            // in the same statement is invisible to it from either side.
+            same("ALTER TABLE Dr ADD CONSTRAINT c2 CHECK (b > 1), DROP CONSTRAINT c2"),
+            same("ALTER TABLE Dr DROP CONSTRAINT c2, ADD CONSTRAINT c2 CHECK (b > 1)"),
+            // The drops that are not in that phase run against a copy of the
+            // table, so the second of a doubled pair finds the first has
+            // already taken the name.
+            same("ALTER TABLE Dr DROP COLUMN a, DROP COLUMN a"),
+            same("ALTER TABLE Dr DROP INDEX ix, DROP INDEX ix"),
+            same("ALTER TABLE Dr DROP FOREIGN KEY fk1, DROP FOREIGN KEY fk1"),
+            // A valid operation beside a refused one is not applied, which the
+            // two shape cases below are what actually check.
+            same("ALTER TABLE Dr DROP COLUMN a, DROP COLUMN nosuch"),
+            same("ALTER TABLE Dr DROP INDEX ix, DROP COLUMN nosuch"),
+            // Nothing above reached the table: every column and every index
+            // the setup gave it is still there.
+            same("SELECT COLUMN_NAME FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Dr' \
+                  ORDER BY ORDINAL_POSITION"),
+            same("SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Dr' \
+                  ORDER BY INDEX_NAME"),
+            // The refusals are not bought by never finding anything: these
+            // drops do reach their targets, under a spelling the setup did not
+            // use. Idempotent, which a case that changes anything has to be --
+            // each puts back the name it took.
+            same("ALTER TABLE Dr DROP CONSTRAINT CK1, ADD CONSTRAINT ck1 CHECK (b > 0)"),
+            same("ALTER TABLE Dr DROP INDEX IX, ADD INDEX ix (a)"),
+            // The two `DROP CONSTRAINT` reaches that `DROP INDEX`'s space and
+            // the plain refusals above cannot show: a unique index, and the
+            // primary key under the literal name MySQL keeps it under. Both
+            // were 3940 here until the name space was measured properly.
+            same("ALTER TABLE Dr DROP CONSTRAINT UQ, ADD CONSTRAINT uq UNIQUE (u)"),
+            same("ALTER TABLE DrPk DROP CONSTRAINT `PRIMARY`, ADD PRIMARY KEY (id)"),
+            // Only reachable if the check the setup added last was named
+            // `_chk_3`: an engine that numbered by counting rather than by the
+            // highest suffix present would have called it `_chk_2` -- a second
+            // check under a name already in use -- and would answer 3940 here.
+            // The name is written back explicitly, so this says nothing about
+            // numbering the second time round and stays idempotent.
+            same("ALTER TABLE DrChk DROP CONSTRAINT DrChk_chk_3, \
+                  ADD CONSTRAINT DrChk_chk_3 CHECK (a > 5)"),
+            // On a table of its own, because dropping a column MySQL has an
+            // index over drops the index too and this engine does not -- a
+            // divergence of its own, and not one to drag into these cases.
+            same("ALTER TABLE DrNoPk DROP COLUMN A, ADD COLUMN a INT NULL"),
+        ],
+    },
 ];

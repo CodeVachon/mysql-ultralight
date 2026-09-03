@@ -19971,11 +19971,8 @@ fn no_statement_leaves_a_table_with_no_columns() {
     // the second position must undo the first, which is why the whole
     // statement runs against a copy rather than the guard being special.
     //
-    // The code is the engine's own and is asserted as such: 8.3 answers 1091
-    // `Can't DROP 'nosuch'` where this answers 1054 `Unknown column`. That is
-    // a separate, pre-existing gap in DROP COLUMN and not what this is about
-    // -- which is that both columns are still there afterwards, and they are
-    // on both servers.
+    // 1091 `Can't DROP 'nosuch'` is 8.3's answer and now this one's too; this
+    // used to be 1054 and carried a note saying so.
     run(
         &engine,
         &mut session,
@@ -19986,8 +19983,8 @@ fn no_statement_leaves_a_table_with_no_columns() {
         "ALTER TABLE Three DROP COLUMN a, DROP COLUMN nosuch",
         &[],
     ) {
-        Err(e) if e.code == 1054 => {}
-        Err(e) => wrong.push(format!("dropping an unknown column -> {e}, want 1054")),
+        Err(e) if e.code == 1091 => {}
+        Err(e) => wrong.push(format!("dropping an unknown column -> {e}, want 1091")),
         Ok(_) => wrong.push("dropping an unknown column was accepted".to_owned()),
     }
     let names: Vec<String> = declared(&engine, &mut session, "Three")
@@ -25145,6 +25142,572 @@ fn a_named_primary_key_constraint_still_calls_its_index_primary() {
     run(&engine, &mut session, "INSERT INTO PK VALUES (1, 1)");
     let err = fails(&engine, &mut session, "INSERT INTO PK VALUES (1, 2)");
     assert_eq!(err.code, 1062);
+}
+
+/// A table with one of everything a `DROP` can name, for the drop tests below.
+///
+/// `ix` is a plain index over `a`, `uq` a unique one over `u`, `fk1` a foreign
+/// key on `pid`, `ck1` a check, and `id` the primary key. Five kinds on one
+/// table, because what these tests are about is which of them each `DROP`
+/// reads — and a table carrying only some of them cannot tell a name space
+/// that is read from one that merely happens to be empty. The unique index in
+/// particular is what separates `DROP CONSTRAINT` from `DROP INDEX`: it is in
+/// both, where `ix` is in only one.
+fn droppable(engine: &Engine, session: &mut Session) {
+    run(
+        engine,
+        session,
+        "CREATE TABLE DropP (id INT NOT NULL PRIMARY KEY, v INT)",
+    );
+    run(
+        engine,
+        session,
+        "CREATE TABLE DropT (id INT NOT NULL, a INT, b INT, u INT, pid INT, \
+         PRIMARY KEY (id), INDEX ix (a), CONSTRAINT uq UNIQUE (u), \
+         CONSTRAINT fk1 FOREIGN KEY (pid) REFERENCES DropP(id), \
+         CONSTRAINT ck1 CHECK (b > 0))",
+    );
+}
+
+/// The indexes `DropT` carries, sorted, as the setup leaves them.
+const DROPPABLE_INDEXES: [&str; 4] = ["PRIMARY", "fk1", "ix", "uq"];
+
+/// The columns `DropT` carries, as the setup leaves them.
+const DROPPABLE_COLUMNS: [&str; 5] = ["id", "a", "b", "u", "pid"];
+
+/// Asserts `DropT` is exactly as `droppable` left it.
+fn droppable_intact(engine: &Engine, session: &mut Session) {
+    let mut names = index_names(engine, session, "DropT");
+    names.sort();
+    assert_eq!(names, DROPPABLE_INDEXES);
+    let columns: Vec<String> = declared(engine, session, "DropT")
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect();
+    assert_eq!(columns, DROPPABLE_COLUMNS);
+}
+
+/// Asserts a statement is refused as ER_CANT_DROP_FIELD_OR_KEY naming `name`.
+///
+/// The message is asserted whole rather than only the code, because the code
+/// was not the only thing wrong: the standalone `DROP INDEX ... ON t` answered
+/// 1091 with a message of its own invention.
+fn cant_drop(engine: &Engine, session: &mut Session, sql: &str, name: &str) {
+    let err = fails(engine, session, sql);
+    assert_eq!(
+        (err.code, err.sql_state.as_str(), err.message.as_str()),
+        (
+            1091,
+            "42000",
+            format!("Can't DROP '{name}'; check that column/key exists").as_str()
+        ),
+        "from: {sql}"
+    );
+}
+
+#[test]
+fn a_drop_naming_nothing_is_cant_drop_rather_than_unknown_column() {
+    // 1091 on 8.3 for every one of these, and 1054 `Unknown column` for none
+    // of them: that code belongs to a *reference* to a missing column, and the
+    // two are told apart by the operation rather than by the name -- see the
+    // 1054 assertions at the bottom, which are the same table and the same
+    // absent name reached through operations that read a column rather than
+    // remove one.
+    let (engine, mut session) = engine();
+    droppable(&engine, &mut session);
+
+    cant_drop(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP COLUMN nosuch",
+        "nosuch",
+    );
+    // The same operation with the `COLUMN` keyword left off.
+    cant_drop(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP nosuch",
+        "nosuch",
+    );
+    cant_drop(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP INDEX nosuch",
+        "nosuch",
+    );
+    cant_drop(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP FOREIGN KEY nosuch",
+        "nosuch",
+    );
+    // The standalone statement, whose message used to read `check that it
+    // exists` -- 1091 with wording no MySQL prints.
+    cant_drop(
+        &engine,
+        &mut session,
+        "DROP INDEX nosuch ON DropT",
+        "nosuch",
+    );
+
+    // `DROP PRIMARY KEY` names nothing, so 8.3 reports the name it keeps a
+    // primary key's index under.
+    run(&engine, &mut session, "CREATE TABLE NoPk (a INT, b INT)");
+    cant_drop(
+        &engine,
+        &mut session,
+        "ALTER TABLE NoPk DROP PRIMARY KEY",
+        "PRIMARY",
+    );
+
+    // The line 1091 does not cross. Both are 1054 `Unknown column 'nosuch' in
+    // 'DropT'` on 8.3, which is what the drops above used to answer too.
+    for sql in [
+        "ALTER TABLE DropT MODIFY COLUMN nosuch INT",
+        "ALTER TABLE DropT RENAME COLUMN nosuch TO z",
+    ] {
+        let err = fails(&engine, &mut session, sql);
+        assert_eq!(
+            (err.code, err.message.as_str()),
+            (1054, "Unknown column 'nosuch' in 'DropT'"),
+            "from: {sql}"
+        );
+    }
+}
+
+#[test]
+fn the_drop_name_spaces_do_not_leak_into_one_another() {
+    // The shared code is not a shared lookup. Each drop reads one name space,
+    // so a name that exists in a *different* one is still 1091 -- measured on
+    // 8.3 with exactly this shape.
+    let (engine, mut session) = engine();
+    droppable(&engine, &mut session);
+
+    // `ix` is an index, not a column.
+    cant_drop(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP COLUMN ix",
+        "ix",
+    );
+    // `a` is a column, not an index.
+    cant_drop(&engine, &mut session, "ALTER TABLE DropT DROP INDEX a", "a");
+    // `ix` is an index, not a foreign key, and `ck1` is a check.
+    cant_drop(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP FOREIGN KEY ix",
+        "ix",
+    );
+    cant_drop(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP FOREIGN KEY ck1",
+        "ck1",
+    );
+
+    // Everything is still there: none of the four refusals above took
+    // anything with it.
+    droppable_intact(&engine, &mut session);
+}
+
+#[test]
+fn dropping_a_constraint_that_is_not_one_is_3940_and_not_1091() {
+    // The name space `DROP CONSTRAINT` reads is the one
+    // information_schema.TABLE_CONSTRAINTS lists: primary key, unique, foreign
+    // key, check. Not "any index" -- an ordinary non-unique one is in none of
+    // them, and 8.3 answers `DROP CONSTRAINT ix` with 3940 and leaves `ix`
+    // standing, where `DROP INDEX ix` would take it.
+    let (engine, mut session) = engine();
+    droppable(&engine, &mut session);
+
+    // `ix` is a plain index and `a` a column: neither is a constraint.
+    for name in ["nosuch", "ix", "a"] {
+        let err = fails(
+            &engine,
+            &mut session,
+            &format!("ALTER TABLE DropT DROP CONSTRAINT `{name}`"),
+        );
+        assert_eq!(
+            (err.code, err.sql_state.as_str(), err.message.as_str()),
+            (
+                3940,
+                "HY000",
+                format!("Constraint '{name}' does not exist.").as_str()
+            ),
+            "dropping constraint {name}"
+        );
+    }
+    droppable_intact(&engine, &mut session);
+
+    // A unique index *is* in it, and this is what separates this name space
+    // from `DROP INDEX`'s: the statement that will not touch `ix` takes `uq`.
+    // Under either spelling, as everywhere else here.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP CONSTRAINT UQ",
+    );
+    let mut names = index_names(&engine, &mut session, "DropT");
+    names.sort();
+    assert_eq!(names, vec!["PRIMARY", "fk1", "ix"]);
+
+    // So is a check -- and it really goes, rather than merely becoming
+    // unfindable: the row `ck1` refused before the drop is accepted after it.
+    let violates = "INSERT INTO DropT (id, b) VALUES (1, -1)";
+    assert_eq!(fails(&engine, &mut session, violates).code, 3819);
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP CONSTRAINT CK1",
+    );
+    run(&engine, &mut session, violates);
+    let gone = fails(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP CONSTRAINT ck1",
+    );
+    assert_eq!(gone.code, 3940);
+
+    // And a foreign key. The index it made for itself is not unique, so it
+    // stays behind -- 8.3 leaves `KEY fk1 (pid)` after `DROP CONSTRAINT fk1`,
+    // and a second `DROP CONSTRAINT fk1` against that leftover is 3940.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP CONSTRAINT FK1",
+    );
+    cant_drop(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP FOREIGN KEY fk1",
+        "fk1",
+    );
+    let leftover = fails(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP CONSTRAINT fk1",
+    );
+    assert_eq!(leftover.code, 3940);
+    run(&engine, &mut session, "ALTER TABLE DropT DROP INDEX fk1");
+    let mut names = index_names(&engine, &mut session, "DropT");
+    names.sort();
+    assert_eq!(names, vec!["PRIMARY", "ix"]);
+}
+
+#[test]
+fn dropping_the_primary_key_as_a_constraint_names_it_primary() {
+    // 8.3 keeps no constraint name for a primary key: the index is `PRIMARY`
+    // whatever the statement called the constraint, and that literal is the
+    // only name `DROP CONSTRAINT` will find it under.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE PkC (a INT NOT NULL, b INT, CONSTRAINT mypk PRIMARY KEY (a))",
+    );
+    let written = fails(
+        &engine,
+        &mut session,
+        "ALTER TABLE PkC DROP CONSTRAINT mypk",
+    );
+    assert_eq!(written.code, 3940);
+
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE PkC DROP CONSTRAINT `PRIMARY`",
+    );
+    assert!(index_names(&engine, &mut session, "PkC").is_empty());
+    // Really gone rather than merely unlisted, on both counts 8.3 reports: the
+    // duplicate it used to refuse is accepted, and COLUMN_KEY stops describing
+    // the column as `PRI`.
+    run(&engine, &mut session, "INSERT INTO PkC VALUES (1, 1)");
+    run(&engine, &mut session, "INSERT INTO PkC VALUES (1, 2)");
+    let key: Vec<String> = declared(&engine, &mut session, "PkC")
+        .into_iter()
+        .map(|row| row[4].clone())
+        .collect();
+    assert_eq!(key, vec!["", ""]);
+
+    // With no primary key left to find, the same statement is 3940. Asked of a
+    // table that once had one, which is the case the engine gets wrong if it
+    // reads the columns' flags without having cleared them.
+    let none = fails(
+        &engine,
+        &mut session,
+        "ALTER TABLE PkC DROP CONSTRAINT `PRIMARY`",
+    );
+    assert_eq!(
+        (none.code, none.message.as_str()),
+        (3940, "Constraint 'PRIMARY' does not exist.")
+    );
+}
+
+#[test]
+fn one_name_on_two_kinds_of_constraint_is_refused_rather_than_dropping_both() {
+    // The spaces `DROP CONSTRAINT` reads across are separate from each other,
+    // so a name can be in two at once and the statement stops saying which is
+    // meant. 8.3 refuses with 3939 rather than dropping both, and this engine
+    // has to as well: its drop would otherwise take the unique index *and* the
+    // check, silently disabling a constraint nobody named.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Amb (a INT, b INT, CONSTRAINT n UNIQUE (a), CONSTRAINT n CHECK (b > 0))",
+    );
+    let err = fails(&engine, &mut session, "ALTER TABLE Amb DROP CONSTRAINT n");
+    assert_eq!(
+        (err.code, err.sql_state.as_str(), err.message.as_str()),
+        (
+            3939,
+            "HY000",
+            "Table has multiple constraints with the name 'n'. \
+             Please use constraint specific 'DROP' clause."
+        )
+    );
+    // Neither of them went.
+    assert_eq!(index_names(&engine, &mut session, "Amb"), vec!["n"]);
+    assert_eq!(
+        fails(&engine, &mut session, "INSERT INTO Amb VALUES (1, -1)").code,
+        3819
+    );
+
+    // A primary key beside a check literally called `PRIMARY` is the same
+    // collision reached without anyone writing a duplicate name.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE AmbPk (a INT NOT NULL, b INT, PRIMARY KEY (a), \
+         CONSTRAINT `PRIMARY` CHECK (b > 0))",
+    );
+    let pk = fails(
+        &engine,
+        &mut session,
+        "ALTER TABLE AmbPk DROP CONSTRAINT `PRIMARY`",
+    );
+    assert_eq!(pk.code, 3939);
+    assert_eq!(index_names(&engine, &mut session, "AmbPk"), vec!["PRIMARY"]);
+}
+
+#[test]
+fn an_unnamed_check_does_not_reuse_a_name_a_dropped_one_had() {
+    // The suffix counts up from the highest name the table carries, not from
+    // how many checks it has. Nothing could tell the two apart until
+    // `DROP CONSTRAINT` learned to remove a check: counting would now mint
+    // `Chk_chk_2` twice, and one `DROP CONSTRAINT Chk_chk_2` would take both
+    // away -- a constraint silently stopping, since checks here are enforced.
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE Chk (a INT, b INT)");
+    run(&engine, &mut session, "ALTER TABLE Chk ADD CHECK (a > 0)");
+    run(&engine, &mut session, "ALTER TABLE Chk ADD CHECK (b > 0)");
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE Chk DROP CONSTRAINT Chk_chk_1",
+    );
+    run(&engine, &mut session, "ALTER TABLE Chk ADD CHECK (a > 5)");
+
+    // If the third check had been named `Chk_chk_2` as well, this would take
+    // the second one with it and the row below would be accepted. 8.3 names it
+    // `Chk_chk_3` and keeps both.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE Chk DROP CONSTRAINT Chk_chk_3",
+    );
+    assert_eq!(
+        fails(&engine, &mut session, "INSERT INTO Chk VALUES (1, -1)").code,
+        3819
+    );
+
+    // With every check dropped the count starts again at one, which is 8.3's
+    // answer too -- the suffix is read off the names present and not off a
+    // counter that only ever grows.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE Chk DROP CONSTRAINT Chk_chk_2",
+    );
+    run(&engine, &mut session, "ALTER TABLE Chk ADD CHECK (a > 9)");
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE Chk DROP CONSTRAINT Chk_chk_1",
+    );
+    run(&engine, &mut session, "INSERT INTO Chk VALUES (1, -1)");
+
+    // A name the statement *wrote* moves the count past it, rather than the
+    // count being kept separately: 8.3 follows `E2_chk_5` with `E2_chk_6`.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE E2 (a INT, b INT, CONSTRAINT E2_chk_5 CHECK (a > 0))",
+    );
+    run(&engine, &mut session, "ALTER TABLE E2 ADD CHECK (b > 0)");
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE E2 DROP CONSTRAINT E2_chk_6",
+    );
+    // `E2_chk_5` is untouched, so the row it refuses is still refused.
+    assert_eq!(
+        fails(&engine, &mut session, "INSERT INTO E2 VALUES (-1, -1)").code,
+        3819
+    );
+}
+
+#[test]
+fn a_missing_constraint_is_settled_before_every_other_operation() {
+    // 8.3 puts `DROP CONSTRAINT` in a phase of its own ahead of the rest, so
+    // it is not the written order that decides which of two bad drops is
+    // reported. Two operations the loop handles *are* decided by written
+    // order, which is the contrast the first two pairs draw.
+    let (engine, mut session) = engine();
+    droppable(&engine, &mut session);
+
+    // Both orders report the constraint.
+    for sql in [
+        "ALTER TABLE DropT DROP COLUMN nosuch1, DROP CONSTRAINT nosuch2",
+        "ALTER TABLE DropT DROP CONSTRAINT nosuch2, DROP COLUMN nosuch1",
+    ] {
+        let err = fails(&engine, &mut session, sql);
+        assert_eq!(
+            (err.code, err.message.as_str()),
+            (3940, "Constraint 'nosuch2' does not exist."),
+            "from: {sql}"
+        );
+    }
+    // Where neither is a constraint, the written order decides.
+    cant_drop(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP COLUMN nosuch1, DROP INDEX nosuch2",
+        "nosuch1",
+    );
+    cant_drop(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP INDEX nosuch2, DROP COLUMN nosuch1",
+        "nosuch2",
+    );
+
+    // Settled against the table as it stands, not as the statement leaves it:
+    // the `ADD` is invisible to the check whichever side of it is written.
+    for sql in [
+        "ALTER TABLE DropT ADD CONSTRAINT c2 CHECK (b > 1), DROP CONSTRAINT c2",
+        "ALTER TABLE DropT DROP CONSTRAINT c2, ADD CONSTRAINT c2 CHECK (b > 1)",
+    ] {
+        let err = fails(&engine, &mut session, sql);
+        assert_eq!(
+            (err.code, err.message.as_str()),
+            (3940, "Constraint 'c2' does not exist."),
+            "from: {sql}"
+        );
+    }
+
+    // And the other side of the same rule: because the check is against the
+    // table as it stands, naming one constraint twice is accepted -- where
+    // the drops the loop handles are asked of the copy and refuse the second.
+    // Both measured on 8.3.
+    cant_drop(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP COLUMN a, DROP COLUMN a",
+        "a",
+    );
+    cant_drop(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP INDEX ix, DROP INDEX ix",
+        "ix",
+    );
+    cant_drop(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP FOREIGN KEY fk1, DROP FOREIGN KEY fk1",
+        "fk1",
+    );
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP CONSTRAINT ck1, DROP CONSTRAINT ck1",
+    );
+
+    // Nothing any of the refusals above named was applied, including the
+    // valid half of the pairs that carried one.
+    droppable_intact(&engine, &mut session);
+
+    // The columns and the indexes do not cover the doubled `DROP FOREIGN KEY`,
+    // which is the one refusal above whose subject neither of them can see: a
+    // foreign key that was rolled back and one that was lost both leave
+    // `KEY fk1 (pid)` standing, because the drop deliberately keeps the index.
+    // Dropping it now is the assertion -- it panics if the first half of that
+    // refused pair was allowed to stand.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP FOREIGN KEY fk1",
+    );
+}
+
+#[test]
+fn a_drop_still_matches_the_name_under_another_spelling() {
+    // The refusals above must not have been bought by matching names exactly:
+    // every one of these succeeds on 8.3, which folds case here as everywhere
+    // else.
+    let (engine, mut session) = engine();
+    droppable(&engine, &mut session);
+
+    run(&engine, &mut session, "ALTER TABLE DropT DROP INDEX IX");
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP FOREIGN KEY FK1",
+    );
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE DropT DROP CONSTRAINT UQ",
+    );
+    run(&engine, &mut session, "ALTER TABLE DropT DROP COLUMN A");
+    run(&engine, &mut session, "ALTER TABLE DropT DROP PRIMARY KEY");
+
+    let columns: Vec<String> = declared(&engine, &mut session, "DropT")
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect();
+    assert_eq!(columns, vec!["id", "b", "u", "pid"]);
+    // `fk1` outlives its foreign key: the drop takes the constraint and leaves
+    // the index, so it is the only one of the four still standing.
+    assert_eq!(index_names(&engine, &mut session, "DropT"), vec!["fk1"]);
+}
+
+#[test]
+fn a_primary_key_added_by_alter_can_still_be_dropped() {
+    // `ADD COLUMN id INT PRIMARY KEY` sets the column's flag and adds no
+    // index, unlike the same clause in a CREATE -- a gap of its own, and one
+    // the 1091 for a missing primary key must not trip over: 8.3 accepts
+    // `DROP PRIMARY KEY` after that ALTER, so a refusal counting indexes alone
+    // would refuse a statement MySQL answers.
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE PkA (a INT)");
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE PkA ADD COLUMN id INT NOT NULL PRIMARY KEY",
+    );
+    run(&engine, &mut session, "ALTER TABLE PkA DROP PRIMARY KEY");
+
+    // And then there is none, so the next one is refused -- which is what says
+    // the drop above cleared the flag rather than merely being waved through.
+    cant_drop(
+        &engine,
+        &mut session,
+        "ALTER TABLE PkA DROP PRIMARY KEY",
+        "PRIMARY",
+    );
 }
 
 #[test]
