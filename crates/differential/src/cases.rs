@@ -4667,4 +4667,117 @@ pub const GROUPS: &[Group] = &[
             same("SELECT LAST_INSERT_ID() AS from_a_single_row_insert"),
         ],
     },
+    Group {
+        // A SELECT with no FROM, clause by clause. #0158: the path evaluated
+        // its projection and its HAVING and dropped the WHERE and the GROUP BY
+        // on the floor, so `SELECT 1 WHERE 0` answered a row — a wrong answer
+        // in one of the simplest statements SQL has, and one that hid every
+        // refusal written inside the clause along with it.
+        //
+        // The point of a group of its own is that this shape has no rows to
+        // hide behind: a corpus case over a populated table cannot reach any
+        // of it.
+        name: "a select with no FROM",
+        setup: &[
+            "CREATE TABLE Fl (id INT NOT NULL, b INT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Fl VALUES (1, 7), (2, 8)",
+        ],
+        cases: &[
+            // Every spelling of a falsehood, because the clause was not
+            // evaluated at all rather than evaluated wrongly.
+            same("SELECT 1 WHERE 0"),
+            same("SELECT 1 WHERE 1 = 0"),
+            same("SELECT 1 WHERE NULL"),
+            same("SELECT 1 WHERE 'a'"),
+            same("SELECT 1 WHERE 0.0"),
+            same("SELECT 1 WHERE CAST('x' AS SIGNED)"),
+            // And the truths beside them, so a filter that rejects everything
+            // is not mistaken for one that works.
+            same("SELECT 1 WHERE 1"),
+            same("SELECT 1 WHERE -1"),
+            same("SELECT 1 WHERE '1abc'"),
+            // A predicate that has to run a query of its own to settle.
+            same("SELECT 1 WHERE (SELECT 0)"),
+            same("SELECT 1 WHERE 1 IN (SELECT 2)"),
+            same("SELECT 1 WHERE 1 IN (SELECT 1)"),
+            same("SELECT 1 WHERE EXISTS (SELECT 1 WHERE 0)"),
+            // The names, under the clause each belongs to. A select-list alias
+            // is not in scope in a WHERE, and the field list is settled first.
+            same("SELECT 1 WHERE zz = 1"),
+            same("SELECT 1 AS a WHERE a = 1"),
+            same("SELECT nope WHERE zz = 1"),
+            // The refusals #0158 recorded as masked. The last two are written
+            // where nothing evaluates them, which is what separates a refusal
+            // settled while the item is resolved from one the evaluator
+            // happens to reach.
+            same("SELECT 1 WHERE 'x' LIKE 'a' ESCAPE '!!'"),
+            same("SELECT 1 WHERE 1 IN (SELECT SIGN(1, 2))"),
+            same("SELECT 1 WHERE CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE '!!') ELSE 9 END"),
+            same("SELECT 1 WHERE 0 AND SIGN(1, 2)"),
+            // An ungrouped aggregate answers one row whatever the WHERE said,
+            // and over a rejected implicit row that row is the fold over
+            // nothing — which is a different answer from no row at all.
+            same("SELECT COUNT(*), SUM(1), MAX(2), MIN(2), AVG(3), GROUP_CONCAT(4) WHERE 0"),
+            same("SELECT 1, COUNT(*) WHERE 0"),
+            same("SELECT COUNT(DISTINCT 1) WHERE 0"),
+            same("SELECT COUNT(*), SUM(1) WHERE 1"),
+            // The argument of an aggregate over an empty group is not
+            // evaluated, so a runtime error in it is not raised — the pair
+            // says so: NULL under `WHERE 0` and 1690 under `WHERE 1`. What it
+            // is still held to is what 8.3 settles while resolving.
+            same("SELECT SUM(9223372036854775807 + 1) WHERE 0"),
+            same("SELECT SUM(9223372036854775807 + 1) WHERE 1"),
+            same("SELECT SUM('a' LIKE 'b' ESCAPE '!!') WHERE 0"),
+            // An aggregate written only in the HAVING aggregates the query
+            // too, so it answers a row where the same statement without one
+            // answers none.
+            same("SELECT 1 WHERE 0 HAVING COUNT(*) = 0"),
+            same("SELECT COUNT(*) WHERE 0 HAVING COUNT(*) = 0"),
+            same("SELECT COUNT(*) WHERE 0 HAVING COUNT(*) = 5"),
+            // A GROUP BY takes that row away again: no rows means no groups.
+            same("SELECT COUNT(*) WHERE 0 GROUP BY 'a'"),
+            same("SELECT 1 WHERE 0 GROUP BY 'a'"),
+            same("SELECT COUNT(*) WHERE 1 GROUP BY 'a'"),
+            // A FROM-less GROUP BY can never change which rows come back, so
+            // the whole of what it decides is what it refuses.
+            same("SELECT 1 GROUP BY 2"),
+            same("SELECT 1 GROUP BY zz"),
+            same("SELECT 1 GROUP BY 'x' LIKE 'a' ESCAPE '!!'"),
+            same("SELECT 1 AS a GROUP BY a"),
+            same("SELECT 1 GROUP BY 1"),
+            // Which clause is named when more than one of them is wrong: the
+            // WHERE before the GROUP BY, the GROUP BY before the HAVING, and
+            // the HAVING even where the WHERE has already emptied the result.
+            same("SELECT 1 WHERE zz = 1 GROUP BY 2"),
+            same("SELECT 1 GROUP BY 2 HAVING zz > 1"),
+            same("SELECT 1 WHERE 0 HAVING zz > 1"),
+            // The clauses that were already reached, kept so the fix cannot
+            // take one of them away.
+            same("SELECT 1 WHERE 0 ORDER BY 1"),
+            same("SELECT 1 AS a WHERE 0 ORDER BY 2"),
+            same("SELECT 1 WHERE 0 LIMIT 1"),
+            same("SELECT 1 WHERE 1 LIMIT 0"),
+            same("SELECT DISTINCT 1 WHERE 0"),
+            // Every context a FROM-less SELECT can be written in, because the
+            // clause has to hold in all of them and not only in a statement of
+            // its own.
+            same("SELECT * FROM (SELECT COUNT(*) AS c WHERE 0) t"),
+            // Counted rather than projected, because a derived table
+            // materialises a bare `1` as a LONG on 8.3 and as a LONGLONG here
+            // — a divergence of its own, which asking for the column back
+            // would report in place of this case's question.
+            same("SELECT COUNT(*) FROM (SELECT 1 AS a WHERE 0) t"),
+            same("WITH c AS (SELECT 1 AS a WHERE 0) SELECT COUNT(*) FROM c"),
+            same("SELECT EXISTS (SELECT 1 WHERE 0)"),
+            same("SELECT 1 AS a WHERE 0 UNION ALL SELECT 2"),
+            same("SELECT 2 AS a UNION ALL SELECT 1 WHERE 0"),
+            // Correlated, so the predicate has to be evaluated against the
+            // enclosing row rather than against nothing. Read from the WHERE
+            // rather than projected, because a scalar subquery in a select
+            // list is declared VAR_STRING by this engine and LONGLONG by 8.3 —
+            // a divergence of its own that would drown this case's question.
+            same("SELECT id FROM Fl WHERE 1 IN (SELECT 1 WHERE Fl.b > 7) ORDER BY id"),
+            same("SELECT id FROM Fl WHERE EXISTS (SELECT 1 WHERE Fl.b > 7) ORDER BY id"),
+        ],
+    },
 ];

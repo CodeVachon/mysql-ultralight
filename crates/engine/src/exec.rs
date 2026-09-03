@@ -1544,9 +1544,7 @@ impl Engine {
         // rather than looking for the word: `HAVING b > (SELECT MIN(b) FROM t)`
         // is per-row on 8.3, and grouping it would collapse the answer to one
         // row.
-        let aggregating = !group_exprs.is_empty()
-            || select.projection.iter().any(select_item_aggregates)
-            || select.having.as_ref().is_some_and(contains_aggregate);
+        let aggregating = !group_exprs.is_empty() || aggregates_of_itself(select);
 
         if aggregating {
             let mut grouped = self.grouped(
@@ -2342,17 +2340,108 @@ impl Engine {
         };
         let implicit_row = [&implicit_values];
 
-        for item in &select.projection {
-            let (alias, e) = match item {
-                SelectItem::UnnamedExpr(e) => (render_expr(e), e),
-                SelectItem::ExprWithAlias { expr, alias } => (alias.value.clone(), expr),
-                other => return Err(unsupported(format!("select item `{other}`"))),
-            };
-            // Before the item is evaluated, because a branch nothing takes is
-            // never evaluated: `SELECT CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE
-            // '!!') ELSE 9 END` answered 9 where 8.3 raises 1210. The
-            // table-backed projection is guarded at the same point.
-            refuse_at_resolve([e])?;
+        let items: Vec<(String, &Expr)> = select
+            .projection
+            .iter()
+            .map(|item| match item {
+                SelectItem::UnnamedExpr(e) => Ok((render_expr(e), e)),
+                SelectItem::ExprWithAlias { expr, alias } => Ok((alias.value.clone(), expr)),
+                other => Err(unsupported(format!("select item `{other}`"))),
+            })
+            .collect::<EngineResult<_>>()?;
+
+        // The field list is resolved before anything is evaluated, and before
+        // the WHERE below, because that is the order 8.3 answers in: `SELECT
+        // nope WHERE zz = 1` is 1054 for `nope` in the field list, not for
+        // `zz` in the where clause.
+        //
+        // The same helper the table-backed path resolves its field list with,
+        // so a check added to either reaches both.
+        for (_, e) in &items {
+            resolve_projected_expr(e, &implicit_schema)?;
+        }
+
+        // The WHERE, which this path used to drop on the floor entirely:
+        // `SELECT 1 WHERE 0` and `SELECT 1 WHERE 1 = 0` each answered a row
+        // where 8.3 answers none, and nothing written in the clause was ever
+        // reached — `SELECT 1 WHERE 1 IN (SELECT SIGN(1,2))` answered a row
+        // rather than 1582, and a malformed ESCAPE in it went the same way.
+        //
+        // Names first and the arguments after, which is what the table-backed
+        // path does and the same helpers, so a mutation to either neuters both
+        // paths at once.
+        let kept = match &select.selection {
+            None => true,
+            Some(predicate) => {
+                if let Some(name) = unresolved_column(predicate, &implicit_schema) {
+                    return Err(EngineError::unknown_column(&name, "where clause"));
+                }
+                refuse_at_resolve([predicate])?;
+                expr::eval(predicate, &ctx)?.truthy() == Some(true)
+            }
+        };
+
+        // A rejected implicit row leaves *no* rows to aggregate over rather
+        // than none to return, which is the whole of the difference between
+        // `SELECT 1 WHERE 0` and `SELECT COUNT(*) WHERE 0`: measured on 8.3
+        // the first is empty and the second answers one row holding 0, with
+        // `SUM`, `MAX`, `MIN`, `AVG` and `GROUP_CONCAT` all NULL beside it.
+        // An ungrouped aggregate always answers exactly one row, and over an
+        // empty relation that row is the fold over nothing.
+        //
+        // Its argument is then never evaluated, which is 8.3's behaviour and
+        // not a shortcut: measured there, `SELECT SUM(9223372036854775807 + 1)
+        // WHERE 0` answers NULL and the same statement with `WHERE 1` is 1690.
+        // What the argument is still held to is what 8.3 settles while
+        // resolving — the field list pass above raises 1210 for `SUM('a' LIKE
+        // 'b' ESCAPE '!!') WHERE 0` exactly as 8.3 does. The gap left is a
+        // function 8.3 resolves by *name*: `SUM(NOSUCHFN(1)) WHERE 0` is 1305
+        // there and NULL here, because this engine learns a function does not
+        // exist by trying to call it. That is the table-backed path's answer
+        // over an empty table too, and closing it means a catalog of names
+        // rather than anything about this clause.
+        let group: &[&Vec<Value>] = if kept { &implicit_row } else { &[] };
+
+        let group_exprs: &[Expr] = match &select.group_by {
+            GroupByExpr::Expressions(exprs, _) => exprs,
+            GroupByExpr::All(_) => return Err(unsupported("GROUP BY ALL")),
+        };
+
+        // The GROUP BY was dropped on the floor here too. It can never change
+        // *which* rows come back — one implicit row is one group whatever it
+        // is grouped on — so the whole of what it decides is what it refuses,
+        // and every refusal was missing: `SELECT 1 GROUP BY 2` and `SELECT 1
+        // GROUP BY zz` are both 1054 in 'group statement' on 8.3 and answered
+        // a row here, and `GROUP BY 'x' LIKE 'a' ESCAPE '!!'` is 1210 there
+        // and answered one too.
+        //
+        // After the WHERE and before the HAVING, which is 8.3's order:
+        // `SELECT 1 WHERE zz = 1 GROUP BY 2` is 1054 for `zz` and `SELECT 1
+        // GROUP BY 2 HAVING zz > 1` is 1054 for the position.
+        //
+        // The clause reads the select list's names as well as the relation's,
+        // so `SELECT 1 AS a GROUP BY a` answers rather than raising.
+        if !group_exprs.is_empty() {
+            let mut scope = implicit_schema.clone();
+            scope.extend(items.iter().map(|(alias, _)| ColumnRef::new("", alias)));
+            if let Some(name) = group_exprs
+                .iter()
+                .find_map(|e| unresolved_column(e, &scope))
+            {
+                return Err(EngineError::unknown_column(&name, "group statement"));
+            }
+            check_group_positions(group_exprs, items.len())?;
+            refuse_at_resolve(group_exprs.iter())?;
+        }
+
+        // Every item is evaluated even where the WHERE has already discarded
+        // the row, because a column's *definition* is not the only thing this
+        // loop settles: an item this engine cannot compute is only found out
+        // by computing it, so skipping the work would turn `SELECT NOSUCHFN(1)
+        // WHERE 0` from a refusal into an answer. The definitions themselves
+        // are read off the expression rather than off the value, so nothing
+        // the client is sent depends on the evaluation succeeding.
+        for (alias, e) in &items {
             let value = if let Expr::Function(f) = e {
                 if f.over.is_none() && is_aggregate(&f.name.to_string()) {
                     let name = f.name.to_string().to_ascii_lowercase();
@@ -2361,7 +2450,7 @@ impl Engine {
                         &name,
                         aggregate_argument(f).as_ref(),
                         &implicit_schema,
-                        &implicit_row,
+                        group,
                         aggregate_is_distinct(f),
                     )?
                 } else {
@@ -2378,7 +2467,7 @@ impl Engine {
             // a later row could produce another type, and describing a
             // statement binds its parameters to NULL so there is often no
             // value worth reading.
-            let mut column = OutColumn::new(alias, computed_column_type(e, &[], &[]));
+            let mut column = OutColumn::new(alias.clone(), computed_column_type(e, &[], &[]));
             column.nullable = !never_null(e, &[], &[]);
             column.unsigned = unsigned_answer(e, &[], &[]);
             column.binary_values = binary_answer(e);
@@ -2393,21 +2482,44 @@ impl Engine {
         // so an aggregate written in the clause folds over it exactly as one
         // in the select list already does — `SELECT COUNT(*) HAVING COUNT(*) >
         // 5` is empty on both.
-        let mut rows = vec![row];
+        //
+        // A row survives a WHERE that rejected the implicit one only where the
+        // query aggregates without grouping, because that is the one shape
+        // whose answer does not depend on there being a row: `SELECT COUNT(*)
+        // WHERE 0` is one row on 8.3 and `SELECT 1 WHERE 0` is none. An
+        // aggregate written only in the HAVING counts, exactly as it does on
+        // the table-backed path — `SELECT 1 WHERE 0 HAVING COUNT(*) = 0`
+        // answers a row there. A GROUP BY takes it away again: no rows means
+        // no groups, so `SELECT COUNT(*) WHERE 0 GROUP BY 'a'` is empty.
+        let mut rows = if kept || (aggregates_of_itself(select) && group_exprs.is_empty()) {
+            vec![row]
+        } else {
+            Vec::new()
+        };
         if let Some(having) = &select.having {
+            // The clause is resolved whether or not there is a row left for it
+            // to filter, for the reason the WHERE above is: `SELECT 1 WHERE 0
+            // HAVING zz > 1` is 1054 in 'having clause' on 8.3, not an empty
+            // set.
+            //
+            // No GROUP BY columns are passed even where the clause has some,
+            // because on this path they can only be a constant or a select
+            // item's own name — the scope already reaches both, and passing an
+            // unresolved position would widen it by the literal rather than by
+            // the column it names.
             check_having_scope(having, &select.projection, &[], &implicit_schema, 0)?;
             refuse_at_resolve([having])?;
-            let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-            let resolved = substitute_aliases(having, &names);
-            let value = self.eval_over_group(
-                &resolved,
-                &implicit_row,
-                &implicit_schema,
-                session,
-                &rows[0],
-            )?;
-            if value.truthy() != Some(true) {
-                rows.clear();
+            if let Some(projected) = rows.first() {
+                let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+                let resolved = substitute_aliases(having, &names);
+                // Over `group` rather than the implicit row, so an aggregate
+                // in the clause folds over what the WHERE left exactly as one
+                // in the select list does.
+                let value =
+                    self.eval_over_group(&resolved, group, &implicit_schema, session, projected)?;
+                if value.truthy() != Some(true) {
+                    rows.clear();
+                }
             }
         }
 
@@ -8739,6 +8851,26 @@ fn wildcard_written(kind: &sqlparser::ast::SelectItemQualifiedWildcardKind) -> S
     }
 }
 
+/// Resolves one select item's expression: its names, and then the arguments
+/// 8.3 settles while resolving rather than while evaluating.
+///
+/// Ahead of every other reading of the item, because the expression path only
+/// resolves a name when it evaluates one, and it evaluates one per row. With
+/// no rows — an empty table, a filter nothing survived, or a statement being
+/// described — `SELECT a.b FROM J2` declared a column called `b` and returned
+/// successfully.
+///
+/// One definition for the two paths that need it: `resolve_field_list` below
+/// for a query with a FROM, and `select_without_table` for one without. A
+/// check added to either has to reach both, and a mutation to this neuters
+/// them together.
+fn resolve_projected_expr(e: &Expr, refs: &[ColumnRef]) -> EngineResult<()> {
+    if let Some(name) = unresolved_column(e, refs) {
+        return Err(EngineError::unknown_column(&name, "field list"));
+    }
+    refuse_at_resolve([e])
+}
+
 /// Resolves every name and every ESCAPE in a select list.
 ///
 /// Its own pass rather than a line inside the projection loop, because the
@@ -8783,16 +8915,7 @@ fn resolve_field_list(
                 }
             }
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                // Ahead of every other reading of the item, because the
-                // expression path only resolves a name when it evaluates one,
-                // and it evaluates one per row. With no rows -- an empty
-                // table, a filter nothing survived, or a statement being
-                // described -- `SELECT a.b FROM J2` declared a column called
-                // `b` and returned successfully.
-                if let Some(name) = unresolved_column(e, refs) {
-                    return Err(EngineError::unknown_column(&name, "field list"));
-                }
-                refuse_at_resolve([e])?;
+                resolve_projected_expr(e, refs)?;
             }
             // Refused where the projection is built, because that is a gap in
             // this engine rather than a question about the statement.
@@ -9215,6 +9338,24 @@ fn references_column(e: &Expr) -> bool {
         Expr::Function(f) => value_arguments(f).iter().any(references_column),
         other => subexpressions(other).into_iter().any(references_column),
     }
+}
+
+/// Whether the query aggregates for a reason other than a GROUP BY: an
+/// aggregate somewhere in the select list, or one written in the HAVING and
+/// nowhere else.
+///
+/// One definition because two paths ask it and neither can be allowed to drift
+/// from the other: the table-backed `select` ORs a GROUP BY on to decide
+/// whether to route to `grouped`, and `select_without_table` asks it *without*
+/// the GROUP BY, because there a GROUP BY is the difference between one row
+/// and none. Measured on 8.3: `SELECT COUNT(*) WHERE 0` is one row and
+/// `SELECT COUNT(*) WHERE 0 GROUP BY 'a'` is none.
+///
+/// An aggregate inside a subquery belongs to that subquery, which is what
+/// `contains_aggregate` and `select_item_aggregates` both stop at.
+fn aggregates_of_itself(select: &Select) -> bool {
+    select.projection.iter().any(select_item_aggregates)
+        || select.having.as_ref().is_some_and(contains_aggregate)
 }
 
 /// True when a select item is or contains an aggregate call.

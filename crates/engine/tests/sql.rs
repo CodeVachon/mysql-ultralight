@@ -2819,6 +2819,300 @@ fn a_from_less_select_applies_its_having() {
     assert!(err.message.contains("having clause"), "{err}");
 }
 
+/// A FROM-less SELECT has a WHERE too, and this engine dropped that as well.
+///
+/// `SELECT 1 WHERE 0` answered a row where 8.3 answers none — a wrong answer
+/// in one of the simplest statements SQL has, and a normal shape for a probe
+/// or a guard query. The predicate was never evaluated at all, so the same
+/// held for every falsehood it could be written as.
+#[test]
+fn a_from_less_select_applies_its_where() {
+    let (engine, mut session) = engine();
+
+    for sql in [
+        "SELECT 1 WHERE 0",
+        "SELECT 1 WHERE 1 = 0",
+        // NULL and a string that is not a number are neither true: measured
+        // on 8.3, both are an empty result.
+        "SELECT 1 WHERE NULL",
+        "SELECT 1 WHERE 'a'",
+        "SELECT 1 WHERE (SELECT 0)",
+        "SELECT 1 WHERE 1 IN (SELECT 2)",
+    ] {
+        assert!(rows(&engine, &mut session, sql).is_empty(), "{sql}");
+    }
+
+    for sql in [
+        "SELECT 1 WHERE 1",
+        "SELECT 1 WHERE 1 = 1",
+        "SELECT 1 WHERE (SELECT 1)",
+        "SELECT 1 WHERE 1 IN (SELECT 1)",
+    ] {
+        assert_eq!(rows(&engine, &mut session, sql), vec![vec!["1"]], "{sql}");
+    }
+
+    // The columns are still described when the row is gone, because a client
+    // reads the column definitions before it reads any rows. Measured on 8.3,
+    // `SELECT 1 AS one WHERE 0` sends one LONGLONG column named `one`.
+    let Outcome::Rows(result) = run(&engine, &mut session, "SELECT 1 AS one WHERE 0") else {
+        panic!("expected rows");
+    };
+    assert!(result.rows.is_empty());
+    assert_eq!(result.columns.len(), 1);
+    assert_eq!(result.columns[0].name, "one");
+}
+
+/// The WHERE is settled when the item is *resolved*, not when a row is
+/// evaluated against it — so a FROM-less SELECT that dropped the clause also
+/// masked every refusal written inside it.
+#[test]
+fn a_from_less_where_is_resolved_not_only_evaluated() {
+    let (engine, mut session) = engine();
+
+    // The clause is named as well as the code: the same 1054 under 'field
+    // list' would pass a test that read only the number.
+    for sql in [
+        "SELECT 1 WHERE zz = 1",
+        // A select-list alias is not in scope in a WHERE, which is 1054 on
+        // 8.3 rather than the row the alias would have matched.
+        "SELECT 1 AS a WHERE a = 1",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1054, "{sql} -> {err}");
+        assert!(err.message.contains("where clause"), "{sql} -> {err}");
+    }
+
+    // 1210 and 1582, the two refusals #0158 recorded as masked: both are
+    // raised on 8.3 and both answered a row here.
+    for sql in [
+        "SELECT 1 WHERE 'x' LIKE 'a' ESCAPE '!!'",
+        // Written where nothing evaluates it, which is what separates the
+        // resolve-time refusal from the evaluator's own. This path always has
+        // one implicit row, so a predicate at the top level is evaluated
+        // whatever happens and the evaluator raises 1210 by itself — only an
+        // untaken branch and a short-circuited operand can tell the two apart.
+        "SELECT 1 WHERE CASE WHEN 0 THEN ('a' LIKE 'b' ESCAPE '!!') ELSE 9 END",
+        "SELECT 1 WHERE 0 AND ('a' LIKE 'b' ESCAPE '!!')",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1210, "{sql} -> {err}");
+    }
+    for sql in [
+        "SELECT 1 WHERE 1 IN (SELECT SIGN(1,2))",
+        "SELECT 1 WHERE 0 AND SIGN(1,2)",
+        "SELECT 1 WHERE CASE WHEN 0 THEN SIGN(1,2) ELSE 9 END",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1582, "{sql} -> {err}");
+    }
+
+    // Which clause is complained about is the whole of what these assert, and
+    // it is the order 8.3 settles them in: the field list before the WHERE,
+    // the WHERE before the GROUP BY and the HAVING, and the HAVING even where
+    // the WHERE has already emptied the result.
+    for (sql, clause) in [
+        ("SELECT nope WHERE zz = 1", "field list"),
+        ("SELECT 1 WHERE zz = 1 GROUP BY 2", "where clause"),
+        ("SELECT 1 WHERE zz = 1 HAVING qq > 1", "where clause"),
+        ("SELECT 1 WHERE 0 GROUP BY 2", "group statement"),
+        ("SELECT 1 WHERE 0 HAVING zz > 1", "having clause"),
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1054, "{sql} -> {err}");
+        assert!(err.message.contains(clause), "{sql} -> {err}");
+    }
+}
+
+/// A WHERE that rejects the implicit row leaves an aggregate with nothing to
+/// fold over, which is not the same as leaving the query with no rows.
+///
+/// Measured on 8.3: `SELECT 1 WHERE 0` is empty and `SELECT COUNT(*) WHERE 0`
+/// is one row holding 0, because an ungrouped aggregate always answers exactly
+/// one row and over an empty relation that row is the fold over nothing.
+#[test]
+fn a_from_less_aggregate_folds_over_what_the_where_kept() {
+    let (engine, mut session) = engine();
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*), SUM(1), MAX(2), MIN(2), GROUP_CONCAT(3) WHERE 0"
+        ),
+        vec![vec!["0", "NULL", "NULL", "NULL", "NULL"]]
+    );
+    // Beside a literal, which is answered from the statement rather than from
+    // the row that is no longer there.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 1, COUNT(*) WHERE 0"),
+        vec![vec!["1", "0"]]
+    );
+    // Unchanged where nothing rejects the row, which is what the fold used to
+    // do unconditionally.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*), SUM(1) WHERE 1"),
+        vec![vec!["1", "1"]]
+    );
+
+    // The fold over nothing does not evaluate the argument, which is 8.3's
+    // behaviour and not a shortcut — the pair says so, and the second half is
+    // what stops the first from being a test that a refusal was lost.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT SUM(9223372036854775807 + 1) WHERE 0"
+        ),
+        vec![vec!["NULL"]]
+    );
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT SUM(9223372036854775807 + 1) WHERE 1",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1690, "{err}");
+    // What the argument is still held to: the refusals 8.3 settles while
+    // resolving reach it whether or not the group has anything in it.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT SUM('a' LIKE 'b' ESCAPE '!!') WHERE 0",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1210, "{err}");
+
+    // An aggregate written only in the HAVING aggregates the query too, the
+    // same rule the table-backed path follows: 8.3 answers a row here.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 1 WHERE 0 HAVING COUNT(*) = 0"
+        ),
+        vec![vec!["1"]]
+    );
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT COUNT(*) WHERE 0 HAVING COUNT(*) = 5"
+    )
+    .is_empty());
+
+    // A GROUP BY takes the row away again: no rows means no groups, so even
+    // the aggregate answers nothing.
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT COUNT(*) WHERE 0 GROUP BY 'a'"
+    )
+    .is_empty());
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) WHERE 1 GROUP BY 'a'"
+        ),
+        vec![vec!["1"]]
+    );
+}
+
+/// A FROM-less GROUP BY can never change which rows come back — one implicit
+/// row is one group whatever it is grouped on — so the whole of what the
+/// clause decides is what it refuses, and this path refused nothing.
+#[test]
+fn a_from_less_select_resolves_its_group_by() {
+    let (engine, mut session) = engine();
+
+    for sql in ["SELECT 1 GROUP BY 2", "SELECT 1 GROUP BY zz"] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1054, "{sql} -> {err}");
+        assert!(err.message.contains("group statement"), "{sql} -> {err}");
+    }
+
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT 1 GROUP BY 'x' LIKE 'a' ESCAPE '!!'",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1210, "{err}");
+
+    // The clause reads the select list's names, so the legal spellings still
+    // answer rather than being refused along with the rest.
+    for sql in ["SELECT 1 AS a GROUP BY a", "SELECT 1 GROUP BY 1"] {
+        assert_eq!(rows(&engine, &mut session, sql), vec![vec!["1"]], "{sql}");
+    }
+}
+
+/// The FROM-less WHERE has to reach every context a FROM-less SELECT can be
+/// written in, not only a statement of its own — each of these answered a row
+/// where 8.3 answers none.
+#[test]
+fn a_from_less_where_holds_inside_every_context() {
+    let (engine, mut session) = engine();
+
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT * FROM (SELECT 1 AS a WHERE 0) t"
+    )
+    .is_empty());
+    assert!(rows(
+        &engine,
+        &mut session,
+        "WITH c AS (SELECT 1 AS a WHERE 0) SELECT * FROM c"
+    )
+    .is_empty());
+    // A scalar subquery over no rows is NULL, and EXISTS over it is 0.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT (SELECT 1 WHERE 0)"),
+        vec![vec!["NULL"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT EXISTS (SELECT 1 WHERE 0)"),
+        vec![vec!["0"]]
+    );
+    // A union branch that answers nothing contributes nothing, in either
+    // position.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 1 AS a WHERE 0 UNION ALL SELECT 2"
+        ),
+        vec![vec!["2"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 2 AS a UNION ALL SELECT 1 WHERE 0"
+        ),
+        vec![vec!["2"]]
+    );
+
+    // A correlated FROM-less subquery reads the enclosing row, so the
+    // predicate has to be evaluated against it rather than against nothing.
+    run(&engine, &mut session, "CREATE TABLE Fw (id INT, b INT)");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Fw VALUES (1, 7), (2, 8)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id, (SELECT b WHERE b > 7) AS c FROM Fw ORDER BY id"
+        ),
+        vec![vec!["1", "NULL"], vec!["2", "8"]]
+    );
+}
+
 /// Under ONLY_FULL_GROUP_BY, selecting a column that is neither grouped nor
 /// aggregated is an error. Evaluating it against the group's first row returns
 /// an arbitrary value instead.

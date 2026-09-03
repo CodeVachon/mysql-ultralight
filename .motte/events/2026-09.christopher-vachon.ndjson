@@ -46,3 +46,6 @@
 {"at":"2026-09-03T03:40:02Z","id":160,"by":"Christopher Vachon","as":"user","type":"created","title":"REPLACE INTO is treated as a plain INSERT","state":"Todo"}
 {"at":"2026-09-03T03:40:02Z","id":161,"by":"Christopher Vachon","as":"user","type":"created","title":"A skipped row still consumes an auto-increment id","state":"Todo"}
 {"at":"2026-09-03T03:40:02Z","id":162,"by":"Christopher Vachon","as":"user","type":"created","title":"LAST_INSERT_ID(expr) ignores its argument","state":"Todo"}
+{"at":"2026-09-03T03:55:00Z","id":132,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T04:07:42Z","id":163,"by":"Christopher Vachon","as":"user","type":"created","title":"FROM DUAL is not a one-row table","state":"Todo"}
+{"at":"2026-09-03T04:07:42Z","id":164,"by":"Christopher Vachon","as":"user","type":"created","title":"check.sh exits non-zero on its own skip path","state":"Todo"}
