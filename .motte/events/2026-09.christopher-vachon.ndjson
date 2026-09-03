@@ -123,3 +123,18 @@
 {"at":"2026-09-03T16:32:40Z","id":118,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
 {"at":"2026-09-03T16:32:40Z","id":122,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
 {"at":"2026-09-03T16:32:41Z","id":123,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T17:51:06Z","id":199,"by":"Christopher Vachon","as":"user","type":"created","title":"A column-to-column copy that overflows is 1265, not 1406","state":"Todo"}
+{"at":"2026-09-03T17:51:08Z","id":200,"by":"Christopher Vachon","as":"user","type":"created","title":"Non-numeric text into a numeric column is refused under every mode","state":"Todo"}
+{"at":"2026-09-03T17:51:08Z","id":201,"by":"Christopher Vachon","as":"user","type":"created","title":"DECIMAL precision is not enforced and BINARY is not NUL-padded","state":"Todo"}
+{"at":"2026-09-03T17:51:08Z","id":202,"by":"Christopher Vachon","as":"user","type":"created","title":"UPDATE IGNORE does not parse","state":"Todo"}
+{"at":"2026-09-03T17:51:23Z","id":203,"by":"Christopher Vachon","as":"user","type":"created","title":"AUTO_INCREMENT overflow answers 1264 instead of clamping to 1062","state":"Todo"}
+{"at":"2026-09-03T17:51:23Z","id":204,"by":"Christopher Vachon","as":"user","type":"created","title":"There is no diagnostics area, so every warning is invisible","state":"Todo"}
+{"at":"2026-09-03T18:11:19Z","id":194,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T18:11:19Z","id":195,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T18:51:30Z","id":205,"by":"Christopher Vachon","as":"user","type":"created","title":"A renamed table does not carry its foreign keys with it","state":"Todo"}
+{"at":"2026-09-03T18:51:31Z","id":206,"by":"Christopher Vachon","as":"user","type":"created","title":"referential_constraints reports RESTRICT where MySQL says NO ACTION","state":"Todo"}
+{"at":"2026-09-03T18:51:31Z","id":207,"by":"Christopher Vachon","as":"user","type":"created","title":"A prefix index is stored rendered, so it matches nothing","state":"Todo"}
+{"at":"2026-09-03T18:51:31Z","id":208,"by":"Christopher Vachon","as":"user","type":"created","title":"A foreign key over a primary-key column gets a redundant index","state":"Todo"}
+{"at":"2026-09-03T19:15:27Z","id":179,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T19:15:27Z","id":180,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T19:15:27Z","id":184,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
