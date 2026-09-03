@@ -169,10 +169,15 @@ fi
 
 echo
 
+# The install hints are single-quoted on purpose. They are shell for the reader
+# to run, not for this script to expand: a `$d` in double quotes is an unbound
+# variable under `set -u`, which aborted here with no verdict printed -- so the
+# one branch written to degrade gracefully was the only one that crashed, and it
+# crashed exactly where a fresh clone missing a tool would land. See #0164.
 if [ ${#SKIPPED[@]} -gt 0 ]; then
     printf '%s\n' "${YELLOW}Skipped: ${SKIPPED[*]}${OFF}"
     echo "  Install with: cargo install cargo-machete cargo-audit --locked"
-    echo "  And, for the examples: for d in examples/*/; do npm install --prefix \"$d\"; done"
+    echo '  And, for the examples: for d in examples/*/; do npm install --prefix "$d"; done'
 fi
 
 if [ ${#FAILED[@]} -gt 0 ]; then
