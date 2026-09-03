@@ -338,7 +338,7 @@ fn hex_integer(value: &Value) -> EngineResult<u64> {
     // would answer `7FFFFFFFFFFFFFFF` for a value nobody wrote. Nothing builds
     // a decimal out of anything else today, so this is about how the *next*
     // thing to build one would fail.
-    if let Value::Decimal(text) = value {
+    if let Value::Decimal(text, _) = value {
         if let Some(rounded) = crate::decimal::whole(text) {
             return Ok(rounded.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64 as u64);
         }
@@ -1033,7 +1033,7 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
             number @ (Value::Int(_)
             | Value::Unsigned(_)
             | Value::Bool(_)
-            | Value::Decimal(_)
+            | Value::Decimal(..)
             | Value::Float(_)
             | Value::Float32(_)) => format!("{:X}", hex_integer(&number)?),
             string => hex_of(string.as_text().as_bytes()),
@@ -1277,8 +1277,12 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
             },
             // A decimal keeps its scale through a sign, which is the same rule
             // `expr.rs` gives the unary minus: 1.50 rather than 1.5.
-            Value::Decimal(ref text) => match crate::decimal::absolute(text) {
-                Some(magnitude) => Value::Decimal(magnitude),
+            Value::Decimal(ref text, display) => match crate::decimal::absolute(text) {
+                // The displayed scale rides along with the value, for the
+                // reason the unary minus keeps it: measured on 8.3,
+                // `ABS(-(1/3))` prints 0.3333 and `JSON_ARRAY(ABS(-(1/3)))` is
+                // `[0.333333333]`.
+                Some(magnitude) => Value::Decimal(magnitude, display),
                 None => Value::Float(crate::value::numeric_prefix(text).abs()),
             },
             other => Value::Float(other.as_number().abs()),
@@ -1299,14 +1303,14 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         "sign" => match arg(0).untag_bool() {
             Value::Unsigned(v) => Value::Int(i64::from(v > 0)),
             Value::Int(v) => Value::Int(v.signum()),
-            Value::Decimal(ref text) => Value::Int(match crate::decimal::sign(text) {
+            Value::Decimal(ref text, _) => Value::Int(match crate::decimal::sign(text) {
                 Some(sign) => sign,
                 None => float_sign(crate::value::numeric_prefix(text)),
             }),
             other => Value::Int(float_sign(other.as_number())),
         },
         "round" => {
-            let places = args.get(1).and_then(Value::as_int).unwrap_or(0);
+            let places = shown_places(&arg(0), args.get(1).and_then(Value::as_int).unwrap_or(0));
             // An unsigned operand is rounded exactly, because an `f64` drops
             // every digit past 2^53 — which is most of a BIGINT UNSIGNED, and
             // is the difference between MySQL's answer and a number ending in
@@ -1362,7 +1366,7 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         // `TRUNCATE(15.6, -1)` is 10. Not rounding — `TRUNCATE(1.567, 1)` is
         // 1.5 where `ROUND` would say 1.6.
         "truncate" => {
-            let places = args.get(1).and_then(Value::as_int).unwrap_or(0);
+            let places = shown_places(&arg(0), args.get(1).and_then(Value::as_int).unwrap_or(0));
             if let Value::Unsigned(v) = arg(0) {
                 return unsigned_scaled(v, places, false);
             }
@@ -1730,15 +1734,19 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
                 // of `1.23457`.
                 Value::Float32(v) => crate::decimal::plain(f64::from(*v)),
                 // Otherwise the numeric text, which is the rendering for
-                // everything but a document — a document converts through the
-                // scalar it holds, so `CAST(CAST('"2.9"' AS JSON) AS
-                // DECIMAL(10,2))` is 2.90 and not 0.00. See #0084.
+                // everything but a document and a decimal. A document converts
+                // through the scalar it holds, so `CAST(CAST('"2.9"' AS JSON)
+                // AS DECIMAL(10,2))` is 2.90 and not 0.00 — #0084 — and a
+                // decimal converts by the digits it *carries*, for the same
+                // reason the float above takes the widened double rather than
+                // the six it shows: `CAST(1/3 AS DECIMAL(20,9))` is
+                // 0.333333333 where `CAST(1/3 AS CHAR)` is 0.3333. See #0118.
                 _ => value.temporal_number().map_or_else(
                     || value.numeric_text().into_owned(),
                     |number| number.as_text(),
                 ),
             };
-            Value::Decimal(crate::types::decimal_digits(&source, scale))
+            Value::decimal(crate::types::decimal_digits(&source, scale))
         }
         D::Char(_) | D::Varchar(_) | D::Text | D::CharacterVarying(_) | D::Character(_) => {
             Value::text(value.as_text())
@@ -1800,7 +1808,7 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
             // `1.2345678806304932` — the widened double, and the same answer
             // `JSON_ARRAY(f)` gives here. Two paths disagreeing about one
             // value is worse than either being wrong. See #0071.
-            Value::Decimal(_) | Value::Float(_) | Value::Float32(_) => {
+            Value::Decimal(..) | Value::Float(_) | Value::Float32(_) => {
                 json::render(&json::from_value(&value))
             }
             _ => json::render(&json::parse(&value)?),
@@ -1950,6 +1958,29 @@ fn json_contains(target: &serde_json::Value, candidate: &serde_json::Value) -> b
     }
 }
 
+/// `places` capped at the scale a decimal argument is *shown* at.
+///
+/// `ROUND` and `TRUNCATE` both declare `min(argument's decimals, places)` and
+/// work the value to that, so asking for more places than the argument shows
+/// gives back the argument's own scale rather than the extra digits a quotient
+/// happens to carry. Measured on 8.3: `ROUND(1/3, 9)` and `TRUNCATE(1/3, 9)`
+/// are both 0.3333 where the value behind them is 0.333333333, while
+/// `TRUNCATE(1.00000/3, 12)` is 0.333333333 because *that* quotient is shown
+/// at nine places.
+///
+/// A negative count is left alone — it names a place to the left of the point,
+/// which no scale bounds — and so is every argument that is not a decimal,
+/// since a double has no declared scale to cap against.
+fn shown_places(value: &Value, places: i64) -> i64 {
+    match value {
+        Value::Decimal(text, display) if places > 0 => {
+            let shown = display.map_or_else(|| crate::decimal::scale_of(text), usize::from);
+            places.min(shown as i64)
+        }
+        _ => places,
+    }
+}
+
 /// The whole number a *numeric* operand of an integer cast carries.
 ///
 /// MySQL rounds here rather than truncating, and by two rules rather than one.
@@ -1985,7 +2016,7 @@ fn numeric_operand(value: &Value) -> Option<i128> {
         // 41-digit DECIMAL is 9223372036854775807 as SIGNED and
         // 18446744073709551615 as UNSIGNED, and `whole` saturating at
         // `i128::MAX` reaches both of those through the clamps below.
-        Value::Decimal(text) => crate::decimal::whole(text),
+        Value::Decimal(text, _) => crate::decimal::whole(text),
         // `as` saturates on a float in Rust, which is the answer wanted here:
         // `CAST(1e300 AS SIGNED)` is the signed maximum on 8.3.
         Value::Float(v) => Some(signed(v.round_ties_even() as i128)),
@@ -2276,7 +2307,7 @@ mod known_names {
     fn a_decimal_that_is_not_digits_is_not_a_saturated_number() {
         let session = Session::new(crate::session::ServerConfig::default(), 1);
         let hex = |text: &str| {
-            call("hex", vec![Value::Decimal(text.to_owned())], &session)
+            call("hex", vec![Value::decimal(text)], &session)
                 .expect("in range")
                 .as_text()
         };

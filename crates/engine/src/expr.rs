@@ -492,17 +492,20 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
                     }
                     // A sign keeps the scale: `-a` over a `DECIMAL(10,2)`
                     // holding 1.50 is -1.50 on 8.3 and is declared
-                    // `decimal(10,2)`, where the `f64` below printed -1.5.
-                    // Subtracted from zero rather than given a `-`, because
-                    // that is the same rule spelled once: a difference already
-                    // takes the wider of the two scales, and zero has none.
-                    Value::Decimal(ref text) => Ok(match crate::decimal::subtract("0", text) {
-                        Some(negated) => Value::Decimal(negated),
-                        // A `Decimal` whose text is not one, which nothing
-                        // validates: read as a number, the way the fall-through
-                        // below reads everything else.
-                        None => Value::Float(-crate::value::numeric_prefix(text)),
-                    }),
+                    // `decimal(10,2)`, where the `f64` below printed -1.5. It
+                    // keeps the *displayed* scale too, which is why the tag is
+                    // carried over rather than rebuilt: `JSON_ARRAY(-(1/3))`
+                    // is `[-0.333333333]` on 8.3 and `SELECT -(1/3)` prints
+                    // -0.3333.
+                    Value::Decimal(ref text, display) => {
+                        Ok(match crate::decimal::negate(text) {
+                            Some(negated) => Value::Decimal(negated, display),
+                            // A `Decimal` whose text is not one, which nothing
+                            // validates: read as a number, the way the
+                            // fall-through below reads everything else.
+                            None => Value::Float(-crate::value::numeric_prefix(text)),
+                        })
+                    }
                     other => Ok(Value::Float(-other.as_number())),
                 },
                 UnaryOperator::Plus => Ok(value),
@@ -1105,7 +1108,7 @@ fn number_literal(text: &str) -> Value {
     // places stays at 37 there, which is why the scale is the text's own and
     // is not clamped here.
     if let Some(exact) = crate::decimal::rescale_wide(text, crate::decimal::scale_of(text)) {
-        return Value::Decimal(exact);
+        return Value::decimal(exact);
     }
     Value::Float(text.parse::<f64>().unwrap_or(0.0))
 }
@@ -1262,9 +1265,9 @@ pub fn literal_of(e: &Expr) -> Option<Value> {
         } => match literal_of(expr)? {
             Value::Int(v) => Some(Value::Int(-v)),
             Value::Float(v) => Some(Value::Float(-v)),
-            // The same subtraction the evaluator's unary minus does, so a
+            // The same sign flip the evaluator's unary minus does, so a
             // `DEFAULT -1.50` is stored at the scale it was written with.
-            Value::Decimal(text) => crate::decimal::subtract("0", &text).map(Value::Decimal),
+            Value::Decimal(text, _) => crate::decimal::negate(&text).map(Value::decimal),
             _ => None,
         },
         _ => None,
@@ -2541,12 +2544,38 @@ fn exact_arithmetic(
     if matches!(op, B::Divide | B::Modulo | B::MyIntegerDivide) && crate::decimal::is_zero(&b) {
         return Some(Ok(Value::Null));
     }
-    let text = match op {
-        B::Plus => crate::decimal::add(&a, &b),
-        B::Minus => crate::decimal::subtract(&a, &b),
-        B::Multiply => crate::decimal::multiply(&a, &b),
-        B::Divide => crate::decimal::divide(&a, &b, increment),
-        B::Modulo => crate::decimal::remainder(&a, &b),
+    // Each operator answers twice: the digits it computes, and how many of
+    // them the client is shown. The two are one number until a quotient is
+    // involved and then are not — measured on 8.3, `(1/3) * 3` is 0.999999999
+    // in a document and 1.0000 printed, `(1/3) + 0` is 0.333333333 for
+    // 0.3333, and `(1/3) / 1` is 0.333333333000000000 for 0.33333333 — so the
+    // two rules are computed side by side here and carried apart on the value.
+    // See `Value::Decimal`.
+    //
+    // Both `display_scale` calls answer for exactly the operands
+    // `exact_decimal` accepted above, so neither `?` is a second way out.
+    let (l, r) = (left.display_scale()?, right.display_scale()?);
+    let (text, shown) = match op {
+        B::Plus => (
+            crate::decimal::add(&a, &b),
+            crate::decimal::widest_display_scale(l, r),
+        ),
+        B::Minus => (
+            crate::decimal::subtract(&a, &b),
+            crate::decimal::widest_display_scale(l, r),
+        ),
+        B::Multiply => (
+            crate::decimal::multiply(&a, &b),
+            crate::decimal::product_display_scale(l, r),
+        ),
+        B::Divide => (
+            crate::decimal::divide(&a, &b, increment),
+            crate::decimal::quotient_display_scale(l, increment),
+        ),
+        B::Modulo => (
+            crate::decimal::remainder(&a, &b),
+            crate::decimal::widest_display_scale(l, r),
+        ),
         B::MyIntegerDivide => {
             let quotient = crate::decimal::integer_divide(&a, &b)?;
             // Through `fitted`, so the answer lands in the same domain the
@@ -2567,7 +2596,7 @@ fn exact_arithmetic(
         }
         _ => return None,
     };
-    Some(Ok(Value::Decimal(text?)))
+    Some(Ok(Value::decimal_at(text?, shown)))
 }
 
 /// A bitwise chain's answer as a `Value`.
@@ -2640,7 +2669,7 @@ fn bit_operand(v: &Value) -> EngineResult<u64> {
         // operand — `dt3 | 0` is 20240105060709 for 06:07:08.500.
         Value::Temporal(text) => match v.temporal_number() {
             Some(Value::Int(n)) => n as u64,
-            Some(Value::Decimal(number)) => decimal_bits(&number),
+            Some(Value::Decimal(number, _)) => decimal_bits(&number),
             // Text a DATE column holds that is not a temporal at all, which
             // nothing validates on the way in. Read as the string it is,
             // which is what it was before the tag existed.
@@ -2651,7 +2680,7 @@ fn bit_operand(v: &Value) -> EngineResult<u64> {
         // `DECIMAL(20,1)` holding 4503599627370496.5 is 4503599627370497 in
         // MySQL and 4503599627370496 through a double, which lands on the
         // wrong side of every bit it is then masked with.
-        Value::Decimal(text) => decimal_bits(text),
+        Value::Decimal(text, _) => decimal_bits(text),
         Value::Text(s, _) => integer_prefix(s),
         // Through the scalar the document holds, so `j | 0` and `j + 0` agree
         // about a quoted numeric: `CAST('"2026"' AS JSON) | 0` is 2026 on 8.3

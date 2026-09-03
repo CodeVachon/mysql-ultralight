@@ -1323,7 +1323,17 @@ pub fn from_value(value: &Value) -> Json {
         // written down. A decimal whose digits will not take the mark keeps
         // its own spelling and types as whatever the digits say, which is the
         // old answer rather than a new wrong one.
-        Value::Decimal(s) => format!("{s}{DECIMAL_MARK}")
+        //
+        // The digits it *carries*, which are not always the digits it prints:
+        // a quotient computes to a nine-digit word boundary and is shown at
+        // its declared scale, and the document gets the wide one. Measured on
+        // 8.3, `JSON_ARRAY(1/3)` is `[0.333333333]` where `SELECT 1/3` prints
+        // 0.3333, and `JSON_ARRAY(AVG(a))` over a `DECIMAL(10,2)` carries
+        // nine places where the printed average shows six. That is #0122. The
+        // mark rides on whichever spelling reaches here, so reading the value
+        // rather than the rendering is the whole of that fix — the marking is
+        // the line above and is left exactly as it was.
+        Value::Decimal(s, _) => format!("{s}{DECIMAL_MARK}")
             .parse::<Number>()
             .or_else(|_| s.parse::<Number>())
             .map_or_else(|_| Json::String(s.clone()), Json::Number),

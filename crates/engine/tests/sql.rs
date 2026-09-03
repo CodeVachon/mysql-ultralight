@@ -30862,3 +30862,367 @@ fn a_decimal_in_a_document_types_decimal_where_a_double_types_double() {
         ]
     );
 }
+
+#[test]
+fn a_quotient_carries_more_places_than_the_column_it_is_shown_under() {
+    // MySQL divides into nine-digit words and truncates at the last one it
+    // filled, then describes the column at the left operand's scale plus
+    // `div_precision_increment`. So the value and the rendering are two
+    // different numbers, and everything that reads a quotient as a *number*
+    // reads the wide one: comparison, arithmetic, a total, and a column it is
+    // written into. Every answer here measured on 8.3. See #0118.
+    let (engine, mut session) = engine();
+
+    for (sql, expected) in [
+        // The rendering, which is the half this engine already had right.
+        ("SELECT 1/3", "0.3333"),
+        ("SELECT 10/3", "3.3333"),
+        ("SELECT 1.50/1.500", "1.000000"),
+        // The value, read through a comparison. `1/3` is above 0.3333 there
+        // because 0.333333333 is, and `IN` is the same question.
+        ("SELECT 1/3 = 0.3333", "0"),
+        ("SELECT 1/3 > 0.3333", "1"),
+        ("SELECT (1/3) IN (0.3333)", "0"),
+        ("SELECT (1/3) BETWEEN 0.3333 AND 0.33334", "1"),
+        // And through arithmetic, where the extra places change the answer
+        // that is printed: 0.333333333 * 3 is 0.999999999, shown at four.
+        ("SELECT (1/3)*3", "1.0000"),
+        ("SELECT 1/3 + 1/3", "0.6667"),
+        // The displayed scale of a sum is the wider of the two operands' and
+        // of a product the two added, over the scales they *show*.
+        ("SELECT 1 + 1.50", "2.50"),
+        ("SELECT 1.50 + 1", "2.50"),
+        ("SELECT 1.50 * 1.500", "2.25000"),
+        ("SELECT 1.50 % 1.500", "0.000"),
+        // A sign and an absolute value keep both scales.
+        ("SELECT -(1/3)", "-0.3333"),
+        ("SELECT ABS(-(1/3))", "0.3333"),
+        // A quotient of a quotient: the width comes from the value's nine
+        // places and the rendering from the declared four.
+        ("SELECT (1/3)/1", "0.33333333"),
+        // The characters, which are the rendering and not the value.
+        ("SELECT CAST(1/3 AS CHAR)", "0.3333"),
+        ("SELECT CONCAT(1/3)", "0.3333"),
+        ("SELECT LENGTH(1/3)", "6"),
+        // A cast to a decimal reads the number instead, so the nine places
+        // survive into a wider column.
+        ("SELECT CAST(1/3 AS DECIMAL(20,9))", "0.333333333"),
+        ("SELECT CAST(1/3 AS DECIMAL(20,2))", "0.33"),
+        // ROUND and TRUNCATE declare `min(the argument's scale, places)`, so
+        // asking for more than the argument shows gives back what it shows.
+        ("SELECT ROUND(1/3, 9)", "0.3333"),
+        ("SELECT TRUNCATE(1/3, 9)", "0.3333"),
+        ("SELECT ROUND(1/3, 2)", "0.33"),
+        // The value is what gets rounded, which is why this is 1 and not 0.
+        ("SELECT ROUND(2/3, 0)", "1"),
+        // A quotient that underflows the words it was given is a plain zero
+        // in the value and still shows its declared places.
+        ("SELECT 1.0/70000000000000000", "0.00000"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // The widths, which are a whole number of nine-digit words and not the
+    // `frac1 + frac2 + increment` rounded up they look like. `1.5/1` and
+    // `1/1.5` carry nine and `1.5/1.5` carries eighteen, so neither half of
+    // the rule can be dropped.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_ARRAY(1.5/1, 1/1.5, 1.5/1.5, 1.000000/1, 1/1.00000000000)"
+        ),
+        vec![vec![
+            "[1.500000000, 0.666666666, 1.000000000000000000, 1.000000000000000000, \
+             1.000000000000000000]"
+        ]]
+    );
+    // 25 places is three words and the increment pushes the sum into a
+    // fourth, so the value carries 36 where the column declares 29.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 1.0000000000000000000000000/7, \
+             JSON_ARRAY(1.0000000000000000000000000/7)"
+        ),
+        vec![vec![
+            "0.14285714285714285714285714286",
+            "[0.142857142857142857142857142857142857]",
+        ]]
+    );
+
+    // `div_precision_increment` moves the *declared* scale directly and the
+    // value's width only through the word boundary: at 6 the quotient still
+    // carries nine places, and at 0 there is no word to divide into at all,
+    // which is why `7/2` is 3 there rather than 4.
+    run(
+        &engine,
+        &mut session,
+        "SET SESSION div_precision_increment = 6",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 1/3, JSON_ARRAY(1/3)"),
+        vec![vec!["0.333333", "[0.333333333]"]]
+    );
+    run(
+        &engine,
+        &mut session,
+        "SET SESSION div_precision_increment = 0",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 1/3, JSON_ARRAY(1/3), 7/2, JSON_ARRAY(7/2)"
+        ),
+        vec![vec!["0", "[0]", "3", "[3]"]]
+    );
+    run(
+        &engine,
+        &mut session,
+        "SET SESSION div_precision_increment = 4",
+    );
+
+    // A total reads the values, so it totals the nine-place ones and rounds
+    // once at the end: eight rows of v/3 come to 10.999999998, shown at six.
+    run(&engine, &mut session, "CREATE TABLE Qt (v DECIMAL(10,2))");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Qt VALUES (1.50),(2.50),(8.50),(4.00),(1.50),(2.50),(8.50),(4.00)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT SUM(v/3), JSON_ARRAY(SUM(v/3)) FROM Qt"
+        ),
+        vec![vec!["11.000000", "[10.999999998]"]]
+    );
+    // MIN and MAX pick a value and keep both of its scales; AVG divides the
+    // total again and widens both.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT MIN(v/3), MAX(v/3), AVG(v/3), JSON_ARRAY(MIN(v/3), MAX(v/3), AVG(v/3)) FROM Qt"
+        ),
+        vec![vec![
+            "0.500000",
+            "2.833333",
+            "1.3749999998",
+            "[0.500000000, 2.833333333, 1.374999999750000000]",
+        ]]
+    );
+
+    // A column stores the number and not the rendering, so a wide enough one
+    // keeps every place the division computed.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Qw (narrow DECIMAL(10,2), wide DECIMAL(20,9))",
+    );
+    run(&engine, &mut session, "INSERT INTO Qw VALUES (1/3, 1/3)");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT narrow, wide FROM Qw"),
+        vec![vec!["0.33", "0.333333333"]]
+    );
+}
+
+#[test]
+fn a_document_gets_the_places_a_decimal_carries_and_not_the_ones_it_shows() {
+    // The same split #0118 is about, seen through JSON: a document takes the
+    // raw decimal where the string conversion rounds to the displayed scale,
+    // so one value has two spellings depending on which it goes through.
+    // Measured on 8.3. See #0122.
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE Jd (a DECIMAL(20,4))");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Jd VALUES (3086419.5750),(3086419.5750)",
+    );
+
+    for (sql, expected) in [
+        // The two the issue records, printed and embedded.
+        ("SELECT AVG(a) FROM Jd", "3086419.57500000"),
+        ("SELECT JSON_ARRAY(AVG(a)) FROM Jd", "[3086419.575000000]"),
+        ("SELECT a/2 FROM Jd LIMIT 1", "1543209.78750000"),
+        (
+            "SELECT JSON_ARRAY(a/2) FROM Jd LIMIT 1",
+            "[1543209.787500000]",
+        ),
+        // Every constructor, because each builds the document its own way.
+        ("SELECT JSON_ARRAY(1/3)", "[0.333333333]"),
+        ("SELECT JSON_OBJECT('q', 1/3)", r#"{"q": 0.333333333}"#),
+        ("SELECT CAST(1/3 AS JSON)", "0.333333333"),
+        ("SELECT JSON_ARRAY(JSON_ARRAY(1/3))", "[[0.333333333]]"),
+        (
+            "SELECT JSON_EXTRACT(JSON_ARRAY(1/3), '$[0]')",
+            "0.333333333",
+        ),
+        // A stored decimal has one spelling and keeps it: only a computed one
+        // carries places it does not show.
+        ("SELECT JSON_ARRAY(a) FROM Jd LIMIT 1", "[3086419.5750]"),
+        // An exact zero is the case where the value has *fewer* places than
+        // the rendering. MySQL's operators normalise one to a bare `0` where a
+        // literal keeps every place it was written to.
+        ("SELECT JSON_ARRAY(0.00)", "[0.00]"),
+        ("SELECT JSON_ARRAY(1.50 - 1.50)", "[0]"),
+        ("SELECT JSON_ARRAY(0.00 * 1.5)", "[0]"),
+        ("SELECT JSON_ARRAY(0.00 / 1)", "[0]"),
+        ("SELECT JSON_ARRAY(2.50 % 1.25)", "[0]"),
+        ("SELECT 1.50 - 1.50", "0.00"),
+        ("SELECT 0.00 / 1", "0.000000"),
+        // A sign is not a subtraction and does not normalise.
+        ("SELECT JSON_ARRAY(-0.00)", "[0.00]"),
+        // A product's value clamps one place *past* the 30 it is shown at.
+        (
+            "SELECT JSON_ARRAY(3.5000000000 * 1.500000000000000000000000000000)",
+            "[5.2500000000000000000000000000000]",
+        ),
+        (
+            "SELECT 3.5000000000 * 1.500000000000000000000000000000",
+            "5.250000000000000000000000000000",
+        ),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // A temporary table has only the places its field declares, so the wide
+    // value stops at one. A derived table and a CTE are both materialised; a
+    // scalar subquery is not, and keeps every place.
+    for (sql, expected) in [
+        ("SELECT JSON_ARRAY(x) FROM (SELECT 1/3 AS x) t", "[0.3333]"),
+        (
+            "WITH c AS (SELECT 1/3 AS x) SELECT JSON_ARRAY(x) FROM c",
+            "[0.3333]",
+        ),
+        (
+            "SELECT JSON_ARRAY(SUM(x)) FROM (SELECT 1/3 AS x) t",
+            "[0.3333]",
+        ),
+        ("SELECT JSON_ARRAY((SELECT 1/3))", "[0.333333333]"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn a_union_shows_every_branch_at_the_widest_scale() {
+    // MySQL types a union's column by aggregating the branches and writes
+    // every row into a temporary table at *that* scale, so the widest scale
+    // wins and an integer branch is padded out to it. Measured on 8.3. See
+    // #0123.
+    let (engine, mut session) = engine();
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 2.50 AS u UNION ALL SELECT 2.5 UNION ALL SELECT 2"
+        ),
+        vec![vec!["2.50"], vec!["2.50"], vec!["2.00"]]
+    );
+    // With de-duplication, 2.50 and 2.5 are the same row once they are both
+    // written at two places.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 2.50 AS u UNION SELECT 2.5 UNION SELECT 2"
+        ),
+        vec![vec!["2.50"], vec!["2.00"]]
+    );
+    // More than two branches, with the widest in the middle rather than
+    // first: the aggregation is over all of them and not a running left one.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 1.5 AS u UNION ALL SELECT 2 UNION ALL SELECT 3.456 UNION ALL SELECT 4.5"
+        ),
+        vec![vec!["1.500"], vec!["2.000"], vec!["3.456"], vec!["4.500"]]
+    );
+    // A quotient's *displayed* scale is what a branch brings, not the places
+    // its value carries.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 1/3 AS u UNION ALL SELECT 2.5 UNION ALL SELECT 2"
+        ),
+        vec![vec!["0.3333"], vec!["2.5000"], vec!["2.0000"]]
+    );
+    // And the values are written at it, not only the rendering: the union
+    // puts 1/3 into a four-place field, which makes it the same number as
+    // 0.3333 and collapses the two rows.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT DISTINCT x FROM (SELECT 1/3 AS x UNION ALL SELECT 0.3333) t"
+        ),
+        vec![vec!["0.3333"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT JSON_ARRAY(x) FROM (SELECT 1/3 AS x UNION ALL SELECT 1.5) z"
+        ),
+        vec![vec!["[0.3333]"], vec!["[1.5000]"]]
+    );
+
+    // A column's scale counts the same as a literal's, whichever side it is
+    // on, and two integer branches are left alone rather than retagged.
+    run(&engine, &mut session, "CREATE TABLE Ub (a DECIMAL(10,2))");
+    run(&engine, &mut session, "INSERT INTO Ub VALUES (1.50),(2.50)");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT a AS u FROM Ub UNION ALL SELECT 1.5"
+        ),
+        vec![vec!["1.50"], vec!["2.50"], vec!["1.50"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 1 AS u UNION ALL SELECT 2 UNION ALL SELECT 3"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["3"]]
+    );
+    // An approximate branch takes the whole column with it, and a string one
+    // makes it a string — neither is a decimal to unify.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 2.5 AS u UNION ALL SELECT 1.5e0"
+        ),
+        vec![vec!["2.5"], vec!["1.5"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 2.5 AS u UNION ALL SELECT 'abc'"
+        ),
+        vec![vec!["2.5"], vec!["abc"]]
+    );
+}

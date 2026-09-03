@@ -1247,7 +1247,7 @@ impl Engine {
             }
 
             added = Vec::with_capacity(produced.rows.len());
-            for row in untagged_booleans(produced.rows) {
+            for row in materialised(produced.rows) {
                 let mut written = Vec::with_capacity(fields.len());
                 for (value, (column, ty)) in row.into_iter().zip(&fields) {
                     written.push(ty.coerce(value, column)?);
@@ -1342,7 +1342,7 @@ impl Engine {
         // boolean is not a `Value::Int`, so `VALUES ROW(TRUE)` fell to its
         // VAR_STRING catch-all and was described a string while carrying 1.
         // MySQL types that constructor's `column_0` LONGLONG.
-        let rows = untagged_booleans(rows);
+        let rows = materialised(rows);
 
         let width = rows.first().map(|r| r.len()).unwrap_or(0);
         // A ragged constructor would produce rows the wire cannot frame, and
@@ -1599,6 +1599,59 @@ impl Engine {
                         // fit the column it came from fits this one.
                         let taken = std::mem::replace(value, Value::Null);
                         *value = declared.coerce(taken, name)?;
+                    }
+                }
+
+                // A decimal column's scale is aggregated across the branches
+                // the same way, and the temporary table's field holds every
+                // branch's values at it. That is #0123: measured on 8.3,
+                // `SELECT 2.50 UNION ALL SELECT 2.5 UNION ALL SELECT 2` is
+                // 2.50, 2.50 and 2.00 there where this engine showed each
+                // branch at its own. An integer branch is written at the
+                // scale too — `SELECT 1/3 UNION ALL SELECT 2.5 UNION ALL
+                // SELECT 2` is 0.3333, 2.5000, 2.0000 there.
+                //
+                // The *values* and not the rendering, which is measurable
+                // before anything is printed: `SELECT DISTINCT x FROM (SELECT
+                // 1/3 AS x UNION ALL SELECT 0.3333) t` is one row on 8.3,
+                // because the union writes the quotient into a four-place
+                // field and the two stop being different numbers.
+                //
+                // Read off the rows rather than off a declared type, because
+                // an expression's scale is not described here at all — that is
+                // #0111 — so a literal branch has no column to take one from.
+                // A branch that declares a scale and returns no row is what
+                // that misses; a branch with rows carries its scale on each.
+                for i in 0..left.columns.len() {
+                    if !matches!(
+                        left.columns[i].ty,
+                        ColumnType::NewDecimal | ColumnType::Decimal
+                    ) {
+                        continue;
+                    }
+                    let widest = left
+                        .rows
+                        .iter()
+                        .chain(right.rows.iter())
+                        .filter_map(|row| row.get(i)?.display_scale())
+                        .max()
+                        .unwrap_or(0);
+                    // Nothing to unify at no places at all, and saying so
+                    // keeps a union of two integers wide enough to need a
+                    // DECIMAL from being retagged one value at a time.
+                    if widest == 0 {
+                        continue;
+                    }
+                    for row in left.rows.iter_mut().chain(right.rows.iter_mut()) {
+                        let Some(value) = row.get_mut(i) else {
+                            continue;
+                        };
+                        let Some(exact) = value.exact_decimal() else {
+                            continue;
+                        };
+                        if let Some(written) = crate::decimal::rescale_wide(&exact, widest) {
+                            *value = Value::decimal(written);
+                        }
                     }
                 }
 
@@ -2640,7 +2693,7 @@ impl Engine {
                         .collect(),
                     // A derived table has no base row to write back to.
                     origins: vec![Vec::new(); inner.rows.len()],
-                    rows: untagged_booleans(inner.rows),
+                    rows: materialised(inner.rows),
                     sources: Vec::new(),
                     base_tables: Vec::new(),
                     source_databases: Vec::new(),
@@ -3840,7 +3893,17 @@ impl Engine {
                 } else if let Some((total, scale)) = exact_total(&present) {
                     // A total keeps the scale it added up, so `SUM` over a
                     // `DECIMAL(10,2)` is a `DECIMAL(_,2)` — `4.00`, not `4`.
-                    Value::Decimal(crate::decimal::render(total, scale))
+                    //
+                    // And it keeps the scale its argument was *shown* at,
+                    // which is a different number wherever a quotient was
+                    // summed: measured on 8.3 over four `DECIMAL(10,2)` rows,
+                    // `SUM(a/3)` prints 5.500000 at six places and
+                    // `JSON_ARRAY(SUM(a/3))` is `[5.499999999]` — the total of
+                    // the nine-place values, rounded once at the end.
+                    Value::decimal_at(
+                        crate::decimal::normalised(crate::decimal::render(total, scale)),
+                        shown_scale(&present),
+                    )
                 } else {
                     Value::Float(approximate_total(&present))
                 }
@@ -3865,7 +3928,7 @@ impl Engine {
                     // 0.333336667 that rounding gives. At an increment of 0
                     // there is no word at all, so `AVG` of 1 and 2 is 1 there
                     // rather than 2.
-                    let sum = crate::decimal::render(total, scale);
+                    let sum = crate::decimal::normalised(crate::decimal::render(total, scale));
                     // `present` is non-empty here, so the divisor cannot be
                     // the zero that is the only thing `divide` refuses a pair
                     // of decimals for; the float is what the inexact branch
@@ -3875,7 +3938,20 @@ impl Engine {
                         &present.len().to_string(),
                         session.div_precision_increment(),
                     ) {
-                        Some(mean) => Value::Decimal(mean),
+                        // Shown at the same increment over the scale the
+                        // *total* is shown at, which is the division's own
+                        // rule: measured on 8.3, `AVG(a)` over a
+                        // `DECIMAL(10,2)` prints at six places while
+                        // `JSON_ARRAY(AVG(a))` carries nine, and `AVG(a/3)`
+                        // prints at ten while the document carries eighteen.
+                        // That second pair is #0122's example.
+                        Some(mean) => Value::decimal_at(
+                            mean,
+                            crate::decimal::quotient_display_scale(
+                                shown_scale(&present),
+                                session.div_precision_increment(),
+                            ),
+                        ),
                         None => Value::Float(approximate_total(&present) / present.len() as f64),
                     }
                 } else {
@@ -5654,7 +5730,7 @@ impl Engine {
         Relation {
             origins: vec![Vec::new(); rows.len()],
             columns,
-            rows: untagged_booleans(rows),
+            rows: materialised(rows),
             sources: Vec::new(),
             base_tables: Vec::new(),
             source_databases: Vec::new(),
@@ -7046,7 +7122,7 @@ fn exact_total(values: &[&Value]) -> Option<(i128, usize)> {
         .iter()
         .map(|v| match exact_operand(v)?.as_ref() {
             Value::Int(_) | Value::Unsigned(_) => Some(0),
-            Value::Decimal(text) => Some(crate::decimal::scale_of(text)),
+            Value::Decimal(text, _) => Some(crate::decimal::scale_of(text)),
             _ => None,
         })
         .try_fold(0usize, |widest, scale| Some(widest.max(scale?)))?;
@@ -7058,12 +7134,30 @@ fn exact_total(values: &[&Value]) -> Option<(i128, usize)> {
             // nothing bounds how many digits that has.
             Value::Int(n) => i128::from(*n).checked_mul(10i128.checked_pow(scale as u32)?)?,
             Value::Unsigned(n) => i128::from(*n).checked_mul(10i128.checked_pow(scale as u32)?)?,
-            Value::Decimal(text) => crate::decimal::units(text, scale)?,
+            Value::Decimal(text, _) => crate::decimal::units(text, scale)?,
             _ => return None,
         };
         total = total.checked_add(units)?;
     }
     Some((total, scale))
+}
+
+/// The scale a total is *shown* at: the widest its addends are shown at.
+///
+/// The same "widest wins" rule [`exact_total`] applies to the digits, over the
+/// declared scale instead. The two are one number until a quotient is summed
+/// and then are not — `SUM(a/3)` over a `DECIMAL(10,2)` totals nine-place
+/// values and shows six of them on 8.3 — which is the whole of #0118 seen
+/// through an aggregate.
+///
+/// A value with no exact reading contributes nothing rather than refusing: the
+/// caller has already established that every addend has one.
+fn shown_scale(values: &[&Value]) -> usize {
+    values
+        .iter()
+        .filter_map(|v| exact_operand(v)?.display_scale())
+        .max()
+        .unwrap_or(0)
 }
 
 /// The inexact total of everything a `SUM` or an `AVG` no exact type covers
@@ -7111,7 +7205,7 @@ fn exact_operand(value: &Value) -> Option<std::borrow::Cow<'_, Value>> {
         // than left to `approximate_total`: `SUM(bu)` over a BIGINT UNSIGNED
         // holding 18446744073709551615 is that number on 8.3, where the `f64`
         // path renders 18446744073709552000.
-        Value::Int(_) | Value::Decimal(_) | Value::Unsigned(_) => {
+        Value::Int(_) | Value::Decimal(..) | Value::Unsigned(_) => {
             Some(std::borrow::Cow::Borrowed(value))
         }
         Value::Temporal(_) => value.temporal_number().map(std::borrow::Cow::Owned),
@@ -12137,17 +12231,31 @@ fn poisoned() -> EngineError {
     )
 }
 
-/// The rows of a table-shaped result, with the boolean tag taken off.
+/// The rows of a table-shaped result, as a temporary table would hold them.
 ///
 /// A derived table and a CTE both give an expression a *column* to live in,
-/// and MySQL stops calling it a boolean at that point: measured on 8.3,
-/// `SELECT JSON_ARRAY(x) FROM (SELECT TRUE AS x) t` is `[1]` where the bare
-/// `SELECT JSON_ARRAY(TRUE)` is `[true]`, and a CTE answers the same. A
-/// *scalar* subquery is not one of these and does keep it — `(SELECT TRUE) =
-/// CAST('true' AS JSON)` is 1 there — which is the opposite of the rule an
-/// ENUM follows, so the two are stripped in different places.
-fn untagged_booleans(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
+/// and two things about the value stop at that boundary.
+///
+/// MySQL stops calling it a boolean: measured on 8.3, `SELECT JSON_ARRAY(x)
+/// FROM (SELECT TRUE AS x) t` is `[1]` where the bare `SELECT
+/// JSON_ARRAY(TRUE)` is `[true]`, and a CTE answers the same.
+///
+/// And a decimal loses the places it carries past the ones it is described
+/// with, because the field it is written into has only the described ones:
+/// `SELECT JSON_ARRAY(x) FROM (SELECT 1/3 AS x) t` is `[0.3333]` there where
+/// the same expression unmaterialised is `[0.333333333]`, and `SUM` over that
+/// derived table totals the four-place value.
+///
+/// A *scalar* subquery is neither of these and keeps both — `(SELECT TRUE) =
+/// CAST('true' AS JSON)` is 1 there and `JSON_ARRAY((SELECT 1/3))` is
+/// `[0.333333333]` — which is the opposite of the rule an ENUM follows, so
+/// those are stripped in different places.
+fn materialised(rows: Vec<Vec<Value>>) -> Vec<Vec<Value>> {
     rows.into_iter()
-        .map(|row| row.into_iter().map(Value::untag_bool).collect())
+        .map(|row| {
+            row.into_iter()
+                .map(|value| value.untag_bool().settled())
+                .collect()
+        })
         .collect()
 }

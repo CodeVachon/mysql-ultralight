@@ -46,7 +46,8 @@ pub enum Value {
     /// Nothing about the string itself says which was meant, so the tag is the
     /// only thing that can tell them apart.
     Json(String),
-    /// A fixed-point decimal, held as its text at the column's scale.
+    /// A fixed-point decimal: its exact digits, and the scale it is *shown*
+    /// at where that is narrower.
     ///
     /// Tagged for the same reason as `Json` above: nothing about `"2.50"` says
     /// whether it is a number or the characters someone stored in a VARCHAR,
@@ -55,7 +56,34 @@ pub enum Value {
     /// their characters, so `'2.5'` and `'2.50'` are *not* equal and `'10.00'`
     /// sorts first. Both of those are MySQL's answers, and only the tag can
     /// pick between them.
-    Decimal(String),
+    ///
+    /// The second field is why a quotient is right in both readings. MySQL's
+    /// division computes to a nine-digit word boundary and declares the column
+    /// at the left operand's scale plus `div_precision_increment`, so the
+    /// value and its rendering are different numbers: measured on 8.3,
+    /// `SELECT 1/3` prints 0.3333 while `JSON_ARRAY(1/3)` is `[0.333333333]`,
+    /// `1/3 = 0.3333` is 0 and `(1/3)*3` is 1.0000 rather than 0.9999. So the
+    /// text here is the *value*, always, and `Some(n)` says the client sees it
+    /// at `n` places instead. `None` is the ordinary case — a literal, a
+    /// column, anything already at its own scale — and means the two agree.
+    ///
+    /// Everything that reads a decimal as a number reads the text: comparison,
+    /// arithmetic, `SUM`, a document, and a column it is written into, all
+    /// measured. Everything that reads it as characters reads the rendering:
+    /// the wire, `CAST(1/3 AS CHAR)`, `CONCAT` and `GROUP_CONCAT`. See #0118
+    /// and #0122.
+    ///
+    /// [`Value::decimal`] builds the agreeing kind and [`Value::decimal_at`]
+    /// the split one; [`Value::displayed`] is the rendering and
+    /// [`Value::settled`] collapses the two, which is what a temporary table
+    /// does — `SELECT JSON_ARRAY(x) FROM (SELECT 1/3 AS x) t` is `[0.3333]` on
+    /// 8.3 where the same expression unmaterialised is `[0.333333333]`.
+    ///
+    /// A byte, not a `usize`, so that carrying the second field costs nothing:
+    /// `Value` is passed by value through the whole evaluator and a recursive
+    /// one is measured in stack frames. MySQL's widest scale anywhere is the
+    /// 81 places a quotient's value reaches, which is well inside a `u8`.
+    Decimal(String, Option<u8>),
     /// A four-byte float, held widened but remembered as four bytes.
     ///
     /// Tagged for the same reason `Decimal` above is: the value alone does not
@@ -182,6 +210,94 @@ impl Value {
         Value::Text(s.into(), Collated::implicit(collation))
     }
 
+    /// A decimal shown at exactly the places it carries: a literal, a column,
+    /// anything whose value and rendering are one number.
+    pub fn decimal(text: impl Into<String>) -> Self {
+        Value::Decimal(text.into(), None)
+    }
+
+    /// A decimal whose value carries more places than the client is shown.
+    ///
+    /// A quotient, and everything computed from one. See the note on
+    /// [`Value::Decimal`].
+    pub fn decimal_at(text: impl Into<String>, display: usize) -> Self {
+        let text = text.into();
+        // Collapsed where the two scales are the same number, which is most of
+        // what comes through here — a sum, a difference and a remainder are
+        // shown at exactly the places they carry unless a quotient was one of
+        // the operands. It saves the rescale on every read, and it is what
+        // keeps the byte below from having to hold a scale no clamp bounds: a
+        // *literal* can be written to more places than a `u8` counts, and the
+        // paths that widen past 30 — `+`, `-` and `%` — are the ones this arm
+        // takes.
+        if display == crate::decimal::scale_of(&text) {
+            return Value::Decimal(text, None);
+        }
+        // Saturating rather than wrapping, for the value that would reach here
+        // some other way: showing every place it carries beats showing a
+        // number of them nobody asked for.
+        Value::Decimal(text, Some(display.min(u8::MAX as usize) as u8))
+    }
+
+    /// How many places this value is *shown* at, for an operand of exact
+    /// arithmetic.
+    ///
+    /// An integer shows none; a decimal shows its declared scale, which is its
+    /// own where it has no narrower one. `None` for everything else, which is
+    /// the answer the exact paths already fall out of.
+    pub(crate) fn display_scale(&self) -> Option<usize> {
+        match self {
+            Value::Int(_) | Value::Unsigned(_) => Some(0),
+            Value::Decimal(text, display) => {
+                Some(display.map_or_else(|| crate::decimal::scale_of(text), usize::from))
+            }
+            _ => None,
+        }
+    }
+
+    /// The characters a client sees, for a decimal that shows fewer places
+    /// than it carries.
+    ///
+    /// Borrowed where the two agree, which is every value that is not a
+    /// quotient or built from one.
+    ///
+    /// Anything that is not a decimal is handed to [`Value::as_text`], which
+    /// is not a cycle: the only arm of that function reaching back here is the
+    /// decimal one, which the two arms above have already taken.
+    pub(crate) fn displayed(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Value::Decimal(text, Some(display)) => {
+                match crate::decimal::rescale_wide(text, usize::from(*display)) {
+                    Some(shown) => std::borrow::Cow::Owned(shown),
+                    // Nothing builds a `Decimal` out of anything but digits, so
+                    // this is unreachable; answering the text keeps a value that
+                    // got here another way readable rather than empty.
+                    None => std::borrow::Cow::Borrowed(text.as_str()),
+                }
+            }
+            Value::Decimal(text, None) => std::borrow::Cow::Borrowed(text.as_str()),
+            _ => std::borrow::Cow::Owned(self.as_text()),
+        }
+    }
+
+    /// The value a temporary table would hold: a decimal cut to the scale it
+    /// is shown at, everything else unchanged.
+    ///
+    /// MySQL's derived tables, CTEs and set operations all write their rows
+    /// into a table whose field carries the *declared* scale, so the extra
+    /// places a quotient computed do not survive one. Measured on 8.3:
+    /// `SELECT JSON_ARRAY(x) FROM (SELECT 1/3 AS x) t` is `[0.3333]` where the
+    /// bare `SELECT JSON_ARRAY(1/3)` is `[0.333333333]`, and a scalar
+    /// subquery — which is not materialised — keeps the nine.
+    pub(crate) fn settled(self) -> Self {
+        match self {
+            Value::Decimal(text, Some(display)) => Value::decimal(
+                crate::decimal::rescale_wide(&text, usize::from(display)).unwrap_or(text),
+            ),
+            other => other,
+        }
+    }
+
     /// The collation this value brings to a comparison.
     ///
     /// Everything that is not text is coercible: MySQL types a number's
@@ -233,7 +349,7 @@ impl Value {
             // 06:07:08.500, and 60709 for the TIME(3) beside it.
             Value::Temporal(_) => match self.temporal_number()? {
                 Value::Int(n) => Some(n),
-                Value::Decimal(text) => i64::try_from(crate::decimal::units(&text, 0)?).ok(),
+                Value::Decimal(text, _) => i64::try_from(crate::decimal::units(&text, 0)?).ok(),
                 _ => None,
             },
             // Its ordinal, which is the whole point of the tag: a member
@@ -249,7 +365,7 @@ impl Value {
             // Through the scalar the document holds rather than through its
             // rendering, so a quoted numeric is unquoted on the way — #0084.
             Value::Json(v) => digits_as_int(&crate::json::numeric_text(v)),
-            Value::Text(v, _) | Value::Decimal(v) => digits_as_int(v),
+            Value::Text(v, _) | Value::Decimal(v, _) => digits_as_int(v),
             // Read the way the text arm above is, for the reason `as_float`
             // gives: a binary string is a string, and only its collation is
             // different. Left out, the two readings disagreed — a value that
@@ -273,7 +389,7 @@ impl Value {
             // Parsed at the full width before falling back to a float, so
             // `'18446744073709551615'` into a `BIGINT UNSIGNED` is the number
             // it spells and not the nearest double to it.
-            Value::Text(v, _) | Value::Decimal(v) => digits_as_exact_int(v),
+            Value::Text(v, _) | Value::Decimal(v, _) => digits_as_exact_int(v),
             // The scalar, not the rendering — #0084. At the full width for the
             // same reason the text arm is: 8.3 takes the JSON string
             // `"18446744073709551615"` into a `BIGINT UNSIGNED` as the number
@@ -300,7 +416,7 @@ impl Value {
             Value::Int(v) => Some(*v as f64),
             Value::Float(v) => Some(*v),
             Value::Float32(v) => Some(*v as f64),
-            Value::Text(v, _) | Value::Decimal(v) => v.trim().parse().ok(),
+            Value::Text(v, _) | Value::Decimal(v, _) => v.trim().parse().ok(),
             // The scalar, not the rendering — #0084.
             Value::Json(v) => crate::json::numeric_text(v).trim().parse().ok(),
             // A binary string is still a *string*: MySQL reads a `BINARY`
@@ -344,7 +460,7 @@ impl Value {
             Value::Int(v) => *v as f64,
             Value::Float(v) => *v,
             Value::Float32(v) => *v as f64,
-            Value::Text(v, _) | Value::Decimal(v) => numeric_prefix(v),
+            Value::Text(v, _) | Value::Decimal(v, _) => numeric_prefix(v),
             // The scalar, not the rendering — #0084. `"2026" + 0` is 2026 on
             // 8.3 and was 0 here, because the leading quote stops
             // `numeric_prefix` before it reaches a digit.
@@ -371,12 +487,20 @@ impl Value {
     /// DECIMAL(10,2))` is 2.90 on 8.3, where reading `"2.9"` — quotes and all
     /// — as digits gives 0.00. See [`crate::json::numeric_text`] and #0084.
     ///
+    /// A decimal is the other value that parts company with its rendering
+    /// here, and in the other direction: it converts by the digits it
+    /// *carries*, where `as_text` answers the ones it shows. Measured on 8.3,
+    /// `CAST(1/3 AS DECIMAL(20,9))` is 0.333333333 and `INSERT ... VALUES
+    /// (1/3)` into a `DECIMAL(20,9)` reads back the same, while `CAST(1/3 AS
+    /// CHAR)` is 0.3333 — see [`Value::Decimal`] and #0118.
+    ///
     /// For the conversions that go through characters rather than through a
     /// double: a DECIMAL cast and a DECIMAL column, both of which keep the
     /// text precisely because parsing it would lose precision.
     pub fn numeric_text(&self) -> std::borrow::Cow<'_, str> {
         match self {
             Value::Json(document) => crate::json::numeric_text(document),
+            Value::Decimal(digits, _) => std::borrow::Cow::Borrowed(digits),
             other => std::borrow::Cow::Owned(other.as_text()),
         }
     }
@@ -400,7 +524,12 @@ impl Value {
             // The member, not the ordinal: only the *numeric* reading of an
             // ENUM is its position, and `SELECT e` still shows `a`.
             Value::Enum { member, .. } => member.clone(),
-            Value::Decimal(v) => v.clone(),
+            // A decimal reads as the characters it is *shown* as, not as the
+            // digits it carries: measured on 8.3, `CAST(1/3 AS CHAR)` and
+            // `CONCAT(1/3, '')` are both `0.3333` where the value behind them
+            // is 0.333333333. `LENGTH(1/3)` is 6 there, which counts the same
+            // six characters.
+            Value::Decimal(..) => self.displayed().into_owned(),
             // The document as MySQL writes it, which is what it sends and what
             // a client reads back. Not the stored text: a decimal inside one
             // is *held* wearing a mark that says it is a decimal and not a
@@ -450,7 +579,7 @@ impl Value {
             Value::Bytes(v) => Some(numeric_prefix(&String::from_utf8_lossy(v)) != 0.0),
             // Read like the text it used to be, so tagging a value changed
             // nothing about how a WHERE clause treats it.
-            Value::Decimal(v) => Some(numeric_prefix(v) != 0.0),
+            Value::Decimal(v, _) => Some(numeric_prefix(v) != 0.0),
             // And a document by the number read out of its *scalar*, which is
             // 8.3's answer for `IF(j, 1, 0)`: 1 for `"2026"`, `"2.5e3"`, `3`
             // and `true`, and 0 for `"abc"`, `"0"`, `null`, `false`, `[]` and
@@ -534,7 +663,7 @@ impl Value {
             self,
             Value::Int(_)
                 | Value::Float(_)
-                | Value::Decimal(_)
+                | Value::Decimal(..)
                 | Value::Float32(_)
                 | Value::Bool(_)
                 | Value::Unsigned(_)
@@ -542,7 +671,7 @@ impl Value {
             other,
             Value::Int(_)
                 | Value::Float(_)
-                | Value::Decimal(_)
+                | Value::Decimal(..)
                 | Value::Float32(_)
                 | Value::Bool(_)
                 | Value::Unsigned(_)
@@ -688,7 +817,7 @@ impl Value {
         match self {
             Value::Unsigned(v) => match i64::try_from(v) {
                 Ok(n) => Value::Int(n),
-                Err(_) => Value::Decimal(v.to_string()),
+                Err(_) => Value::decimal(v.to_string()),
             },
             other => other,
         }
@@ -723,7 +852,7 @@ impl Value {
         match self {
             Value::Int(v) => Some(std::borrow::Cow::Owned(v.to_string())),
             Value::Unsigned(v) => Some(std::borrow::Cow::Owned(v.to_string())),
-            Value::Decimal(text) => Some(std::borrow::Cow::Borrowed(text)),
+            Value::Decimal(text, _) => Some(std::borrow::Cow::Borrowed(text)),
             _ => None,
         }
     }
@@ -750,7 +879,7 @@ impl Value {
         Some(if fraction.is_empty() {
             Value::Int(format!("{sign}{integer}").parse().ok()?)
         } else {
-            Value::Decimal(format!("{sign}{integer}.{fraction}"))
+            Value::decimal(format!("{sign}{integer}.{fraction}"))
         })
     }
 
@@ -871,7 +1000,7 @@ impl Value {
             //
             // The bare integer, too, so `2.00` keys the same as the `2` a
             // union might put beside it.
-            Value::Decimal(text) => match crate::decimal::shortest(text) {
+            Value::Decimal(text, _) => match crate::decimal::shortest(text) {
                 Some(key) => key,
                 // A `Decimal` whose text is not one, which nothing validates.
                 None => text.to_lowercase(),
@@ -899,7 +1028,12 @@ impl Value {
             // A decimal travels as its text, which is how MySQL sends one.
             // A temporal does too — the packed number is a reading, not a
             // representation, and a client asking for a DATE gets its text.
-            Value::Decimal(v) | Value::Temporal(v) => WireValue::Str(v.clone()),
+            Value::Temporal(v) => WireValue::Str(v.clone()),
+            // At the scale it is described with, which is where a quotient's
+            // extra places stop: `SELECT 1/3` sends `0.3333` on 8.3 for a
+            // value of 0.333333333. This is the edge both protocols leave
+            // through, so it is the one place the rounding has to happen.
+            Value::Decimal(..) => WireValue::Str(self.displayed().into_owned()),
             // JSON crosses the wire as text, which is how MySQL transmits it —
             // through `as_text`, so the stored form's decimal mark comes off
             // here exactly as it does in every other rendering of a document.
@@ -1223,12 +1357,9 @@ mod tests {
         // A fraction packs after the point, keeping exactly the digits given.
         assert_eq!(
             packed("2024-01-05 06:07:08.500"),
-            Some(Value::Decimal("20240105060708.500".to_owned()))
+            Some(Value::decimal("20240105060708.500"))
         );
-        assert_eq!(
-            packed("06:07:08.5"),
-            Some(Value::Decimal("60708.5".to_owned()))
-        );
+        assert_eq!(packed("06:07:08.5"), Some(Value::decimal("60708.5")));
         // And text that is not a temporal at all has no packed number, which
         // is how the callers know to read it as a string instead.
         assert_eq!(packed("hello"), None);

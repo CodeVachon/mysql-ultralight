@@ -624,7 +624,7 @@ impl SqlType {
             // one inexact value in the column, which sent `SUM` over *every*
             // row back through the float path.
             TypeKind::Decimal => {
-                Value::Decimal(crate::decimal::render(0, self.scale.unwrap_or(0) as usize))
+                Value::decimal(crate::decimal::render(0, self.scale.unwrap_or(0) as usize))
             }
             // The epoch rather than MySQL's `0000-00-00`, because the mode this
             // engine targets sets NO_ZERO_DATE and would reject that value.
@@ -904,6 +904,14 @@ impl SqlType {
                 // holds: 8.3 stores `CAST('"2.505"' AS JSON)` into a
                 // `DECIMAL(10,2)` as 2.51, where the rendering's leading quote
                 // made it 0.00 here. See #0084.
+                //
+                // A decimal goes through it too, and for the same reason in
+                // the other direction: `numeric_text` answers the digits it
+                // *carries* where its rendering would round them. Measured on
+                // 8.3, `INSERT INTO t (DECIMAL(20,9)) VALUES (1/3)` reads back
+                // 0.333333333 where `SELECT 1/3` prints 0.3333 — the column
+                // keeps what the division computed, cut to its own scale and
+                // not to the expression's. See #0118.
                 let text = value.numeric_text().into_owned();
                 // By the text rather than a parsed float: the point of keeping
                 // the text is that parsing loses precision, and the sign is
@@ -922,7 +930,7 @@ impl SqlType {
                 // 1.5 in a `DECIMAL(6,2)` is `1.50` and 1.005 is `1.01`.
                 // Keeping whatever the caller wrote made the scale a property
                 // of the statement rather than of the column.
-                Value::Decimal(decimal_digits(&stored, self.scale.unwrap_or(0) as usize))
+                Value::decimal(decimal_digits(&stored, self.scale.unwrap_or(0) as usize))
             }
             TypeKind::Blob => match value {
                 Value::Bytes(b) => Value::Bytes(b),
@@ -962,7 +970,7 @@ impl SqlType {
                     // `i64::MAX` wraps negative and is refused, which is the
                     // right answer for a position no column declares.
                     Value::Unsigned(n) => Some(*n as i64),
-                    Value::Float(_) | Value::Float32(_) | Value::Decimal(_) => {
+                    Value::Float(_) | Value::Float32(_) | Value::Decimal(..) => {
                         Some(value.as_number().trunc() as i64)
                     }
                     _ => None,
@@ -1217,7 +1225,7 @@ fn stored_int(value: &Value) -> Option<i128> {
         // A binary string is read as text here for the same reason
         // `as_exact_int` reads it that way: MySQL reads it in a numeric
         // context exactly as it reads a string.
-        Value::Text(text, _) | Value::Decimal(text) => {
+        Value::Text(text, _) | Value::Decimal(text, _) => {
             rounded_digits(text).or_else(|| value.as_exact_int())
         }
         // And a document by the scalar it holds, so a quoted numeric goes into
@@ -1265,7 +1273,7 @@ fn rounded_digits(text: &str) -> Option<i128> {
 /// would predict it.
 fn negative_decimal(value: &Value) -> bool {
     match value {
-        Value::Decimal(text) => {
+        Value::Decimal(text, _) => {
             let text = text.trim_start();
             text.starts_with('-') && text.bytes().any(|b| b.is_ascii_digit() && b != b'0')
         }

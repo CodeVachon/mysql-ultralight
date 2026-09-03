@@ -439,7 +439,7 @@ impl ResultSet {
                     // Tagged a decimal rather than left as text because it is
                     // a number.
                     let shortest = crate::decimal::plain(value.as_number());
-                    *value = Value::Decimal(crate::types::decimal_digits(&shortest, scale));
+                    *value = Value::decimal(crate::types::decimal_digits(&shortest, scale));
                     continue;
                 }
                 match (column.ty, &value) {
@@ -454,7 +454,7 @@ impl ResultSet {
                     // the text protocol wrote every declared digit and the
                     // binary one sent a rounded f64 of them. Same split the
                     // integer pairing below closes, in the other direction.
-                    (ColumnType::Double, Value::Decimal(text)) => {
+                    (ColumnType::Double, Value::Decimal(text, _)) => {
                         if let Ok(n) = text.parse::<f64>() {
                             *value = Value::Float(n);
                         }
@@ -462,7 +462,7 @@ impl ResultSet {
                     // A decimal column never carries an exponent, whatever the
                     // float behind it renders as. See `decimal::plain`.
                     (ColumnType::NewDecimal | ColumnType::Decimal, Value::Float(v)) => {
-                        *value = Value::Decimal(crate::decimal::plain(*v));
+                        *value = Value::decimal(crate::decimal::plain(*v));
                     }
                     // A fraction under an integer code. The text protocol
                     // writes the digits and the binary one parses them as an
@@ -481,7 +481,7 @@ impl ResultSet {
                         | ColumnType::Long
                         | ColumnType::LongLong
                         | ColumnType::Year,
-                        Value::Decimal(text),
+                        Value::Decimal(text, _),
                     ) => {
                         if let Some(n) =
                             crate::decimal::units(text, 0).and_then(|u| i64::try_from(u).ok())
@@ -631,21 +631,18 @@ mod tests {
         // guard exists because this failure is invisible to any test that
         // reads the text, not because a known query produces it.
         assert_eq!(
-            mismatched(ColumnType::LongLong, Value::Decimal("60708.567".to_owned())),
+            mismatched(ColumnType::LongLong, Value::decimal("60708.567")),
             Value::Int(60709)
         );
         assert_eq!(
-            mismatched(ColumnType::Long, Value::Decimal("-2.5".to_owned())),
+            mismatched(ColumnType::Long, Value::decimal("-2.5")),
             Value::Int(-3)
         );
         // A decimal under a *decimal* code is left alone, which is the whole
         // point of the tag.
         assert_eq!(
-            mismatched(
-                ColumnType::NewDecimal,
-                Value::Decimal("60708.567".to_owned())
-            ),
-            Value::Decimal("60708.567".to_owned())
+            mismatched(ColumnType::NewDecimal, Value::decimal("60708.567")),
+            Value::decimal("60708.567")
         );
 
         // Nothing else is touched: a wrongly tagged value elsewhere is a bug

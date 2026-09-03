@@ -533,9 +533,18 @@ fn write_value(w: &mut Writer, value: &Value) {
         // it *is*, scale and all, and calling it a string on the way out would
         // reload it as one — comparing by characters where MySQL compares by
         // value.
-        Value::Decimal(s) => {
+        Value::Decimal(s, display) => {
             w.u8(6);
-            w.str(s);
+            // At the scale it is *shown* at, which for a stored decimal is
+            // the only scale it has: every column value goes through
+            // `SqlType::store`, which writes it at the column's declared
+            // scale, so `display` is `None` here. Honouring it anyway means a
+            // value that reached the image another way reloads as the number
+            // it was written as rather than wider.
+            match display.and_then(|scale| crate::decimal::rescale_wide(s, usize::from(scale))) {
+                Some(shown) => w.str(&shown),
+                None => w.str(s),
+            }
         }
         // Tag 7. Four bytes, because that is the whole point of the tag: a
         // reload as a double would print every digit of the widening.
@@ -612,7 +621,7 @@ fn read_value(r: &mut Reader<'_>) -> EngineResult<Value> {
             // which is the kind of difference nothing would think to look for.
             Value::Json(crate::json::render_text(&parsed))
         }
-        6 => Value::Decimal(r.str()?),
+        6 => Value::decimal(r.str()?),
         7 => Value::Float32(f32::from_bits(r.u32()?)),
         8 => Value::Temporal(r.str()?),
         // Bound in write order rather than built as a struct literal, so a

@@ -94,8 +94,11 @@ pub fn literal(value: &Value) -> String {
         Value::Unsigned(v) => v.to_string(),
         Value::Float32(v) => literal(&Value::Float(*v as f64)),
         // Unquoted, so it re-parses as the number it is rather than as the
-        // characters that spell it.
-        Value::Decimal(v) => v.clone(),
+        // characters that spell it — and the digits it *carries*, not the ones
+        // it shows: a parameter is substituted into SQL that is evaluated
+        // again, and rendering it first would round the operand before the
+        // statement saw it.
+        Value::Decimal(v, _) => v.clone(),
         // Quoted, because SQL has no temporal literal without a keyword in
         // front of it — so this round trip loses the tag, exactly as the JSON
         // one below does. A bound parameter has no declared type to lose.

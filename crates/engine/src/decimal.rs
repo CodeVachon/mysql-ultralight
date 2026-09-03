@@ -191,7 +191,7 @@ fn padded(digits: &[u8], scale: usize) -> Vec<u8> {
 }
 
 /// The largest scale a MySQL DECIMAL *column* carries, and the ceiling a
-/// product or a quotient is clamped to.
+/// product's or a quotient's *displayed* scale is clamped to.
 ///
 /// Only those two. Measured on 8.3 over a literal written to 37 places, which
 /// is the one way a scale past 30 gets into an expression at all: `+`, `-`,
@@ -204,6 +204,25 @@ fn padded(digits: &[u8], scale: usize) -> Vec<u8> {
 /// `DECIMAL(65,0)` operands multiply to a 70-digit answer there, printed in
 /// full under a column still described `decimal(65,0)`.
 pub const MAX_SCALE: usize = 30;
+
+/// The ceiling a product's *value* is clamped to, which is one place past the
+/// scale it is shown at.
+///
+/// Measured on 8.3 through a document, where the value and its rendering part
+/// company: `1.0…0 * 1` over a 37-place literal prints at 30 places and
+/// `JSON_ARRAY` of it carries 31, and the same holds for a 36-place quotient
+/// times 1. So the product's own clamp is not [`MAX_SCALE`] — that is the
+/// display's — and using one number for both rounded a digit MySQL keeps.
+pub const MAX_PRODUCT_SCALE: usize = 31;
+
+/// The ceiling a quotient's *value* is clamped to: nine nine-digit words.
+///
+/// [`divide`] computes to a whole number of words, and MySQL's decimal buffer
+/// holds nine of them. Measured on 8.3 at a `div_precision_increment` of 30,
+/// where the word count would otherwise reach ten: a 30-place operand over
+/// another comes back with 81 fractional digits, not the 90 the word rule
+/// alone predicts.
+pub const MAX_QUOTIENT_SCALE: usize = 81;
 
 /// The extra decimal places a quotient gains over its left operand, for a
 /// session that has not said otherwise.
@@ -269,6 +288,21 @@ fn parts(text: &str) -> Option<Parts> {
             .collect(),
         scale: fraction.len(),
     })
+}
+
+/// `text` with its sign flipped, keeping the scale.
+///
+/// A sign is not a subtraction, and the difference is measurable: MySQL's
+/// unary minus flips the sign on the value and leaves everything else alone,
+/// where `0 - x` runs the operator and normalises an exact zero. Measured on
+/// 8.3 through a document, `JSON_ARRAY(-0.00)` is `[0.00]` while
+/// `JSON_ARRAY(1.50 - 1.50)` is `[0]`.
+///
+/// Zero still has no sign, which is what [`spell`] answers for it and what
+/// `SELECT -0.00` shows.
+pub fn negate(text: &str) -> Option<String> {
+    let value = parts(text)?;
+    Some(spell(!value.negative, &value.digits, value.scale))
 }
 
 /// `text` without its sign, keeping the scale.
@@ -453,8 +487,8 @@ fn aligned(a: &Parts, b: &Parts, scale: usize) -> (Vec<u8>, Vec<u8>) {
 /// Digits carrying `from` places, written at `to` of them.
 ///
 /// Rounds half away from zero, which is MySQL's rule everywhere a decimal is
-/// shortened: measured on 8.3, a `DECIMAL(65,20)` times another is declared
-/// with 30 places, and 5e-31 comes back 1e-30 while 4e-31 comes back zero.
+/// shortened: measured on 8.3, a product's value stops at 31 places, and
+/// 5e-32 comes back 1e-31 while 4e-32 comes back zero.
 fn rounded(negative: bool, digits: &[u8], from: usize, to: usize) -> String {
     if to >= from {
         return spell(negative, digits, from);
@@ -468,13 +502,47 @@ fn rounded(negative: bool, digits: &[u8], from: usize, to: usize) -> String {
     spell(negative, &kept, to)
 }
 
-/// `a` at `scale`, clamped to [`MAX_SCALE`].
+/// Digits carrying `from` places, cut to `to` of them.
+///
+/// The other half of [`rounded`], for the one operator that does not round:
+/// MySQL's division truncates at the word boundary it computed to.
+fn truncated(negative: bool, digits: &[u8], from: usize, to: usize) -> String {
+    if to >= from {
+        return spell(negative, digits, from);
+    }
+    let all = padded(digits, from);
+    spell(negative, &all[..all.len() - (from - to)], to)
+}
+
+/// `a` at `scale`, clamped to [`MAX_PRODUCT_SCALE`].
 ///
 /// A product's clamp, and the one place a value can lose digits it computed
-/// exactly: a `DECIMAL(65,20)` times another is declared with 30 places, not
-/// 40.
+/// exactly: a `DECIMAL(65,20)` times another asks for 40 places and gets 31.
+/// The 30 such a product is *shown* at is a different clamp — see
+/// [`product_display_scale`].
 fn narrowed(negative: bool, digits: &[u8], scale: usize) -> String {
-    rounded(negative, digits, scale, scale.min(MAX_SCALE))
+    rounded(negative, digits, scale, scale.min(MAX_PRODUCT_SCALE))
+}
+
+/// A computed decimal, with an exact zero spelled the way MySQL spells one.
+///
+/// MySQL's `+`, `-`, `*`, `/` and `%` all normalise an exact zero to a bare
+/// `0` with no places at all, where a *literal* keeps every place it was
+/// written to. Measured on 8.3 through a document, which is the only place the
+/// difference shows: `JSON_ARRAY(0.00)` is `[0.00]` and `JSON_ARRAY(1.50 -
+/// 1.50)`, `[1.50 + (-1.50)]`, `[0.00 * 1.5]`, `[0.00 / 1]` and `[2.50 %
+/// 1.25]` are all `[0]`. Printed, all of them still show their operator's
+/// scale, because that is the *display* scale and this is the value.
+///
+/// Every operator here applies it, and so does the running total an aggregate
+/// folds — `SUM` over 1.50 and -1.50 is `[0]` in a document on 8.3, not
+/// `[0.00]` — which is why it is reachable from outside this module.
+pub fn normalised(text: String) -> String {
+    if is_zero(&text) {
+        "0".to_owned()
+    } else {
+        text
+    }
 }
 
 /// `a + b`, exactly, at the wider of the two scales.
@@ -503,7 +571,17 @@ fn combine(a: &str, b: &str, negate: bool) -> Option<String> {
     } else {
         (a_negative, sub_magnitude(&x, &y))
     };
-    Some(spell(negative, &digits, widest))
+    Some(normalised(spell(negative, &digits, widest)))
+}
+
+/// The scale a sum, a difference or a remainder is *shown* at.
+///
+/// The wider of the two operands' displayed scales, which is the same rule the
+/// value follows over the operands' own. They part company only where an
+/// operand carries more places than it shows: `(1/3) + 0` is `0.333333333` in
+/// a document and `0.3333` printed, both measured on 8.3.
+pub fn widest_display_scale(a: usize, b: usize) -> usize {
+    a.max(b)
 }
 
 /// `a * b`, exactly, at the two scales added together.
@@ -513,11 +591,20 @@ fn combine(a: &str, b: &str, negate: bool) -> Option<String> {
 pub fn multiply(a: &str, b: &str) -> Option<String> {
     let (a, b) = (parts(a)?, parts(b)?);
     let scale = a.scale + b.scale;
-    Some(narrowed(
+    Some(normalised(narrowed(
         a.negative != b.negative,
         &mul_magnitude(&a.digits, &b.digits),
         scale,
-    ))
+    )))
+}
+
+/// The scale a product is *shown* at: the two operands' displayed scales
+/// added, clamped to [`MAX_SCALE`].
+///
+/// One place short of what the value is clamped to, which is why the two
+/// clamps are separate constants — see [`MAX_PRODUCT_SCALE`].
+pub fn product_display_scale(a: usize, b: usize) -> usize {
+    (a + b).min(MAX_SCALE)
 }
 
 /// `a / b`, at the left operand's scale plus `increment`.
@@ -526,27 +613,22 @@ pub fn multiply(a: &str, b: &str) -> Option<String> {
 /// constant, because MySQL's is: at 6, `1/3` is 0.333333 and `1.5/1.5` is
 /// 1.0000000, and at 0 `1/3` is 0 — all measured on 8.3.
 ///
-/// The rounding is not simply "round the true quotient", and the difference is
-/// measurable. MySQL computes the quotient to a whole number of nine-digit
-/// words — `frac1 + frac2 + div_precision_increment` rounded up to a multiple
-/// of nine — truncating there, and rounds *that* to the result's scale. At an
-/// increment of 0 there are no words at all over two integers, which is why
-/// `7/2` is 3 there and not 4: the truncation happens before any rounding
-/// could. Where the two coincide the truncation is what shows: `1.00001 / 3`
-/// is 0.333336666 on 8.3, at nine places, where rounding the true quotient
-/// gives 0.333336667. `1 / 7` is 0.1429 because the nine-digit intermediate
-/// does get rounded down to four.
+/// The answer is not the true quotient rounded, and the difference is
+/// measurable. MySQL computes to a whole number of nine-digit words — see
+/// [`quotient_scale`] — and truncates there, so `1.00001 / 3` is 0.333336666
+/// on 8.3 at nine places where rounding would give 0.333336667. At an
+/// increment of 0 there is no word at all over two integers, which is why
+/// `7/2` is 3 there and not 4.
 ///
-/// What comes back is the quotient at the scale MySQL *displays*, which is not
-/// quite the number MySQL holds. Measured on 8.3, `JSON_ARRAY(1/3)` is
-/// `[0.333333333]` — nine places, where the column is declared with four —
-/// so the interim survives in the value and only the rendering rounds it. The
-/// difference is visible wherever something reads a quotient rather than
-/// printing it: `1/3 = 0.3333` is false there, `SUM(v/3)` over 32768 rows
-/// totals the nine-digit values, and `(1/3)*3` is 1.0000 for 0.9999. Rounding
-/// here instead is deliberate — the engine has nowhere to put a scale a value
-/// does not carry, since a column is described without one at all — and it is
-/// the choice that makes every *printed* quotient right. See #0118.
+/// What comes back is the quotient MySQL *holds*, which carries more places
+/// than the column it is shown under declares. Measured on 8.3,
+/// `JSON_ARRAY(1/3)` is `[0.333333333]` — nine places, where the column is
+/// declared with four and `SELECT 1/3` prints 0.3333. Everything that reads
+/// the quotient rather than printing it reads those nine: `1/3 = 0.3333` is 0
+/// there, `(1/3)*3` is 0.999999999 rounded to 1.0000, and `SUM(v/3)` totals
+/// the nine-place values. So the rounding to four belongs at the edge and not
+/// here — see [`quotient_display_scale`] and `Value::Decimal`, which carries
+/// the two scales apart. That is #0118.
 ///
 /// `None` for an operand that is not a decimal. A zero divisor is the caller's
 /// to test with [`is_zero`], because its answer is NULL rather than a number.
@@ -555,16 +637,58 @@ pub fn divide(a: &str, b: &str, increment: usize) -> Option<String> {
     if b.is_zero() {
         return None;
     }
-    let interim = (a.scale + b.scale + increment).div_ceil(9) * 9;
+    let scale = quotient_scale(a.scale, b.scale, increment);
     // `a`'s digits carry a factor of 10^-a.scale and `b`'s a factor of
-    // 10^-b.scale, so the shift that leaves the quotient at `interim` places
-    // is `interim + b.scale - a.scale` — never negative, since `interim` is at
-    // least `a.scale + b.scale + increment` rounded up.
+    // 10^-b.scale, so shifting `a` left by `scale + b.scale` leaves a quotient
+    // counted at `a.scale + scale` places. Shifting by the difference instead
+    // would go straight to `scale` and save those digits, at the cost of a
+    // subtraction that underflows for an operand written to more places than
+    // the clamp above allows — which a literal can be.
     let mut numerator = a.digits.clone();
-    numerator.resize(numerator.len() + interim + b.scale - a.scale, 0);
+    numerator.resize(numerator.len() + scale + b.scale, 0);
     let (quotient, _) = divmod_magnitude(&numerator, &b.digits);
-    let scale = (a.scale + increment).min(MAX_SCALE);
-    Some(rounded(a.negative != b.negative, &quotient, interim, scale))
+    // Truncated and not rounded, which is measured: `1.00001 / 3` is
+    // 0.333336666 on 8.3 where rounding the true quotient gives 0.333336667,
+    // and `7 / 2` at an increment of 0 is 3 rather than 4 because there is no
+    // word to round in at all.
+    Some(normalised(truncated(
+        a.negative != b.negative,
+        &quotient,
+        a.scale + scale,
+        scale,
+    )))
+}
+
+/// How many places a quotient's *value* carries, over two operands' own.
+///
+/// MySQL divides into a buffer of nine-digit words and truncates at the last
+/// one it filled, so the width is a whole number of nines and is not the
+/// simple `frac1 + frac2 + increment` rounded up that it looks like. Measured
+/// on 8.3 over the whole 13×13 grid of operand scales, at increments 0, 1, 4,
+/// 6, 9, 10 and 30 — 440 points — the width is the larger of two word counts:
+/// the operands' own words added, and the sum of their places plus the
+/// increment rounded up. The second alone predicts 9 places for `1.5 / 1.5`,
+/// where 8.3 gives 18; the first alone predicts 9 for `1 / 7.000000`, where
+/// 8.3 gives 18 as well. Neither half is dropped because each is the one that
+/// bites somewhere.
+///
+/// Clamped to [`MAX_QUOTIENT_SCALE`], which is the buffer running out.
+pub fn quotient_scale(a: usize, b: usize, increment: usize) -> usize {
+    let words = |places: usize| places.div_ceil(9);
+    let widest = (words(a) + words(b)).max(words(a + b + increment));
+    (widest * 9).min(MAX_QUOTIENT_SCALE)
+}
+
+/// The scale a quotient is *shown* at: the left operand's displayed scale plus
+/// `increment`, clamped to [`MAX_SCALE`].
+///
+/// The declared half of the same division, and the only half
+/// `div_precision_increment` moves directly — the value's width takes the
+/// increment through a word boundary instead. Measured on 8.3: `1/3` is shown
+/// at four places at the stock increment, at six when it is set to 6, and at
+/// none at 0, while the value carries nine at all three.
+pub fn quotient_display_scale(a: usize, increment: usize) -> usize {
+    (a + increment).min(MAX_SCALE)
 }
 
 /// `a % b`, at the wider of the two scales, with the dividend's sign.
@@ -582,7 +706,7 @@ pub fn remainder(a: &str, b: &str) -> Option<String> {
     let scale = a.scale.max(b.scale);
     let (x, y) = aligned(&a, &b, scale);
     let (_, rest) = divmod_magnitude(&x, &y);
-    Some(spell(a.negative, &rest, scale))
+    Some(normalised(spell(a.negative, &rest, scale)))
 }
 
 /// `a DIV b`, truncated toward zero, as the digits of a whole number.
@@ -763,28 +887,96 @@ mod tests {
     /// `DECIMAL(8,3)` both holding 1.5. Every one of these was read off the
     /// server, and the table in the issue was checked against it rather than
     /// trusted.
+    ///
+    /// The values, which for a quotient are not the digits it prints — those
+    /// are the display scales below.
     #[test]
     fn the_operators_carry_mysql_s_scales() {
         assert_eq!(add("1.50", "1.500").as_deref(), Some("3.000"));
         assert_eq!(add("1.500", "1.50").as_deref(), Some("3.000"));
-        assert_eq!(subtract("1.50", "1.500").as_deref(), Some("0.000"));
-        assert_eq!(subtract("1.500", "1.50").as_deref(), Some("0.000"));
+        // An exact zero loses its places: `JSON_ARRAY(1.50 - 1.500)` is `[0]`
+        // on 8.3, where the printed difference still shows 0.000.
+        assert_eq!(subtract("1.50", "1.500").as_deref(), Some("0"));
+        assert_eq!(subtract("1.500", "1.50").as_deref(), Some("0"));
         assert_eq!(multiply("1.50", "1.500").as_deref(), Some("2.25000"));
         assert_eq!(multiply("1.500", "1.50").as_deref(), Some("2.25000"));
+        // Two words of fraction, because each operand's own places round up
+        // to a word before they are added: `JSON_ARRAY(1.50/1.500)` is
+        // `[1.000000000000000000]` on 8.3 while `SELECT 1.50/1.500` prints
+        // 1.000000.
         assert_eq!(
             divide("1.50", "1.500", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
-            Some("1.000000")
+            Some("1.000000000000000000")
         );
         assert_eq!(
             divide("1.500", "1.50", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
-            Some("1.0000000")
+            Some("1.000000000000000000")
         );
-        assert_eq!(remainder("1.50", "1.500").as_deref(), Some("0.000"));
+        assert_eq!(remainder("1.50", "1.500").as_deref(), Some("0"));
         assert_eq!(integer_divide("1.50", "1.500").as_deref(), Some("1"));
         // And against an integer, whose scale is zero.
         assert_eq!(add("1.50", "1").as_deref(), Some("2.50"));
         assert_eq!(multiply("1.50", "2").as_deref(), Some("3.00"));
         assert_eq!(add("1.50", "0.5").as_deref(), Some("2.00"));
+    }
+
+    /// The *displayed* scales, which are the ones the same statements print.
+    ///
+    /// Measured on 8.3 beside the values above: `1.50/1.500` prints 1.000000
+    /// at six places and `1.500/1.50` 1.0000000 at seven, both over a value
+    /// carrying eighteen. `div_precision_increment` moves this half and not
+    /// the other — at 6, `1/3` prints 0.333333 and still carries nine.
+    #[test]
+    fn the_displayed_scales_are_a_rule_of_their_own() {
+        assert_eq!(widest_display_scale(2, 3), 3);
+        assert_eq!(widest_display_scale(3, 2), 3);
+        assert_eq!(product_display_scale(2, 3), 5);
+        assert_eq!(
+            quotient_display_scale(2, DEFAULT_DIV_PRECISION_INCREMENT),
+            6
+        );
+        assert_eq!(
+            quotient_display_scale(3, DEFAULT_DIV_PRECISION_INCREMENT),
+            7
+        );
+        assert_eq!(quotient_display_scale(0, 6), 6);
+        assert_eq!(quotient_display_scale(0, 0), 0);
+        // Both clamp at 30, which is where a *column* stops. The value does
+        // not: a product carries 31 places and a quotient up to 81.
+        assert_eq!(product_display_scale(20, 20), MAX_SCALE);
+        assert_eq!(quotient_display_scale(30, 4), MAX_SCALE);
+    }
+
+    /// A quotient's *value* is as wide as the words MySQL divided into, and
+    /// that width is not the `frac1 + frac2 + increment` rounded up it looks
+    /// like.
+    ///
+    /// Measured on 8.3 over the whole 13×13 grid of operand scales at seven
+    /// increments — the two halves of the rule each decide points the other
+    /// gets wrong, which is why neither is dropped.
+    #[test]
+    fn a_quotient_is_as_wide_as_the_words_it_was_divided_into() {
+        // Rounding the sum up alone: right here…
+        assert_eq!(quotient_scale(0, 0, 4), 9);
+        assert_eq!(quotient_scale(0, 6, 4), 18);
+        assert_eq!(quotient_scale(9, 0, 4), 18);
+        // …and wrong here, where it predicts 9 and 8.3 gives 18.
+        assert_eq!(quotient_scale(1, 1, 4), 18);
+        assert_eq!(quotient_scale(1, 9, 4), 18);
+        // Adding the operands' own words alone: right here…
+        assert_eq!(quotient_scale(10, 10, 4), 36);
+        // …and wrong here, where it predicts 9 and 8.3 gives 18.
+        assert_eq!(quotient_scale(0, 12, 4), 18);
+        assert_eq!(quotient_scale(25, 0, 4), 36);
+        // The increment moves it through the word boundary rather than
+        // directly: 1/3 is nine places wide at 0, 4 and 6 alike.
+        assert_eq!(quotient_scale(0, 0, 0), 0);
+        assert_eq!(quotient_scale(0, 0, 6), 9);
+        assert_eq!(quotient_scale(0, 0, 9), 9);
+        assert_eq!(quotient_scale(0, 0, 10), 18);
+        // And the buffer runs out at nine words.
+        assert_eq!(quotient_scale(30, 30, 30), MAX_QUOTIENT_SCALE);
+        assert_eq!(quotient_scale(25, 30, 30), MAX_QUOTIENT_SCALE);
     }
 
     /// A sign says nothing about how many places a number is written to, and
@@ -795,6 +987,13 @@ mod tests {
         assert_eq!(subtract("0", "-1.50").as_deref(), Some("1.50"));
         assert_eq!(absolute("-1.50").as_deref(), Some("1.50"));
         assert_eq!(absolute("-0.00").as_deref(), Some("0.00"));
+        // A sign is not a subtraction: it keeps the places where `0 - x`
+        // normalises them away. `JSON_ARRAY(-0.00)` is `[0.00]` on 8.3 and
+        // `JSON_ARRAY(0.00 - 0.00)` is `[0]`.
+        assert_eq!(negate("1.50").as_deref(), Some("-1.50"));
+        assert_eq!(negate("-1.50").as_deref(), Some("1.50"));
+        assert_eq!(negate("-0.00").as_deref(), Some("0.00"));
+        assert_eq!(negate("0.00").as_deref(), Some("0.00"));
         // Measured: the remainder takes the *dividend's* sign, and the
         // divisor's is ignored entirely.
         assert_eq!(remainder("10.5", "3").as_deref(), Some("1.5"));
@@ -803,39 +1002,44 @@ mod tests {
         assert_eq!(remainder("-10.5", "-3").as_deref(), Some("-1.5"));
         // And it pads to the wider scale rather than to its own digits.
         assert_eq!(remainder("10.5", "3.00").as_deref(), Some("1.50"));
-        assert_eq!(remainder("3.00", "1").as_deref(), Some("0.00"));
+        // An exact remainder of nothing loses its places, the way every
+        // operator's exact zero does: `JSON_ARRAY(3.00 % 1)` is `[0]` on 8.3.
+        assert_eq!(remainder("3.00", "1").as_deref(), Some("0"));
         // `DIV` truncates toward zero rather than flooring.
         assert_eq!(integer_divide("-7.5", "2").as_deref(), Some("-3"));
         assert_eq!(integer_divide("7.5", "-2").as_deref(), Some("-3"));
         assert_eq!(integer_divide("1.5", "0.4").as_deref(), Some("3"));
     }
 
-    /// Division is not "round the true quotient". MySQL computes it to a whole
-    /// number of nine-digit words and truncates there, then rounds *that* to
-    /// the result's scale — so where the two coincide the truncation shows.
+    /// Division truncates at the word boundary and stops. It is not "round
+    /// the true quotient", and it is not "round to the declared scale" either
+    /// — that second rounding belongs at the edge, over a value that keeps
+    /// every digit MySQL keeps.
+    ///
+    /// Every expectation here is `JSON_ARRAY` of the same division on 8.3,
+    /// which is the one reading that shows the value rather than the
+    /// rendering.
     #[test]
-    fn division_truncates_at_nine_digit_words_before_it_rounds() {
+    fn division_truncates_at_nine_digit_words() {
         // 0.33333666666… truncated at nine places, not rounded to …667.
         assert_eq!(
             divide("1.00001", "3", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
             Some("0.333336666")
         );
-        // And where there are digits to spare it does round: 1/7 at nine
-        // places is 0.142857142, rounded to four.
         assert_eq!(
             divide("1", "7", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
-            Some("0.1429")
+            Some("0.142857142")
         );
         assert_eq!(
             divide("2", "3", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
-            Some("0.6667")
+            Some("0.666666666")
         );
         assert_eq!(
             divide("-2", "3", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
-            Some("-0.6667")
+            Some("-0.666666666")
         );
-        // 25 places on the left asks for 29 and computes 36, which is where
-        // the rounding at the far end is visible.
+        // 25 places on the left is three words, and the increment pushes the
+        // sum into a fourth: 36 places, where the column is declared with 29.
         assert_eq!(
             divide(
                 "1.0000000000000000000000000",
@@ -843,15 +1047,26 @@ mod tests {
                 DEFAULT_DIV_PRECISION_INCREMENT
             )
             .as_deref(),
-            Some("0.14285714285714285714285714286")
+            Some("0.142857142857142857142857142857142857")
         );
         assert_eq!(
             divide("1", "3", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
-            Some("0.3333")
+            Some("0.333333333")
         );
         assert_eq!(
             divide("10", "3", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
-            Some("3.3333")
+            Some("3.333333333")
+        );
+        // At an increment of 0 there is no word to divide into at all, which
+        // is why `7/2` is 3 there and not 4.
+        assert_eq!(divide("7", "2", 0).as_deref(), Some("3"));
+        assert_eq!(divide("1", "3", 0).as_deref(), Some("0"));
+        // A quotient that underflows the words it was given is a plain zero,
+        // not the places it was computed to: `JSON_ARRAY(1.0/7e16)` is `[0]`
+        // on 8.3 while `SELECT 1.0/70000000000000000` prints 0.00000.
+        assert_eq!(
+            divide("1.0", "70000000000000000", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
+            Some("0")
         );
         // A zero divisor has no answer here; NULL is the caller's to give.
         assert_eq!(divide("1", "0", DEFAULT_DIV_PRECISION_INCREMENT), None);
@@ -872,10 +1087,12 @@ mod tests {
             Some("9999999999999999999999999999999999800000000000000000000000000000000001")
         );
         // A `DECIMAL(30,10)` times a `DECIMAL(65,30)`: 40 places asked for,
-        // 30 given, and the digits kept exactly.
+        // 31 given, and the digits kept exactly. 31 and not 30, which is
+        // measured — `JSON_ARRAY(3.5000000000 * 1.5…0)` carries 31 places on
+        // 8.3 where the printed product shows 30.
         assert_eq!(
             multiply("3.5000000000", "1.500000000000000000000000000000").as_deref(),
-            Some("5.250000000000000000000000000000")
+            Some("5.2500000000000000000000000000000")
         );
         assert_eq!(
             add(
@@ -885,20 +1102,18 @@ mod tests {
             .as_deref(),
             Some("3.000000000000000000000000000000")
         );
-        // Only `*` and `/` clamp, and they round half away from zero doing it:
-        // 5e-31 is 1e-30 and 4e-31 is nothing.
-        let tiny = |digits: &str| multiply(digits, "0.00000000000000000001");
+        // A product clamps at 31 and rounds half away from zero doing it, so
+        // 5e-32 is 1e-31 and 4e-32 is nothing at all — and nothing at all is
+        // spelled `0`, the way every operator spells an exact zero.
+        let tiny = |digits: &str| multiply(digits, "0.000000000000000000001");
         assert_eq!(
             tiny("0.00000000005").as_deref(),
-            Some("0.000000000000000000000000000001")
+            Some("0.0000000000000000000000000000001")
         );
-        assert_eq!(
-            tiny("0.00000000004").as_deref(),
-            Some("0.000000000000000000000000000000")
-        );
+        assert_eq!(tiny("0.00000000004").as_deref(), Some("0"));
         assert_eq!(
             tiny("-0.00000000005").as_deref(),
-            Some("-0.000000000000000000000000000001")
+            Some("-0.0000000000000000000000000000001")
         );
         // 37 places, which only a literal reaches: `+`, `-` and `%` keep all
         // of them where `*` and `/` do not.
@@ -911,11 +1126,14 @@ mod tests {
         );
         assert_eq!(
             multiply(long, "1").as_deref(),
-            Some("1.500000000000000000000000000000")
+            Some("1.5000000000000000000000000000000")
         );
+        // Five words: 37 places is five of them, and the quotient fills every
+        // one. `JSON_ARRAY(1.5…0/1)` carries 45 places on 8.3 where the
+        // printed quotient shows 30.
         assert_eq!(
             divide(long, "1", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
-            Some("1.500000000000000000000000000000")
+            Some("1.500000000000000000000000000000000000000000000")
         );
     }
 
@@ -944,25 +1162,37 @@ mod tests {
             "-7",
             "12345.6789",
         ];
+        // The counted reference spells an exact zero at the operator's scale
+        // and the operators spell it `0`, which is the one difference between
+        // them: MySQL normalises a computed zero and `an_answer_is_spelled…`
+        // above is where that is asserted rather than assumed. Every other
+        // pair is compared digit for digit, scale included.
+        let counted = |units: i128, scale: usize| {
+            if units == 0 {
+                "0".to_owned()
+            } else {
+                render(units, scale)
+            }
+        };
         for a in values {
             for b in values {
                 let scale = scale_of(a).max(scale_of(b));
                 let (x, y) = (units(a, scale).unwrap(), units(b, scale).unwrap());
                 assert_eq!(
                     add(a, b).as_deref(),
-                    Some(render(x + y, scale).as_str()),
+                    Some(counted(x + y, scale).as_str()),
                     "{a} + {b}"
                 );
                 assert_eq!(
                     subtract(a, b).as_deref(),
-                    Some(render(x - y, scale).as_str()),
+                    Some(counted(x - y, scale).as_str()),
                     "{a} - {b}"
                 );
                 let product = scale_of(a) + scale_of(b);
-                let counted = units(a, scale_of(a)).unwrap() * units(b, scale_of(b)).unwrap();
+                let whole = units(a, scale_of(a)).unwrap() * units(b, scale_of(b)).unwrap();
                 assert_eq!(
                     multiply(a, b).as_deref(),
-                    Some(render(counted, product).as_str()),
+                    Some(counted(whole, product).as_str()),
                     "{a} * {b}"
                 );
                 if y == 0 {
@@ -971,7 +1201,7 @@ mod tests {
                 }
                 assert_eq!(
                     remainder(a, b).as_deref(),
-                    Some(render(x % y, scale).as_str()),
+                    Some(counted(x % y, scale).as_str()),
                     "{a} % {b}"
                 );
                 assert_eq!(
@@ -984,15 +1214,25 @@ mod tests {
     }
 
     /// A decimal is written the one way however it was reached: nothing before
-    /// the point is still a zero, a value that came out zero has no sign, and
-    /// a remainder short of the scale is padded rather than truncated.
+    /// the point is still a zero, a value that came out zero has no sign and
+    /// no places, and a remainder short of the scale is padded rather than
+    /// truncated.
+    ///
+    /// The places an exact zero loses are the operator's doing and not the
+    /// spelling's, which is measurable: on 8.3 `JSON_ARRAY(0.00)` is `[0.00]`
+    /// and `JSON_ARRAY(1.50 - 1.50)`, `[0.00 * 1.5]`, `[0.00 / 1]` and
+    /// `[2.50 % 1.25]` are every one of them `[0]`.
     #[test]
     fn an_answer_is_spelled_the_way_mysql_spells_it() {
         assert_eq!(add("0.04", "0.01").as_deref(), Some("0.05"));
         assert_eq!(subtract("0.01", "0.02").as_deref(), Some("-0.01"));
-        assert_eq!(multiply("-0.5", "0").as_deref(), Some("0.0"));
-        assert_eq!(subtract("0.5", "0.5").as_deref(), Some("0.0"));
-        assert_eq!(remainder("1.500", "1.50").as_deref(), Some("0.000"));
+        assert_eq!(multiply("-0.5", "0").as_deref(), Some("0"));
+        assert_eq!(subtract("0.5", "0.5").as_deref(), Some("0"));
+        assert_eq!(remainder("1.500", "1.50").as_deref(), Some("0"));
+        assert_eq!(
+            divide("0.00", "1", DEFAULT_DIV_PRECISION_INCREMENT).as_deref(),
+            Some("0")
+        );
         assert_eq!(add("007.5", "0").as_deref(), Some("7.5"));
         assert_eq!(add(".5", "0").as_deref(), Some("0.5"));
         // Text that is not a decimal is not this path's to answer.

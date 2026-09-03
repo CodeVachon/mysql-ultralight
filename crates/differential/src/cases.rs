@@ -4646,12 +4646,12 @@ pub const GROUPS: &[Group] = &[
             same("SELECT 1.0000000000000000000000000/7"),
             same("SELECT -1/3, -2/3, 1/-3, -1/-3, -1/8, -3/8"),
             same("SELECT SUM(two) / COUNT(*), AVG(two), SUM(two) + 0 FROM Dm"),
-            // A quotient is covered by what it *prints*. MySQL's own value
-            // carries more places than the column declares — `JSON_ARRAY(1/3)`
-            // is `[0.333333333]` against a `decimal(5,4)` column — so anything
-            // that reads a quotient instead of printing one still diverges.
-            // That is #0118, and it needs a scale on the column before it can
-            // be fixed rather than moved.
+            // What a quotient prints is only half of it: MySQL's value
+            // carries more places than the column declares —
+            // `JSON_ARRAY(1/3)` is `[0.333333333]` against a `decimal(5,4)`
+            // column — so a reading that is not a printing sees a different
+            // number. That was #0118 and it is covered now, in "a decimal's
+            // value against the scale it shows" below.
 
             // Past what an `i128` counts, which is 38 digits: MySQL's DECIMAL
             // is 65 and a product of two of them is 70, printed in full.
@@ -4754,6 +4754,138 @@ pub const GROUPS: &[Group] = &[
                   -2.5 < -1.5, 0.0 = -0.0"),
             same("SELECT s = 2.5, s = 2.50000, s > 2.4999999999, \
                   s BETWEEN 2 AND 3 FROM Wd ORDER BY id"),
+        ],
+    },
+    Group {
+        // #0118, #0122 and #0123: one mechanism read three ways. MySQL's
+        // decimal division computes to a whole number of nine-digit words and
+        // describes the column at the left operand's scale plus
+        // `div_precision_increment`, so a quotient's *value* carries more
+        // places than its rendering shows. Everything that reads it as a
+        // number reads the wide one — comparison, arithmetic, a total, a
+        // document, a column it is written into — and everything that reads it
+        // as characters reads the narrow one.
+        //
+        // The decimal group above covers a quotient by what it prints, and
+        // said for a long time that it could cover no more. This group is
+        // what changed that: `JSON_ARRAY` is the reading that shows the value,
+        // and `=` against the printed digits is the one that shows the
+        // difference is not cosmetic.
+        //
+        // What is deliberately not asked here: `GROUP BY` over a decimal
+        // expression. MySQL settles the wide value into a temporary table's
+        // field when the group needs one and leaves it wide when an index
+        // serves the group — measured on 8.3, `JSON_ARRAY(SUM(b/3))` under
+        // `GROUP BY a` carries nine places with a key on `a` and six with
+        // `GROUP BY a+0` — so a case for it would be a case about which plan
+        // MySQL chose. `materialised_by_mysql` in the engine makes the same
+        // argument about widths.
+        //
+        // The increment is left at the default: three groups above already
+        // move it, and MySQL fixes a quotient's scale when a statement is
+        // *prepared*, so a statement whose text repeated one of theirs would
+        // be asked at their increment rather than at this group's.
+        name: "a decimal's value against the scale it shows",
+        setup: &[
+            "CREATE TABLE Qv (
+                 id INT NOT NULL,
+                 v DECIMAL(10,2) NOT NULL,
+                 a DECIMAL(20,4) NOT NULL,
+                 PRIMARY KEY (id)
+             )",
+            "INSERT INTO Qv (id, v, a) VALUES
+                 (1, 1.50, 3086419.5750), (2, 2.50, 3086419.5750),
+                 (3, 8.50, 3086419.5750), (4, 4.00, 3086419.5750)",
+            "CREATE TABLE Qs (id INT NOT NULL, narrow DECIMAL(10,2) NULL, \
+             wide DECIMAL(20,9) NULL, PRIMARY KEY (id))",
+        ],
+        cases: &[
+            // The two halves side by side. The column says four places and
+            // the value has nine.
+            same("SELECT 1/3 AS shown, JSON_ARRAY(1/3), CAST(1/3 AS CHAR), CONCAT(1/3)"),
+            same("SELECT JSON_ARRAY(10/3, 2/3, 1/7, 1/8, 5/8, 1/16, -1/3, 1/-3)"),
+            // The width is a whole number of words and is not the sum of the
+            // scales rounded up: `1.5/1` and `1/1.5` carry nine, `1.5/1.5`
+            // eighteen, and a 25-place operand thirty-six.
+            same("SELECT JSON_ARRAY(1.5/1, 1/1.5, 1.5/1.5, 1.000000/1, 1/1.00000000000)"),
+            same("SELECT JSON_ARRAY(1.0/7, 1.00/7, 1.000/7, 1.0000/7, 1.00000/7)"),
+            same("SELECT JSON_ARRAY(1/7.0, 1/7.00, 1/7.000, 1/7.0000, 1/7.00000)"),
+            same("SELECT JSON_ARRAY(1.0000000000000000000000000/7), \
+                  1.0000000000000000000000000/7"),
+            // A quotient of a quotient takes its width from the value's
+            // places and its rendering from the declared ones.
+            same("SELECT (1/3)/1 AS chained, JSON_ARRAY((1/3)/1, (1/3)+0, (1/3)*3, \
+                  (1/3)-0, (1/3)%1, -(1/3), ABS(-(1/3)))"),
+            // Comparison reads the value, which is the wrong answer on money
+            // that #0118 is filed for.
+            same("SELECT 1/3 = 0.3333 AS eq, 1/3 > 0.3333, 1/3 < 0.33333334, \
+                  (1/3) BETWEEN 0.3333 AND 0.33334, (1/3) IN (0.3333)"),
+            same("SELECT (1/3)*3 AS times, 1/3 + 1/3, 2/3 + 1/3"),
+            // ROUND and TRUNCATE declare `min(the argument's scale, places)`;
+            // a cast to a decimal reads the number and a cast to characters
+            // reads the rendering.
+            same("SELECT ROUND(1/3, 9) AS capped, TRUNCATE(1/3, 9), ROUND(1/3, 2), \
+                  TRUNCATE(1/3, 2), ROUND(2/3, 0), TRUNCATE(1/3, 0), ROUND(1/3, -1)"),
+            same("SELECT ROUND(1.00000/3, 12) AS wider, TRUNCATE(1.00000/3, 12), \
+                  JSON_ARRAY(ROUND(1.00000/3, 12))"),
+            same("SELECT CAST(1/3 AS DECIMAL(20,9)) AS cast9, \
+                  CAST(1/3 AS DECIMAL(20,2)), CAST(1/3 AS DECIMAL(20,18)), \
+                  JSON_ARRAY(CAST(1/3 AS DECIMAL(20,9)))"),
+            // An exact zero is the case where the value has *fewer* places
+            // than the rendering: MySQL's operators normalise one to a bare
+            // `0` where a literal keeps every place it was written to.
+            same("SELECT JSON_ARRAY(0.00, 0.000000, -0.00) AS literal"),
+            same("SELECT JSON_ARRAY(1.50 - 1.50, 1.50 + (-1.50), 0.00 * 1.5, 0.00 / 1, \
+                  2.50 % 1.25, -(1.50 - 1.50)) AS computed"),
+            same("SELECT 1.50 - 1.50 AS printed, 0.00 * 1.5, 0.00 / 1, 2.50 % 1.25"),
+            same("SELECT 1.0/70000000000000000 AS underflow, \
+                  JSON_ARRAY(1.0/70000000000000000, 0.5/1000000000000000000000000000000)"),
+            // A product's value clamps one place past the 30 it prints at.
+            same("SELECT 3.5000000000 * 1.500000000000000000000000000000 AS product, \
+                  JSON_ARRAY(3.5000000000 * 1.500000000000000000000000000000)"),
+            same("SELECT JSON_ARRAY(1.5000000000000000000000000000000000000 * 1, \
+                  1.5000000000000000000000000000000000000 / 1, \
+                  1.5000000000000000000000000000000000000 + 0) AS thirtyseven"),
+            // #0122's own example, and the aggregates around it. `SUM` keeps
+            // the scale its argument is shown at and totals the wide values;
+            // `MIN` and `MAX` carry a value's two scales through; `AVG`
+            // divides again and widens both.
+            same("SELECT AVG(a) AS avg4, JSON_ARRAY(AVG(a)) FROM Qv"),
+            same("SELECT a/2 AS half, JSON_ARRAY(a/2) FROM Qv ORDER BY id LIMIT 1"),
+            same("SELECT SUM(v/3) AS totalled, JSON_ARRAY(SUM(v/3)) FROM Qv"),
+            same("SELECT MIN(v/3) AS extremes, MAX(v/3), \
+                  JSON_ARRAY(MIN(v/3), MAX(v/3)) FROM Qv"),
+            same("SELECT AVG(v/3) AS mean, JSON_ARRAY(AVG(v/3)) FROM Qv"),
+            same("SELECT SUM(v) AS zeroed, JSON_ARRAY(SUM(v) - SUM(v)) FROM Qv"),
+            // A temporary table holds only the places its field declares, so
+            // a derived table and a CTE settle the value where a scalar
+            // subquery does not.
+            same("SELECT JSON_ARRAY(x) AS derived FROM (SELECT 1/3 AS x) t"),
+            same("WITH c AS (SELECT 1/3 AS x) SELECT JSON_ARRAY(x) AS cte FROM c"),
+            same("SELECT JSON_ARRAY(SUM(x)) AS dsum FROM (SELECT 1/3 AS x) t"),
+            same("SELECT JSON_ARRAY((SELECT 1/3)) AS scalarsub"),
+            // A column stores the number and not the rendering.
+            same("INSERT INTO Qs (id, narrow, wide) VALUES (1, 1/3, 1/3), (2, 2/3, 2/3)"),
+            same("SELECT id, narrow, wide FROM Qs ORDER BY id"),
+            same("SELECT JSON_ARRAY(narrow, wide) AS written FROM Qs ORDER BY id"),
+            same("SELECT COUNT(*) AS matched FROM Qs WHERE wide = 1/3"),
+            // #0123: a set operation types its column by aggregating the
+            // branches and writes every row into a field at that scale, so an
+            // integer branch is padded out and the widest scale wins wherever
+            // it sits.
+            same("SELECT 2.50 AS u3 UNION ALL SELECT 2.5 UNION ALL SELECT 2"),
+            same("SELECT 2.50 AS u3d UNION SELECT 2.5 UNION SELECT 2"),
+            same("SELECT 1.5 AS u4 UNION ALL SELECT 2 UNION ALL SELECT 3.456 \
+                  UNION ALL SELECT 4.5"),
+            same("SELECT 1/3 AS uq UNION ALL SELECT 2.5 UNION ALL SELECT 2"),
+            same("SELECT 1 AS ui UNION ALL SELECT 2 UNION ALL SELECT 3"),
+            same("SELECT 2.5 AS uf UNION ALL SELECT 1.5e0"),
+            same("SELECT 2.5 AS us UNION ALL SELECT 'abc'"),
+            same("SELECT v AS uc FROM Qv UNION ALL SELECT 1.5 ORDER BY uc"),
+            same("SELECT DISTINCT x AS ud FROM (SELECT 1/3 AS x UNION ALL SELECT 0.3333) t"),
+            same("SELECT JSON_ARRAY(x) AS uj FROM (SELECT 1/3 AS x UNION ALL SELECT 1.5) z \
+                  ORDER BY x"),
+            same("SELECT COUNT(*) AS ur FROM (SELECT 2.50 AS x UNION SELECT 2.5) t"),
         ],
     },
     Group {
