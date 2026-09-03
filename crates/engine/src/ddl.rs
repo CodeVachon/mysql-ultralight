@@ -5,7 +5,7 @@ use sqlparser::ast::{
     CreateTableOptions, ObjectName, RenameTableNameKind, SqlOption, TableConstraint,
 };
 
-use crate::catalog::{Catalog, Column, ForeignKey, Index, Table};
+use crate::catalog::{Catalog, Column, Database, ForeignKey, Index, Table};
 use crate::error::{unsupported, EngineError, EngineResult};
 use crate::exec::Engine;
 use crate::expr;
@@ -133,11 +133,7 @@ pub fn create_table(
             .iter()
             .any(|c| c.name.eq_ignore_ascii_case(&column.name))
         {
-            return Err(EngineError::new(
-                1060,
-                "42S21",
-                format!("Duplicate column name '{}'", column.name),
-            ));
+            return Err(EngineError::duplicate_column(&column.name));
         }
     }
 
@@ -829,6 +825,172 @@ fn drop_named<T>(items: &mut Vec<T>, matches: impl Fn(&T) -> bool) -> bool {
     items.len() != before
 }
 
+/// Takes a dropped column out of every index over it.
+///
+/// 8.3 *narrows* rather than drops, which is the half of this that is easy to
+/// get wrong: with `INDEX ix (a, b)`, dropping `a` leaves `ix (b)` there —
+/// renumbered from `SEQ_IN_INDEX` 1 — and a narrowed `UNIQUE KEY` stays
+/// unique, `UNIQUE uq (a, b)` minus `b` being `uq (a)` with `NON_UNIQUE` 0.
+/// A `PRIMARY KEY (a, b)` narrows the same way. Only an index left with no
+/// columns at all goes, which is what a single-column key does; the
+/// primary-key flags go with it for the reason [`drop_indexes`] gives, though
+/// here the flagged column is itself being removed.
+///
+/// Renumbering is not code: `information_schema.STATISTICS` reads the position
+/// out of the `Vec`, so removing the element is the renumbering.
+fn narrow_indexes(table: &mut Table, dropped: &str) {
+    for index in &mut table.indexes {
+        index.columns.retain(|c| !c.eq_ignore_ascii_case(dropped));
+    }
+    drop_indexes(table, |i| i.columns.is_empty());
+    // A unique key that narrows onto one column *is* a one-column unique key,
+    // and `information_schema.COLUMNS.COLUMN_KEY` reads that from the column's
+    // flag rather than from the indexes. Measured on 8.3: `UNIQUE uq (a, b)`
+    // with `b` dropped reports `a` as `UNI`, where the index alone left it
+    // `MUL`. The primary-key side needs nothing — a composite primary key
+    // flags every one of its columns already.
+    let now_unique: Vec<String> = table
+        .indexes
+        .iter()
+        .filter(|i| i.unique && !i.primary && i.columns.len() == 1)
+        .map(|i| i.columns[0].clone())
+        .collect();
+    for name in now_unique {
+        if let Some(at) = table.column_index(&name) {
+            table.columns[at].unique = true;
+        }
+    }
+}
+
+/// Carries a renamed column into the keys that name it.
+///
+/// A key holds its columns by name, so a rename that touched only
+/// `table.columns` left `information_schema` reporting an index and a foreign
+/// key over a name the table no longer has — the same phantom
+/// [`narrow_indexes`] exists to prevent, through a different door, and it also
+/// hid the renamed column from the 1828 rule, which then let a foreign key's
+/// own column be dropped under its new name. 8.3 carries both: after
+/// `RENAME COLUMN pid TO qid`, `STATISTICS` and `KEY_COLUMN_USAGE` both say
+/// `qid` there, and `DROP COLUMN qid` afterwards is 1828.
+///
+/// The referencing side only. The columns a key in another table *points at*
+/// are carried by [`rename_referenced_columns`], which runs once at the end
+/// because it writes outside the table being altered.
+fn rename_key_column(table: &mut Table, old: &str, new: &str) {
+    for name in table
+        .indexes
+        .iter_mut()
+        .flat_map(|i| i.columns.iter_mut())
+        .chain(
+            table
+                .foreign_keys
+                .iter_mut()
+                .flat_map(|f| f.columns.iter_mut()),
+        )
+    {
+        if name.eq_ignore_ascii_case(old) {
+            *name = new.to_owned();
+        }
+    }
+}
+
+/// The names a column list ends up with after a statement's renames.
+///
+/// In the statement's order, so a column renamed twice arrives at the second
+/// name rather than at the first.
+fn after_renames(columns: &[String], renames: &[(String, String)]) -> Vec<String> {
+    columns
+        .iter()
+        .map(|column| {
+            let mut name = column.clone();
+            for (old, new) in renames {
+                if name.eq_ignore_ascii_case(old) {
+                    name = new.clone();
+                }
+            }
+            name
+        })
+        .collect()
+}
+
+/// Carries this table's column renames into the foreign keys that point at it.
+///
+/// The other half of [`rename_key_column`], and it has to be a separate pass
+/// because it writes to *other* tables: 8.3 renames a parent's column in every
+/// child's constraint too, and `KEY_COLUMN_USAGE.REFERENCED_COLUMN_NAME` says
+/// the new name there afterwards. Left behind, the constraint points at a
+/// column that is not there, which stops it being enforced at all — the
+/// referenced positions no longer resolve, and an unresolvable key is skipped.
+///
+/// Returns the tables it changed, which a transaction has to know about for
+/// the same reason the altered table itself is marked.
+fn rename_referenced_columns(
+    database: &mut Database,
+    table_name: &str,
+    renames: &[(String, String)],
+) -> Vec<String> {
+    let mut touched = Vec::new();
+    for other in database.tables.values_mut() {
+        let mut changed = false;
+        for fk in &mut other.foreign_keys {
+            if !references_table(fk, table_name) {
+                continue;
+            }
+            let renamed = after_renames(&fk.referenced_columns, renames);
+            if renamed != fk.referenced_columns {
+                fk.referenced_columns = renamed;
+                changed = true;
+            }
+        }
+        if changed {
+            touched.push(other.name.clone());
+        }
+    }
+    touched
+}
+
+/// Whether a foreign key points at the table called `table_name`.
+///
+/// `referenced_table` is stored as the constraint wrote it, so
+/// `REFERENCES app.P(id)` keeps the database on the front while the name being
+/// altered is bare. Compared whole, every qualified constraint fell outside
+/// the rules below and its parent's column could be dropped from under it.
+///
+/// One database, which is what every other foreign key comparison here assumes
+/// too: `crate::foreign_keys` resolves a parent by name inside the child's own
+/// database, so a qualified name reaching a *different* one is a gap this does
+/// not close.
+fn references_table(fk: &ForeignKey, table_name: &str) -> bool {
+    let referenced = fk
+        .referenced_table
+        .rsplit('.')
+        .next()
+        .unwrap_or(&fk.referenced_table);
+    referenced.eq_ignore_ascii_case(table_name)
+}
+
+/// Whether an index can answer a lookup on exactly `columns`.
+///
+/// A *leading* prefix, in order, which is the rule MySQL binds a foreign key
+/// to an index by: measured on 8.3, `KEY wide (pid, x)` serves
+/// `FOREIGN KEY (pid)` — no index of the constraint's own is created beside it
+/// — while `KEY tail (x, pid)` does not and one is. Uniqueness is no part of
+/// it on either side of the constraint: a parent carrying `UNIQUE uq (u)`
+/// beside `KEY spare (u)` accepts `DROP INDEX uq` there and refuses
+/// `DROP INDEX spare` afterwards.
+fn index_serves(index: &Index, columns: &[String]) -> bool {
+    columns.len() <= index.columns.len()
+        && columns
+            .iter()
+            .zip(&index.columns)
+            .all(|(wanted, held)| wanted.eq_ignore_ascii_case(held))
+}
+
+/// Whether any of the table's indexes serves `columns`.
+fn served_by_some_index(table: &Table, columns: &[String]) -> bool {
+    table.indexes.iter().any(|i| index_serves(i, columns))
+}
+
 /// The same, for indexes, clearing the primary-key flags along with the key.
 ///
 /// The flags are what `information_schema.COLUMNS.COLUMN_KEY` reports from, so
@@ -1036,10 +1198,12 @@ fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineRe
             // covers its columns, and names it after the constraint. Prisma
             // then renames that index in a later migration, which has nothing
             // to find if the index was never created.
-            let covered = table
-                .indexes
-                .iter()
-                .any(|i| i.columns.starts_with(key_columns.as_slice()));
+            // Through the same predicate the drop refusals read, so there is
+            // one answer to "which index backs this key" rather than two that
+            // have to agree — and this one compares the names the way every
+            // other identifier comparison here does, where `starts_with` on
+            // the raw strings made `KEY IX (PID)` not cover `(pid)`.
+            let covered = served_by_some_index(table, &key_columns);
             // The name is checked only where an index is actually created:
             // measured on 8.3, a foreign key whose columns an existing index
             // already covers takes no index of its own and so may reuse that
@@ -1263,6 +1427,58 @@ pub fn alter_table(
         }
     }
 
+    // The indexes as the statement found them, kept because 1553 below names
+    // the index that was *dropped* and by then it is gone from the copy.
+    let original_indexes = table.indexes.clone();
+
+    // The columns this statement takes away, and whether the loop refuses it
+    // first for a reason the rule below must not get in front of.
+    let walk = walk_columns(table, operations);
+    let dropped_columns = walk.dropped;
+
+    // The referencing half of the foreign key rule, and it sits here rather
+    // than after the loop because 8.3 settles it there: `DROP COLUMN pid,
+    // DROP INDEX nosuch` and the same pair reversed are both 1828 on a child
+    // table, so the rule outranks an operation that does not resolve. It
+    // outranks a duplicate column name (1060) too, and a `DROP COLUMN` of a
+    // name the table has not got (1091), both measured both ways round.
+    //
+    // Two refusals still beat it, and each is skipped rather than reordered so
+    // that nothing else about the loop moves — see `ColumnWalk::answered_first`.
+    //
+    // Against the foreign keys the statement *leaves*, which is what makes
+    // `DROP COLUMN pid, DROP FOREIGN KEY fk7` legal on 8.3 in either order —
+    // and it is how a migration retires a column and its constraint at once.
+    if !dropped_columns.is_empty() && !walk.answered_first {
+        for fk in surviving_foreign_keys(table, operations) {
+            for column in &fk.columns {
+                if dropped_columns
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(column))
+                {
+                    return Err(EngineError::fk_column_cannot_drop(column, &fk.name));
+                }
+            }
+        }
+    }
+
+    // Recorded rather than applied, which is the whole of #0184: this arm used
+    // to write to the catalog and return, so every operation written after the
+    // rename was skipped in silence and `RENAME TO t2, DROP INDEX nosuch`
+    // renamed the table where 8.3 answers 1091 and leaves it alone. Hoisted
+    // out, the statement is settled before any of it applies, like every other
+    // operation here. The last one wins when a statement writes two, as it
+    // does on 8.3: `RENAME TO r7b, RENAME TO r7c` leaves `r7c`.
+    let mut renamed_to: Option<String> = None;
+
+    // The column renames the statement makes, in the order it makes them.
+    // Recorded because a key in *another* table may point at one of them, and
+    // that table cannot be written to until the whole statement has passed.
+    let mut renamed_columns: Vec<(String, String)> = Vec::new();
+
+    // The name a rename left the table under, for the transaction to mark.
+    let mut moved_to: Option<String> = None;
+
     for operation in operations {
         match operation {
             AlterTableOperation::AddColumn {
@@ -1274,11 +1490,7 @@ pub fn alter_table(
                     if *if_not_exists {
                         continue;
                     }
-                    return Err(EngineError::new(
-                        1060,
-                        "42S21",
-                        format!("Duplicate column name '{}'", column_def.name.value),
-                    ));
+                    return Err(EngineError::duplicate_column(&column_def.name.value));
                 }
                 let column = build_column(column_def, table.columns.len() + 1)?;
                 // Back-filling NULL into a NOT NULL column stores rows that
@@ -1324,7 +1536,7 @@ pub fn alter_table(
                                      use DROP TABLE instead",
                                 ));
                             }
-                            table.columns.remove(index);
+                            let removed = table.columns.remove(index).name;
                             for row in &mut table.rows {
                                 if index < row.len() {
                                     row.remove(index);
@@ -1333,6 +1545,17 @@ pub fn alter_table(
                             for (position, column) in table.columns.iter_mut().enumerate() {
                                 column.position = position + 1;
                             }
+                            // The column leaves its keys with it, which is
+                            // #0179: leaving them behind listed an index over
+                            // a column that is gone in
+                            // `information_schema.STATISTICS`, and since #0150
+                            // that phantom also holds its name against a later
+                            // `CREATE INDEX` that MySQL accepts.
+                            //
+                            // By the stored spelling rather than the one the
+                            // statement wrote, because that is what the
+                            // indexes hold.
+                            narrow_indexes(table, &removed);
                         }
                         None if *if_exists => {}
                         // 1091 and not the 1054 a *reference* to a missing
@@ -1356,7 +1579,22 @@ pub fn alter_table(
                 let index = table.column_index(&old_column_name.value).ok_or_else(|| {
                     EngineError::unknown_column(&old_column_name.value, &table_name)
                 })?;
-                table.columns[index].name = new_column_name.value.clone();
+                // Renaming onto a name the table already carries would leave
+                // two columns of one name, which every reference then resolves
+                // to the first of — and the keys, which hold their columns by
+                // name, could no longer say which they were over. The column's
+                // own name is not that, and `RENAME COLUMN a TO A` succeeds on
+                // 8.3 as it does here.
+                if matches!(table.column_index(&new_column_name.value), Some(other) if other != index)
+                {
+                    return Err(EngineError::duplicate_column(&new_column_name.value));
+                }
+                let old = std::mem::replace(
+                    &mut table.columns[index].name,
+                    new_column_name.value.clone(),
+                );
+                rename_key_column(table, &old, &new_column_name.value);
+                renamed_columns.push((old, new_column_name.value.clone()));
             }
             AlterTableOperation::RenameTable {
                 table_name: new_name,
@@ -1364,37 +1602,13 @@ pub fn alter_table(
                 // The kind's Display renders "TO Gadget"; the name is inside
                 // it, and using the rendered form names the table "TO Gadget".
                 //
-                // This arm writes to the catalog and returns, so it is the one
-                // place the copy-then-swap rule above is bypassed and every
-                // operation written *after* the rename is skipped in silence.
-                // 8.3 disagrees — `RENAME TO T4b, DROP INDEX nosuch` is 1091
-                // there and leaves the table called `T4` — so this is a gap of
-                // its own, and not one the drop refusals below can close from
-                // where they sit. Reordered the other way it now agrees:
-                // `DROP INDEX nosuch, RENAME TO T4b` refuses before the rename
-                // is reached.
+                // Noted and not applied — see `renamed_to` above. The move
+                // itself is the write-back at the end of this function, which
+                // is the only place the catalog is touched now.
                 let target = match new_name {
                     RenameTableNameKind::To(name) | RenameTableNameKind::As(name) => name,
                 };
-                let new_name = name::dotted(target);
-                // From the copy, so any operation earlier in the same
-                // statement travels with it rather than being dropped on the
-                // floor with the original.
-                let mut moved = table.clone();
-                moved.name = new_name.clone();
-                // Remove by the stored key rather than what the user typed:
-                // the two can differ in case, which would leave the rows
-                // present under both names.
-                let old_key = database
-                    .tables
-                    .keys()
-                    .find(|k| k.eq_ignore_ascii_case(&table_name))
-                    .cloned();
-                if let Some(key) = old_key {
-                    database.tables.remove(&key);
-                }
-                database.tables.insert(new_name, moved);
-                return Ok(Outcome::ok());
+                renamed_to = Some(name::dotted(target));
             }
             AlterTableOperation::AddConstraint { constraint, .. } => {
                 apply_constraint(table, constraint)?
@@ -1490,6 +1704,11 @@ pub fn alter_table(
                 let index = table
                     .column_index(&old_name.value)
                     .ok_or_else(|| EngineError::unknown_column(&old_name.value, &table_name))?;
+                // `CHANGE COLUMN` renames, so it collides the same way
+                // `RENAME COLUMN` does above.
+                if matches!(table.column_index(&new_name.value), Some(other) if other != index) {
+                    return Err(EngineError::duplicate_column(&new_name.value));
+                }
                 let position = table.columns[index].position;
                 let def = ColumnDef {
                     name: new_name.clone(),
@@ -1503,6 +1722,11 @@ pub fn alter_table(
                         .collect(),
                 };
                 table.columns[index] = build_column(&def, position)?;
+                // `CHANGE COLUMN` renames as well as retypes, and the keys
+                // over the old name have to follow it for the same reason
+                // `RENAME COLUMN`'s do.
+                rename_key_column(table, &old_name.value, &new_name.value);
+                renamed_columns.push((old_name.value.clone(), new_name.value.clone()));
             }
             AlterTableOperation::ModifyColumn {
                 col_name,
@@ -1536,10 +1760,119 @@ pub fn alter_table(
         }
     }
 
+    // Four rules the statement is judged by as a whole rather than operation
+    // by operation, in the order 8.3 answers them — each pairing was measured
+    // both ways round, because an ALTER that breaks two rules reports one.
+    //
+    // All four sit *after* the loop, so an operation that does not resolve
+    // wins over every one of them: `ADD INDEX ixz (nosuch), DROP INDEX
+    // nosuchidx` is 1091 there and not the 1072 the first half would earn.
+    // The referencing half of the foreign key rule is the exception and is
+    // handled before the loop; the note there says why.
+
+    // 1072: a key the statement adds is resolved against the table the
+    // statement *leaves*, so `DROP COLUMN a, ADD INDEX ixa (a)` and
+    // `ADD INDEX ixa (a), DROP COLUMN a` are both refused on 8.3 — the second
+    // one despite the add having succeeded against the table as it stood.
+    //
+    // Read off the operations rather than off `table.indexes`, and that is the
+    // half the reversed order needs: narrowing takes the dropped column out of
+    // the index the add had just made, which leaves it with no columns and so
+    // removes it, and a scan of what survived would find nothing to complain
+    // about.
+    for operation in operations {
+        let AlterTableOperation::AddConstraint { constraint, .. } = operation else {
+            continue;
+        };
+        for column in key_columns_declared(constraint) {
+            if table.column_index(&column).is_none() {
+                return Err(EngineError::key_column_missing(&column));
+            }
+        }
+    }
+
+    // Every foreign key that points at this table, its own included: a
+    // self-referencing key is on both sides at once and 8.3 answers it with
+    // the *referenced* side's code, naming its own table. This table's keys
+    // are read from the copy so that one the statement dropped no longer
+    // counts; the other tables' from the catalog, since the statement cannot
+    // have touched them.
+    let referencing = keys_pointing_at(database, &table_name, table);
+
+    // 1829: the referenced half of the foreign key rule, 1828 above being the
+    // referencing half.
+    //
+    // Of the columns this statement dropped and did not put back. A name that
+    // is gone from the copy but was never named by a `DROP COLUMN` was renamed
+    // rather than dropped, and a rename is not what this refuses.
+    for dropped in &dropped_columns {
+        if table.column_index(dropped).is_some() {
+            continue;
+        }
+        for (other, fk) in &referencing {
+            if fk
+                .referenced_columns
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(dropped))
+            {
+                return Err(EngineError::fk_column_cannot_drop_child(
+                    dropped, &fk.name, other,
+                ));
+            }
+        }
+    }
+
+    // 1553, through the same helper the standalone `DROP INDEX ... ON t` calls.
+    refuse_unbacked_foreign_key(
+        database,
+        &table_name,
+        table,
+        &original_indexes,
+        &renamed_columns,
+    )?;
+
+    // 1062: a unique key narrowed onto columns whose rows now collide. The
+    // narrowing above is what makes this reachable — an index over a column
+    // that had been dropped was inert, `check_unique` skipping any key whose
+    // columns do not resolve, and a narrowed one is live again. 8.3 refuses
+    // the whole statement: `UNIQUE (a, b)` over `(1, 1), (1, 2)` with `b`
+    // dropped is `Duplicate entry '1'` there and leaves the table alone.
+    //
+    // Only when a key actually narrowed, because this is quadratic in the rows
+    // and every other ALTER would pay for it.
+    if table
+        .indexes
+        .iter()
+        .filter(|i| i.unique || i.primary)
+        .any(|i| {
+            original_indexes
+                .iter()
+                .any(|o| o.name.eq_ignore_ascii_case(&i.name) && o.columns.len() > i.columns.len())
+        })
+    {
+        for (position, row) in table.rows.iter().enumerate() {
+            table.check_unique(row, Some(position))?;
+        }
+    }
+
+    // 1050: a rename onto a name the database already holds. `insert` would
+    // otherwise replace that table — its columns and its rows — with this one
+    // and report success, which is the only place in this function that
+    // destroys data nothing asked it to. 8.3 refuses and leaves both alone.
+    //
+    // A rename onto the table's *own* name is not that: it differs only in
+    // case, or not at all, and removing the old key before inserting makes it
+    // the no-op it should be.
+    if let Some(new_name) = &renamed_to {
+        if !new_name.eq_ignore_ascii_case(&table_name) && database.table(new_name).is_some() {
+            return Err(EngineError::table_exists(new_name));
+        }
+    }
+
     // Every operation succeeded, so the copy becomes the table. Written back
     // under the stored key rather than what the user typed, which can differ
     // in case — inserting under the typed spelling would leave the rows under
-    // both names, which is the bug `RenameTable` already carries a note about.
+    // both names.
     let key = database
         .tables
         .keys()
@@ -1547,10 +1880,342 @@ pub fn alter_table(
         .cloned();
     if let Some(key) = key {
         resolve_collations(table, &database.collation);
-        database.tables.insert(key, table.clone());
+        match renamed_to {
+            // Removed by the stored key and inserted under the new name, so a
+            // rename that differs only in case does not leave the rows under
+            // both.
+            Some(new_name) => {
+                database.tables.remove(&key);
+                table.name = new_name.clone();
+                database.tables.insert(new_name.clone(), table.clone());
+                // The name the table arrives under is marked too, and not only
+                // the one it left: a rollback restores what the snapshot held
+                // for every table the transaction touched and *removes* the
+                // ones it does not know about, so an unmarked target survived
+                // the rollback beside the original coming back.
+                moved_to = Some(new_name);
+            }
+            None => {
+                database.tables.insert(key, table.clone());
+            }
+        }
+    }
+
+    // Before the guard is dropped, because it writes outside this table: the
+    // constraints pointing at a column this statement renamed follow it. After
+    // the write-back, so the table's own self-referencing keys are updated
+    // where they now live.
+    let mut touched = match renamed_columns.is_empty() {
+        true => Vec::new(),
+        false => rename_referenced_columns(database, &table_name, &renamed_columns),
+    };
+    touched.extend(moved_to);
+    drop(catalog);
+    for name in touched {
+        engine.mark_modified_public(session, &db, &name);
     }
 
     Ok(Outcome::ok())
+}
+
+/// Every foreign key that points at `table_name`, with the table it is on.
+///
+/// This table's own keys included: a self-referencing key is on both sides at
+/// once, and 8.3 answers a drop of the column it points *at* with the
+/// referenced side's code, naming its own table. Those are read from `table` —
+/// the copy an `ALTER TABLE` is building — so a key the statement dropped no
+/// longer counts; every other table's from the catalog, since one statement
+/// cannot have touched them.
+fn keys_pointing_at<'a>(
+    database: &'a Database,
+    table_name: &str,
+    table: &'a Table,
+) -> Vec<(&'a str, &'a ForeignKey)> {
+    database
+        .tables
+        .values()
+        .flat_map(|other| {
+            let keys = if other.name.eq_ignore_ascii_case(table_name) {
+                &table.foreign_keys
+            } else {
+                &other.foreign_keys
+            };
+            // `other.name` and never the spelling the statement wrote: the
+            // message reports the table as the catalog holds it, and for the
+            // self case those two can differ in case.
+            keys.iter()
+                .filter(|fk| references_table(fk, table_name))
+                .map(move |fk| (other.name.as_str(), fk))
+        })
+        .collect()
+}
+
+/// Refuses a change that leaves some foreign key with no index behind it.
+///
+/// Both sides: a key needs an index over its own columns on the child, and one
+/// over the columns it points at on the parent. Asked of the table as the
+/// statement leaves it, which is what makes `DROP INDEX fkc, DROP FOREIGN KEY
+/// fkc` and `DROP INDEX k2, ADD INDEX k3 (pid)` legal on 8.3 — a key that is
+/// gone needs nothing, and a substitute added by the same statement counts.
+///
+/// The message names the index that was *dropped*, so the blame is looked up
+/// rather than derived: the first of the indexes no longer there that would
+/// have served. First by the table's own order and not the statement's, which
+/// is what 8.3 reports — `DROP INDEX k1, DROP INDEX k2` and the same pair
+/// reversed both name `k1`, `k1` being the one declared first.
+///
+/// Shared with the standalone `DROP INDEX ... ON t`, which reads the same rule
+/// there: `DROP INDEX fk ON C` is 1553 on 8.3 exactly as the ALTER spelling is,
+/// and that spelling walked away with it while this lived in `alter_table`.
+pub(crate) fn refuse_unbacked_foreign_key(
+    database: &Database,
+    table_name: &str,
+    table: &Table,
+    original_indexes: &[Index],
+    renames: &[(String, String)],
+) -> EngineResult<()> {
+    let referencing = keys_pointing_at(database, table_name, table);
+    // The columns a key points at are read under the names this statement
+    // leaves them, because the indexes over them already carry those names.
+    // Asked under the old ones, `RENAME COLUMN u TO v` on a parent looked like
+    // a drop of the index that backed the key and answered 1553, where 8.3
+    // renames both sides and says nothing.
+    let needed: Vec<Vec<String>> = table
+        .foreign_keys
+        .iter()
+        .map(|fk| fk.columns.clone())
+        .chain(
+            referencing
+                .iter()
+                .map(|(_, fk)| after_renames(&fk.referenced_columns, renames)),
+        )
+        .collect();
+    for columns in &needed {
+        if served_by_some_index(table, columns) {
+            continue;
+        }
+        // Gone means gone as it was: an index whose name the statement reused
+        // for other columns took the old one's place, and the old one is what
+        // the key has lost.
+        let blamed = original_indexes
+            .iter()
+            .filter(|i| {
+                !table.indexes.iter().any(|kept| {
+                    kept.name.eq_ignore_ascii_case(&i.name) && kept.columns == i.columns
+                })
+            })
+            .find(|i| index_serves(i, columns));
+        // No dropped index to blame means the key lost its backing some other
+        // way, and inventing an index name for that would be a worse answer
+        // than the one this engine already gives.
+        if let Some(index) = blamed {
+            return Err(EngineError::drop_index_needed_by_fk(&index.name));
+        }
+    }
+    Ok(())
+}
+
+/// Removes the named indexes, refusing a name the table has not got.
+///
+/// The standalone `DROP INDEX ... ON t` reaches this; the `ALTER TABLE`
+/// spelling has its own arm. Through [`drop_indexes`] rather than a plain
+/// `retain`, so `` DROP INDEX `PRIMARY` ON t `` clears the column flags with
+/// the key instead of leaving a column reported `PRI` under no primary key.
+pub(crate) fn drop_indexes_named(
+    table: &mut Table,
+    names: &[String],
+    if_exists: bool,
+) -> EngineResult<()> {
+    for name in names {
+        if !drop_indexes(table, |i| i.name.eq_ignore_ascii_case(name)) && !if_exists {
+            // The same message the ALTER TABLE form gives, which is what 8.3
+            // prints here too: `check that column/key exists`, not the `check
+            // that it exists` this used to invent.
+            return Err(EngineError::cant_drop(name));
+        }
+    }
+    Ok(())
+}
+
+/// The plain column names a table constraint puts a key over.
+///
+/// A foreign key's referencing columns are in it and its *referenced* ones are
+/// not: those name the parent's columns, which this table cannot be asked
+/// about. A CHECK constrains no key at all.
+///
+/// Only the parts that are a bare column name, which is the difference between
+/// this and [`index_column_names`]. That one renders anything else as text so
+/// the index matches no column — a functional index over `(a + 1)`, and a
+/// prefix index over `b(4)`, which is the shape Prisma generates for every
+/// `TEXT` column it indexes. Asking `column_index` about the rendered form
+/// would answer 1072 for both, where 8.3 accepts them.
+fn key_columns_declared(constraint: &TableConstraint) -> Vec<String> {
+    match constraint {
+        TableConstraint::PrimaryKey(pk) => key_column_identifiers(&pk.columns),
+        TableConstraint::Unique(unique) => key_column_identifiers(&unique.columns),
+        TableConstraint::Index(index) => key_column_identifiers(&index.columns),
+        TableConstraint::ForeignKey(fk) => fk.columns.iter().map(|c| c.value.clone()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The subset of an index's key parts that name a column and nothing else.
+fn key_column_identifiers(columns: &[sqlparser::ast::IndexColumn]) -> Vec<String> {
+    columns
+        .iter()
+        .filter_map(|c| match &c.column.expr {
+            sqlparser::ast::Expr::Identifier(ident) => Some(ident.value.clone()),
+            sqlparser::ast::Expr::CompoundIdentifier(parts) => {
+                parts.last().map(|p| p.value.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The foreign keys an `ALTER TABLE` leaves the table holding.
+///
+/// The ones it drops are read off the statement rather than by applying it,
+/// because the rule they feed is settled before the loop runs. Both spellings
+/// of the drop count: `DROP FOREIGN KEY` and the `DROP CONSTRAINT` that
+/// reaches the same key.
+fn surviving_foreign_keys<'a>(
+    table: &'a Table,
+    operations: &[AlterTableOperation],
+) -> Vec<&'a ForeignKey> {
+    table
+        .foreign_keys
+        .iter()
+        .filter(|fk| {
+            !operations.iter().any(|operation| match operation {
+                AlterTableOperation::DropForeignKey { name, .. }
+                | AlterTableOperation::DropConstraint { name, .. } => {
+                    fk.name.eq_ignore_ascii_case(&name.value)
+                }
+                _ => false,
+            })
+        })
+        .collect()
+}
+
+/// What an `ALTER TABLE`'s column operations come to, walked in order.
+struct ColumnWalk {
+    /// The columns the statement takes away, under the names the table carried
+    /// before it ran — which is how the indexes and the foreign keys spell
+    /// them. A column renamed and *then* dropped is in here under its original
+    /// name: `RENAME COLUMN pid TO qid, DROP COLUMN qid` takes `pid` away, and
+    /// reading the drops against the original table alone missed that, so a
+    /// foreign key over `pid` was left pointing at nothing.
+    dropped: Vec<String>,
+    /// Whether the operation loop refuses the statement first, for a reason
+    /// 8.3 puts ahead of the foreign key rule hoisted above it.
+    ///
+    /// Two of them, and both were measured beating 1828 on 8.3:
+    ///
+    ///   * 1090, the last-column refusal. `DROP COLUMN pid, DROP COLUMN id,
+    ///     DROP COLUMN x` on a three-column child is 1090 there and not 1828.
+    ///   * 1054, a *reference* to a column that is not there, which on 8.3
+    ///     outranks everything an `ALTER TABLE` could report — 1091, 1090,
+    ///     1061 and 1072 were each measured losing to it, both ways round.
+    ///
+    /// Skipping the rule rather than reordering the loop is what keeps the
+    /// rest of the statement's answers where they were: nothing here moves a
+    /// refusal, it only declines to get in front of one.
+    answered_first: bool,
+}
+
+/// Walks an `ALTER TABLE`'s column operations, in the statement's order.
+///
+/// Over the columns as the loop leaves them, and *that loop's* answers are
+/// what this predicts rather than MySQL's. The two differ over a column the
+/// same statement added or renamed — the loop resolves `ADD COLUMN z INT,
+/// DROP COLUMN pid, MODIFY z INT` where 8.3 answers it 1054, and drops `qid`
+/// in the rename above where 8.3 answers 1091, each a divergence of its own —
+/// and asking the original table here would have waved the foreign key rule
+/// off those statements in favour of a refusal the loop then does not raise,
+/// leaving the key's column dropped. A walk that predicts the loop cannot do
+/// that: it declines only where a refusal really is coming.
+fn walk_columns(table: &Table, operations: &[AlterTableOperation]) -> ColumnWalk {
+    // Each live column as it is spelled now, beside the name the statement
+    // found it under — `None` for one the statement itself added, which no key
+    // that existed before it can name.
+    let mut live: Vec<(&str, Option<&str>)> = table
+        .columns
+        .iter()
+        .map(|c| (c.name.as_str(), Some(c.name.as_str())))
+        .collect();
+    let mut dropped: Vec<String> = Vec::new();
+    let position = |live: &[(&str, Option<&str>)], name: &str| {
+        live.iter().position(|(c, _)| c.eq_ignore_ascii_case(name))
+    };
+    for operation in operations {
+        match operation {
+            AlterTableOperation::AddColumn { column_def, .. } => {
+                // A name already there is 1060, which does *not* precede the
+                // rule — so the column list is left as it is and the loop
+                // answers whichever of the two comes first.
+                if position(&live, &column_def.name.value).is_none() {
+                    live.push((&column_def.name.value, None));
+                }
+            }
+            AlterTableOperation::DropColumn { column_names, .. } => {
+                for name in column_names {
+                    // A name the table has not got is 1091, which loses to the
+                    // rule, so it is passed over rather than answered here.
+                    let Some(at) = position(&live, &name.value) else {
+                        continue;
+                    };
+                    if live.len() == 1 {
+                        return ColumnWalk {
+                            dropped,
+                            answered_first: true,
+                        };
+                    }
+                    if let (_, Some(original)) = live.remove(at) {
+                        if !dropped.iter().any(|d| d.eq_ignore_ascii_case(original)) {
+                            dropped.push(original.to_owned());
+                        }
+                    }
+                }
+            }
+            AlterTableOperation::RenameColumn {
+                old_column_name,
+                new_column_name,
+            } => match position(&live, &old_column_name.value) {
+                Some(at) => live[at].0 = &new_column_name.value,
+                None => {
+                    return ColumnWalk {
+                        dropped,
+                        answered_first: true,
+                    }
+                }
+            },
+            AlterTableOperation::ChangeColumn {
+                old_name, new_name, ..
+            } => match position(&live, &old_name.value) {
+                Some(at) => live[at].0 = &new_name.value,
+                None => {
+                    return ColumnWalk {
+                        dropped,
+                        answered_first: true,
+                    }
+                }
+            },
+            AlterTableOperation::ModifyColumn { col_name, .. }
+                if position(&live, &col_name.value).is_none() =>
+            {
+                return ColumnWalk {
+                    dropped,
+                    answered_first: true,
+                }
+            }
+            _ => {}
+        }
+    }
+    ColumnWalk {
+        dropped,
+        answered_first: false,
+    }
 }
 
 pub fn create_index(

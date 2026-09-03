@@ -6886,4 +6886,318 @@ pub const GROUPS: &[Group] = &[
             same("SELECT k, v, t FROM Trad ORDER BY k"),
         ],
     },
+    Group {
+        // What an ALTER TABLE leaves behind: #0179, #0180, #0184.
+        //
+        // Every ALTER below is followed by a read of information_schema,
+        // because a DDL statement prints nothing and a case that prints
+        // nothing on both servers compares nothing. The refusals are the
+        // exception — a refusal is an answer, carrying its code and SQLSTATE.
+        name: "what an ALTER TABLE leaves behind",
+        setup: &[
+            // Narrowing: one key over one column, one over two, a unique one,
+            // a composite primary key and a single-column one.
+            "CREATE TABLE NrwOne (a INT, b INT, INDEX ix (a))",
+            "CREATE TABLE Nrw (a INT, b INT, c INT, INDEX ix (a, b), UNIQUE KEY uq (b, c))",
+            "CREATE TABLE NrwPk (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY (a, b))",
+            "CREATE TABLE NrwPk1 (a INT NOT NULL PRIMARY KEY, b INT)",
+            // A parent and the several shapes of child a foreign key takes.
+            "CREATE TABLE FkP (id INT NOT NULL PRIMARY KEY, u INT NOT NULL, UNIQUE KEY uq (u))",
+            "CREATE TABLE FkC (id INT, pid INT, x INT, \
+             CONSTRAINT fkc FOREIGN KEY (pid) REFERENCES FkP(id))",
+            "CREATE TABLE FkTwo (id INT, pid INT, KEY k1 (pid), KEY k2 (pid), \
+             CONSTRAINT fk2 FOREIGN KEY (pid) REFERENCES FkP(id))",
+            "CREATE TABLE FkBoth (id INT, pid INT, KEY k1 (pid), KEY k2 (pid), \
+             CONSTRAINT fkb FOREIGN KEY (pid) REFERENCES FkP(id))",
+            "CREATE TABLE FkWide (pid INT, x INT, KEY wide (pid, x), \
+             CONSTRAINT fkw FOREIGN KEY (pid) REFERENCES FkP(id))",
+            "CREATE TABLE FkTail (pid INT, x INT, KEY tail (x, pid), \
+             CONSTRAINT fkt FOREIGN KEY (pid) REFERENCES FkP(id))",
+            "CREATE TABLE FkSelf (id INT NOT NULL PRIMARY KEY, parent_id INT, \
+             CONSTRAINT fks FOREIGN KEY (parent_id) REFERENCES FkSelf(id))",
+            "CREATE TABLE FkGo (id INT, pid INT, u INT, \
+             CONSTRAINT fkg FOREIGN KEY (pid) REFERENCES FkP(u))",
+            "CREATE TABLE FkSwap (id INT, pid INT, KEY k2 (pid), \
+             CONSTRAINT fkx FOREIGN KEY (pid) REFERENCES FkP(u))",
+            "CREATE TABLE FkName (id INT, pid INT, x INT, \
+             CONSTRAINT fkn FOREIGN KEY (pid) REFERENCES FkP(id))",
+            "CREATE TABLE FkBare (id INT, pid INT, x INT, \
+             CONSTRAINT fkbare FOREIGN KEY (pid) REFERENCES FkP(id))",
+            // A rename has to carry the keys over the old name with it.
+            "CREATE TABLE RenCol (id INT, pid INT, x INT, INDEX ixx (x), \
+             CONSTRAINT fkrc FOREIGN KEY (pid) REFERENCES FkP(id))",
+            "CREATE TABLE ChgCol (id INT, pid INT, \
+             CONSTRAINT fkcc FOREIGN KEY (pid) REFERENCES FkP(id))",
+            // A parent of its own, so renaming its column cannot disturb the
+            // keys the rest of this group points at FkP.
+            "CREATE TABLE RenP (id INT NOT NULL PRIMARY KEY, u INT NOT NULL, UNIQUE KEY uq (u))",
+            "CREATE TABLE RenPC (pid INT, CONSTRAINT fkrp FOREIGN KEY (pid) REFERENCES RenP(u))",
+            // A constraint whose parent is written with its database on the
+            // front, which is stored as written.
+            "CREATE TABLE QualP (id INT NOT NULL PRIMARY KEY, u INT NOT NULL)",
+            "CREATE TABLE QualC (pid INT, \
+             CONSTRAINT fkq FOREIGN KEY (pid) REFERENCES differential.QualP(id))",
+            // Renaming a column onto one the table already has.
+            "CREATE TABLE DupCol (a INT, b INT, INDEX ixb (b))",
+            // A key part that is not a bare column name.
+            "CREATE TABLE KeyExpr (a INT, b VARCHAR(200))",
+            // A rename onto a name the database already holds.
+            "CREATE TABLE RenA (a INT)",
+            "CREATE TABLE RenBB (b INT, c INT)",
+            "INSERT INTO RenA VALUES (1)",
+            "INSERT INTO RenBB VALUES (2, 3)",
+            // A key added over a column the same statement drops.
+            "CREATE TABLE KeyGone (a INT, b INT)",
+            "CREATE TABLE KeyBack (a INT, b INT)",
+            // RENAME TO beside other operations.
+            "CREATE TABLE Ren (a INT, b INT, INDEX ix (a))",
+            "CREATE TABLE Ren2 (a INT, b INT)",
+            "CREATE TABLE Ren3 (a INT)",
+        ],
+        cases: &[
+            // #0179. A single-column key goes with its column, a wider one
+            // narrows and renumbers from 1, and a narrowed unique key stays
+            // unique. The engine used to keep every one of them whole, listing
+            // an index over a column that is gone.
+            same("ALTER TABLE NrwOne DROP COLUMN a"),
+            same("SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, NON_UNIQUE \
+                  FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'NrwOne' \
+                  ORDER BY INDEX_NAME, SEQ_IN_INDEX"),
+            // The name the departed index held is free again, which is what
+            // #0150 turned from cosmetic into a refusal.
+            same("CREATE INDEX ix ON NrwOne (b)"),
+            same("SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'NrwOne' \
+                  ORDER BY INDEX_NAME, SEQ_IN_INDEX"),
+            same("ALTER TABLE Nrw DROP COLUMN b"),
+            same("SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, NON_UNIQUE \
+                  FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Nrw' \
+                  ORDER BY INDEX_NAME, SEQ_IN_INDEX"),
+            same("ALTER TABLE NrwPk DROP COLUMN b"),
+            same("SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, NON_UNIQUE \
+                  FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'NrwPk' \
+                  ORDER BY INDEX_NAME, SEQ_IN_INDEX"),
+            // The whole of a single-column primary key, and COLUMN_KEY with
+            // it: that reads a flag rather than the index, so the two have to
+            // be cleared together.
+            same("ALTER TABLE NrwPk1 DROP COLUMN a"),
+            same("SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'NrwPk1' \
+                  ORDER BY INDEX_NAME"),
+            same("SELECT COLUMN_NAME, COLUMN_KEY, ORDINAL_POSITION \
+                  FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'NrwPk1' \
+                  ORDER BY ORDINAL_POSITION"),
+
+            // #0180, the referencing half: 1828, and it outranks an operation
+            // that does not resolve in either order.
+            same("ALTER TABLE FkC DROP COLUMN pid"),
+            same("ALTER TABLE FkC DROP COLUMN pid, DROP INDEX nosuch"),
+            same("ALTER TABLE FkC DROP INDEX nosuch, DROP COLUMN pid"),
+            // A column the same statement adds keeps the table from running
+            // out of them, so the last-column refusal that would have
+            // outranked this one is not coming.
+            same("ALTER TABLE FkC ADD COLUMN y INT, DROP COLUMN pid, DROP COLUMN id, \
+                  DROP COLUMN x"),
+            // A column renamed earlier in the same statement is the same
+            // column, and read against the original table alone
+            // `RENAME COLUMN pid TO qid, DROP COLUMN qid` looked like a
+            // statement that dropped nothing. Not a case here, because the two
+            // servers refuse it with different codes: 8.3 resolves a drop
+            // against the table as the statement *found* it and answers 1091,
+            // where this engine resolves against the table it is building and
+            // reaches 1828. Covered by an engine test instead, and the
+            // resolution difference belongs to an issue of its own.
+            same("SELECT COLUMN_NAME FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'FkC' \
+                  ORDER BY ORDINAL_POSITION"),
+            // The referenced half is a different code, and it *loses* to the
+            // 1091 that 1828 beat.
+            same("ALTER TABLE FkP DROP COLUMN id"),
+            same("ALTER TABLE FkP DROP COLUMN id, DROP INDEX nosuch"),
+            same("ALTER TABLE FkP DROP INDEX nosuch, DROP COLUMN id"),
+            // A self-referencing key is on both sides at once, and answers
+            // with the referencing code for one column and the referenced code
+            // — naming its own table — for the other.
+            same("ALTER TABLE FkSelf DROP COLUMN parent_id"),
+            same("ALTER TABLE FkSelf DROP COLUMN id"),
+            same("SELECT COLUMN_NAME FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('FkP', 'FkSelf') \
+                  ORDER BY TABLE_NAME, ORDINAL_POSITION"),
+
+            // #0180, the index half: 1553, which names the index and no
+            // constraint at all.
+            same("ALTER TABLE FkC DROP INDEX fkc"),
+            same("ALTER TABLE FkP DROP INDEX uq"),
+            same("ALTER TABLE FkP DROP PRIMARY KEY"),
+            // A substitute is enough, and neither index here is unique.
+            same("ALTER TABLE FkTwo DROP INDEX k1"),
+            same("SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'FkTwo' \
+                  ORDER BY INDEX_NAME"),
+            same("ALTER TABLE FkTwo DROP INDEX k2"),
+            // Both at once, either way round, and the index named is the first
+            // the *table* carries rather than the first the statement wrote.
+            same("ALTER TABLE FkBoth DROP INDEX k1, DROP INDEX k2"),
+            same("ALTER TABLE FkBoth DROP INDEX k2, DROP INDEX k1"),
+            // A wider index whose leading column is the key's serves it, so it
+            // is refused; one whose leading column is something else does not,
+            // which is why FkTail carries an index of the constraint's own.
+            same("ALTER TABLE FkWide DROP INDEX wide"),
+            same("SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('FkWide', 'FkTail') \
+                  ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"),
+            // 1091 outranks 1553, which is the opposite of how 1828 sits
+            // against it.
+            same("ALTER TABLE FkC DROP INDEX fkc, DROP INDEX nosuch"),
+            same("ALTER TABLE FkC DROP INDEX nosuch, DROP INDEX fkc"),
+            // A substitute that is only the *name* is not one, and the index
+            // reported is the one that was there rather than the one that took
+            // its name.
+            same("ALTER TABLE FkName DROP INDEX fkn, ADD INDEX fkn (x)"),
+            same("SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'FkName' \
+                  ORDER BY INDEX_NAME, SEQ_IN_INDEX"),
+            // A key that is gone needs nothing, and a substitute added by the
+            // same statement counts: both of these are legal.
+            same("ALTER TABLE FkGo DROP COLUMN pid, DROP FOREIGN KEY fkg"),
+            same("ALTER TABLE FkSwap DROP INDEX k2, ADD INDEX k3 (pid)"),
+            same("SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('FkGo', 'FkSwap') \
+                  ORDER BY TABLE_NAME, INDEX_NAME"),
+            same("SELECT CONSTRAINT_NAME, TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, \
+                  REFERENCED_COLUMN_NAME FROM information_schema.key_column_usage \
+                  WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL \
+                  AND TABLE_NAME <> 'QualC' ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION"),
+            // Without DELETE_RULE and UPDATE_RULE, which diverge for a reason
+            // that has nothing to do with any of this: an unwritten
+            // referential action is `NO ACTION` on 8.3 and `RESTRICT` here,
+            // and both columns are an ENUM there and a string here. Measured,
+            // and left for an issue of its own rather than smuggled in as a
+            // baseline line.
+            same("SELECT CONSTRAINT_NAME, TABLE_NAME, REFERENCED_TABLE_NAME \
+                  FROM information_schema.referential_constraints \
+                  WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME <> 'QualC' \
+                  ORDER BY CONSTRAINT_NAME"),
+
+            // A key an ALTER adds is resolved against the table the statement
+            // *leaves*, so both orders are 1072 — the second despite the add
+            // having succeeded against the table as it stood when it ran.
+            same("ALTER TABLE KeyGone DROP COLUMN a, ADD INDEX ixa (a)"),
+            same("ALTER TABLE KeyBack ADD INDEX ixa (a), DROP COLUMN a"),
+            same("SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('KeyGone', 'KeyBack') \
+                  ORDER BY TABLE_NAME, ORDINAL_POSITION"),
+            same("SELECT COUNT(*) FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('KeyGone', 'KeyBack')"),
+
+            // The standalone spelling of the drop reads the same rule, and
+            // read none of it: it had a drop of its own with no foreign key
+            // check in front of it.
+            same("DROP INDEX fkbare ON FkBare"),
+            same("SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'FkBare' \
+                  ORDER BY INDEX_NAME"),
+
+            // A rename carries the keys over the old name with it, and a key
+            // left behind on the old name is the same phantom a dropped column
+            // used to leave -- it also hid the column from the rule above, so
+            // the key's own column could then be dropped under its new name.
+            same("ALTER TABLE RenCol RENAME COLUMN pid TO qid"),
+            same("ALTER TABLE RenCol RENAME COLUMN x TO y"),
+            same("SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'RenCol' \
+                  ORDER BY INDEX_NAME, SEQ_IN_INDEX"),
+            same("SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_COLUMN_NAME \
+                  FROM information_schema.key_column_usage \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'RenCol' \
+                  AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY ORDINAL_POSITION"),
+            same("ALTER TABLE RenCol DROP COLUMN qid"),
+            // CHANGE COLUMN renames too.
+            same("ALTER TABLE ChgCol CHANGE COLUMN pid qid INT"),
+            same("SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ChgCol' \
+                  ORDER BY INDEX_NAME"),
+            same("ALTER TABLE ChgCol DROP COLUMN qid"),
+            // And the parent's side of a rename, which is carried into every
+            // constraint pointing at the column. Left behind, the constraint
+            // points at a column that is not there, and an unresolvable key is
+            // skipped rather than enforced.
+            same("ALTER TABLE RenP RENAME COLUMN u TO w"),
+            same("SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
+                  FROM information_schema.key_column_usage \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'RenPC' \
+                  AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY ORDINAL_POSITION"),
+            same("SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'RenP' \
+                  ORDER BY INDEX_NAME, SEQ_IN_INDEX"),
+
+            // A constraint whose parent is written with its database on the
+            // front is the same constraint: compared whole, `referenced_table`
+            // never matched the bare name being altered and every qualified
+            // key fell outside both rules.
+            same("ALTER TABLE QualP DROP COLUMN id"),
+            same("ALTER TABLE QualP DROP PRIMARY KEY"),
+            same("ALTER TABLE QualP RENAME COLUMN id TO nid"),
+            // Without REFERENCED_TABLE_NAME, which diverges for a reason of
+            // its own: this engine reports the name the constraint was written
+            // with, `differential.QualP`, where 8.3 reports the bare `QualP`.
+            // Measured, and it is why the two group-wide reads below leave
+            // `QualC` out.
+            same("SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_COLUMN_NAME \
+                  FROM information_schema.key_column_usage \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'QualC' \
+                  AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY ORDINAL_POSITION"),
+
+            // Two columns of one name is not a table: every reference resolves
+            // to the first of them, and the keys hold their columns by name.
+            same("ALTER TABLE DupCol RENAME COLUMN a TO b"),
+            same("ALTER TABLE DupCol CHANGE COLUMN a b INT"),
+            // The column's own name is not a duplicate, in either case.
+            same("ALTER TABLE DupCol RENAME COLUMN a TO a"),
+            same("ALTER TABLE DupCol RENAME COLUMN a TO A"),
+            same("SELECT COLUMN_NAME FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'DupCol' \
+                  ORDER BY ORDINAL_POSITION"),
+
+            // A key part that is not a bare column name is not asked about by
+            // the rule above at all: a prefix index is what Prisma generates
+            // for every long text column it indexes, so refusing one would
+            // fail real migrations.
+            same("ALTER TABLE KeyExpr ADD INDEX ixp (b(4))"),
+            same("SELECT COUNT(*) FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'KeyExpr'"),
+
+            // #0184. The rename used to write to the catalog and return, so
+            // everything after it was skipped in silence.
+            same("ALTER TABLE Ren RENAME TO RenB, DROP INDEX nosuch"),
+            same("SELECT TABLE_NAME FROM information_schema.tables \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('Ren', 'RenB') \
+                  ORDER BY TABLE_NAME"),
+            // The same pair with the drop resolving: the rename happens and
+            // the drop travels with it.
+            same("ALTER TABLE Ren RENAME TO RenB, DROP INDEX ix"),
+            same("SELECT TABLE_NAME, INDEX_NAME FROM information_schema.statistics \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('Ren', 'RenB') \
+                  ORDER BY TABLE_NAME, INDEX_NAME"),
+            // And an operation written before it, which the old arm did carry.
+            same("ALTER TABLE Ren2 ADD COLUMN c INT, RENAME TO Ren2B"),
+            same("SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('Ren2', 'Ren2B') \
+                  ORDER BY TABLE_NAME, ORDINAL_POSITION"),
+            // Two renames in one statement: the last wins.
+            same("ALTER TABLE Ren3 RENAME TO Ren3B, RENAME TO Ren3C"),
+            same("SELECT TABLE_NAME FROM information_schema.tables \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('Ren3', 'Ren3B', 'Ren3C') \
+                  ORDER BY TABLE_NAME"),
+            // A rename onto a name the database already holds would have
+            // replaced that table, its rows included, and reported success.
+            same("ALTER TABLE RenA RENAME TO RenBB"),
+            same("SELECT b, c FROM RenBB ORDER BY b"),
+            same("SELECT a FROM RenA ORDER BY a"),
+        ],
+    },
 ];

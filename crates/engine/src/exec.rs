@@ -5398,25 +5398,40 @@ impl Engine {
                 };
                 let (db, table_name) = self.split_name(session, on_table)?;
                 let mut catalog = self.catalog_mut()?;
-                let table = catalog
+                let database = catalog
                     .database_mut(&db)
-                    .ok_or_else(|| EngineError::unknown_database(&db))?
-                    .table_mut(&table_name)
+                    .ok_or_else(|| EngineError::unknown_database(&db))?;
+                let stored = database
+                    .table(&table_name)
                     .ok_or_else(|| EngineError::no_such_table(&table_name))?;
 
-                for name in names {
-                    let index = name::dotted(name);
-                    let before = table.indexes.len();
-                    table
-                        .indexes
-                        .retain(|i| !i.name.eq_ignore_ascii_case(&index));
-                    if table.indexes.len() == before && !if_exists {
-                        // The same message the ALTER TABLE form gives, which
-                        // is what 8.3 prints here too: `check that column/key
-                        // exists`, not the `check that it exists` this used to
-                        // invent.
-                        return Err(EngineError::cant_drop(&index));
-                    }
+                // Applied to a copy and swapped in only once the foreign key
+                // rule below has passed, for the reason `ddl::alter_table`
+                // works on one: this statement either happens or does not, and
+                // a refusal must not leave the earlier names dropped.
+                let mut table = stored.clone();
+                let original_indexes = table.indexes.clone();
+                let dropped: Vec<String> = names.iter().map(name::dotted).collect();
+                ddl::drop_indexes_named(&mut table, &dropped, if_exists)?;
+                // The same rule the ALTER TABLE spelling reads, and 8.3 reads
+                // it here too: `DROP INDEX fk ON C` is 1553 there. This arm
+                // walked away with it until the rule had one home. No renames
+                // to carry, since this statement only drops.
+                ddl::refuse_unbacked_foreign_key(
+                    database,
+                    &table_name,
+                    &table,
+                    &original_indexes,
+                    &[],
+                )?;
+
+                let key = database
+                    .tables
+                    .keys()
+                    .find(|k| k.eq_ignore_ascii_case(&table_name))
+                    .cloned();
+                if let Some(key) = key {
+                    database.tables.insert(key, table);
                 }
                 mark_modified(session, &db, std::slice::from_ref(&table_name));
             }

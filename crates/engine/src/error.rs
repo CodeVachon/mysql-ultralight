@@ -66,6 +66,86 @@ impl EngineError {
         )
     }
 
+    /// ER_DUP_FIELDNAME.
+    ///
+    /// Every way a statement can end up with two columns of one name: a
+    /// definition that lists it twice, an `ADD COLUMN` of a name already
+    /// there, and a `RENAME COLUMN`/`CHANGE COLUMN` onto one — 8.3 answers all
+    /// of them this. The name is spelled as the statement wrote it rather than
+    /// as the table stored it, measured: `(a INT, A INT)` reports `'A'`.
+    ///
+    /// A rename onto the column's *own* name is not a duplicate, in any case:
+    /// `RENAME COLUMN a TO A` succeeds on 8.3 and leaves the column called
+    /// `A`.
+    pub fn duplicate_column(name: &str) -> Self {
+        Self::new(1060, "42S21", format!("Duplicate column name '{name}'"))
+    }
+
+    /// ER_KEY_COLUMN_DOES_NOT_EXITS — MySQL's own spelling of the symbol.
+    ///
+    /// An index over a column the table has not got. The table's name is not
+    /// in the message, which is MySQL's doing and not an omission here.
+    ///
+    /// Reached from `ALTER TABLE` when the statement leaves a key naming a
+    /// column the statement does not leave, whichever order the two were
+    /// written in: measured on 8.3, `DROP COLUMN a, ADD INDEX ixa (a)` and
+    /// `ADD INDEX ixa (a), DROP COLUMN a` are both this, so the key is
+    /// resolved against the table the statement *ends* with.
+    pub fn key_column_missing(name: &str) -> Self {
+        Self::new(
+            1072,
+            "42000",
+            format!("Key column '{name}' doesn't exist in table"),
+        )
+    }
+
+    /// ER_FK_COLUMN_CANNOT_DROP: the referencing side of a foreign key.
+    ///
+    /// The child's own constraint, so the message names the constraint and
+    /// nothing else — the table it is on is the table being altered.
+    /// [`Self::fk_column_cannot_drop_child`] is the other half, for a column a
+    /// constraint on *another* table points at, and carries that table's name.
+    pub fn fk_column_cannot_drop(column: &str, constraint: &str) -> Self {
+        Self::new(
+            1828,
+            "HY000",
+            format!(
+                "Cannot drop column '{column}': needed in a foreign key constraint '{constraint}'"
+            ),
+        )
+    }
+
+    /// ER_FK_COLUMN_CANNOT_DROP_CHILD: the referenced side.
+    ///
+    /// A separate code from 1828 and not a wording variant of it, and the two
+    /// are ordered differently against the rest of an `ALTER TABLE` besides:
+    /// on 8.3 `DROP COLUMN <fk column>, DROP INDEX nosuch` on the child is
+    /// 1828, while the same shape on the parent is 1091. The child's rule is
+    /// settled before the statement's operations are read and the parent's
+    /// after them.
+    pub fn fk_column_cannot_drop_child(column: &str, constraint: &str, table: &str) -> Self {
+        Self::new(
+            1829,
+            "HY000",
+            format!(
+                "Cannot drop column '{column}': needed in a foreign key constraint \
+                 '{constraint}' of table '{table}'"
+            ),
+        )
+    }
+
+    /// ER_DROP_INDEX_FK.
+    ///
+    /// No constraint name in it, unlike 1828 and 1829 — MySQL says only that
+    /// some foreign key needed the index.
+    pub fn drop_index_needed_by_fk(index: &str) -> Self {
+        Self::new(
+            1553,
+            "HY000",
+            format!("Cannot drop index '{index}': needed in a foreign key constraint"),
+        )
+    }
+
     /// ER_CONSTRAINT_NOT_FOUND.
     ///
     /// `DROP CONSTRAINT` misses with its own code rather than the 1091 the

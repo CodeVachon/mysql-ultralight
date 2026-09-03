@@ -6662,6 +6662,21 @@ fn a_foreign_key_creates_the_index_mysql_would() {
         &mut session,
         "ALTER TABLE Child RENAME INDEX Child_parent TO Child_parent_index",
     );
+
+    // Under its new name it is still the foreign key's index, so it cannot go
+    // while the key is there -- and that refusal is a second reading of the
+    // same claim, since a name nothing created could not be needed by
+    // anything. 8.3 answers this one 1553 too.
+    let err = engine
+        .execute(&mut session, "DROP INDEX Child_parent_index ON Child", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1553, "{err}");
+
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE Child DROP FOREIGN KEY Child_parent",
+    );
     run(
         &engine,
         &mut session,
@@ -28765,6 +28780,1137 @@ fn the_recursive_table_may_not_be_on_the_padded_side_of_either_outer_join() {
              JOIN (SELECT 2 AS k) z ON z.k > t.n WHERE t.n < 2) SELECT n FROM t ORDER BY n"
         ),
         vec![vec!["1"], vec!["2"]]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// What an ALTER TABLE leaves behind: #0179, #0180 and #0184. Every code and
+// message below was measured against mysql:8.3 with scripts/ask.sh rather than
+// remembered, and the assertions read information_schema back rather than
+// resting on the statement having been refused -- a refusal says nothing about
+// what the catalog then holds.
+
+/// Every index column of a table, as `information_schema.STATISTICS` lists it.
+///
+/// The position and the uniqueness are in it on purpose. Narrowing is the
+/// interesting half of #0179 and it is invisible in the index *names*: an
+/// `INDEX ix (a, b)` that lost `a` is still called `ix`, still there, and now
+/// over one column numbered 1.
+fn index_layout(engine: &Engine, session: &mut Session, table: &str) -> Vec<Vec<String>> {
+    rows(
+        engine,
+        session,
+        &format!(
+            "SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, NON_UNIQUE \
+             FROM information_schema.statistics WHERE TABLE_NAME = '{table}' \
+             ORDER BY INDEX_NAME, SEQ_IN_INDEX"
+        ),
+    )
+}
+
+/// The column names of a table, in position order.
+fn column_names(engine: &Engine, session: &mut Session, table: &str) -> Vec<String> {
+    rows(
+        engine,
+        session,
+        &format!(
+            "SELECT COLUMN_NAME FROM information_schema.columns \
+             WHERE TABLE_NAME = '{table}' ORDER BY ORDINAL_POSITION"
+        ),
+    )
+    .into_iter()
+    .map(|r| r[0].clone())
+    .collect()
+}
+
+/// Asserts a refusal by code, SQLSTATE and message all three.
+///
+/// The message carries the constraint name for 1828 and 1829 and the index
+/// name for 1553, and those names are the whole content of the answer: a test
+/// asserting only the code would pass with the wrong constraint named.
+fn refused(engine: &Engine, session: &mut Session, sql: &str, code: u16, message: &str) {
+    let err = fails(engine, session, sql);
+    assert_eq!(
+        (err.code, err.sql_state.as_str(), err.message.as_str()),
+        (code, "HY000", message),
+        "from: {sql}"
+    );
+}
+
+#[test]
+fn dropping_a_column_takes_its_keys_with_it() {
+    // #0179. On 8.3 a key over the dropped column *narrows*, and only a key
+    // left with no columns at all goes away. Both halves are here, because
+    // narrowing is the one that is easy to get wrong in the direction of
+    // dropping the whole index.
+    let (engine, mut session) = engine();
+
+    // A single-column index goes with its column.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N1 (a INT, b INT, INDEX ix (a))",
+    );
+    run(&engine, &mut session, "ALTER TABLE N1 DROP COLUMN a");
+    assert!(index_layout(&engine, &mut session, "N1").is_empty());
+
+    // A two-column index narrows, and the survivor is renumbered to 1.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N2 (a INT, b INT, c INT, INDEX ix (a, b))",
+    );
+    run(&engine, &mut session, "ALTER TABLE N2 DROP COLUMN a");
+    assert_eq!(
+        index_layout(&engine, &mut session, "N2"),
+        vec![vec!["ix", "1", "b", "1"]]
+    );
+
+    // The trailing column of one, which leaves the leading one where it was.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N3 (a INT, b INT, c INT, INDEX ix (a, b))",
+    );
+    run(&engine, &mut session, "ALTER TABLE N3 DROP COLUMN b");
+    assert_eq!(
+        index_layout(&engine, &mut session, "N3"),
+        vec![vec!["ix", "1", "a", "1"]]
+    );
+
+    // A narrowed UNIQUE stays unique -- NON_UNIQUE 0, which is the column the
+    // enforcement rests on and not decoration. It is now a one-column unique
+    // key, so COLUMN_KEY reads UNI: that comes off the column's own flag
+    // rather than the index, and narrowing left it saying MUL until the two
+    // were made to agree.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N4 (a INT, b INT, c INT, UNIQUE KEY uq (a, b))",
+    );
+    run(&engine, &mut session, "ALTER TABLE N4 DROP COLUMN b");
+    assert_eq!(
+        index_layout(&engine, &mut session, "N4"),
+        vec![vec!["uq", "1", "a", "0"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLUMN_KEY FROM information_schema.columns \
+             WHERE TABLE_NAME = 'N4' ORDER BY ORDINAL_POSITION"
+        ),
+        vec![vec!["a", "UNI"], vec!["c", ""]]
+    );
+
+    // So does a narrowed PRIMARY KEY, under its own name.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N5 (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY (a, b))",
+    );
+    run(&engine, &mut session, "ALTER TABLE N5 DROP COLUMN b");
+    assert_eq!(
+        index_layout(&engine, &mut session, "N5"),
+        vec![vec!["PRIMARY", "1", "a", "0"]]
+    );
+
+    // A single-column primary key goes entirely, and the surviving column is
+    // not left reported as `PRI` -- COLUMN_KEY reads the flag rather than the
+    // index, so the two have to be cleared together.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N6 (a INT NOT NULL PRIMARY KEY, b INT)",
+    );
+    run(&engine, &mut session, "ALTER TABLE N6 DROP COLUMN a");
+    assert!(index_layout(&engine, &mut session, "N6").is_empty());
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLUMN_KEY FROM information_schema.columns \
+             WHERE TABLE_NAME = 'N6'"
+        ),
+        vec![vec!["b", ""]]
+    );
+
+    // Both columns of one index, in one statement.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N7 (a INT, b INT, c INT, INDEX ix (a, b))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE N7 DROP COLUMN a, DROP COLUMN b",
+    );
+    assert!(index_layout(&engine, &mut session, "N7").is_empty());
+}
+
+#[test]
+fn a_dropped_column_frees_its_index_name() {
+    // Why #0179 got sharper when #0150 landed: the leftover index occupied its
+    // name, so a later CREATE INDEX under that name was 1061 where 8.3 accepts
+    // it. Asserted through the catalog and not through the absence of an
+    // error, because the point is which columns the new `ix` is over.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE F1 (a INT, b INT, INDEX ix (a))",
+    );
+    run(&engine, &mut session, "ALTER TABLE F1 DROP COLUMN a");
+    run(&engine, &mut session, "CREATE INDEX ix ON F1 (b)");
+    assert_eq!(
+        index_layout(&engine, &mut session, "F1"),
+        vec![vec!["ix", "1", "b", "1"]]
+    );
+}
+
+/// A parent and a child, the shape every foreign key test below starts from.
+fn parent_and_child(engine: &Engine, session: &mut Session) {
+    run(
+        engine,
+        session,
+        "CREATE TABLE P (id INT NOT NULL PRIMARY KEY, u INT NOT NULL, UNIQUE KEY uq (u))",
+    );
+    run(
+        engine,
+        session,
+        "CREATE TABLE C (id INT, pid INT, x INT, \
+         CONSTRAINT fkc FOREIGN KEY (pid) REFERENCES P(id))",
+    );
+}
+
+#[test]
+fn a_column_a_foreign_key_needs_cannot_be_dropped() {
+    // #0180, the referencing half.
+    let (engine, mut session) = engine();
+    parent_and_child(&engine, &mut session);
+
+    let message = "Cannot drop column 'pid': needed in a foreign key constraint 'fkc'";
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE C DROP COLUMN pid",
+        1828,
+        message,
+    );
+
+    // It outranks an operation that does not resolve, in *either* order --
+    // which is what says the rule is settled before the statement's operations
+    // are read rather than in the middle of reading them. 8.3 answers both of
+    // these 1828 and not the 1091 the second operation would earn.
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE C DROP COLUMN pid, DROP INDEX nosuch",
+        1828,
+        message,
+    );
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE C DROP INDEX nosuch, DROP COLUMN pid",
+        1828,
+        message,
+    );
+
+    // Nothing reached the catalog: the column, its index and the constraint
+    // are all still there. Reading only `columns` back would have missed two
+    // of the three.
+    assert_eq!(
+        column_names(&engine, &mut session, "C"),
+        vec!["id", "pid", "x"]
+    );
+    assert_eq!(
+        index_layout(&engine, &mut session, "C"),
+        vec![vec!["fkc", "1", "pid", "1"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CONSTRAINT_NAME FROM information_schema.referential_constraints \
+             WHERE TABLE_NAME = 'C'"
+        ),
+        vec![vec!["fkc"]]
+    );
+
+    // Two refusals still outrank it, and both were measured that way round on
+    // 8.3: emptying the table, and a *reference* to a column that is not
+    // there. The engine answers each from the operation loop, so what this
+    // asserts is that the rule above did not get in front of them.
+    let err = fails(
+        &engine,
+        &mut session,
+        "ALTER TABLE C DROP COLUMN pid, DROP COLUMN id, DROP COLUMN x",
+    );
+    assert_eq!(err.code, 1090, "{err}");
+    for sql in [
+        "ALTER TABLE C DROP COLUMN pid, RENAME COLUMN nosuch TO z",
+        "ALTER TABLE C RENAME COLUMN nosuch TO z, DROP COLUMN pid",
+        // All three spellings of a reference, because the rule is skipped for
+        // each of them separately and 8.3 answers each of these 1054.
+        "ALTER TABLE C DROP COLUMN pid, MODIFY nosuch INT",
+        "ALTER TABLE C MODIFY nosuch INT, DROP COLUMN pid",
+        "ALTER TABLE C DROP COLUMN pid, CHANGE COLUMN nosuch z INT",
+    ] {
+        let err = fails(&engine, &mut session, sql);
+        assert_eq!(
+            (err.code, err.message.as_str()),
+            (1054, "Unknown column 'nosuch' in 'C'"),
+            "{sql}"
+        );
+    }
+
+    // A column the same statement adds keeps the table from running out of
+    // them, so the last-column refusal is not coming and the rule applies
+    // after all -- 8.3 answers this one 1828 too. Asking the table as it
+    // stands rather than as the statement leaves it got this wrong in the
+    // direction that matters: the ALTER was accepted and `pid` went.
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE C ADD COLUMN y INT, DROP COLUMN pid, DROP COLUMN id, DROP COLUMN x",
+        1828,
+        message,
+    );
+    assert_eq!(
+        column_names(&engine, &mut session, "C"),
+        vec!["id", "pid", "x"]
+    );
+
+    // The same shape for the 1054 exemption, and this one is a *divergence*
+    // rather than agreement: 8.3 resolves `MODIFY z` against the table as the
+    // statement found it and answers 1054, where this engine resolves it
+    // against the table the statement is building and so reaches the foreign
+    // key rule. Both refuse; the codes differ, and the alternative here was
+    // dropping the column, so this asserts the refusal it has.
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE C ADD COLUMN z INT, DROP COLUMN pid, MODIFY z INT",
+        1828,
+        message,
+    );
+    assert_eq!(
+        column_names(&engine, &mut session, "C"),
+        vec!["id", "pid", "x"]
+    );
+
+    // The column and the constraint together is legal, in either order, and
+    // that is the shape a migration retires a foreign key with. The rule is
+    // asked of the keys the statement *leaves*, which is the whole reason
+    // these two are accepted.
+    for (table, constraint, sql) in [
+        (
+            "C7",
+            "fk7",
+            "ALTER TABLE C7 DROP COLUMN pid, DROP FOREIGN KEY fk7",
+        ),
+        (
+            "C8",
+            "fk8",
+            "ALTER TABLE C8 DROP FOREIGN KEY fk8, DROP COLUMN pid",
+        ),
+    ] {
+        run(
+            &engine,
+            &mut session,
+            &format!(
+                "CREATE TABLE {table} (id INT, pid INT, u INT, \
+                 CONSTRAINT {constraint} FOREIGN KEY (pid) REFERENCES P(u))"
+            ),
+        );
+        run(&engine, &mut session, sql);
+        assert_eq!(column_names(&engine, &mut session, table), vec!["id", "u"]);
+        // The index the constraint made for itself went with the column.
+        assert!(
+            index_layout(&engine, &mut session, table).is_empty(),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn a_column_a_foreign_key_points_at_cannot_be_dropped() {
+    // #0180, the referenced half -- a different code from 1828, and ordered
+    // differently against the rest of the statement besides.
+    let (engine, mut session) = engine();
+    parent_and_child(&engine, &mut session);
+
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE P DROP COLUMN id",
+        1829,
+        "Cannot drop column 'id': needed in a foreign key constraint 'fkc' of table 'C'",
+    );
+    assert_eq!(column_names(&engine, &mut session, "P"), vec!["id", "u"]);
+
+    // Unlike 1828, this one *loses* to an operation that does not resolve --
+    // 8.3 answers 1091 for both of these, and asserting it is what keeps the
+    // two halves from being implemented as one rule in one place.
+    for sql in [
+        "ALTER TABLE P DROP COLUMN id, DROP INDEX nosuch",
+        "ALTER TABLE P DROP INDEX nosuch, DROP COLUMN id",
+    ] {
+        let err = fails(&engine, &mut session, sql);
+        assert_eq!(err.code, 1091, "{sql}\n  -> {err}");
+    }
+
+    // A self-referencing key is on both sides at once, and 8.3 reports the
+    // referencing column with 1828 and the referenced one with 1829 naming its
+    // own table.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE S (id INT NOT NULL PRIMARY KEY, parent_id INT, \
+         CONSTRAINT fks FOREIGN KEY (parent_id) REFERENCES S(id))",
+    );
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE S DROP COLUMN parent_id",
+        1828,
+        "Cannot drop column 'parent_id': needed in a foreign key constraint 'fks'",
+    );
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE S DROP COLUMN id",
+        1829,
+        "Cannot drop column 'id': needed in a foreign key constraint 'fks' of table 'S'",
+    );
+    // The table as the catalog holds it and not as the statement spelled it,
+    // which is what every other table in the message gets. Only the
+    // self-referencing case could tell the two apart.
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE s DROP COLUMN id",
+        1829,
+        "Cannot drop column 'id': needed in a foreign key constraint 'fks' of table 'S'",
+    );
+    assert_eq!(
+        column_names(&engine, &mut session, "S"),
+        vec!["id", "parent_id"]
+    );
+
+    // Dropping the key first makes both legal, which is the same
+    // leaves-the-statement rule 1828 is asked under.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE S DROP FOREIGN KEY fks, DROP COLUMN parent_id",
+    );
+    assert_eq!(column_names(&engine, &mut session, "S"), vec!["id"]);
+}
+
+#[test]
+fn an_index_a_foreign_key_needs_cannot_be_dropped() {
+    // #0180, the index half. 1553 carries no constraint name -- MySQL says
+    // only that some foreign key needed the index -- so the name in the
+    // message is the *index*, and which index gets blamed is the part worth
+    // asserting.
+    let (engine, mut session) = engine();
+    parent_and_child(&engine, &mut session);
+
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE C DROP INDEX fkc",
+        1553,
+        "Cannot drop index 'fkc': needed in a foreign key constraint",
+    );
+    assert_eq!(
+        index_layout(&engine, &mut session, "C"),
+        vec![vec!["fkc", "1", "pid", "1"]]
+    );
+
+    // The parent's side of it: the index the key points at is needed too, and
+    // both spellings of dropping a primary key report the name MySQL keeps one
+    // under rather than the table's.
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE P DROP INDEX `PRIMARY`",
+        1553,
+        "Cannot drop index 'PRIMARY': needed in a foreign key constraint",
+    );
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE P DROP PRIMARY KEY",
+        1553,
+        "Cannot drop index 'PRIMARY': needed in a foreign key constraint",
+    );
+    assert_eq!(
+        index_layout(&engine, &mut session, "P"),
+        vec![vec!["PRIMARY", "1", "id", "0"], vec!["uq", "1", "u", "0"]]
+    );
+
+    // A substitute is enough, and it need not be unique on either side: 8.3
+    // takes `DROP INDEX k1` here and refuses `DROP INDEX k2` afterwards.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C3 (id INT, pid INT, KEY k1 (pid), KEY k2 (pid), \
+         CONSTRAINT fk3 FOREIGN KEY (pid) REFERENCES P(id))",
+    );
+    run(&engine, &mut session, "ALTER TABLE C3 DROP INDEX k1");
+    assert_eq!(
+        index_layout(&engine, &mut session, "C3"),
+        vec![vec!["k2", "1", "pid", "1"]]
+    );
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE C3 DROP INDEX k2",
+        1553,
+        "Cannot drop index 'k2': needed in a foreign key constraint",
+    );
+
+    // Two of them at once, and the one 8.3 names is the first the *table*
+    // carries rather than the first the statement wrote -- both orders below
+    // report `k1`.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C4 (id INT, pid INT, KEY k1 (pid), KEY k2 (pid), \
+         CONSTRAINT fk4 FOREIGN KEY (pid) REFERENCES P(id))",
+    );
+    for sql in [
+        "ALTER TABLE C4 DROP INDEX k1, DROP INDEX k2",
+        "ALTER TABLE C4 DROP INDEX k2, DROP INDEX k1",
+    ] {
+        refused(
+            &engine,
+            &mut session,
+            sql,
+            1553,
+            "Cannot drop index 'k1': needed in a foreign key constraint",
+        );
+    }
+
+    // A wider index whose *leading* column is the key's serves, and dropping
+    // it is refused for that reason. One whose leading column is something
+    // else does not, which is why `C6` gets an index of the constraint's own.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C5 (pid INT, x INT, KEY wide (pid, x), \
+         CONSTRAINT fk5 FOREIGN KEY (pid) REFERENCES P(id))",
+    );
+    assert_eq!(
+        index_layout(&engine, &mut session, "C5"),
+        vec![vec!["wide", "1", "pid", "1"], vec!["wide", "2", "x", "1"]]
+    );
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE C5 DROP INDEX wide",
+        1553,
+        "Cannot drop index 'wide': needed in a foreign key constraint",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C6 (pid INT, x INT, KEY tail (x, pid), \
+         CONSTRAINT fk6 FOREIGN KEY (pid) REFERENCES P(id))",
+    );
+    assert_eq!(
+        index_layout(&engine, &mut session, "C6"),
+        vec![
+            vec!["fk6", "1", "pid", "1"],
+            vec!["tail", "1", "x", "1"],
+            vec!["tail", "2", "pid", "1"],
+        ]
+    );
+
+    // 1091 outranks it -- an index the table has not got is reported ahead of
+    // one it may not lose, both ways round.
+    for sql in [
+        "ALTER TABLE C DROP INDEX fkc, DROP INDEX nosuch",
+        "ALTER TABLE C DROP INDEX nosuch, DROP INDEX fkc",
+    ] {
+        let err = fails(&engine, &mut session, sql);
+        assert_eq!(err.code, 1091, "{sql}\n  -> {err}");
+    }
+
+    // The index and the key it backs, dropped together, is legal -- and so is
+    // a substitute added by the same statement. Both are the same rule: 1553
+    // is asked of the table the statement leaves.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE C DROP INDEX fkc, DROP FOREIGN KEY fkc",
+    );
+    assert!(index_layout(&engine, &mut session, "C").is_empty());
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE C3 DROP INDEX k2, ADD INDEX k3 (pid)",
+    );
+    assert_eq!(
+        index_layout(&engine, &mut session, "C3"),
+        vec![vec!["k3", "1", "pid", "1"]]
+    );
+
+    // A substitute that is only the *name* is not one: 8.3 refuses this, and
+    // the index it names is the one that was there rather than the one that
+    // took its name. Matching the survivors by name alone accepted it and left
+    // a key with nothing behind it.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C9 (id INT, pid INT, x INT, \
+         CONSTRAINT fk9 FOREIGN KEY (pid) REFERENCES P(id))",
+    );
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE C9 DROP INDEX fk9, ADD INDEX fk9 (x)",
+        1553,
+        "Cannot drop index 'fk9': needed in a foreign key constraint",
+    );
+    assert_eq!(
+        index_layout(&engine, &mut session, "C9"),
+        vec![vec!["fk9", "1", "pid", "1"]]
+    );
+
+    // The standalone spelling reads the same rule on 8.3, and read none of it
+    // here: `DROP INDEX ... ON t` had a drop of its own with no foreign key
+    // check in front of it, so the statement the ALTER form refuses walked
+    // straight through.
+    refused(
+        &engine,
+        &mut session,
+        "DROP INDEX fk9 ON C9",
+        1553,
+        "Cannot drop index 'fk9': needed in a foreign key constraint",
+    );
+    assert_eq!(
+        index_layout(&engine, &mut session, "C9"),
+        vec![vec!["fk9", "1", "pid", "1"]]
+    );
+    // The parent's side of it through the same spelling, and dropping the
+    // primary key that way must clear the column's flag with it -- that arm
+    // used to remove the index with a bare `retain`, which left the column
+    // reported PRI under no primary key.
+    refused(
+        &engine,
+        &mut session,
+        "DROP INDEX `PRIMARY` ON P",
+        1553,
+        "Cannot drop index 'PRIMARY': needed in a foreign key constraint",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Pk1 (a INT NOT NULL PRIMARY KEY, b INT)",
+    );
+    run(&engine, &mut session, "DROP INDEX `PRIMARY` ON Pk1");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLUMN_KEY FROM information_schema.columns \
+             WHERE TABLE_NAME = 'Pk1' ORDER BY ORDINAL_POSITION"
+        ),
+        vec![vec!["a", ""], vec!["b", ""]]
+    );
+}
+
+#[test]
+fn a_renamed_column_takes_its_keys_with_it() {
+    // A key holds its columns by name, so a rename that touched only the
+    // columns left an index and a foreign key over a name the table no longer
+    // has -- the same phantom dropping a column used to leave, through a
+    // different door. It also hid the renamed column from the rule above, so
+    // the foreign key's own column could be dropped under its new name.
+    let (engine, mut session) = engine();
+    parent_and_child(&engine, &mut session);
+    run(&engine, &mut session, "CREATE INDEX ixx ON C (x)");
+
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE C RENAME COLUMN pid TO qid",
+    );
+    run(&engine, &mut session, "ALTER TABLE C RENAME COLUMN x TO y");
+    assert_eq!(
+        index_layout(&engine, &mut session, "C"),
+        vec![vec!["fkc", "1", "qid", "1"], vec!["ixx", "1", "y", "1"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
+             FROM information_schema.key_column_usage \
+             WHERE TABLE_NAME = 'C' AND REFERENCED_TABLE_NAME IS NOT NULL"
+        ),
+        vec![vec!["qid", "P", "id"]]
+    );
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE C DROP COLUMN qid",
+        1828,
+        "Cannot drop column 'qid': needed in a foreign key constraint 'fkc'",
+    );
+
+    // `CHANGE COLUMN` renames too, and carries them the same way.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE C CHANGE COLUMN qid rid INT",
+    );
+    assert_eq!(
+        index_layout(&engine, &mut session, "C"),
+        vec![vec!["fkc", "1", "rid", "1"], vec!["ixx", "1", "y", "1"]]
+    );
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE C DROP COLUMN rid",
+        1828,
+        "Cannot drop column 'rid': needed in a foreign key constraint 'fkc'",
+    );
+
+    // The other side of it: a column the *parent* renames is carried into
+    // every constraint pointing at it, which 8.3 does too. Left behind, the
+    // constraint points at a column that is not there, and an unresolvable key
+    // is skipped rather than enforced -- so the foreign key quietly stops
+    // being one. It also made the index the key needs look dropped rather than
+    // renamed, which answered 1553 for a statement 8.3 accepts.
+    run(&engine, &mut session, "ALTER TABLE P RENAME COLUMN u TO w");
+    assert_eq!(
+        index_layout(&engine, &mut session, "P"),
+        vec![vec!["PRIMARY", "1", "id", "0"], vec!["uq", "1", "w", "0"]]
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE CU (pid INT, CONSTRAINT fku FOREIGN KEY (pid) REFERENCES P(w))",
+    );
+    run(&engine, &mut session, "ALTER TABLE P RENAME COLUMN w TO z");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_COLUMN_NAME \
+             FROM information_schema.key_column_usage \
+             WHERE TABLE_NAME = 'CU' AND REFERENCED_TABLE_NAME IS NOT NULL"
+        ),
+        vec![vec!["CU", "pid", "z"]]
+    );
+    // And the constraint still bites, which is the part that would have gone
+    // silently: a key whose referenced columns do not resolve is skipped.
+    run(&engine, &mut session, "INSERT INTO P VALUES (1, 5)");
+    let err = fails(&engine, &mut session, "INSERT INTO CU VALUES (9)");
+    assert_eq!(err.code, 1452, "{err}");
+    run(&engine, &mut session, "INSERT INTO CU VALUES (5)");
+}
+
+#[test]
+fn a_column_renamed_and_then_dropped_is_still_the_foreign_keys_column() {
+    // The rule reads the drops off the statement, and a column renamed earlier
+    // in the same statement is not there under the name the drop wrote. Read
+    // against the original table alone, `RENAME COLUMN pid TO qid, DROP COLUMN
+    // qid` looked like a statement that dropped nothing, and the key over
+    // `pid` was left pointing at a column that had gone.
+    //
+    // 8.3 answers this 1091: it resolves a drop against the table as the
+    // statement *found* it, so `qid` is a name it has not got. This engine
+    // resolves against the table it is building -- a divergence of its own,
+    // and one that leaves a refusal either way rather than the phantom.
+    let (engine, mut session) = engine();
+    parent_and_child(&engine, &mut session);
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE C RENAME COLUMN pid TO qid, DROP COLUMN qid",
+        1828,
+        "Cannot drop column 'pid': needed in a foreign key constraint 'fkc'",
+    );
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE C CHANGE COLUMN pid rid INT, DROP COLUMN rid",
+        1828,
+        "Cannot drop column 'pid': needed in a foreign key constraint 'fkc'",
+    );
+    assert_eq!(
+        column_names(&engine, &mut session, "C"),
+        vec!["id", "pid", "x"]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME FROM information_schema.key_column_usage \
+             WHERE TABLE_NAME = 'C' AND REFERENCED_TABLE_NAME IS NOT NULL"
+        ),
+        vec![vec!["pid"]]
+    );
+}
+
+#[test]
+fn a_qualified_parent_is_the_same_parent() {
+    // `referenced_table` is stored as the constraint wrote it, so
+    // `REFERENCES testdb.P(id)` keeps the database on the front while the name
+    // being altered is bare. Compared whole, every qualified constraint fell
+    // outside both foreign key rules -- and Prisma writes plenty of them.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE QP (id INT NOT NULL PRIMARY KEY, u INT NOT NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE QC (pid INT, CONSTRAINT fkq FOREIGN KEY (pid) REFERENCES testdb.QP(id))",
+    );
+
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE QP DROP COLUMN id",
+        1829,
+        "Cannot drop column 'id': needed in a foreign key constraint 'fkq' of table 'QC'",
+    );
+    assert_eq!(column_names(&engine, &mut session, "QP"), vec!["id", "u"]);
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE QP DROP PRIMARY KEY",
+        1553,
+        "Cannot drop index 'PRIMARY': needed in a foreign key constraint",
+    );
+    // And a rename on the qualified parent reaches the child too.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE QP RENAME COLUMN id TO nid",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT REFERENCED_COLUMN_NAME FROM information_schema.key_column_usage \
+             WHERE TABLE_NAME = 'QC' AND REFERENCED_TABLE_NAME IS NOT NULL"
+        ),
+        vec![vec!["nid"]]
+    );
+}
+
+#[test]
+fn renaming_a_column_onto_one_that_exists_is_refused() {
+    // Two columns of one name is not a table: every reference resolves to the
+    // first of them, and the keys -- which hold their columns by name -- can
+    // no longer say which they are over.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE RC (a INT, b INT, INDEX ixb (b))",
+    );
+    for sql in [
+        "ALTER TABLE RC RENAME COLUMN a TO b",
+        "ALTER TABLE RC CHANGE COLUMN a b INT",
+    ] {
+        let err = fails(&engine, &mut session, sql);
+        assert_eq!(
+            (err.code, err.sql_state.as_str(), err.message.as_str()),
+            (1060, "42S21", "Duplicate column name 'b'"),
+            "from: {sql}"
+        );
+    }
+    assert_eq!(column_names(&engine, &mut session, "RC"), vec!["a", "b"]);
+
+    // The column's own name is not a duplicate, in either case -- 8.3 takes
+    // both of these and leaves the column called `A`.
+    run(&engine, &mut session, "ALTER TABLE RC RENAME COLUMN a TO a");
+    run(&engine, &mut session, "ALTER TABLE RC RENAME COLUMN a TO A");
+    assert_eq!(column_names(&engine, &mut session, "RC"), vec!["A", "b"]);
+}
+
+#[test]
+fn a_rolled_back_rename_leaves_one_table_and_not_two() {
+    // The write-back inserts the table under its new name, and a rollback
+    // removes the tables a transaction created from what it recorded as
+    // modified. The old name was recorded and the new one was not, so the
+    // rollback restored `RT` and left `RT2` standing beside it.
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE RT (a INT)");
+    run(&engine, &mut session, "INSERT INTO RT VALUES (1)");
+    run(&engine, &mut session, "START TRANSACTION");
+    run(&engine, &mut session, "ALTER TABLE RT RENAME TO RT2");
+    run(&engine, &mut session, "ROLLBACK");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME FROM information_schema.tables \
+             WHERE TABLE_NAME IN ('RT', 'RT2') ORDER BY TABLE_NAME"
+        ),
+        vec![vec!["RT"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a FROM RT"),
+        vec![vec!["1"]]
+    );
+}
+
+#[test]
+fn renaming_a_table_onto_one_that_exists_is_refused() {
+    // The write-back inserts under the new name, which would have replaced
+    // that table -- its columns and its rows -- and reported success. 8.3
+    // refuses and leaves both alone.
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE RA (a INT)");
+    run(&engine, &mut session, "INSERT INTO RA VALUES (1)");
+    run(&engine, &mut session, "CREATE TABLE RB (b INT, c INT)");
+    run(&engine, &mut session, "INSERT INTO RB VALUES (2, 3)");
+
+    let err = fails(&engine, &mut session, "ALTER TABLE RA RENAME TO RB");
+    assert_eq!(
+        (err.code, err.sql_state.as_str(), err.message.as_str()),
+        (1050, "42S01", "Table 'RB' already exists")
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a FROM RA"),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT b, c FROM RB"),
+        vec![vec!["2", "3"]]
+    );
+
+    // Renaming a table onto its own name in another case is not that, and has
+    // to stay the no-op it was.
+    run(&engine, &mut session, "ALTER TABLE RA RENAME TO ra");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a FROM ra"),
+        vec![vec!["1"]]
+    );
+}
+
+#[test]
+fn a_key_added_over_a_column_the_statement_drops_is_refused() {
+    // A key an ALTER adds is resolved against the table the statement
+    // *leaves*, so both orders are 1072 on 8.3 -- the second despite the add
+    // having succeeded against the table as it stood when it ran.
+    let (engine, mut session) = engine();
+    for (table, sql) in [
+        ("K1", "ALTER TABLE K1 DROP COLUMN a, ADD INDEX ixa (a)"),
+        ("K2", "ALTER TABLE K2 ADD INDEX ixa (a), DROP COLUMN a"),
+    ] {
+        run(
+            &engine,
+            &mut session,
+            &format!("CREATE TABLE {table} (a INT, b INT)"),
+        );
+        let err = fails(&engine, &mut session, sql);
+        assert_eq!(
+            (err.code, err.sql_state.as_str(), err.message.as_str()),
+            (1072, "42000", "Key column 'a' doesn't exist in table"),
+            "from: {sql}"
+        );
+        // Refused whole: the column is still there and no index was made.
+        assert_eq!(column_names(&engine, &mut session, table), vec!["a", "b"]);
+        assert!(
+            index_layout(&engine, &mut session, table).is_empty(),
+            "{sql}"
+        );
+    }
+
+    // 1091 outranks it, which is what puts this check after the operation loop
+    // rather than before it.
+    run(&engine, &mut session, "CREATE TABLE K3 (a INT, b INT)");
+    let err = fails(
+        &engine,
+        &mut session,
+        "ALTER TABLE K3 ADD INDEX ixz (nosuch), DROP INDEX nosuchidx",
+    );
+    assert_eq!(err.code, 1091, "{err}");
+
+    // A key part that is not a bare column name is not asked about at all.
+    // 8.3 takes both of these, and a prefix index is what Prisma generates for
+    // every long text column it indexes -- `@@index([col(length: 191)])`
+    // arrives here as exactly this statement, so refusing it would fail real
+    // migrations. This engine stores the rendered form and matches no column
+    // with it, which is what it did before; the point is that it does not now
+    // refuse.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE K4 (a INT, b VARCHAR(200))",
+    );
+    run(&engine, &mut session, "ALTER TABLE K4 ADD INDEX ixp (b(4))");
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE K4 ADD INDEX ixf ((a + 1))",
+    );
+}
+
+#[test]
+fn narrowing_a_unique_key_onto_colliding_rows_is_refused() {
+    // Narrowing is what makes this reachable: an index over a dropped column
+    // was inert, because a key whose columns do not resolve is skipped, and a
+    // narrowed one is live again. 8.3 refuses the whole ALTER and leaves the
+    // table alone.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE U1 (a INT, b INT, UNIQUE KEY uqd (a, b))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO U1 VALUES (1, 1), (1, 2)",
+    );
+    let err = fails(&engine, &mut session, "ALTER TABLE U1 DROP COLUMN b");
+    assert_eq!((err.code, err.sql_state.as_str()), (1062, "23000"), "{err}");
+    assert_eq!(
+        index_layout(&engine, &mut session, "U1"),
+        vec![vec!["uqd", "1", "a", "0"], vec!["uqd", "2", "b", "0"]]
+    );
+
+    // Rows that do not collide narrow fine -- and the narrowed key then bites,
+    // which is the point of narrowing it rather than dropping it.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE U2 (a INT, b INT, UNIQUE KEY uqn (a, b))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO U2 VALUES (1, 1), (2, 2)",
+    );
+    run(&engine, &mut session, "ALTER TABLE U2 DROP COLUMN b");
+    let err = fails(&engine, &mut session, "INSERT INTO U2 VALUES (1)");
+    assert_eq!(err.code, 1062, "{err}");
+}
+
+#[test]
+fn rename_to_does_not_skip_the_operations_after_it() {
+    // #0184. The rename used to write to the catalog and return, so anything
+    // written after it was never read: `RENAME TO T2, DROP INDEX nosuch`
+    // renamed the table where 8.3 answers 1091 and leaves it called `T`.
+    let (engine, mut session) = engine();
+
+    run(&engine, &mut session, "CREATE TABLE R1 (a INT, b INT)");
+    let err = fails(
+        &engine,
+        &mut session,
+        "ALTER TABLE R1 RENAME TO R1b, DROP INDEX nosuch",
+    );
+    assert_eq!(err.code, 1091, "{err}");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME FROM information_schema.tables \
+             WHERE TABLE_NAME IN ('R1', 'R1b')"
+        ),
+        vec![vec!["R1"]]
+    );
+
+    // An operation after the rename that *succeeds* has to travel with it, so
+    // the drop below applies to the renamed table rather than being lost.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE R2 (a INT, b INT, INDEX ix (a))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE R2 RENAME TO R2b, DROP INDEX ix",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME FROM information_schema.tables \
+             WHERE TABLE_NAME IN ('R2', 'R2b')"
+        ),
+        vec![vec!["R2b"]]
+    );
+    assert!(index_layout(&engine, &mut session, "R2b").is_empty());
+
+    // And one written *before* it, which the old arm did carry.
+    run(&engine, &mut session, "CREATE TABLE R3 (a INT, b INT)");
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE R3 ADD COLUMN c INT, RENAME TO R3b",
+    );
+    assert_eq!(
+        column_names(&engine, &mut session, "R3b"),
+        vec!["a", "b", "c"]
+    );
+
+    // The rows travel too, which is what says the rename moves the table and
+    // not just its name.
+    run(&engine, &mut session, "CREATE TABLE R4 (a INT)");
+    run(&engine, &mut session, "INSERT INTO R4 VALUES (7)");
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE R4 RENAME TO R4b, ADD COLUMN b INT",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a, b FROM R4b"),
+        vec![vec!["7", "NULL"]]
+    );
+
+    // Two renames in one statement: the last one wins, as on 8.3.
+    run(&engine, &mut session, "CREATE TABLE R5 (a INT)");
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE R5 RENAME TO R5b, RENAME TO R5c",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME FROM information_schema.tables \
+             WHERE TABLE_NAME IN ('R5', 'R5b', 'R5c')"
+        ),
+        vec![vec!["R5c"]]
+    );
+
+    // A rename in front of a refusal the foreign key rules raise, which is
+    // settled before the loop is even entered: 8.3 answers 1828 and the table
+    // keeps its name.
+    parent_and_child(&engine, &mut session);
+    refused(
+        &engine,
+        &mut session,
+        "ALTER TABLE C RENAME TO Cb, DROP COLUMN pid",
+        1828,
+        "Cannot drop column 'pid': needed in a foreign key constraint 'fkc'",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME FROM information_schema.tables \
+             WHERE TABLE_NAME IN ('C', 'Cb')"
+        ),
+        vec![vec!["C"]]
     );
 }
 
