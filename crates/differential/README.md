@@ -72,7 +72,7 @@ Two things fail a run:
 
 So the file only ever shrinks, and it shrinks by fixing things.
 
-**It is empty.** All 3640 statements answer exactly as MySQL 8.3 answers them,
+**It is empty.** All 3646 statements answer exactly as MySQL 8.3 answers them,
 in both protocols — the rows, and every part of the column definition listed
 under "What a column is compared on" below. It started at 108 divergences
 across 66 statements.
@@ -161,8 +161,11 @@ view). They are `Case::value_kind`.
 reports a non-empty `org_table` — a column read out of a table or a view, whose
 shape is a *declaration*. A computed column's shape is `Item::max_length` and
 the collation arithmetic around it, a width per function, per operator and per
-literal, and this engine models none of it: asking would report the same
-missing feature on 560 statements and drown every other signal in the file.
+literal, and this engine models none of it as a width: asking would report the
+same missing feature on 560 statements and drown every other signal in the
+file. It models just enough of `Item::max_length` to pick the *type code* a
+materialised integer takes — #0110 — and the type code is compared on every
+column, computed ones included.
 
 The scope is read off the reference's answer alone, so an engine that wrongly
 claimed a table for a computed column could not exempt itself from the
@@ -171,8 +174,9 @@ comparison by doing so.
 A handful of cases opt out of the width alone, each with its reason written
 above it, because a view's column *is* an expression and MySQL declares it from
 that expression's width — `varchar(2)` for a view over `'ab'`, where this
-engine declares `varchar(512)`. They are `Case::widths`, and like the baseline
-that list only ever gets shorter.
+engine declares `varchar(512)`, and 2 for a view over `1 MOD 3` against 11.
+They are `Case::widths`, and like the baseline that list only ever gets
+shorter.
 
 ### The bits of the flags word
 

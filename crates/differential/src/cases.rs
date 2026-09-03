@@ -1719,6 +1719,12 @@ pub const GROUPS: &[Group] = &[
             "CREATE VIEW LP AS SELECT +'abc'",
             "CREATE VIEW LE AS SELECT 'a''b'",
             "CREATE VIEW LU AS SELECT 'a' 'b' UNION SELECT 'c'",
+            // The rewriter's spelling rather than a literal's: the parser is
+            // handed `%` and the name has to come back `1 MOD 3`. Its type is
+            // asked as well, which is what #0110 was -- MySQL materialises
+            // this column as an INT and this engine sent a BIGINT until the
+            // width behind that decision was modelled.
+            "CREATE VIEW LM AS SELECT 1 MOD 3",
             // Names an identifier cannot hold without escaping. The first
             // doubles cleanly and is pinned into the definition; the second
             // does not survive being written back and falls back to the
@@ -1783,11 +1789,13 @@ pub const GROUPS: &[Group] = &[
             same("SELECT * FROM LV").without_widths(),
             same("SELECT * FROM LP").without_widths(),
             same("SELECT * FROM LE").without_widths(),
-            // A view over `1 MOD 3` belongs here too and is not here: MySQL
-            // materialises that column as INT and this engine as BIGINT,
-            // which is about a view's shape rather than about naming. It is
-            // covered by name in `crates/engine/tests/sql.rs`.
             same("SELECT * FROM LU ORDER BY 1").without_widths(),
+            // The ninth, and the only one whose column is a number. It
+            // excuses the same width the eight above do -- 2 on 8.3 against
+            // 11 here -- and asks the type code, which did not agree until
+            // #0110 narrowed a materialised integer to the width its
+            // expression can print.
+            same("SELECT * FROM LM").without_widths(),
             same("SELECT * FROM LD").without_widths(),
             same("SELECT * FROM LC").without_widths(),
             same("SELECT * FROM LB").without_widths(),
@@ -5449,12 +5457,16 @@ pub const GROUPS: &[Group] = &[
             // clause has to hold in all of them and not only in a statement of
             // its own.
             same("SELECT * FROM (SELECT COUNT(*) AS c WHERE 0) t"),
-            // Counted rather than projected, because a derived table
-            // materialises a bare `1` as a LONG on 8.3 and as a LONGLONG here
-            // — a divergence of its own, which asking for the column back
-            // would report in place of this case's question.
             same("SELECT COUNT(*) FROM (SELECT 1 AS a WHERE 0) t"),
             same("WITH c AS (SELECT 1 AS a WHERE 0) SELECT COUNT(*) FROM c"),
+            // The same two with the column read back rather than counted.
+            // They were written as counts while a derived table materialised
+            // a bare `1` as a LONGLONG here against 8.3's LONG, which asking
+            // for the column would have reported in place of this group's
+            // question; #0110 answered it, and the projection is worth more
+            // than the count because it asks the type as well as the rows.
+            same("SELECT a FROM (SELECT 1 AS a WHERE 0) t"),
+            same("WITH c AS (SELECT 1 AS a WHERE 0) SELECT a FROM c"),
             same("SELECT EXISTS (SELECT 1 WHERE 0)"),
             same("SELECT 1 AS a WHERE 0 UNION ALL SELECT 2"),
             same("SELECT 2 AS a UNION ALL SELECT 1 WHERE 0"),
@@ -5789,15 +5801,8 @@ pub const GROUPS: &[Group] = &[
             // The kinds that carry no limit at all, so the refusal above is
             // not widened into them. A table alias and a CTE's column names
             // both take 300 characters on 8.3 and resolve in full.
-            //
-            // These materialise a string rather than an integer on purpose.
-            // A derived table or a CTE over `SELECT 1` is MYSQL_TYPE_LONG
-            // there and LONGLONG here — #0110, the width a materialised
-            // column takes — which has nothing to do with how long a name may
-            // be, and asking it here would cost the empty baseline for a
-            // reason this group is not about.
-            same("SELECT 1 FROM (SELECT 'x') AS `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`"),
-            same("WITH c (`aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`) AS (SELECT 'x') SELECT * FROM c"),
+            same("SELECT 1 FROM (SELECT 1) AS `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`"),
+            same("WITH c (`aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`) AS (SELECT 1) SELECT * FROM c"),
             // A named constraint written against the *column* rather than the
             // table. The table-level spelling was refused while this one was
             // stored, over-long name and all, because the check read a

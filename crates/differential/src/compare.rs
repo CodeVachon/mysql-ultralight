@@ -102,10 +102,14 @@ pub fn differences(
                 // `org_table` on MySQL's side means. A computed column's shape
                 // is `Item::max_length` and the collation arithmetic around
                 // it — a width per function, per operator and per literal —
-                // and this engine models none of it, so asking would report
-                // the same missing feature 560 times and drown everything
-                // else. The scope is read off the *reference*, deliberately:
-                // an engine that wrongly claimed a table for a computed column
+                // and this engine models none of it as a *width*, so asking
+                // would report the same missing feature 560 times and drown
+                // everything else. (#0110 models enough of it to pick a
+                // materialised column's type code, which is compared
+                // everywhere and is a different question.)
+                //
+                // The scope is read off the *reference*, deliberately: an
+                // engine that wrongly claimed a table for a computed column
                 // could otherwise exclude itself from the comparison.
                 //
                 // What that leaves unasked is written down rather than left to

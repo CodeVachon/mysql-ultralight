@@ -6,6 +6,17 @@ use mysql_ultralight_protocol::{ColumnDef, ColumnType};
 use crate::types::SqlType;
 use crate::value::Value;
 
+/// The widest `Item::max_length` a materialised integer expression still fits
+/// an `int` at.
+///
+/// MySQL writes the test as `item->max_length > MY_INT32_NUM_DECIMAL_DIGITS -
+/// 2`, and `MY_INT32_NUM_DECIMAL_DIGITS` is 11 — the eleven characters
+/// `-2147483648` takes. The two it subtracts are the sign and one digit, so
+/// the widest expression that still gets an `int` field prints nine
+/// characters. Measured through a view on 8.3: `99999999` is `int` and
+/// `999999999` is `bigint`, one digit before `INT_MAX` would have needed it.
+const INT_MAX_LENGTH: u32 = 9;
+
 /// One column of a result set.
 #[derive(Debug, Clone)]
 pub struct OutColumn {
@@ -77,6 +88,22 @@ pub struct OutColumn {
     /// nothing declared. `ROW_NUMBER()` counts from one and MySQL marks it
     /// UNSIGNED; so does `CAST(x AS UNSIGNED)`, which says so in the statement.
     pub unsigned: bool,
+    /// How many characters an integer expression's widest value can print,
+    /// where this engine models it.
+    ///
+    /// MySQL calls this `Item::max_length`, and for an integer it counts the
+    /// digits plus a column for the sign: `SELECT 1` is 2, `SELECT 127` is 4
+    /// and `SELECT 9223372036854775807` is 20. It is the whole of what decides
+    /// the *type code* a materialised copy of the column gets — see
+    /// [`Self::materialised_sql_type`] — which is why it is carried here
+    /// rather than recomputed: a view stores its shape from these columns and
+    /// has no expression left to ask.
+    ///
+    /// `None` for everything else — a declared column, a non-integer, and the
+    /// integer expressions whose width `integer_width` does not model. None
+    /// means "as wide as an integer gets", which is the answer this engine
+    /// gave for every expression before this field existed.
+    pub int_width: Option<u32>,
 }
 
 impl OutColumn {
@@ -92,6 +119,7 @@ impl OutColumn {
             declared: None,
             origin: None,
             origin_table: None,
+            int_width: None,
         }
     }
 
@@ -109,6 +137,11 @@ impl OutColumn {
             declared: Some(ty.clone()),
             origin: None,
             origin_table: None,
+            // A declared column carries its own width in `declared`, and
+            // materialising one copies the field rather than deriving a new
+            // one: `SELECT ti FROM (SELECT ti FROM t) d` is a TINY on 8.3
+            // where `SELECT ti + 0` through the same derived table is not.
+            int_width: None,
         }
     }
 
@@ -147,7 +180,9 @@ impl OutColumn {
     ///
     /// The width is 512 rather than 8 for the same reason the textual
     /// widening is `varchar(512)` — this engine has no `Item::max_length`
-    /// arithmetic — and the two are kept the same shape deliberately.
+    /// arithmetic for a string — and the two are kept the same shape
+    /// deliberately. It has one for an integer, and it decides a type code
+    /// rather than a width; see [`Self::materialised_sql_type`].
     pub fn sql_type(&self) -> SqlType {
         self.declared.clone().unwrap_or_else(|| {
             let mut widened = if self.binary_values {
@@ -176,6 +211,55 @@ impl OutColumn {
         })
     }
 
+    /// The type this column takes in a temporary table MySQL builds from it.
+    ///
+    /// [`Self::sql_type`] plus the one narrowing a materialisation performs:
+    /// an integer *expression* lands in a field sized for the values it can
+    /// print, so a `bigint` that can never need more than nine characters
+    /// becomes an `int`. MySQL's own condition is `item->max_length >
+    /// MY_INT32_NUM_DECIMAL_DIGITS - 2` in `create_tmp_field_from_item`, which
+    /// is 9 — measured rather than read: through a view, `99999999` (nine
+    /// characters with its sign) is `int` on 8.3 and `999999999` (ten) is
+    /// `bigint`, and the same step is what makes `CREATE VIEW LM AS SELECT 1
+    /// MOD 3` an `int` there where this engine said `bigint`. That was #0110.
+    ///
+    /// Only an expression narrows, and the *spelling* is what says so. A
+    /// column reference carries a width like anything else — `integer_width`
+    /// reads one so that `ti + 1` can be sized from it — but it also carries
+    /// its declaration, and MySQL copies that field rather than deriving a new
+    /// one: `SELECT ti FROM (SELECT ti FROM t) d` is a TINY on 8.3 and not a
+    /// LONG, and so are `+ti` and `(ti)`, which MySQL'''s parser hands straight
+    /// back. `bigint` is the only thing an integer *expression* is widened to
+    /// here, so asking for that spelling is what separates the two.
+    ///
+    /// Which callers use this and which use `sql_type` is the other half of
+    /// the rule, and it is not a detail: MySQL *merges* a derived table or a
+    /// view that has a FROM clause into the enclosing query instead of
+    /// materialising it, and a merged column is still the expression, LONGLONG
+    /// and all. See `materialised_by_mysql`.
+    pub fn materialised_sql_type(&self) -> SqlType {
+        let mut ty = self.sql_type();
+        // The spelling is checked as well as the width, and it holds today
+        // for free: everything `integer_width` models is typed LONGLONG by
+        // `computed_column_type`, so this can only ever be looking at a
+        // `bigint`. It is here for the day that stops being true. This engine
+        // types `CASE WHEN 1 THEN ti END` over a `TINYINT` as a TINY, and a
+        // width for that shape -- which 8.3 declares `int`, so one is worth
+        // having -- would otherwise relabel a `tinyint(1)` as an `int` while
+        // leaving the wire code a TINY, and the binary protocol would send one
+        // byte for a column announced as four.
+        let narrows =
+            self.int_width.is_some_and(|w| w <= INT_MAX_LENGTH) && ty.base_name() == "bigint";
+        if narrows {
+            ty.declared = if ty.unsigned {
+                "int unsigned".to_owned()
+            } else {
+                "int".to_owned()
+            };
+        }
+        ty
+    }
+
     pub fn in_table(mut self, schema: &str, table: &str) -> Self {
         self.schema = schema.to_owned();
         self.table = table.to_owned();
@@ -196,7 +280,9 @@ impl OutColumn {
             // The width MySQL sends is the one the column was declared with.
             // Everything without a declaration keeps the type's default, which
             // is a guess: MySQL takes an expression's width from
-            // `Item::max_length`, an arithmetic this engine does not model.
+            // `Item::max_length`, and `int_width` models only the corner of
+            // that arithmetic a type code depends on — nothing here reads it,
+            // so a computed column's width is still the type's default. #0126.
             def = def.with_length(declared.wire_length());
         }
         // Without this the binary protocol reads the bytes back signed, so an

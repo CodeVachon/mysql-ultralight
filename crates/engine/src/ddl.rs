@@ -293,9 +293,17 @@ pub fn create_table(
 /// - MySQL narrows a computed column to the width its expression can produce,
 ///   so `SELECT 1` declares `int` where this engine declares `bigint`, and
 ///   `SELECT 'x'` declares `varchar(1)` where this declares `varchar(512)`.
-///   That width is `Item::max_length`, which this engine does not model at
-///   all — #0126 — and inventing one per expression here would be guessing.
-///   Only the integer case is visible on the wire, as LONGLONG for LONG.
+///   That width is `Item::max_length` — #0126.
+///
+///   `OutColumn::materialised_sql_type` models the integer half of it for a
+///   view, a derived table and a CTE, and this path deliberately does not
+///   share it: `CREATE TABLE ... AS SELECT` narrows by a *different* rule.
+///   Measured on 8.3, a view over `mi + 1` from a `MEDIUMINT` is a `bigint`
+///   and `CREATE TABLE ... AS` over the same expression is an `int`, and so
+///   are `LENGTH('ab')`, `INSTR('abc','b')` and `CRC32('a')`, all of which the
+///   view declares `bigint`. Borrowing the view's rule here would narrow a
+///   subset correctly and still leave those wrong, so the rule this path needs
+///   is its own measurement and belongs with #0126.
 /// - A default is copied out of the table the *relation* says the column came
 ///   from, which the alias does not change: `SELECT s.name FROM src s` and
 ///   `SELECT Other2.name FROM Src Other2` both copy `src`'s `'x'`, as 8.3

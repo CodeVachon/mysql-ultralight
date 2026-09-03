@@ -9388,6 +9388,262 @@ fn a_view_column_is_described_like_a_table_column() {
     );
 }
 
+/// A materialised integer column is narrowed to the width its expression can
+/// print, exactly where MySQL materialises one.
+///
+/// `CREATE VIEW LM AS SELECT 1 MOD 3; SELECT * FROM LM` was a LONGLONG here
+/// and is a LONG on 8.3 — #0110. MySQL sizes the temporary-table field from
+/// `Item::max_length`: nine characters or fewer fit an `int`, ten or more need
+/// a `bigint`, which is `item->max_length > MY_INT32_NUM_DECIMAL_DIGITS - 2`
+/// in `create_tmp_field_from_item`. Every expectation below was read off 8.3.
+#[test]
+fn a_materialised_integer_takes_the_width_its_expression_can_print() {
+    use mysql_ultralight_protocol::ColumnType;
+
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Iw (id INT NOT NULL, ti TINYINT NULL, si SMALLINT NULL, \
+         mi MEDIUMINT NULL, i INT NULL, iu INT UNSIGNED NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Iw VALUES (1, 1, 1, 1, 1, 1)",
+    );
+
+    // The type code on the wire, which is what a prepared client decodes by.
+    let code = |engine: &Engine, session: &Session, sql: &str| {
+        engine
+            .describe(session, sql, 0)
+            .unwrap_or_else(|e| panic!("{sql}\n  -> {e}"))
+            .unwrap_or_else(|| panic!("{sql} described nothing"))
+            .iter()
+            .map(|c| c.to_wire().column_type)
+            .collect::<Vec<_>>()
+    };
+
+    run(&engine, &mut session, "CREATE VIEW LM AS SELECT 1 MOD 3");
+    // The issue as written. Bare, the expression is a LONGLONG on both
+    // servers; through the view it is a LONG, because the view has no FROM
+    // clause to merge into the reading query and so is materialised.
+    assert_eq!(
+        code(&engine, &session, "SELECT 1 MOD 3"),
+        vec![ColumnType::LongLong]
+    );
+    assert_eq!(
+        code(&engine, &session, "SELECT * FROM LM"),
+        vec![ColumnType::Long]
+    );
+
+    // The same column through the other two shapes that materialise a
+    // FROM-less block.
+    for sql in [
+        "SELECT * FROM (SELECT 1 MOD 3) d",
+        "WITH c AS (SELECT 1 MOD 3) SELECT * FROM c",
+    ] {
+        assert_eq!(
+            code(&engine, &session, sql),
+            vec![ColumnType::Long],
+            "{sql}"
+        );
+    }
+
+    // Where the threshold is. A literal's width is its digits plus a column
+    // for the sign, so `99999999` is nine and fits an `int` and `999999999`
+    // is ten and does not — one digit before `INT_MAX` would have needed the
+    // wider field, which is why this is measured and not derived.
+    assert_eq!(
+        code(
+            &engine,
+            &session,
+            "SELECT * FROM (SELECT 1, -1, 99999999, 999999999, 2147483647, \
+             9223372036854775807) d"
+        ),
+        vec![
+            ColumnType::Long,
+            ColumnType::Long,
+            ColumnType::Long,
+            ColumnType::LongLong,
+            ColumnType::LongLong,
+            ColumnType::LongLong,
+        ]
+    );
+
+    // The operators, over columns as well as literals: an addition is one
+    // wider than its wider operand, a multiplication is the two widths less
+    // the sign they share, `DIV` cannot exceed its dividend and `MOD` cannot
+    // exceed either side. `ti + 1` is 5 and `mi + 1` is 10, which is the
+    // narrow side of the threshold and the wide side of it over two columns
+    // that differ by one byte.
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Vw AS SELECT ti + 1 AS a, mi + 1 AS b, ti * si AS c, i * i AS d, \
+         i DIV 2 AS e, ti MOD 3 AS f, -ti AS g, ABS(ti) AS h, 1 = 1 AS j, iu + 1 AS k FROM Iw",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Vw' ORDER BY ORDINAL_POSITION"
+        ),
+        vec![
+            vec!["a", "int"],
+            vec!["b", "bigint"],
+            vec!["c", "int"],
+            vec!["d", "bigint"],
+            vec!["e", "bigint"],
+            vec!["f", "int"],
+            vec!["g", "int"],
+            vec!["h", "int"],
+            vec!["j", "int"],
+            vec!["k", "bigint unsigned"],
+        ]
+    );
+
+    // And the two places MySQL does *not* narrow, which is half of what makes
+    // the rule a rule. A view or a derived table with a FROM clause is merged
+    // into the reading query rather than materialised, so the column is still
+    // the expression; and a set operation materialises but types its column by
+    // aggregating the branches' types, which never reads a width.
+    for sql in [
+        "SELECT a FROM Vw",
+        "SELECT * FROM (SELECT ti + 1 AS a FROM Iw) z",
+        "SELECT 1 MOD 3 UNION SELECT 4",
+    ] {
+        assert_eq!(
+            code(&engine, &session, sql),
+            vec![ColumnType::LongLong],
+            "{sql}"
+        );
+    }
+
+    // The set operation again, stored rather than read, because a view's shape
+    // is built from the materialised field whether the view is merged on read
+    // or not -- so it is the one place a union's column meets the narrowing
+    // with nothing else in the way. Carrying the left branch's width through
+    // the merge declared this `int` over a column that returns 2^63-1, and
+    // `COLUMN_TYPE` is what a generated client reads to pick a field type.
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Uv AS SELECT 1 AS a UNION SELECT 9223372036854775807",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_TYPE FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Uv'"
+        ),
+        vec![vec!["bigint"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT * FROM Uv ORDER BY 1"),
+        vec![vec!["1"], vec!["9223372036854775807"]]
+    );
+
+    // A column reference is not an expression: a materialisation copies the
+    // field it already has, so a `TINYINT` stays a TINY rather than becoming
+    // the `int` its four characters would otherwise ask for.
+    assert_eq!(
+        code(&engine, &session, "SELECT * FROM (SELECT ti, i FROM Iw) d"),
+        vec![ColumnType::Tiny, ColumnType::Long]
+    );
+
+    // The spellings that are still a reference. MySQL's parser hands a unary
+    // plus and a pair of parentheses their operand straight back, so these are
+    // the columns themselves and 8.3 declares them `tinyint`, `smallint` and
+    // `mediumint`. Each has a width of nine or fewer, so anything that read
+    // the width without first asking whether the column was an expression
+    // would have called all three `int`.
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Pv AS SELECT +ti AS a, +si AS b, (mi) AS c FROM Iw",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_TYPE FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Pv' ORDER BY ORDINAL_POSITION"
+        ),
+        vec![vec!["tinyint"], vec!["smallint"], vec!["mediumint"]]
+    );
+
+    // A declared display width is not checked against anything, so the
+    // arithmetic above has to survive both ends of a `u32`. `INT(0)` gives a
+    // multiplication two zero-width operands to subtract a sign column from,
+    // and `INT(4294967295)` gives an addition a width to carry into -- both
+    // panicked on overflow in a debug build before the sums saturated, on a
+    // statement any client can send.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Zw (z1 INT(0) NULL, z2 INT(0) NULL, wide INT(4294967295) NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Zv AS SELECT z1 * z2 AS a, wide + 1 AS b FROM Zw",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Zv' ORDER BY ORDINAL_POSITION"
+        ),
+        vec![vec!["a"], vec!["b"]]
+    );
+
+    // The columns that compute as numbers without being sized like one. A
+    // YEAR is four characters wide and behaves exactly as an integer of that
+    // width, sign and all -- 8.3 declares all three of these `int unsigned` --
+    // and so does a BOOLEAN, which is a `tinyint(1)` underneath.
+    //
+    // A DATE, a TIME and a DATETIME are where this stops. `dd + 0` and
+    // `ts + 0` are `bigint` on 8.3 and here; `tm + 0` is an `int` there and a
+    // `bigint` here, because a TIME prints ten characters and computes in
+    // seven, and a width per temporal type is a measurement this has not made.
+    // The wrong half is recorded rather than smoothed over: it is the answer
+    // this engine already gave, and sizing a temporal by its display width
+    // would have made `dd + 0` wrong in the other direction.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Tw (yr YEAR NULL, dd DATE NULL, tm TIME NULL, ts DATETIME NULL, \
+         flag BOOLEAN NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW Tv AS SELECT yr + 0 AS a, yr MOD 3 AS b, ABS(yr) AS c, flag + 1 AS d, \
+         dd + 0 AS e, tm + 0 AS f, ts + 0 AS g FROM Tw",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.columns \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Tv' ORDER BY ORDINAL_POSITION"
+        ),
+        vec![
+            vec!["a", "int unsigned"],
+            vec!["b", "int unsigned"],
+            vec!["c", "int unsigned"],
+            vec!["d", "int"],
+            vec!["e", "bigint"],
+            vec!["f", "bigint"],
+            vec!["g", "bigint"],
+        ]
+    );
+}
+
 #[test]
 fn column_type_is_spelled_the_way_mysql_spells_it() {
     // `COLUMN_TYPE` is not the DDL echoed back — it is rebuilt from the parsed

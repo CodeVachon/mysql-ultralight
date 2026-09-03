@@ -219,7 +219,15 @@ impl Engine {
             .map(|(i, c)| {
                 let mut column = crate::catalog::Column::new(
                     explicit.get(i).cloned().unwrap_or_else(|| c.name.clone()),
-                    c.sql_type(),
+                    // Always the materialised type, whether or not the view is
+                    // one MySQL merges on read: a view's stored shape is built
+                    // from the temporary-table field either way. Measured on
+                    // 8.3, `information_schema.columns` calls a view over
+                    // `ti + 1` an `int` while `SELECT` through the same view
+                    // sends a LONGLONG, because reading it merges the
+                    // expression back into the query and the declaration was
+                    // fixed when the view was created.
+                    c.materialised_sql_type(),
                 );
                 column.position = i + 1;
                 column.nullable = c.nullable;
@@ -1231,6 +1239,19 @@ impl Engine {
                 // the widening the wire type implies is the honest version of
                 // that without a type lattice.
                 for (i, column) in left.columns.iter_mut().enumerate() {
+                    // Whatever the branches were, the merged column is not an
+                    // expression any more and has no width of one. Measured on
+                    // 8.3: `SELECT 1 MOD 3 UNION SELECT 4` materialises -- it
+                    // loses the BINARY flag -- and stays a LONGLONG, because a
+                    // set operation aggregates the branches' *types* and never
+                    // their widths. Carried through, the left branch's width
+                    // narrowed the merged column: `CREATE VIEW v AS SELECT 1
+                    // UNION SELECT 9223372036854775807` declared an `int` over
+                    // a column that returns 2^63-1, and `COLUMN_TYPE` is what
+                    // Prisma reads to pick a field type. Cleared before the
+                    // NULL arms below, so every path out of this loop drops
+                    // it.
+                    column.int_width = None;
                     let Some(right) = right.columns.get(i) else {
                         continue;
                     };
@@ -2365,6 +2386,10 @@ impl Engine {
                 subquery, alias, ..
             } => {
                 let inner = self.query(session, subquery)?;
+                // Whether the columns take the shape a temporary table would
+                // give them, or stay the expressions MySQL would have merged
+                // into this query. See `materialised_by_mysql`.
+                let narrowed = materialised_by_mysql(subquery);
                 let name = alias
                     .as_ref()
                     .map(|a| a.name.value.clone())
@@ -2383,7 +2408,11 @@ impl Engine {
                             qualifier_database: String::new(),
                             table: name.clone(),
                             name: c.name.clone(),
-                            ty: c.sql_type(),
+                            ty: if narrowed {
+                                c.materialised_sql_type()
+                            } else {
+                                c.sql_type()
+                            },
                             nullable: c.nullable,
                         })
                         .collect(),
@@ -2570,6 +2599,7 @@ impl Engine {
             column.nullable = !never_null(e, &implicit_schema, &[], sub);
             column.unsigned = unsigned_answer(e, &implicit_schema, &[], sub);
             column.binary_values = binary_answer(e, &implicit_schema, sub);
+            column.int_width = integer_width(e, &implicit_schema, &[], sub);
             columns.push(column);
             row.push(value);
         }
@@ -2699,6 +2729,7 @@ impl Engine {
                             column.nullable = !never_null(e, refs, &relation.columns, sub);
                             column.unsigned = unsigned_answer(e, refs, &relation.columns, sub);
                             column.binary_values = binary_answer(e, refs, sub);
+                            column.int_width = integer_width(e, refs, &relation.columns, sub);
                             columns.push(column);
                             plan.push(Projection::Window(windows.len()));
                             windows.push(values);
@@ -3054,6 +3085,7 @@ impl Engine {
         column.nullable = !never_null(e, refs, &relation.columns, sub);
         column.unsigned = unsigned_answer(e, refs, &relation.columns, sub);
         column.binary_values = binary_answer(e, refs, sub);
+        column.int_width = integer_width(e, refs, &relation.columns, sub);
         Ok((column, Projection::Expr(Box::new(e.clone()))))
     }
 
@@ -3262,6 +3294,7 @@ impl Engine {
                     column.nullable = !never_null(e, refs, input_columns, sub);
                     column.unsigned = unsigned_answer(e, refs, input_columns, sub);
                     column.binary_values = binary_answer(e, refs, sub);
+                    column.int_width = integer_width(e, refs, input_columns, sub);
                     column
                 }
             })
@@ -5284,6 +5317,9 @@ impl Engine {
         name: &str,
     ) -> EngineResult<Relation> {
         let rows = self.query(session, query)?;
+        // As for a derived table, which a CTE resolves like in every other
+        // respect too. See `materialised_by_mysql`.
+        let narrowed = materialised_by_mysql(query);
         let schema = session.current_database.clone().unwrap_or_default();
         let columns = rows
             .columns
@@ -5299,7 +5335,11 @@ impl Engine {
                 qualifier_database: String::new(),
                 table: name.to_owned(),
                 name: c.name.clone(),
-                ty: c.sql_type(),
+                ty: if narrowed {
+                    c.materialised_sql_type()
+                } else {
+                    c.sql_type()
+                },
                 nullable: c.nullable,
             })
             .collect();
@@ -5478,6 +5518,18 @@ impl Engine {
             ));
         };
 
+        // Whether reading the view hands back a temporary table's columns or
+        // the expressions MySQL would have merged into the reading query. The
+        // stored shape cannot answer it: that one is always the materialised
+        // shape. See `materialised_by_mysql`.
+        //
+        // Asked only where an answer could change something. Answering it
+        // costs a rewrite and a parse of the definition, on top of the one
+        // `execute_at_depth` has just done, and no column narrows without a
+        // width -- which almost none have.
+        let narrowed = rows.columns.iter().any(|c| c.int_width.is_some())
+            && definition_materialised_by_mysql(&scoped, &view.definition);
+
         // Explicit column names from `CREATE VIEW v (a, b)` rename the output.
         let columns = rows
             .columns
@@ -5499,7 +5551,11 @@ impl Engine {
                 // The inner query already worked out each column's type;
                 // discarding it reports every view column as text, and a typed
                 // client then decodes a number as a string.
-                ty: c.sql_type(),
+                ty: if narrowed {
+                    c.materialised_sql_type()
+                } else {
+                    c.sql_type()
+                },
                 nullable: c.nullable,
             })
             .collect();
@@ -8099,10 +8155,12 @@ fn function_result_type(name: &str) -> Option<ColumnType> {
         // `FROM_BASE64` takes three quarters of it — and reaches for a blob
         // code when the product outgrows a VARCHAR, so `HEX(bl)` over a `BLOB`
         // is a MEDIUM_BLOB there and `HEX(j)` over a document a LONG_BLOB.
-        // That is `Item::max_length` arithmetic, which this engine does not
-        // model for any expression: `CONCAT(tx, tx)` and `UPPER(tx)` over a
-        // `TEXT` column are already MEDIUM_BLOB on 8.3 and VAR_STRING here.
-        // These join that gap — #0142 — rather than widening it.
+        // That is `Item::max_length` arithmetic, which this engine models
+        // for one thing and one thing only — the type code a materialised
+        // *integer* takes, in `integer_width`. Nothing sizes a string:
+        // `CONCAT(tx, tx)` and `UPPER(tx)` over a `TEXT` column are already
+        // MEDIUM_BLOB on 8.3 and VAR_STRING here. These join that gap —
+        // #0142 — rather than widening it.
         "hex" | "unhex" | "to_base64" | "from_base64" | "bin" => ColumnType::VarString,
         _ => return None,
     })
@@ -8427,6 +8485,268 @@ fn merged_approximate(
         variants: Vec::new(),
         binary_collation: false,
     })
+}
+
+/// How many characters an integer expression's widest value can print.
+///
+/// MySQL's `Item::max_length`, for the corner of it that decides a type code:
+/// a materialised integer column is an `int` where this is nine or fewer and a
+/// `bigint` where it is more. See [`OutColumn::materialised_sql_type`], which
+/// is the only reader — nothing here reaches the wire width, which is #0126
+/// and a wider gap than this.
+///
+/// Every number below is measured on 8.3 by selecting the expression and
+/// reading `Length` off the column definition:
+///
+/// | expression | width |
+/// |---|---|
+/// | `1`, `-1` | 2 |
+/// | `127` | 4 |
+/// | `9223372036854775807` | 20 |
+/// | `1 + 1` | 3 |
+/// | `ti + 1` over a `TINYINT` | 5 |
+/// | `ti * si` over a `TINYINT` and a `SMALLINT` | 9 |
+/// | `1 MOD 3`, `7 DIV 2`, `ABS(-5)` | 2 |
+/// | `1 = 1`, `1 IS NULL`, `NOT 1`, `1 IN (1,2)` | 1 |
+///
+/// So an integer literal is its digits plus a column for the sign, an addition
+/// is the wider operand plus one for the carry, a multiplication is the two
+/// operands' digits plus one, `DIV` cannot exceed its dividend, `MOD` cannot
+/// exceed either operand, and everything that answers yes or no is one
+/// character.
+///
+/// `None` is "not modelled", and it reads as *wide* — which is deliberate and
+/// is why this can be a subset rather than a whole. MySQL's own default for an
+/// integer function is 21, so `SIGN`, `CEIL`, `COUNT(*)`, `CAST(x AS SIGNED)`
+/// and every bitwise operator are `bigint` there too, and answering `None` for
+/// them is the right answer by the shortest route. The functions that are
+/// *not* — `MONTH` is 3, `LENGTH` is 10, `ASCII` is 3 — are a width per
+/// function, the same arithmetic #0142 records for the string ones, and are
+/// left to it: a missing width keeps the answer this engine already gave,
+/// where a wrong one would invent a new divergence.
+fn integer_width(
+    e: &Expr,
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+    sub: Option<Sub<'_>>,
+) -> Option<u32> {
+    // Only an integer has a width of this shape, and the check is made here
+    // rather than inside the walk: `computed_column_type` runs a probe query
+    // for a scalar subquery, so asking it once per expression is the cost this
+    // is worth and asking it once per *node* is not. Nothing below can narrow
+    // a column this rejects anyway — `materialised_sql_type` only ever
+    // narrows a `bigint` — so the guard states the rule rather than enforcing
+    // it twice.
+    if !is_integer(computed_column_type(e, refs, input, sub)) {
+        return None;
+    }
+    printed_width(e, refs, input)
+}
+
+/// The walk behind [`integer_width`].
+///
+/// The *root* is known to be an integer, because `integer_width` checked it;
+/// a subexpression is not, and does not have to be. A width that comes back
+/// from one can only reach a caller through an operator, and an operator over
+/// something that is not an integer does not answer one either — so the
+/// column is not a `bigint` and `materialised_sql_type` leaves it alone
+/// whatever number arrives here. Nothing below re-asks the type for that
+/// reason: `computed_column_type` is not free.
+fn printed_width(
+    e: &Expr,
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+) -> Option<u32> {
+    use sqlparser::ast::BinaryOperator as B;
+    use sqlparser::ast::UnaryOperator as U;
+
+    /// One character of yes or no, for everything that answers a predicate.
+    const BOOLEAN: u32 = 1;
+
+    let recur = |inner: &Expr| printed_width(inner, refs, input);
+    // The corrected shape, for the reason `computed_column_type` asks for it
+    // just above: the operator at the root of the tree as parsed is often not
+    // the operator that decides, and the walkers over these trees have to read
+    // the same shape `eval` does or they describe a different expression than
+    // the one that runs.
+    if let Some(fixed) = crate::expr::reassociated_postfix(e) {
+        return printed_width(&fixed, refs, input);
+    }
+    match e {
+        Expr::Nested(inner) => recur(inner),
+        // A column reference is the display width it was declared with — 4 for
+        // a `TINYINT`, 11 for an `INT`, 4 for a `YEAR` — which is what
+        // `wire_length` already answers, and the same number MySQL reports for
+        // the bare column.
+        //
+        // Only for a column that is a number to begin with. A temporal
+        // computes as one and is not sized like one -- it computes in the
+        // digits of its packed form and prints in rather more -- so its
+        // display width is the wrong number to hand to the arithmetic below.
+        // Measured on 8.3: `tm + 0` over a `TIME` is an `int`, where the ten
+        // characters `-838:59:59` takes would ask for a `bigint`, while
+        // `dd + 0` over a `DATE` really is a `bigint`. Every temporal this
+        // engine has happens to fall on the `bigint` side either way today, so
+        // this changes no answer -- it keeps a number that is wrong for the
+        // right reason out of a sum that would then be wrong for no reason.
+        // The widths themselves are a measurement per temporal type and are
+        // left unmade rather than guessed at.
+        //
+        // Reachable only from inside a larger expression: a reference on its
+        // own keeps its declaration, and a materialisation copies that field
+        // rather than deriving one.
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => direct_column(e, refs, input)
+            .filter(|column| {
+                matches!(
+                    column.ty.kind,
+                    crate::types::TypeKind::Int
+                        | crate::types::TypeKind::Bool
+                        | crate::types::TypeKind::Year
+                )
+            })
+            .map(|column| column.ty.wire_length()),
+        Expr::Value(v) => match &v.value {
+            // The digits, plus one for the sign: `1` is 2 on 8.3 and `127` is
+            // 4. A point or an exponent is not an integer and has no width of
+            // this shape, so the digits are checked rather than assumed — a
+            // subexpression arrives here unguarded, and `10.5` would otherwise
+            // count its point as a digit.
+            //
+            // `-1` is one token to MySQL's parser and two to this one; the
+            // unary arm below hands back the same 2 either way, and the prefix
+            // is stripped here in case a dialect ever folds it in.
+            sqlparser::ast::Value::Number(text, _) => {
+                let digits = text.strip_prefix('-').unwrap_or(text);
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                u32::try_from(digits.len())
+                    .ok()
+                    .map(|digits| digits.saturating_add(1))
+            }
+            // `TRUE` and `FALSE` are the constants 1 and 0.
+            sqlparser::ast::Value::Boolean(_) => Some(BOOLEAN),
+            _ => None,
+        },
+        Expr::UnaryOp { op, expr } => {
+            if let Some(fixed) = crate::expr::reassociated_unary(op, expr) {
+                return printed_width(&fixed, refs, input);
+            }
+            match op {
+                // Neither sign adds a character: the width already carries a
+                // column for one. `-(1)` is 2 on 8.3, as `1` is.
+                U::Plus | U::Minus => recur(expr),
+                U::Not => Some(BOOLEAN),
+                _ => None,
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            if let Some(fixed) = crate::expr::reassociated(op, left, right) {
+                return printed_width(&fixed, refs, input);
+            }
+            match op {
+                // One more than the wider operand, for the carry.
+                B::Plus | B::Minus => Some(recur(left)?.max(recur(right)?).saturating_add(1)),
+                // The digits of both, plus a column for the sign — so the two
+                // widths added, less the one sign column they each already
+                // carry. `ti * si` is 4 + 6 - 1 = 9 on 8.3, and `i * i`
+                // 11 + 11 - 1 = 21.
+                B::Multiply => Some(recur(left)?.saturating_add(recur(right)?).saturating_sub(1)),
+                // A quotient cannot be wider than what was divided, and a
+                // remainder cannot be wider than either side.
+                B::MyIntegerDivide => recur(left),
+                B::Modulo => Some(recur(left)?.max(recur(right)?)),
+                B::Eq
+                | B::NotEq
+                | B::Lt
+                | B::LtEq
+                | B::Gt
+                | B::GtEq
+                | B::Spaceship
+                | B::And
+                | B::Or
+                | B::Xor => Some(BOOLEAN),
+                // The other reading of `||`, which is the connective unless
+                // the mode says otherwise. `computed_column_type` splits the
+                // token the same way.
+                B::StringConcat if !pipes_as_concat() => Some(BOOLEAN),
+                _ => None,
+            }
+        }
+        Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsNotFalse(_)
+        | Expr::InList { .. }
+        | Expr::InSubquery { .. }
+        | Expr::Between { .. }
+        | Expr::Exists { .. }
+        | Expr::Like { .. }
+        | Expr::ILike { .. }
+        | Expr::RLike { .. }
+        | Expr::IsDistinctFrom(_, _)
+        | Expr::IsNotDistinctFrom(_, _) => Some(BOOLEAN),
+        // `ABS` cannot widen what it was given: the negative half of an
+        // integer is the deeper one, so the sign column it gives up is the
+        // digit the positive half would need. 8.3 reports 2 for `ABS(-5)` and
+        // 11 for `ABS(-2147483648)`, which are the widths of the literals.
+        Expr::Function(f) if f.name.to_string().eq_ignore_ascii_case("abs") => {
+            match function_arguments(f).as_slice() {
+                [argument] => recur(argument),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether MySQL puts this query block in a temporary table rather than
+/// merging it into the query that reads it.
+///
+/// It decides whether a column materialised out of the block is narrowed by
+/// [`OutColumn::materialised_sql_type`], and it exists because this engine has
+/// no merge: every derived table, CTE and view is run and its rows fed back in
+/// as a relation, so without this the narrowing would be applied to blocks
+/// MySQL never materialises at all. Measured on 8.3 — `SELECT * FROM (SELECT
+/// ti + 1 AS a FROM Ints) z` is a LONGLONG carrying the BINARY flag, the
+/// expression itself, where the same derived table without the FROM clause is
+/// a LONG without it.
+///
+/// A FROM-less block is the case that cannot be merged, and it is the whole of
+/// what this claims. MySQL also materialises for DISTINCT, GROUP BY, LIMIT and
+/// a window function — measured, all three of `SELECT * FROM (SELECT ti + 1 AS
+/// a FROM Ints LIMIT 1) z`, `... DISTINCT ...` and `... GROUP BY 1` are LONG —
+/// and this does not say so, because each of those blocks reads its width from
+/// a *column* and the widths of columns through those clauses are not what
+/// #0110 measured. Saying less leaves the answer this engine already gave.
+///
+/// A set operation is not one of them, which is measured rather than assumed:
+/// `SELECT 1 MOD 3 UNION SELECT 4` materialises — it loses the BINARY flag —
+/// and stays a LONGLONG, because a UNION's column is typed by aggregating the
+/// branches' *types* and never their widths.
+fn definition_materialised_by_mysql(session: &Session, definition: &str) -> bool {
+    // A view is stored as the text it was written with, so the block has to be
+    // parsed back to be asked. Through `normalise`, because that text is
+    // MySQL's and not sqlparser's — `1 MOD 3` is the case #0110 is about, and
+    // it is the rewriter that turns the `MOD` into the `%` this parser reads.
+    //
+    // A definition that will not parse is left unnarrowed rather than guessed
+    // at; running the view is what reports the problem.
+    let normalised = rewrite::normalise(definition, session.sql_mode());
+    let Ok(statements) = Parser::parse_sql(&MySqlDialect {}, &normalised.sql) else {
+        return false;
+    };
+    matches!(statements.as_slice(), [Statement::Query(query)] if materialised_by_mysql(query))
+}
+
+fn materialised_by_mysql(query: &Query) -> bool {
+    match query.body.as_ref() {
+        SetExpr::Select(select) => select.from.is_empty(),
+        SetExpr::Query(inner) => materialised_by_mysql(inner),
+        _ => false,
+    }
 }
 
 /// The input column an expression names outright, if it names one.
