@@ -19,6 +19,7 @@ pub mod info_schema;
 pub mod json;
 pub(crate) mod name;
 pub mod params;
+pub(crate) mod recursive;
 pub mod relation;
 pub mod result;
 pub mod rewrite;

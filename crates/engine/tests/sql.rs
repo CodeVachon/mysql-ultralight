@@ -6439,20 +6439,6 @@ fn a_cte_can_feed_an_update() {
 }
 
 #[test]
-fn a_recursive_cte_is_refused() {
-    let (engine, mut session) = engine();
-    widgets(&engine, &mut session);
-    let err = engine
-        .execute(
-            &mut session,
-            "WITH RECURSIVE n AS (SELECT 1 AS x) SELECT x FROM n",
-            &[],
-        )
-        .unwrap_err();
-    assert_eq!(err.code, 1235);
-}
-
-#[test]
 fn named_locks_are_held_per_connection() {
     // Prisma's migration engine takes GET_LOCK before it applies anything.
     let (engine, mut first) = engine();
@@ -26789,4 +26775,960 @@ fn an_upsert_that_changes_nothing_reports_nothing() {
         );
         run(&engine, &mut session, "DROP TABLE Rd");
     }
+}
+
+/// `WITH RECURSIVE` over a CTE that does not name itself is not a recursion,
+/// and 8.3 answers it. This was the whole of what the keyword did here before
+/// #0192 — it was refused with 1235 before anything was evaluated, which is
+/// what the target application's folder walk ran into.
+#[test]
+fn a_recursive_cte_that_does_not_recurse_answers() {
+    let (engine, mut session) = engine();
+    widgets(&engine, &mut session);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE n AS (SELECT 1 AS x) SELECT x FROM n"
+        ),
+        vec![vec!["1"]]
+    );
+}
+
+/// A folder tree, the shape `apps/api/src/models/Folder.ts` walks.
+fn folder_tree(engine: &Engine, session: &mut Session) {
+    run(
+        engine,
+        session,
+        "CREATE TABLE Folder (id INT NOT NULL, parentId INT NULL, name VARCHAR(64) NOT NULL, \
+         PRIMARY KEY (id))",
+    );
+    run(
+        engine,
+        session,
+        "INSERT INTO Folder VALUES (1, NULL, 'root'), (2, 1, 'a'), (3, 1, 'b'), \
+         (4, 2, 'a1'), (5, 4, 'a1x'), (6, NULL, 'other')",
+    );
+}
+
+/// The statement #0192 is about: the target application walks its folder tree
+/// with a recursive CTE, and this engine refused every one of them outright.
+///
+/// The depth and the path are what make it worth having as a whole statement
+/// rather than as an integer sequence — both are computed from the row the
+/// previous round produced, so a recursion that fed the wrong rows back would
+/// still answer the right *set* of ids and the wrong depths.
+#[test]
+fn a_recursive_cte_walks_a_folder_tree() {
+    let (engine, mut session) = engine();
+    folder_tree(&engine, &mut session);
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE FolderTree AS ( \
+               SELECT id, parentId, name, 0 AS depth, CAST(name AS CHAR(200)) AS path \
+               FROM Folder WHERE id = 1 \
+               UNION ALL \
+               SELECT f.id, f.parentId, f.name, ft.depth + 1, CONCAT(ft.path, '/', f.name) \
+               FROM Folder f JOIN FolderTree ft ON f.parentId = ft.id \
+             ) SELECT id, depth, path FROM FolderTree ORDER BY depth, id"
+        ),
+        vec![
+            vec!["1", "0", "root"],
+            vec!["2", "1", "root/a"],
+            vec!["3", "1", "root/b"],
+            vec!["4", "2", "root/a/a1"],
+            vec!["5", "3", "root/a/a1/a1x"],
+        ]
+    );
+}
+
+/// The anchor is the branch that does not name the CTE, and it has to come
+/// first. Measured on 8.3, all three: a recursive branch written first is
+/// 3574, so is a non-recursive one written after a recursive one, and a CTE
+/// where *no* branch names it is not recursive at all and simply answers.
+#[test]
+fn a_recursive_cte_needs_its_anchor_first() {
+    let (engine, mut session) = engine();
+
+    for sql in [
+        "WITH RECURSIVE t AS (SELECT n + 1 AS n FROM t WHERE n < 5 UNION ALL SELECT 1 AS n) \
+         SELECT * FROM t",
+        "WITH RECURSIVE t AS (SELECT n FROM t UNION ALL SELECT n + 1 FROM t) SELECT * FROM t",
+        "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3 \
+         UNION ALL SELECT 99) SELECT * FROM t",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 3574, "{sql}\n  -> {err}");
+        assert_eq!(err.sql_state, "HY000", "{sql}");
+    }
+
+    // No branch names it, so `RECURSIVE` promises a recursion that is not
+    // there and the CTE is an ordinary one.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE nr AS (SELECT 1 AS n UNION ALL SELECT 2) SELECT * FROM nr"
+        ),
+        vec![vec!["1"], vec!["2"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE nr AS (SELECT 1 AS n) SELECT * FROM nr"
+        ),
+        vec![vec!["1"]]
+    );
+
+    // Two anchors and one recursive branch, which says the split is a
+    // position in the chain and not a pair. Measured on 8.3: 1, 2, 11, 12, 21.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT 2 \
+             UNION ALL SELECT n + 10 FROM t WHERE n < 12) SELECT * FROM t ORDER BY n"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["11"], vec!["12"], vec!["21"]]
+    );
+}
+
+/// Each round runs against the rows the *previous* round added, and not
+/// against the whole result so far.
+///
+/// Two recursive branches over one anchor is the case that tells them apart: a
+/// round that re-read everything would produce 2 and 11 again from the anchor
+/// row and answer more rows than 8.3 does. Measured on 8.3: 1, 2, 3, 11, 12.
+#[test]
+fn each_round_of_a_recursive_cte_reads_only_the_last_one() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n \
+             UNION ALL SELECT n + 1 FROM t WHERE n < 3 \
+             UNION ALL SELECT n + 10 FROM t WHERE n < 3) SELECT * FROM t ORDER BY n"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["3"], vec!["11"], vec!["12"]]
+    );
+}
+
+/// UNION de-duplicates a produced row against everything the CTE already
+/// holds; UNION ALL keeps it. That is the whole difference, and over a cycle
+/// in the data it is the difference between an answer and 3636.
+#[test]
+fn union_and_union_all_differ_between_rounds_of_a_recursive_cte() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Cyc (id INT NOT NULL, parentId INT NULL, PRIMARY KEY (id))",
+    );
+    // A is the parent of B and B the parent of A.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Cyc VALUES (1, 2), (2, 1)",
+    );
+    session
+        .set_system_variable("cte_max_recursion_depth", &Value::Int(4))
+        .unwrap();
+
+    let cycle = |quantifier| {
+        format!(
+            "WITH RECURSIVE w AS (SELECT id, parentId FROM Cyc WHERE id = 1 \
+             UNION {quantifier} SELECT c.id, c.parentId FROM Cyc c JOIN w ON c.parentId = w.id) \
+             SELECT id FROM w"
+        )
+    };
+    assert_eq!(
+        rows(&engine, &mut session, &cycle("")),
+        vec![vec!["1"], vec!["2"]]
+    );
+    let err = engine
+        .execute(&mut session, &cycle("ALL"), &[])
+        .unwrap_err();
+    assert_eq!(err.code, 3636, "{err}");
+
+    // Against everything produced so far and not only against the round that
+    // produced it: 1 comes back on the third round, from a row two rounds
+    // older. Measured on 8.3, which answers 1, 2, 3 and terminates.
+    session
+        .set_system_variable("cte_max_recursion_depth", &Value::Int(1000))
+        .unwrap();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION SELECT n % 3 + 1 FROM t) \
+             SELECT * FROM t ORDER BY n"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["3"]]
+    );
+
+    // One DISTINCT anywhere in the chain de-duplicates the whole CTE, the
+    // anchor rows included: 8.3 answers 1, 2, 3 here rather than 1, 1, 2, 3.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT 1 \
+             UNION SELECT n + 1 FROM t WHERE n < 3) SELECT * FROM t ORDER BY n"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["3"]]
+    );
+    // And with no DISTINCT the duplicates travel: 1, 1, 2, 2, 3, 3.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT 1 \
+             UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT * FROM t ORDER BY n"
+        ),
+        vec![
+            vec!["1"],
+            vec!["1"],
+            vec!["2"],
+            vec!["2"],
+            vec!["3"],
+            vec!["3"]
+        ]
+    );
+}
+
+/// `cte_max_recursion_depth` is 1000 by default and aborts with 3636.
+///
+/// The number in the message is the depth plus one, which is measured: at 3,
+/// a recursion that needs a fourth round is "aborted after 4 iterations" —
+/// and one that finishes in three, the last of them adding nothing, answers.
+/// So the bound is on the round that would *add* rows, not on how deep a row
+/// is.
+#[test]
+fn a_recursive_cte_stops_at_cte_max_recursion_depth() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @@cte_max_recursion_depth"),
+        vec![vec!["1000"]]
+    );
+
+    let err = engine
+        .execute(
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t) \
+             SELECT COUNT(*) FROM t",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 3636, "{err}");
+    assert_eq!(err.sql_state, "HY000");
+    assert_eq!(
+        err.message,
+        "Recursive query aborted after 1001 iterations. Try increasing \
+         @@cte_max_recursion_depth to a larger value."
+    );
+
+    session
+        .set_system_variable("cte_max_recursion_depth", &Value::Int(3))
+        .unwrap();
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @@cte_max_recursion_depth"),
+        vec![vec!["3"]]
+    );
+    // Three rounds, the third adding nothing.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+             SELECT * FROM t"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["3"]]
+    );
+    // One more row than that needs a fourth.
+    let err = engine
+        .execute(
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 4) \
+             SELECT * FROM t",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 3636, "{err}");
+    assert_eq!(
+        err.message,
+        "Recursive query aborted after 4 iterations. Try increasing \
+         @@cte_max_recursion_depth to a larger value."
+    );
+
+    // An anchor that produced nothing has no round to run and so no depth to
+    // exceed, even at zero.
+    session
+        .set_system_variable("cte_max_recursion_depth", &Value::Int(0))
+        .unwrap();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n FROM (SELECT 1) z WHERE 0 \
+             UNION ALL SELECT n + 1 FROM t) SELECT COUNT(*) FROM t"
+        ),
+        vec![vec!["0"]]
+    );
+    // The variable is clamped like the other three that are read rather than
+    // stored: measured on 8.3, -1 is 0 and 4294967296 is 4294967295.
+    session
+        .set_system_variable("cte_max_recursion_depth", &Value::Int(-1))
+        .unwrap();
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @@cte_max_recursion_depth"),
+        vec![vec!["0"]]
+    );
+    session
+        .set_system_variable("cte_max_recursion_depth", &Value::Int(4_294_967_296))
+        .unwrap();
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @@cte_max_recursion_depth"),
+        vec![vec!["4294967295"]]
+    );
+}
+
+/// The anchor branch alone types the CTE, and every later round is written
+/// through those types.
+///
+/// Not a description of the result: the write is what makes a `TINYINT` anchor
+/// refuse a round that leaves its range, and what keeps a `DECIMAL(10,2)`
+/// anchor's scale on a value the recursion computed. Both measured on 8.3.
+///
+/// What it does *not* reproduce is a value too long for the anchor's declared
+/// width — 1406 on 8.3, rows here — because `SqlType::coerce` does not enforce
+/// a string's length for an INSERT either. See `Engine::recursive_cte`.
+#[test]
+fn a_recursive_cte_is_typed_by_its_anchor() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Small (v TINYINT NOT NULL, m DECIMAL(10,2) NOT NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Small VALUES (100, 1.00)",
+    );
+
+    // 130 does not fit the anchor's `TINYINT`, and the column is not widened
+    // to hold it.
+    let err = engine
+        .execute(
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT v FROM Small \
+             UNION ALL SELECT v + 10 FROM t WHERE v < 200) SELECT v FROM t",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1264, "{err}");
+    assert_eq!(err.sql_state, "22003");
+    // Stopping one round earlier is not an error, which is what says the range
+    // came from the anchor's column and not from the addition.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT v FROM Small \
+             UNION ALL SELECT v + 10 FROM t WHERE v < 120) SELECT v FROM t"
+        ),
+        vec![vec!["100"], vec!["110"], vec!["120"]]
+    );
+    // And the scale travels with it: every round is written at the anchor's
+    // two places, including the ones a half-step produced.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT m FROM Small \
+             UNION ALL SELECT m + 0.5 FROM t WHERE m < 3) SELECT m FROM t"
+        ),
+        vec![
+            vec!["1.00"],
+            vec!["1.50"],
+            vec!["2.00"],
+            vec!["2.50"],
+            vec!["3.00"]
+        ]
+    );
+
+    // The sign is the anchor's too: 8.3 answers 1690 for a round that takes an
+    // unsigned column below zero.
+    let err = engine
+        .execute(
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT CAST(1 AS UNSIGNED) AS n \
+             UNION ALL SELECT n - 2 FROM t WHERE n > 0) SELECT * FROM t",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1690, "{err}");
+    assert_eq!(err.sql_state, "22003");
+
+    // The same statement over a signed anchor is not an error, which is what
+    // says the sign came from the anchor rather than from the subtraction.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT CAST(1 AS SIGNED) AS n \
+             UNION ALL SELECT n - 2 FROM t WHERE n > -2) SELECT * FROM t"
+        ),
+        vec![vec!["1"], vec!["-1"], vec!["-3"]]
+    );
+
+    // Every column of a recursive CTE is nullable, whatever the anchor
+    // declared — `id` is this table's primary key and `name` is NOT NULL.
+    folder_tree(&engine, &mut session);
+    let Outcome::Rows(recursive) = run(
+        &engine,
+        &mut session,
+        "WITH RECURSIVE ft AS (SELECT id, name FROM Folder WHERE id = 1 \
+         UNION ALL SELECT f.id, f.name FROM Folder f JOIN ft ON f.parentId = ft.id) \
+         SELECT id, name FROM ft",
+    ) else {
+        panic!("expected rows")
+    };
+    assert!(
+        recursive.columns.iter().all(|c| c.nullable),
+        "a recursive CTE's columns are all nullable: {:?}",
+        recursive
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.nullable))
+            .collect::<Vec<_>>()
+    );
+    // The same CTE without a recursive branch keeps the flags, which is what
+    // says the recursion is what relaxes them.
+    let Outcome::Rows(plain) = run(
+        &engine,
+        &mut session,
+        "WITH RECURSIVE ft AS (SELECT id, name FROM Folder WHERE id = 1) \
+         SELECT id, name FROM ft",
+    ) else {
+        panic!("expected rows")
+    };
+    assert!(
+        plain.columns.iter().all(|c| !c.nullable),
+        "a non-recursive CTE keeps NOT NULL"
+    );
+
+    // The two halves of the UNION are evaluated apart here, so their widths
+    // are compared explicitly. 8.3 answers 1222 either way round.
+    for sql in [
+        "WITH RECURSIVE t AS (SELECT 1 AS n, 'x' AS s UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+         SELECT * FROM t",
+        "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1, 'y' FROM t WHERE n < 3) \
+         SELECT * FROM t",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1222, "{sql}\n  -> {err}");
+        assert_eq!(err.sql_state, "21000", "{sql}");
+    }
+}
+
+/// What 8.3 refuses in a recursive query block, and the order it refuses it
+/// in. Every code and every SQLSTATE here was measured against `mysql:8.3`.
+#[test]
+fn a_recursive_query_block_is_restricted() {
+    let (engine, mut session) = engine();
+
+    for (sql, code, state) in [
+        // ORDER BY over the CTE's own UNION, with and without a LIMIT beside
+        // it.
+        (
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 5 \
+             ORDER BY n) SELECT * FROM t",
+            1235,
+            "42000",
+        ),
+        (
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 5 \
+             ORDER BY n LIMIT 2) SELECT * FROM t",
+            1235,
+            "42000",
+        ),
+        // A bracketed recursive branch with a LIMIT of its own.
+        (
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL (SELECT n + 1 FROM t WHERE n < 5 \
+             LIMIT 1)) SELECT * FROM t",
+            1235,
+            "42000",
+        ),
+        (
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT DISTINCT n + 1 FROM t \
+             WHERE n < 5) SELECT * FROM t",
+            1235,
+            "42000",
+        ),
+        // UNION DISTINCT with a UNION ALL after it. The other way round is
+        // accepted, and is tested above.
+        (
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION SELECT n + 1 FROM t WHERE n < 3 \
+             UNION ALL SELECT n + 100 FROM t WHERE n < 3) SELECT * FROM t",
+            1235,
+            "42000",
+        ),
+        // An aggregate, a GROUP BY and a window function.
+        (
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT MAX(n) + 1 FROM t WHERE n < 5) \
+             SELECT * FROM t",
+            3575,
+            "HY000",
+        ),
+        (
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 5 \
+             GROUP BY n) SELECT * FROM t",
+            3575,
+            "HY000",
+        ),
+        (
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT ROW_NUMBER() OVER () + n \
+             FROM t WHERE n < 5) SELECT * FROM t",
+            3575,
+            "HY000",
+        ),
+        // The CTE named twice, and named inside a subquery.
+        (
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT a.n + 1 FROM t a JOIN t b \
+             ON a.n = b.n WHERE a.n < 5) SELECT * FROM t",
+            3577,
+            "HY000",
+        ),
+        (
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t \
+             WHERE n < (SELECT MAX(n) FROM t)) SELECT * FROM t",
+            3577,
+            "HY000",
+        ),
+        // On the right of a LEFT JOIN, where an unmatched row would invent a
+        // CTE row no round produced.
+        (
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT z.k FROM (SELECT 2 AS k) z \
+             LEFT JOIN t ON t.n = z.k WHERE z.k < 3) SELECT * FROM t",
+            3576,
+            "HY000",
+        ),
+        // Anything but UNION between the branches.
+        (
+            "WITH RECURSIVE t AS (SELECT 1 AS n INTERSECT SELECT n FROM t) SELECT * FROM t",
+            3573,
+            "HY000",
+        ),
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, code, "{sql}\n  -> {err}");
+        assert_eq!(err.sql_state, state, "{sql}\n  -> {err}");
+    }
+
+    // The order between two of them, measured: a doubled reference beats a
+    // DISTINCT, and a DISTINCT beats an aggregate.
+    let doubled = engine
+        .execute(
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT DISTINCT a.n FROM t a \
+             JOIN t b ON a.n = b.n WHERE a.n < 3) SELECT * FROM t",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(doubled.code, 3577, "{doubled}");
+    let distinct = engine
+        .execute(
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT DISTINCT MAX(n) FROM t \
+             WHERE n < 3) SELECT * FROM t",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(distinct.code, 1235, "{distinct}");
+
+    // None of that touches the anchor: it may sort, limit, de-duplicate and
+    // aggregate as any other query block does.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS ((SELECT DISTINCT 3 AS n ORDER BY n LIMIT 1) \
+             UNION ALL SELECT n - 1 FROM t WHERE n > 1) SELECT * FROM t"
+        ),
+        vec![vec!["3"], vec!["2"], vec!["1"]]
+    );
+}
+
+/// The CTE's own LIMIT stops the recursion; the statement's does not.
+///
+/// Measured on 8.3, and the two are not the same clause: `... FROM t LIMIT 5`
+/// on the *outer* query runs the CTE to `cte_max_recursion_depth` and is 3636,
+/// while the same LIMIT written inside the CTE answers 1 to 5. The offset
+/// counts towards it, because the rows it skips still have to be produced.
+#[test]
+fn a_limit_inside_a_recursive_cte_stops_the_recursion() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t LIMIT 5) \
+             SELECT * FROM t"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["3"], vec!["4"], vec!["5"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t LIMIT 3 OFFSET 2) \
+             SELECT * FROM t"
+        ),
+        vec![vec!["3"], vec!["4"], vec!["5"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t LIMIT 0) \
+             SELECT COUNT(*) FROM t"
+        ),
+        vec![vec!["0"]]
+    );
+
+    // The outer LIMIT does not, so the runaway is still 3636.
+    let err = engine
+        .execute(
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t) \
+             SELECT * FROM t LIMIT 5",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 3636, "{err}");
+
+    // The CTE's LIMIT is reached before the depth limit can fire, and one row
+    // further is not: at 2, `LIMIT 3` answers and `LIMIT 4` is 3636.
+    session
+        .set_system_variable("cte_max_recursion_depth", &Value::Int(2))
+        .unwrap();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t LIMIT 3) \
+             SELECT * FROM t"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["3"]]
+    );
+    let err = engine
+        .execute(
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t LIMIT 4) \
+             SELECT * FROM t",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 3636, "{err}");
+}
+
+/// A recursive CTE nothing reads is not looked at.
+///
+/// Measured on 8.3, which answers 42 for a statement carrying a runaway
+/// recursive CTE the body never names — and answers 42 for one carrying a
+/// *malformed* one too, so it is not merely the rows that are skipped. This
+/// was the one thing in #0192 the differential corpus caught and the probes
+/// did not: it had been written the other way round, on the reasoning that a
+/// shape is checked while a statement is resolved.
+#[test]
+fn an_unread_recursive_cte_is_not_run() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE unused AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM unused) \
+             SELECT 42 AS answer"
+        ),
+        vec![vec!["42"]]
+    );
+    // Read by a later CTE rather than by the body, which counts.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3), \
+             u AS (SELECT SUM(n) AS s FROM t) SELECT * FROM u"
+        ),
+        vec![vec!["6"]]
+    );
+    // Read through a body whose rendering runs straight into the ORDER BY,
+    // which is where the identifier scan behind this first went wrong: joined
+    // without a separator, `SELECT n FROM t` and `ORDER BY n` spell the name
+    // inside `torder` and the CTE the statement plainly reads looked unread.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+             SELECT n FROM t ORDER BY n DESC"
+        ),
+        vec![vec!["3"], vec!["2"], vec!["1"]]
+    );
+    // Not resolved either: this one has its recursive branch first, which is
+    // 3574 the moment anything looks at it, and 8.3 answers 42.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE unused AS (SELECT n + 1 AS n FROM unused UNION ALL SELECT 1) \
+             SELECT 42 AS answer"
+        ),
+        vec![vec!["42"]]
+    );
+    // Which is not a licence to skip a CTE something *does* read: the same
+    // malformed CTE is still 3574 once the body names it.
+    let err = engine
+        .execute(
+            &mut session,
+            "WITH RECURSIVE used AS (SELECT n + 1 AS n FROM used UNION ALL SELECT 1) \
+             SELECT n FROM used",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 3574, "{err}");
+}
+
+/// A recursive CTE is a named result like any other: it can be read twice, in
+/// a subquery, through a derived table, by a view, and by the body of a write.
+#[test]
+fn a_recursive_cte_is_read_like_any_other_relation() {
+    let (engine, mut session) = engine();
+    folder_tree(&engine, &mut session);
+
+    let sequence = "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3)";
+
+    // Twice in the body, and in two scalar subqueries.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            &format!("{sequence} SELECT a.n, b.n FROM t a JOIN t b ON a.n = b.n ORDER BY a.n"),
+        ),
+        vec![vec!["1", "1"], vec!["2", "2"], vec!["3", "3"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            &format!(
+                "{sequence} SELECT (SELECT MAX(n) FROM t) AS m, (SELECT COUNT(*) FROM t) AS c"
+            ),
+        ),
+        vec![vec!["3", "3"]]
+    );
+    // Inside a derived table, which is a whole statement of its own.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            &format!("SELECT SUM(z.n) FROM ({sequence} SELECT * FROM t) z"),
+        ),
+        vec![vec!["6"]]
+    );
+    // As a view's definition.
+    run(
+        &engine,
+        &mut session,
+        &format!("CREATE VIEW VSeq AS {sequence} SELECT n FROM t"),
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT n FROM VSeq ORDER BY n"),
+        vec![vec!["1"], vec!["2"], vec!["3"]]
+    );
+    // And in front of a write, where the CTE is materialised before the body
+    // runs.
+    assert_eq!(
+        affected(
+            &engine,
+            &mut session,
+            &format!(
+                "{sequence} UPDATE Folder f JOIN t ON f.id = t.n \
+                 SET f.name = CONCAT(f.name, '!')"
+            ),
+        ),
+        3
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT name FROM Folder ORDER BY id LIMIT 4"
+        ),
+        vec![vec!["root!"], vec!["a!"], vec!["b!"], vec!["a1"]]
+    );
+
+    // A comma join reads the CTE as a second FROM item rather than as a join's
+    // right side, which reaches a different path through the executor — and
+    // that path indexes the relation's `origins` by row, so it panicked
+    // outright while a round could add more rows than the anchor had.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE ft AS (SELECT id, parentId FROM Folder WHERE id = 1 \
+             UNION ALL SELECT f.id, f.parentId FROM Folder f, ft WHERE f.parentId = ft.id) \
+             SELECT id FROM ft ORDER BY id"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["3"], vec!["4"], vec!["5"]]
+    );
+
+    // `WITH x (a) AS ...` renames the columns, and the recursive branch reads
+    // the CTE by the *new* names: the anchor here has no column called `n`.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 3) \
+             SELECT n FROM seq"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["3"]]
+    );
+}
+
+/// Without the RECURSIVE keyword, a CTE naming itself is naming a table.
+///
+/// Measured on 8.3: the reference is resolved against the catalog, so a CTE
+/// that would have recursed is 1146 instead. The keyword is what turns the
+/// reference into a recursion.
+#[test]
+fn a_cte_naming_itself_without_recursive_names_a_table() {
+    let (engine, mut session) = engine();
+    let err = engine
+        .execute(
+            &mut session,
+            "WITH t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT * FROM t",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1146, "{err}");
+}
+
+/// A CTE name is a table name, and 8.3 on Linux compares those exactly.
+///
+/// The whole point of #0192 is a PascalCase Prisma model walked by a
+/// lowercase CTE, and matching the name case-insensitively made the CTE read
+/// its own name in the table it walks: `WITH RECURSIVE folder AS (SELECT id
+/// FROM Folder ...)` was 3574 where 8.3 answers rows.
+#[test]
+fn a_cte_and_the_table_it_reads_are_told_apart_by_case() {
+    let (engine, mut session) = engine();
+    folder_tree(&engine, &mut session);
+
+    // Not recursive at all: `Folder` is the table, not this CTE.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE folder AS (SELECT id FROM Folder WHERE id = 1) SELECT id FROM folder"
+        ),
+        vec![vec!["1"]]
+    );
+    // And recursive when it really does name itself, beside the table whose
+    // name differs only in case.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE folder AS (SELECT id, parentId FROM Folder WHERE id = 1 \
+             UNION ALL SELECT f.id, f.parentId FROM Folder f \
+             JOIN folder ON f.parentId = folder.id) SELECT id FROM folder ORDER BY id"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["3"], vec!["4"], vec!["5"]]
+    );
+}
+
+/// A recursive CTE may have a WITH clause of its own, and its branches read
+/// it by name.
+///
+/// The split into anchor and step is a split of the *body*, so the clause
+/// belongs to neither half and was dropped: 8.3 answers 1, 2, 3 here and this
+/// was 1146 for `x`.
+#[test]
+fn a_recursive_cte_can_have_a_with_clause_of_its_own() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (WITH x AS (SELECT 1 AS n) SELECT n FROM x \
+             UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t ORDER BY n"
+        ),
+        vec![vec!["1"], vec!["2"], vec!["3"]]
+    );
+}
+
+/// Reaching a recursive CTE is transitive: a sibling that names it counts only
+/// if anything reaches *that* sibling.
+///
+/// Measured on 8.3, which answers 42 for both statements below — the body
+/// names neither CTE, so neither is looked at, malformed or runaway.
+#[test]
+fn an_unread_recursive_cte_stays_unread_through_an_unread_sibling() {
+    let (engine, mut session) = engine();
+    for sql in [
+        "WITH RECURSIVE a AS (SELECT n + 1 AS n FROM a UNION ALL SELECT 1), \
+         b AS (SELECT n FROM a) SELECT 42 AS answer",
+        "WITH RECURSIVE a AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM a), \
+         b AS (SELECT n FROM a) SELECT 42 AS answer",
+    ] {
+        assert_eq!(rows(&engine, &mut session, sql), vec![vec!["42"]], "{sql}");
+    }
+    // A sibling the body *does* read carries the reference through, so the
+    // runaway is still 3636.
+    let err = engine
+        .execute(
+            &mut session,
+            "WITH RECURSIVE a AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM a), \
+             b AS (SELECT n FROM a) SELECT COUNT(*) FROM b",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 3636, "{err}");
+}
+
+/// A RIGHT JOIN is a LEFT JOIN with the operands swapped, so the recursive
+/// table on its *left* is the same 3576.
+///
+/// Measured on 8.3, which is 3576 for both spellings. Checking only the LEFT
+/// JOIN left this one to run away to 3636 instead.
+#[test]
+fn the_recursive_table_may_not_be_on_the_padded_side_of_either_outer_join() {
+    let (engine, mut session) = engine();
+    for sql in [
+        "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT z.k FROM (SELECT 2 AS k) z \
+         LEFT JOIN t ON t.n = z.k WHERE z.k < 3) SELECT n FROM t",
+        "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT z.k FROM t \
+         RIGHT JOIN (SELECT 2 AS k) z ON t.n = z.k WHERE z.k < 3) SELECT n FROM t",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 3576, "{sql}\n  -> {err}");
+        assert_eq!(err.sql_state, "HY000", "{sql}");
+    }
+    // An inner join over the same shape is not refused, which is what says the
+    // operator decides it and not the join.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT z.k FROM t \
+             JOIN (SELECT 2 AS k) z ON z.k > t.n WHERE t.n < 2) SELECT n FROM t ORDER BY n"
+        ),
+        vec![vec!["1"], vec!["2"]]
+    );
 }

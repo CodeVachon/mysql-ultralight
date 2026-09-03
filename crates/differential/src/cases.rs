@@ -1313,6 +1313,321 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // #0192. The target application walks its folder tree with a recursive
+        // CTE, and this engine refused every one of them before its anchor was
+        // evaluated — so the whole of `Folder.ts` was unreachable rather than
+        // wrong.
+        //
+        // Written from measurement rather than from the manual, because the
+        // rules are not the ones a summary suggests. `ORDER BY` over the CTE's
+        // UNION is refused while `LIMIT` over the same UNION is accepted and
+        // stops the recursion early. `UNION ALL` may be followed by `UNION`
+        // and not the other way round. A recursive CTE nothing reads is not
+        // run at all, and a malformed one nothing reads is still refused. The
+        // depth limit counts the round that would *add* rows, so a recursion
+        // finishing in exactly `cte_max_recursion_depth` rounds answers and
+        // one needing a further round is 3636.
+        //
+        // What is deliberately not here: `@@cte_max_recursion_depth` itself,
+        // which this engine answers as a string like every other system
+        // variable; a recursion whose step is fractional over an integer
+        // anchor, which `SqlType::coerce` truncates where 8.3 rounds; and one
+        // that outgrows a narrow *string* anchor, which is 1406 there and rows
+        // here because `coerce` does not enforce a string's length for an
+        // INSERT either. All three are visible without a CTE at all.
+        name: "recursive common table expressions",
+        setup: &[
+            "CREATE TABLE Folder (id INT NOT NULL, parentId INT NULL, \
+             name VARCHAR(64) NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Folder VALUES (1,NULL,'root'),(2,1,'a'),(3,1,'b'),\
+             (4,2,'a1'),(5,4,'a1x'),(6,NULL,'other')",
+            // A cycle: each of these is the other's parent, which is what
+            // separates UNION from UNION ALL.
+            "CREATE TABLE Cyc (id INT NOT NULL, parentId INT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Cyc VALUES (1,2),(2,1)",
+            "CREATE TABLE Narrow (v TINYINT NOT NULL, m DECIMAL(10,2) NOT NULL)",
+            "INSERT INTO Narrow VALUES (100, 1.00)",
+        ],
+        cases: &[
+            // The application's shape. The depth and the path are computed
+            // from the row the previous round produced, so a recursion fed the
+            // wrong rows would still answer the right set of ids.
+            same(
+                "WITH RECURSIVE FolderTree AS (SELECT id, parentId, name, 0 AS depth, \
+                 CAST(name AS CHAR(200)) AS path FROM Folder WHERE id = 1 UNION ALL \
+                 SELECT f.id, f.parentId, f.name, ft.depth + 1, \
+                 CONCAT(ft.path, '/', f.name) FROM Folder f \
+                 JOIN FolderTree ft ON f.parentId = ft.id) \
+                 SELECT id, parentId, name, depth, path FROM FolderTree ORDER BY depth, id",
+            ),
+            same(
+                "WITH RECURSIVE FolderTree AS (SELECT id, parentId FROM Folder \
+                 WHERE parentId IS NULL UNION ALL SELECT f.id, f.parentId FROM Folder f \
+                 JOIN FolderTree ft ON f.parentId = ft.id) SELECT COUNT(*) FROM FolderTree",
+            ),
+            // The recursive reference as a second FROM item rather than a
+            // join's right side, which reaches a different path through the
+            // executor.
+            same(
+                "WITH RECURSIVE ft AS (SELECT id, parentId FROM Folder WHERE id = 1 UNION ALL \
+                 SELECT f.id, f.parentId FROM Folder f, ft WHERE f.parentId = ft.id) \
+                 SELECT id FROM ft ORDER BY id",
+            ),
+            // An integer sequence, the smallest recursion there is.
+            same(
+                "WITH RECURSIVE seq AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM seq \
+                 WHERE n < 5) SELECT n FROM seq ORDER BY n",
+            ),
+            same(
+                "WITH RECURSIVE seq AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM seq \
+                 WHERE n < 5) SELECT SUM(n), COUNT(*) FROM seq",
+            ),
+            // The column list renames before the recursive branch reads the
+            // CTE, so the anchor here has no column called `n` until it has.
+            same(
+                "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq \
+                 WHERE n < 3) SELECT n FROM seq ORDER BY n",
+            ),
+            // RECURSIVE says a CTE may recurse, not that it does.
+            same("WITH RECURSIVE nr AS (SELECT 1 AS n UNION ALL SELECT 2) SELECT n FROM nr \
+                  ORDER BY n"),
+            same("WITH RECURSIVE nr AS (SELECT 1 AS n) SELECT n FROM nr"),
+            // Two anchors, then two recursive branches: the split is a
+            // position in the chain and not a pair.
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL \
+                 SELECT n + 10 FROM t WHERE n < 12) SELECT n FROM t ORDER BY n",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3 \
+                 UNION ALL SELECT n + 10 FROM t WHERE n < 3) SELECT n FROM t ORDER BY n",
+            ),
+            // UNION against UNION ALL over the cycle: the first terminates,
+            // the second runs to the depth limit and is aborted.
+            same(
+                "WITH RECURSIVE w AS (SELECT id, parentId FROM Cyc WHERE id = 1 UNION \
+                 SELECT c.id, c.parentId FROM Cyc c JOIN w ON c.parentId = w.id) \
+                 SELECT id FROM w ORDER BY id",
+            ),
+            same(
+                "WITH RECURSIVE w AS (SELECT id, parentId FROM Cyc WHERE id = 1 UNION ALL \
+                 SELECT c.id, c.parentId FROM Cyc c JOIN w ON c.parentId = w.id) \
+                 SELECT id FROM w ORDER BY id",
+            ),
+            // De-duplicated against everything produced so far and not against
+            // the round that produced it: 1 comes back two rounds later.
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION SELECT n % 3 + 1 FROM t) \
+                 SELECT n FROM t ORDER BY n",
+            ),
+            // A recursion with no bound at all.
+            same("WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t) \
+                  SELECT COUNT(*) FROM t"),
+            // One DISTINCT anywhere in the chain de-duplicates the anchor rows
+            // too, and with none of them the duplicates travel.
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT 1 UNION \
+                 SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t ORDER BY n",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT 1 UNION ALL \
+                 SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t ORDER BY n",
+            ),
+            // UNION ALL then UNION is accepted; the mixture the other way
+            // round is 1235.
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3 \
+                 UNION SELECT n + 100 FROM t WHERE n < 3) SELECT n FROM t ORDER BY n",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION SELECT n + 1 FROM t WHERE n < 3 \
+                 UNION ALL SELECT n + 100 FROM t WHERE n < 3) SELECT n FROM t",
+            ),
+            // The anchor has to come first, and nothing may follow the
+            // recursive branches.
+            same(
+                "WITH RECURSIVE t AS (SELECT n + 1 AS n FROM t WHERE n < 5 UNION ALL \
+                 SELECT 1 AS n) SELECT n FROM t",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3 \
+                 UNION ALL SELECT 99) SELECT n FROM t",
+            ),
+            same("WITH RECURSIVE t AS (SELECT 1 AS n INTERSECT SELECT n FROM t) SELECT n FROM t"),
+            // What a recursive query block may not carry.
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 5 \
+                 ORDER BY n) SELECT n FROM t",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL (SELECT n + 1 FROM t \
+                 WHERE n < 5 LIMIT 1)) SELECT n FROM t",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT DISTINCT n + 1 FROM t \
+                 WHERE n < 5) SELECT n FROM t",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT MAX(n) + 1 FROM t \
+                 WHERE n < 5) SELECT n FROM t",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 5 \
+                 GROUP BY n) SELECT n FROM t",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT ROW_NUMBER() OVER () + n \
+                 FROM t WHERE n < 5) SELECT n FROM t",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT a.n + 1 FROM t a \
+                 JOIN t b ON a.n = b.n WHERE a.n < 5) SELECT n FROM t",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t \
+                 WHERE n < (SELECT MAX(n) FROM t)) SELECT n FROM t",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT z.k FROM (SELECT 2 AS k) z \
+                 LEFT JOIN t ON t.n = z.k WHERE z.k < 3) SELECT n FROM t",
+            ),
+            // Which of two refusals wins, where a block breaks both rules.
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT DISTINCT a.n FROM t a \
+                 JOIN t b ON a.n = b.n WHERE a.n < 3) SELECT n FROM t",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT DISTINCT MAX(n) FROM t \
+                 WHERE n < 3) SELECT n FROM t",
+            ),
+            // None of it touches the anchor, which may sort, limit,
+            // de-duplicate and aggregate as any other query block does.
+            same(
+                "WITH RECURSIVE t AS ((SELECT DISTINCT 3 AS n ORDER BY n LIMIT 1) UNION ALL \
+                 SELECT n - 1 FROM t WHERE n > 1) SELECT n FROM t ORDER BY n",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT MAX(id) AS n FROM Folder UNION ALL \
+                 SELECT n - 1 FROM t WHERE n > 3) SELECT n FROM t ORDER BY n",
+            ),
+            // The CTE's own LIMIT stops the recursion; the statement's does
+            // not. The offset counts towards it.
+            same("WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t LIMIT 5) \
+                  SELECT n FROM t ORDER BY n"),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t \
+                 LIMIT 3 OFFSET 2) SELECT n FROM t ORDER BY n",
+            ),
+            same("WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t LIMIT 0) \
+                  SELECT COUNT(*) FROM t"),
+            same("WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t) \
+                  SELECT n FROM t LIMIT 5"),
+            // An unread recursive CTE is not looked at: neither the runaway
+            // one nor the malformed one below is run *or* resolved, and both
+            // statements answer 42. The second is the case this corpus caught
+            // and the probes did not — it had been implemented the other way
+            // round, refusing the malformed one on the reasoning that a shape
+            // is checked while a statement is resolved.
+            same("WITH RECURSIVE unused AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM unused) \
+                  SELECT 42 AS answer"),
+            same("WITH RECURSIVE unused AS (SELECT n + 1 AS n FROM unused UNION ALL SELECT 1) \
+                  SELECT 42 AS answer"),
+            // Which is not a licence to skip one something reads.
+            same("WITH RECURSIVE used AS (SELECT n + 1 AS n FROM used UNION ALL SELECT 1) \
+                  SELECT n FROM used"),
+            // The two branches of the UNION have to be the same width, in
+            // either direction.
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n, 'x' AS s UNION ALL SELECT n + 1 FROM t \
+                 WHERE n < 3) SELECT n FROM t",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1, 'y' FROM t \
+                 WHERE n < 3) SELECT n FROM t",
+            ),
+            // The anchor alone types the CTE: 130 does not fit a `TINYINT` and
+            // the column is not widened to hold it, a `DECIMAL(10,2)` keeps
+            // its scale through every round, and an unsigned anchor refuses a
+            // round that goes below zero.
+            same("WITH RECURSIVE t AS (SELECT v FROM Narrow UNION ALL SELECT v + 10 FROM t \
+                  WHERE v < 200) SELECT v FROM t"),
+            same("WITH RECURSIVE t AS (SELECT v FROM Narrow UNION ALL SELECT v + 10 FROM t \
+                  WHERE v < 120) SELECT v FROM t ORDER BY v"),
+            same("WITH RECURSIVE t AS (SELECT m FROM Narrow UNION ALL SELECT m + 0.5 FROM t \
+                  WHERE m < 3) SELECT m FROM t ORDER BY m"),
+            same(
+                "WITH RECURSIVE t AS (SELECT CAST(1 AS UNSIGNED) AS n UNION ALL \
+                 SELECT n - 2 FROM t WHERE n > 0) SELECT n FROM t",
+            ),
+            // An anchor that produced nothing has no round to run.
+            same(
+                "WITH RECURSIVE t AS (SELECT id AS n FROM Folder WHERE id = 99 UNION ALL \
+                 SELECT n + 1 FROM t) SELECT COUNT(*) FROM t",
+            ),
+            // Read like any other named result: twice in the body, in two
+            // scalar subqueries, through a derived table, and by a later CTE.
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+                 SELECT a.n, b.n FROM t a JOIN t b ON a.n = b.n ORDER BY a.n",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+                 SELECT (SELECT MAX(n) FROM t) AS m, (SELECT COUNT(*) FROM t) AS c",
+            ),
+            same(
+                "SELECT SUM(z.n) FROM (WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL \
+                 SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t) z",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3), \
+                 u AS (SELECT SUM(n) AS s FROM t) SELECT s FROM u",
+            ),
+            // Without the keyword the reference is resolved against the
+            // catalog, so a CTE that would have recursed is 1146.
+            same("WITH t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3) \
+                  SELECT n FROM t"),
+            // A CTE name is a table name, and this MySQL runs on Linux with
+            // `lower_case_table_names = 0`. The PascalCase model walked by a
+            // lowercase CTE is the shape #0192 exists for, and matching the
+            // two case-insensitively made the CTE read its own name in the
+            // table it walks.
+            same("WITH RECURSIVE folder AS (SELECT id FROM Folder WHERE id = 1) \
+                  SELECT id FROM folder"),
+            same(
+                "WITH RECURSIVE folder AS (SELECT id, parentId FROM Folder WHERE id = 1 \
+                 UNION ALL SELECT f.id, f.parentId FROM Folder f \
+                 JOIN folder ON f.parentId = folder.id) SELECT id FROM folder ORDER BY id",
+            ),
+            same("WITH q AS (SELECT 1 AS n) SELECT n FROM Q"),
+            same("WITH Q AS (SELECT 1 AS n) SELECT n FROM q"),
+            // The CTE may have a WITH clause of its own. The anchor/step split
+            // is a split of the body, so the clause belongs to neither half
+            // and was dropped.
+            same(
+                "WITH RECURSIVE t AS (WITH x AS (SELECT 1 AS n) SELECT n FROM x \
+                 UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t ORDER BY n",
+            ),
+            // Reaching a CTE is transitive: a sibling that names it counts
+            // only if anything reaches that sibling.
+            same("WITH RECURSIVE a AS (SELECT n + 1 AS n FROM a UNION ALL SELECT 1), \
+                  b AS (SELECT n FROM a) SELECT 42 AS answer"),
+            same("WITH RECURSIVE a AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM a), \
+                  b AS (SELECT n FROM a) SELECT 42 AS answer"),
+            same("WITH RECURSIVE a AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM a), \
+                  b AS (SELECT n FROM a) SELECT COUNT(*) FROM b"),
+            // A RIGHT JOIN is a LEFT JOIN with the operands swapped, so the
+            // recursive table on its left is the same 3576.
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT z.k FROM t \
+                 RIGHT JOIN (SELECT 2 AS k) z ON t.n = z.k WHERE z.k < 3) SELECT n FROM t",
+            ),
+            same(
+                "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT z.k FROM t \
+                 JOIN (SELECT 2 AS k) z ON z.k > t.n WHERE t.n < 2) SELECT n FROM t ORDER BY n",
+            ),
+        ],
+    },
+    Group {
         // A column that never holds anything but NULL has no type, and no
         // temporary-table field can carry one — so materialising it gives it
         // `binary(0)`. Which statements materialise is the whole question, and

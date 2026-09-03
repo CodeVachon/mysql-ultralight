@@ -13,6 +13,9 @@ const DEFAULT_GROUP_CONCAT_MAX_LEN: u64 = 1024;
 /// clamped up to it, so a separator plus one short value always fits.
 const MIN_GROUP_CONCAT_MAX_LEN: u64 = 4;
 
+/// The stock 8.3 value of `cte_max_recursion_depth`, measured.
+const DEFAULT_CTE_MAX_RECURSION_DEPTH: u64 = 1000;
+
 /// Server configuration a session reports and can override.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -252,6 +255,13 @@ impl Session {
                 MIN_GROUP_CONCAT_MAX_LEN as i128,
                 u64::MAX as i128,
             )?,
+            // Clamped for the same reason again: a recursive CTE stops at
+            // this, so a value taken unchecked is either an answer MySQL
+            // refuses or a refusal MySQL answers. Measured on 8.3: -1 is
+            // stored as 0, 4294967296 as 4294967295, and 4294967295 is kept —
+            // the variable is a `u32`, which is where the high bound comes
+            // from.
+            "cte_max_recursion_depth" => clamped_integer(&name, value, 0, u32::MAX as i128)?,
             _ => value.as_text(),
         };
         if name == "sql_mode" {
@@ -322,6 +332,25 @@ impl Session {
             .unwrap_or(DEFAULT_GROUP_CONCAT_MAX_LEN)
     }
 
+    /// How many iterations a recursive CTE gets before 8.3 aborts it, which
+    /// MySQL spells `cte_max_recursion_depth`.
+    ///
+    /// Read straight off the override for the reason the three above give: it
+    /// cannot change while the statement runs, and this is asked once per
+    /// statement rather than once per row — so the normalised name and the
+    /// cloned value `system_variable` builds would both be waste.
+    ///
+    /// The parse cannot fail for anything this engine stored:
+    /// `set_system_variable` refuses a non-integer and clamps the rest into
+    /// `0..=u32::MAX` first. 1000 for an absent override is the stock 8.3
+    /// default, measured.
+    pub fn cte_max_recursion_depth(&self) -> u64 {
+        self.overrides
+            .get("cte_max_recursion_depth")
+            .and_then(|stored| stored.parse().ok())
+            .unwrap_or(DEFAULT_CTE_MAX_RECURSION_DEPTH)
+    }
+
     /// Resolves a system variable.
     ///
     /// Every driver reads several of these while connecting, and Prisma's
@@ -379,6 +408,12 @@ impl Session {
             "protocol_version" => int(10),
             "auto_increment_increment" | "auto_increment_offset" => int(1),
             "group_concat_max_len" => int(DEFAULT_GROUP_CONCAT_MAX_LEN as i64),
+            // Read by a recursive CTE, so the session has to be able to answer
+            // it and to carry a `SET` of it — and listed rather than left to
+            // materialise on the first write, for the reason
+            // `div_precision_increment` below gives. 1000 is the stock 8.3
+            // default, measured.
+            "cte_max_recursion_depth" => int(DEFAULT_CTE_MAX_RECURSION_DEPTH as i64),
             // `EXTRACT(WEEK FROM x)` reads this rather than taking a mode
             // argument, so the session has to be able to answer it and to
             // carry a `SET` of it. 0 is the stock 8.3 default, measured.
@@ -414,6 +449,7 @@ impl Session {
             "collation_connection",
             "collation_database",
             "collation_server",
+            "cte_max_recursion_depth",
             "default_storage_engine",
             "default_week_format",
             "div_precision_increment",
@@ -496,19 +532,19 @@ pub struct Transaction {
 
 /// An integer system variable's stored text, clamped to `low..=high`.
 ///
-/// Measured on 8.3 for all three variables that use it, which behave
+/// Measured on 8.3 for all four variables that use it, which behave
 /// identically and differ only in their bounds. Out of range is clamped rather
 /// than refused — `default_week_format = 9` is stored as 7,
-/// `div_precision_increment = 31` as 30 and `group_concat_max_len = 3` as 4,
-/// and -1 is the low bound for any of them. The clamp carries warning 1292
-/// that this engine has nowhere to put. A value that is not an integer is
-/// refused with 1232, a *string* spelling one included: `'3'`, `3.7`, `b'11'`
-/// and NULL are all errors, while `TRUE` and `1 + 1` are taken as the numbers
-/// they are.
+/// `div_precision_increment = 31` as 30, `group_concat_max_len = 3` as 4 and
+/// `cte_max_recursion_depth = 4294967296` as 4294967295, and -1 is the low
+/// bound for any of them. The clamp carries warning 1292 that this engine has
+/// nowhere to put. A value that is not an integer is refused with 1232, a
+/// *string* spelling one included: `'3'`, `3.7`, `b'11'` and NULL are all
+/// errors, while `TRUE` and `1 + 1` are taken as the numbers they are.
 ///
-/// Shared between those three because all three were measured, and not offered
+/// Shared between those four because all four were measured, and not offered
 /// as a general rule: MySQL's integer variables are not uniform in what they
-/// refuse and what they clamp, so a fourth one belongs here only once it has
+/// refuse and what they clamp, so a fifth one belongs here only once it has
 /// been measured too. #0095 is the general question.
 fn clamped_integer(name: &str, value: &Value, low: i128, high: i128) -> EngineResult<String> {
     match value {

@@ -309,8 +309,10 @@ breaking `ROLLBACK` and watching it fail.
 
 Named honestly, because the engine returns an error rather than a wrong answer for each:
 explicit window frames (`ROWS`/`RANGE BETWEEN`), named `WINDOW` clauses, `NTH_VALUE`, a
-computed (non-constant) offset or default in `LAG`/`LEAD`, `WITH RECURSIVE`, and
-`NESTED PATH` in `JSON_TABLE`.
+computed (non-constant) offset or default in `LAG`/`LEAD`, and `NESTED PATH` in
+`JSON_TABLE`.
+
+`WITH RECURSIVE` was on that list until #0192 and is not any more.
 
 `ORDER BY` and `LIMIT` on an `UPDATE` or `DELETE` are refused only on the multi-table
 forms, where MySQL refuses them too — "the first row" is not defined across a join.

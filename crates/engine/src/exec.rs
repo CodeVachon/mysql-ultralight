@@ -1018,39 +1018,243 @@ impl Engine {
     /// Runs each CTE of a query and puts its rows in scope under its name.
     ///
     /// Each is evaluated once, and can see the ones declared before it, which
-    /// is what MySQL does for a non-recursive WITH.
+    /// is what MySQL does for a non-recursive WITH. A CTE of a `WITH
+    /// RECURSIVE` that names itself is run repeatedly instead; see
+    /// [`Self::recursive_cte`].
     fn materialise_ctes(&self, session: &mut Session, query: &Query) -> EngineResult<()> {
         let Some(with) = &query.with else {
             return Ok(());
         };
-        if with.recursive {
-            return Err(unsupported("WITH RECURSIVE"));
-        }
 
-        for cte in &with.cte_tables {
+        // 8.3 does not look at a `WITH RECURSIVE` entry nothing reads at all —
+        // it neither runs it nor resolves it. Measured: a statement carrying a
+        // runaway recursive CTE the body never names answers, where running it
+        // would be 3636, and so does one carrying a *malformed* recursive CTE,
+        // where resolving it would be 3574. So such an entry is skipped whole
+        // rather than planned and refused.
+        //
+        // Computed once for the whole list rather than per entry, because
+        // reachability is transitive and an entry cannot answer it alone. See
+        // `recursive::read_ctes`, which errs towards "read".
+        let read = if with.recursive {
+            crate::recursive::read_ctes(query)
+        } else {
+            Vec::new()
+        };
+
+        for (position, cte) in with.cte_tables.iter().enumerate() {
             let name = cte.alias.name.value.clone();
-            let mut relation = self.relation_of_query(session, &cte.query, &name)?;
-
-            // `WITH x (a, b) AS ...` renames the columns of the result.
-            if !cte.alias.columns.is_empty() {
-                if cte.alias.columns.len() != relation.columns.len() {
-                    return Err(EngineError::new(
-                        1353,
-                        "HY000",
-                        format!(
-                            "In definition of view, derived table or common table expression, \
-                             SELECT and column names list have different column counts: '{name}'"
-                        ),
-                    ));
-                }
-                for (column, alias) in relation.columns.iter_mut().zip(&cte.alias.columns) {
-                    column.name = alias.name.value.clone();
-                }
+            if with.recursive && !read[position] {
+                continue;
             }
-
+            // Only under `WITH RECURSIVE`: without the keyword a CTE naming
+            // itself is naming a *table*, and 8.3 answers 1146 where the table
+            // does not exist rather than recursing.
+            let plan = if with.recursive {
+                crate::recursive::plan(cte, &name)?
+            } else {
+                None
+            };
+            let relation = match plan {
+                // Renamed already: a recursive branch reads the CTE by the
+                // alias's column names, so `recursive_cte` has to apply them
+                // before it iterates rather than after.
+                Some(plan) => self.recursive_cte(session, cte, &name, &plan)?,
+                None => {
+                    let mut plain = self.relation_of_query(session, &cte.query, &name)?;
+                    rename_cte_columns(&mut plain, cte, &name)?;
+                    plain
+                }
+            };
             session.ctes.push((name, relation));
         }
         Ok(())
+    }
+
+    /// Runs a recursive CTE: the anchor once, then the recursive branches
+    /// against the rows the previous round added, until a round adds none.
+    ///
+    /// Three things here are measured on 8.3 rather than derived, and each of
+    /// them is a different answer if it is guessed:
+    ///
+    /// * **The anchor alone types the CTE.** Every row a later round produces
+    ///   is written into a field the anchor's column declared, so a recursion
+    ///   that outgrows it is an error and not a wider column: over a `TINYINT`
+    ///   anchor holding 100, stepping by ten to 130 is 1264, and over
+    ///   `CAST(1 AS UNSIGNED)`, stepping down past zero is 1690. The scale
+    ///   travels the same way — a `DECIMAL(10,2)` anchor answers `1.50` for a
+    ///   round that computed `1.5`.
+    /// * **`UNION` de-duplicates against everything produced so far**, not
+    ///   only against the round that produced it, which is what makes a cycle
+    ///   in the data terminate.
+    /// * **The CTE's own `LIMIT` stops the recursion**, and stops it before
+    ///   the depth limit can fire: at `cte_max_recursion_depth = 2`,
+    ///   `... UNION ALL SELECT n + 1 FROM t LIMIT 3` answers 1, 2, 3 and the
+    ///   same statement with `LIMIT 4` is 3636.
+    ///
+    /// Only reached for a CTE something reads: `materialise_ctes` skips one
+    /// nothing names, because 8.3 does not look at it either.
+    ///
+    /// The write into the anchor's field is [`crate::types::SqlType::coerce`],
+    /// which is short of MySQL in two ways this path inherits rather than
+    /// causes. Both are visible without a CTE at all, which is what says they
+    /// belong to `coerce`: `INSERT INTO t (s VARCHAR(3)) VALUES ('abcdef')`
+    /// stores the six characters where 8.3 is 1406, and `INSERT INTO t
+    /// (i INT) VALUES (1.5), (2.5), (-1.5)` stores 1, 2 and -1 where 8.3
+    /// rounds away from zero to 2, 3 and -2. So a recursion that outgrows a
+    /// narrow anchor answers rows here and 1406 there, and one that steps by a
+    /// fraction steps by the truncated value.
+    fn recursive_cte(
+        &self,
+        session: &Session,
+        cte: &sqlparser::ast::Cte,
+        name: &str,
+        plan: &crate::recursive::Plan,
+    ) -> EngineResult<Relation> {
+        // The CTE's *own* WITH clause, which its branches read by name.
+        // `recursive::plan` flattened the body, so the clause is part of
+        // neither the anchor nor the step and every branch below is handed to
+        // `set_expr` without it — `WITH RECURSIVE t AS (WITH x AS (SELECT 1 AS
+        // n) SELECT n FROM x UNION ALL SELECT n + 1 FROM t ...)` answered 1146
+        // for `x`. The ordinary CTE path never had this: it goes through
+        // `query`, which materialises a nested WITH on the way in.
+        let mut inner;
+        let session = if cte.query.with.is_some() {
+            inner = session.clone();
+            self.materialise_ctes(&mut inner, &cte.query)?;
+            &inner
+        } else {
+            session
+        };
+
+        let mut anchor = self.set_expr(session, &plan.anchor, None)?;
+        if plan.distinct {
+            dedupe(&mut anchor.rows);
+        }
+        // The alias's column names before anything else, because the recursive
+        // branch references the CTE *by them*: `WITH RECURSIVE seq(n) AS
+        // (SELECT 1 UNION ALL SELECT n + 1 FROM seq ...)` has no column called
+        // `n` until the rename has happened, and answers 1054 without it.
+        let mut scratch = self.relation_from_result(
+            session,
+            &anchor.columns,
+            anchor.rows.clone(),
+            &cte.query,
+            name,
+        );
+        rename_cte_columns(&mut scratch, cte, name)?;
+        // Every column of a recursive CTE is nullable, whatever the anchor
+        // declared. Measured on 8.3 rather than reasoned about: over a folder
+        // table whose `id` is a primary key and whose `name` is NOT NULL, both
+        // columns come back without NOT_NULL through a recursive CTE, and the
+        // same CTE without a recursive branch keeps the flag on both. The
+        // recursive branch is what does it — it names the CTE, so its own
+        // nullability cannot be settled without already knowing the answer,
+        // and MySQL settles the cycle by taking the relaxed side. A NOT_NULL
+        // sent here is what a generated client reads a field's optionality
+        // from.
+        for column in &mut scratch.columns {
+            column.nullable = true;
+        }
+
+        // The fields every produced row is written through, taken from the
+        // anchor and never widened afterwards. Kept with their names because
+        // that is what an over-long value's 1406 reports.
+        let fields: Vec<(String, crate::types::SqlType)> = scratch
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.ty.clone()))
+            .collect();
+
+        // How far it is worth recursing at all. `None` for no LIMIT; the
+        // offset is counted in because the rows it skips still have to be
+        // produced before the rows it keeps can be.
+        let reach = limit_reach(session, &cte.query)?;
+        let depth = session.cte_max_recursion_depth();
+
+        let mut added = std::mem::take(&mut scratch.rows);
+        let mut seen: std::collections::HashSet<Vec<String>> = if plan.distinct {
+            added.iter().map(|row| row_key(row)).collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let mut rows = added.clone();
+        let mut round = 0u64;
+
+        // Cloned once, not once per round. The session carries every CTE
+        // already in scope, so cloning it inside the loop copied all of their
+        // rows on every iteration: a 900-round recursion beside a 2000-row
+        // sibling CTE took 292ms where the same recursion alone took 3.7ms.
+        // The recursive CTE's own entry is the last one and is the only thing
+        // that changes, so the loop replaces that entry rather than the
+        // session.
+        let mut scoped = session.clone();
+        scoped.ctes.push((name.to_owned(), scratch.clone()));
+        let bound = scoped.ctes.len() - 1;
+
+        // An anchor that produced nothing ends it here, without an iteration
+        // and so without a depth limit to exceed: measured on 8.3, an empty
+        // anchor over a runaway recursive branch answers no rows at
+        // `cte_max_recursion_depth = 0` rather than 3636.
+        while !added.is_empty() && reach.is_none_or(|reach| rows.len() < reach) {
+            round += 1;
+            if round > depth {
+                return Err(EngineError::new(
+                    3636,
+                    "HY000",
+                    format!(
+                        "Recursive query aborted after {round} iterations. Try increasing \
+                         @@cte_max_recursion_depth to a larger value."
+                    ),
+                ));
+            }
+
+            // Only the rows the last round added, which is what makes this a
+            // fixpoint rather than a re-run: feeding the whole result back
+            // produces every row again on every round, and a `UNION ALL` that
+            // terminates would stop terminating.
+            scratch.rows = added;
+            // In step with the rows, always. A join reads `origins` by row
+            // index to know which stored row a joined one came from, so a
+            // round that adds more rows than the anchor had left the shorter
+            // vector behind and the next join indexed past its end — a panic
+            // in the middle of a user's statement rather than an answer.
+            scratch.origins = vec![Vec::new(); scratch.rows.len()];
+            scoped.ctes[bound].1 = scratch.clone();
+            let produced = self.set_expr(&scoped, &plan.step, None)?;
+            // The two halves of the UNION are evaluated apart, so nothing else
+            // compares their widths — and a mismatch would otherwise be
+            // silently zipped away, padding a row with NULL or dropping a
+            // column. 8.3 answers 1222 for either direction.
+            if produced.columns.len() != fields.len() {
+                return Err(EngineError::new(
+                    1222,
+                    "21000",
+                    "The used SELECT statements have a different number of columns",
+                ));
+            }
+
+            added = Vec::with_capacity(produced.rows.len());
+            for row in untagged_booleans(produced.rows) {
+                let mut written = Vec::with_capacity(fields.len());
+                for (value, (column, ty)) in row.into_iter().zip(&fields) {
+                    written.push(ty.coerce(value, column)?);
+                }
+                // Against everything produced so far and not against this
+                // round, which is the whole of what stops a cycle in the data.
+                if plan.distinct && !seen.insert(row_key(&written)) {
+                    continue;
+                }
+                added.push(written);
+            }
+            rows.extend(added.iter().cloned());
+        }
+
+        anchor.rows = rows;
+        apply_limit(&mut anchor, session, &cte.query)?;
+        scratch.origins = vec![Vec::new(); anchor.rows.len()];
+        scratch.rows = anchor.rows;
+        Ok(scratch)
     }
 
     /// Runs a query, optionally against an enclosing row so a correlated
@@ -2279,15 +2483,21 @@ impl Engine {
             TableFactor::Table { name, alias, .. } => {
                 // A CTE shadows a table of the same name, and is looked up
                 // before the catalog for exactly that reason. Innermost wins.
+                //
+                // The *same* name, spelled the same way: a CTE name is a table
+                // name, and the MySQL this engine is compared against runs on
+                // Linux with `lower_case_table_names = 0`. Measured on 8.3,
+                // `WITH q AS (SELECT 1) SELECT * FROM Q` is 1146 and so is the
+                // pair the other way round. Matched case-insensitively, a
+                // lowercase CTE swallowed the PascalCase table it was reading
+                // — `WITH RECURSIVE folder AS (... FROM Folder ...)` joined
+                // itself instead of the table, which is the shape #0192 is
+                // about. Only the CTE *name* is exact; a column qualifier is a
+                // separate question and is left alone.
                 let unqualified = name.0.len() == 1;
                 let plain = name::dotted(name);
                 if unqualified {
-                    if let Some((_, cte)) = session
-                        .ctes
-                        .iter()
-                        .rev()
-                        .find(|(n, _)| n.eq_ignore_ascii_case(&plain))
-                    {
+                    if let Some((_, cte)) = session.ctes.iter().rev().find(|(n, _)| *n == plain) {
                         let shown = alias
                             .as_ref()
                             .map(|a| a.name.value.clone())
@@ -5352,13 +5562,34 @@ impl Engine {
         query: &Query,
         name: &str,
     ) -> EngineResult<Relation> {
-        let rows = self.query(session, query)?;
+        let result = self.query(session, query)?;
+        Ok(self.relation_from_result(session, &result.columns, result.rows, query, name))
+    }
+
+    /// The relation a result set stands as, under the name a qualified
+    /// reference will use.
+    ///
+    /// Split from [`Self::relation_of_query`] because a recursive CTE needs
+    /// the shape before it has the rows: the anchor alone types the columns,
+    /// and every later round is written through those types. Both callers go
+    /// through here so the two cannot describe a CTE differently.
+    ///
+    /// The columns and the rows arrive apart because the recursive caller
+    /// keeps its result set — it still has a LIMIT to apply to the rows this
+    /// produces — and the ordinary one does not.
+    fn relation_from_result(
+        &self,
+        session: &Session,
+        columns: &[OutColumn],
+        rows: Vec<Vec<Value>>,
+        query: &Query,
+        name: &str,
+    ) -> Relation {
         // As for a derived table, which a CTE resolves like in every other
         // respect too. See `materialised_by_mysql`.
         let narrowed = materialised_by_mysql(query);
         let schema = session.current_database.clone().unwrap_or_default();
-        let columns = rows
-            .columns
+        let columns = columns
             .iter()
             .map(|c| crate::relation::RelColumn {
                 schema: schema.clone(),
@@ -5380,14 +5611,14 @@ impl Engine {
             })
             .collect();
 
-        Ok(Relation {
-            origins: vec![Vec::new(); rows.rows.len()],
+        Relation {
+            origins: vec![Vec::new(); rows.len()],
             columns,
-            rows: untagged_booleans(rows.rows),
+            rows: untagged_booleans(rows),
             sources: Vec::new(),
             base_tables: Vec::new(),
             source_databases: Vec::new(),
-        })
+        }
     }
 
     /// Expands a JSON document into rows, one per match of the row path.
@@ -6622,6 +6853,69 @@ fn apply_limit(result: &mut ResultSet, session: &Session, query: &Query) -> Engi
         }
     }
 
+    Ok(())
+}
+
+/// How many rows a query's LIMIT can possibly want, offset included.
+///
+/// `None` where there is no LIMIT, and where the clause is one this engine
+/// does not read — a producer that stops early on a number it guessed would
+/// answer fewer rows than the statement asked for, so not knowing has to mean
+/// "no bound" rather than zero.
+///
+/// The offset is added rather than ignored: `LIMIT 3 OFFSET 2` needs five rows
+/// produced before it can keep three, and 8.3 produces exactly five —
+/// `... UNION ALL SELECT n + 1 FROM t LIMIT 3 OFFSET 2` answers 3, 4, 5 rather
+/// than running away.
+fn limit_reach(session: &Session, query: &Query) -> EngineResult<Option<usize>> {
+    use sqlparser::ast::LimitClause;
+    // LIMIT and OFFSET are constants or parameters, never subqueries — the
+    // same argument `apply_limit` makes, and the same context it evaluates in.
+    let ctx = Context::rowless(session);
+    let (limit, offset) = match &query.limit_clause {
+        Some(LimitClause::LimitOffset { limit, offset, .. }) => (
+            limit.as_ref().map(|e| expr::eval(e, &ctx)).transpose()?,
+            offset
+                .as_ref()
+                .map(|o| expr::eval(&o.value, &ctx))
+                .transpose()?,
+        ),
+        Some(LimitClause::OffsetCommaLimit { offset, limit }) => (
+            Some(expr::eval(limit, &ctx)?),
+            Some(expr::eval(offset, &ctx)?),
+        ),
+        None => return Ok(None),
+    };
+    let Some(limit) = limit.and_then(|v| v.as_int()) else {
+        return Ok(None);
+    };
+    let skipped = offset.and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    Ok(Some(skipped.saturating_add(limit.max(0) as usize)))
+}
+
+/// Applies a CTE's `WITH x (a, b) AS ...` column list, which renames the
+/// columns of its result.
+fn rename_cte_columns(
+    relation: &mut Relation,
+    cte: &sqlparser::ast::Cte,
+    name: &str,
+) -> EngineResult<()> {
+    if cte.alias.columns.is_empty() {
+        return Ok(());
+    }
+    if cte.alias.columns.len() != relation.columns.len() {
+        return Err(EngineError::new(
+            1353,
+            "HY000",
+            format!(
+                "In definition of view, derived table or common table expression, \
+                 SELECT and column names list have different column counts: '{name}'"
+            ),
+        ));
+    }
+    for (column, alias) in relation.columns.iter_mut().zip(&cte.alias.columns) {
+        column.name = alias.name.value.clone();
+    }
     Ok(())
 }
 
@@ -10578,7 +10872,7 @@ fn literal_text(value: &sqlparser::ast::ValueWithSpan) -> String {
 /// `Function`, because the walks disagree about what an aggregate's arguments
 /// mean, and a subquery, because its columns are resolved in its own scope
 /// rather than this one.
-fn subexpressions(e: &Expr) -> Vec<&Expr> {
+pub(crate) fn subexpressions(e: &Expr) -> Vec<&Expr> {
     match e {
         Expr::BinaryOp { left, right, .. } => vec![left, right],
         Expr::UnaryOp { expr, .. }
@@ -10675,7 +10969,7 @@ fn aggregates_of_itself(select: &Select) -> bool {
 }
 
 /// True when a select item is or contains an aggregate call.
-fn select_item_aggregates(item: &SelectItem) -> bool {
+pub(crate) fn select_item_aggregates(item: &SelectItem) -> bool {
     match item {
         SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
             contains_aggregate(e)
@@ -10696,7 +10990,7 @@ fn contains_aggregate(e: &Expr) -> bool {
 }
 
 /// The expression arguments of a function call.
-fn function_arguments(f: &sqlparser::ast::Function) -> Vec<Expr> {
+pub(crate) fn function_arguments(f: &sqlparser::ast::Function) -> Vec<Expr> {
     use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
     let FunctionArguments::List(list) = &f.args else {
         return Vec::new();
