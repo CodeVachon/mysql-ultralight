@@ -1,11 +1,11 @@
 ---
 id: 102
 title: DML does not resolve its qualifiers over an empty table
-state: In Progress
+state: Done
 parent: 9
 labels: [compat]
 created: 2026-08-25T14:48:58Z
-updated: 2026-09-03T04:09:47Z
+updated: 2026-09-03T05:10:42Z
 ---
 
 ## Description
@@ -29,3 +29,25 @@ The mechanism to reuse is unresolved_column and refused_at_prepare in crates/eng
 That makes this a one-line change beside an existing guard rather than a re-derivation. The ordering is already measured and encoded there: 8.3 answers 1146 for a missing table before either check, and 1210 for a malformed escape before 1054 for an unknown assignment target.
 
 Confirmed while doing it: UPDATE and DELETE resolve no names at all today. UPDATE LE SET s='x' WHERE nope LIKE 'a' ESCAPE '!!' is 1054 on 8.3 and 0 rows affected here. The consequence of fixing only the escape half is recorded in the code -- a DML statement wrong both ways currently answers 1210 where 8.3 answers 1054, and closing this issue is what corrects that ordering.
+
+### 2026-09-03T05:10:41Z — Christopher Vachon (user)
+
+Done in 6d6ade9 (landed with #0120; their corpus groups and tests share files).
+
+One line beside the guard #0087 placed, as that issue's note intended -- not a re-derivation.
+
+Full DML error ordering measured on 8.3 and now matched: 1146 missing table, then 1066/1109 for a repeated or unknown multi-DELETE target, then the WHERE left to right with names and ESCAPE interleaved POSITIONALLY, then every SET target, then the SET values. Targets beat values; a bad value beats the generated-column 3105. The clause in the message follows the position: 'where clause' for a WHERE, 'field list' for a SET target and for a SET value alike, 'order clause' for a DML ORDER BY.
+
+Also corrected: the joined and single-table DELETE paths reported 'field list' for a WHERE name over a POPULATED table, where 8.3 says 'where clause'.
+
+Zero-rows checklist all four ways: empty table, WHERE 1=0, LIMIT 0, untaken CASE branch -- all refuse now, all in the test and the corpus.
+
+Still answering, verified case by case: correlated IN/EXISTS/scalar subqueries in the WHERE and in a SET value; alias-qualified, back-quoted and database-qualified references; @@sql_mode; TIMESTAMPDIFF(DAY, ...); and SET col = DEFAULT.
+
+Review caught the first cut refusing SET col = DEFAULT, which parses as Expr::Identifier("DEFAULT") -- the same shape as #0058's back-quoted qualifier, where a resolver refused legal SQL. Exempted by reusing the recognition writes_nothing already had. Not implemented: over a populated table it is still 1054, unchanged rather than widened.
+
+Two entry points deliberately left. ON DUPLICATE KEY UPDATE has the identical hole and a different scope -- it resolves VALUES(x) and the insert's own column list -- filed as #0165. The DML ORDER BY belongs to #0100, and fixing it here would have closed that issue silently, which is exactly what #0087's note avoided; the measurements are on #0100 now.
+
+8 mutations. Caveat stated: three of them hit both call sites of a pair at once because the strings are identical, so they prove the DELETE pair and the UPDATE pair are wired rather than each site individually.
+
+Corpus 2866 -> 3000 across both issues, baseline empty, both gates verified independently on the merged tree.

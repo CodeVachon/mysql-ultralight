@@ -6,6 +6,13 @@ use std::collections::BTreeMap;
 use crate::error::{EngineError, EngineResult};
 use crate::value::Value;
 
+/// The stock 8.3 value of `group_concat_max_len`, measured.
+const DEFAULT_GROUP_CONCAT_MAX_LEN: u64 = 1024;
+
+/// The smallest value 8.3 keeps for `group_concat_max_len`. Anything below is
+/// clamped up to it, so a separator plus one short value always fits.
+const MIN_GROUP_CONCAT_MAX_LEN: u64 = 4;
+
 /// Server configuration a session reports and can override.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -192,13 +199,26 @@ impl Session {
         let text = match name.as_str() {
             // Masking to three bits instead of clamping answers week 1 where
             // MySQL answers week 52, which is what the range is here to stop.
-            "default_week_format" => clamped_integer(&name, value, 7)?,
+            "default_week_format" => clamped_integer(&name, value, 0, 7)?,
             // 30 here and `MAX_SCALE` being 30 as well is a coincidence of
             // value: this is the range MySQL documents and clamps the variable
             // to, not the scale a product or a quotient is capped at.
             "div_precision_increment" => {
-                clamped_integer(&name, value, crate::decimal::MAX_DIV_PRECISION_INCREMENT)?
+                clamped_integer(&name, value, 0, crate::decimal::MAX_DIV_PRECISION_INCREMENT)?
             }
+            // Clamped for the same reason the two above are: `GROUP_CONCAT`
+            // now truncates at this, so a value taken unchecked is a shorter
+            // answer than MySQL's rather than an unread string. Measured on
+            // 8.3: 3 is stored as 4 with warning 1292, -1 is 4 as well, and
+            // 18446744073709551615 is kept — the variable really does run to
+            // the full `u64`, which is why `high` is that and not a smaller
+            // round number.
+            "group_concat_max_len" => clamped_integer(
+                &name,
+                value,
+                MIN_GROUP_CONCAT_MAX_LEN as i128,
+                u64::MAX as i128,
+            )?,
             _ => value.as_text(),
         };
         if name == "sql_mode" {
@@ -246,6 +266,27 @@ impl Session {
             .get("div_precision_increment")
             .and_then(|stored| stored.parse().ok())
             .unwrap_or(crate::decimal::DEFAULT_DIV_PRECISION_INCREMENT)
+    }
+
+    /// The length `GROUP_CONCAT` truncates its answer at, in **bytes**.
+    ///
+    /// Bytes and not characters, measured: at 4, `GROUP_CONCAT` over a column
+    /// holding `'éé'` and `'ab'` is `'éé'` — four bytes and two characters —
+    /// and at 5 it is `'éé,'`.
+    ///
+    /// Read straight off the override for the reason the two above give: it
+    /// cannot change while the statement runs, and this is asked once per
+    /// group.
+    ///
+    /// The parse cannot fail for anything this engine stored:
+    /// `set_system_variable` refuses a non-integer and clamps the rest into
+    /// `4..=u64::MAX` first. 1024 for an absent override is the stock 8.3
+    /// default, measured.
+    pub fn group_concat_max_len(&self) -> u64 {
+        self.overrides
+            .get("group_concat_max_len")
+            .and_then(|stored| stored.parse().ok())
+            .unwrap_or(DEFAULT_GROUP_CONCAT_MAX_LEN)
     }
 
     /// Resolves a system variable.
@@ -304,7 +345,7 @@ impl Session {
             "innodb_version" => text(&self.config.version),
             "protocol_version" => int(10),
             "auto_increment_increment" | "auto_increment_offset" => int(1),
-            "group_concat_max_len" => int(1024),
+            "group_concat_max_len" => int(DEFAULT_GROUP_CONCAT_MAX_LEN as i64),
             // `EXTRACT(WEEK FROM x)` reads this rather than taking a mode
             // argument, so the session has to be able to answer it and to
             // carry a `SET` of it. 0 is the stock 8.3 default, measured.
@@ -420,22 +461,23 @@ pub struct Transaction {
     pub modified: Vec<(String, String)>,
 }
 
-/// An integer system variable's stored text, clamped to `0..=high`.
+/// An integer system variable's stored text, clamped to `low..=high`.
 ///
-/// Measured on 8.3 for both variables that use it, which behave identically
-/// and differ only in their upper bound. Out of range is clamped rather than
-/// refused — `default_week_format = 9` is stored as 7 and
-/// `div_precision_increment = 31` as 30, and -1 is 0 for either, each with
-/// warning 1292 that this engine has nowhere to put. A value that is not an
-/// integer is refused with 1232, a *string* spelling one included: `'3'`,
-/// `3.7`, `b'11'` and NULL are all errors, while `TRUE` and `1 + 1` are taken
-/// as the numbers they are.
+/// Measured on 8.3 for all three variables that use it, which behave
+/// identically and differ only in their bounds. Out of range is clamped rather
+/// than refused — `default_week_format = 9` is stored as 7,
+/// `div_precision_increment = 31` as 30 and `group_concat_max_len = 3` as 4,
+/// and -1 is the low bound for any of them. The clamp carries warning 1292
+/// that this engine has nowhere to put. A value that is not an integer is
+/// refused with 1232, a *string* spelling one included: `'3'`, `3.7`, `b'11'`
+/// and NULL are all errors, while `TRUE` and `1 + 1` are taken as the numbers
+/// they are.
 ///
-/// Shared between those two because both were measured, and not offered as a
-/// general rule: MySQL's integer variables are not uniform in what they refuse
-/// and what they clamp, so a third one belongs here only once it has been
-/// measured too. #0095 is the general question.
-fn clamped_integer(name: &str, value: &Value, high: i128) -> EngineResult<String> {
+/// Shared between those three because all three were measured, and not offered
+/// as a general rule: MySQL's integer variables are not uniform in what they
+/// refuse and what they clamp, so a fourth one belongs here only once it has
+/// been measured too. #0095 is the general question.
+fn clamped_integer(name: &str, value: &Value, low: i128, high: i128) -> EngineResult<String> {
     match value {
         Value::Int(_) | Value::Unsigned(_) | Value::Bool(_) => {
             // `as_exact_int`, not `as_int`: the latter wraps a `u64` above
@@ -444,7 +486,11 @@ fn clamped_integer(name: &str, value: &Value, high: i128) -> EngineResult<String
             // to 0 and answered week 1 for a date MySQL puts in week 52. A
             // literal that large really does arrive here as `Value::Unsigned`.
             // `i128` holds both ranges exactly.
-            Ok(value.as_exact_int().unwrap_or(0).clamp(0, high).to_string())
+            Ok(value
+                .as_exact_int()
+                .unwrap_or(0)
+                .clamp(low, high)
+                .to_string())
         }
         _ => Err(EngineError::new(
             1232,

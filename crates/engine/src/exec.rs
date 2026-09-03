@@ -2448,10 +2448,9 @@ impl Engine {
                     self.fold(
                         session,
                         &name,
-                        aggregate_argument(f).as_ref(),
+                        &AggregateCall::read(f)?,
                         &implicit_schema,
                         group,
-                        aggregate_is_distinct(f),
                     )?
                 } else {
                     expr::eval(e, &ctx)?
@@ -2659,7 +2658,7 @@ impl Engine {
         }
 
         let name = f.name.to_string().to_ascii_lowercase();
-        let argument = aggregate_argument(f);
+        let call = AggregateCall::read(f)?;
 
         let evaluate = |e: &Expr, row: &Vec<Value>| -> EngineResult<Value> {
             let ctx = Context {
@@ -2855,14 +2854,7 @@ impl Engine {
                             .iter()
                             .map(|(_, index)| matching[*index])
                             .collect();
-                        let value = self.fold(
-                            session,
-                            other,
-                            argument.as_ref(),
-                            refs,
-                            &group,
-                            aggregate_is_distinct(f),
-                        )?;
+                        let value = self.fold(session, other, &call, refs, &group)?;
                         for (_, index) in &ordered[position..=end] {
                             out[*index] = value.clone();
                         }
@@ -3253,15 +3245,7 @@ impl Engine {
         if let Expr::Function(f) = e {
             if f.over.is_none() && is_aggregate(&f.name.to_string()) {
                 let name = f.name.to_string().to_ascii_lowercase();
-                let argument = aggregate_argument(f);
-                let value = self.fold(
-                    session,
-                    &name,
-                    argument.as_ref(),
-                    refs,
-                    group,
-                    aggregate_is_distinct(f),
-                )?;
+                let value = self.fold(session, &name, &AggregateCall::read(f)?, refs, group)?;
                 let slot = folded.len();
                 folded.push(value);
                 return Ok(Expr::Identifier(Ident::new(folded_name(slot))));
@@ -3423,11 +3407,21 @@ impl Engine {
         &self,
         session: &Session,
         name: &str,
-        argument: Option<&Expr>,
+        call: &AggregateCall,
         refs: &[ColumnRef],
         matching: &[&Vec<Value>],
-        distinct: bool,
     ) -> EngineResult<Value> {
+        // Ahead of the generic pass below rather than a branch inside it,
+        // because GROUP_CONCAT folds a different thing: every argument
+        // concatenated per row, ordered by the call's own ORDER BY, and joined
+        // with its own separator. Sharing the pass would mean evaluating the
+        // first argument twice and dropping the rest.
+        if name == "group_concat" {
+            return self.fold_group_concat(session, call, refs, matching);
+        }
+
+        let argument = call.argument();
+        let distinct = call.distinct;
         let mut values = Vec::new();
         if let Some(arg) = argument {
             for row in matching {
@@ -3539,19 +3533,6 @@ impl Engine {
                     })
                     .unwrap_or(Value::Null)
             }
-            "group_concat" => {
-                if present.is_empty() {
-                    Value::Null
-                } else {
-                    Value::Text(
-                        present
-                            .iter()
-                            .map(|v| v.as_text())
-                            .collect::<Vec<_>>()
-                            .join(","),
-                    )
-                }
-            }
             // Unlike GROUP_CONCAT this keeps each value's type, so numbers
             // stay numbers in the document — and it keeps NULLs, which become
             // JSON nulls rather than being dropped.
@@ -3568,6 +3549,107 @@ impl Engine {
             }
             other => return Err(unsupported(format!("aggregate `{other}()`"))),
         })
+    }
+
+    /// Folds `GROUP_CONCAT` over the matching rows.
+    ///
+    /// Every part of this was measured on 8.3, because every part of it was
+    /// being thrown away — #0088.
+    ///
+    /// - A row's contribution is *all* the arguments concatenated, under
+    ///   `CONCAT`'s NULL rule: `GROUP_CONCAT(k, s)` over a row whose `s` is
+    ///   NULL contributes nothing at all, not `k` alone.
+    /// - A row contributing NULL is dropped, and a group that contributes
+    ///   nothing is NULL rather than the empty string.
+    /// - DISTINCT de-duplicates on that concatenated value and keeps the
+    ///   *first* row of each: over `('a',5),('b',2),('a',1),('c',9)`,
+    ///   `GROUP_CONCAT(DISTINCT s ORDER BY n)` is `b,a,c` on 8.3, which is the
+    ///   5 and not the 1.
+    /// - With DISTINCT and no ORDER BY the answer comes back sorted by the
+    ///   value: `a,B` and not `B,a` for `'B','a'`, and `9,10,100` and not
+    ///   `10,100,9` for the numbers, so it is the same comparison ORDER BY
+    ///   uses and not a text one.
+    /// - The join is the call's separator, and the whole answer is truncated
+    ///   to `group_concat_max_len` bytes.
+    ///
+    /// One thing deliberately *not* matched: 8.3 breaks a tie between two rows
+    /// with equal sort keys by putting the later row first — over four rows
+    /// tied on the key, `a,b,c,d` comes back `d,c,b,a`, and a constant key
+    /// like `ORDER BY 1+1` reverses the whole group. That is its insert-order
+    /// tree showing through rather than an order it defines, so this sorts
+    /// stably and leaves tied rows as they arrived. Nothing in the suite or
+    /// the corpus ties, for the reason the differential README gives about
+    /// orders that are not total.
+    fn fold_group_concat(
+        &self,
+        session: &Session,
+        call: &AggregateCall,
+        refs: &[ColumnRef],
+        matching: &[&Vec<Value>],
+    ) -> EngineResult<Value> {
+        // The concatenated value and this row's sort keys, in arrival order.
+        let mut rows: Vec<(Value, Vec<Value>)> = Vec::with_capacity(matching.len());
+        for row in matching {
+            let ctx = Context {
+                row: Some(Row {
+                    schema: refs,
+                    values: row,
+                }),
+                session,
+                executor: Some(self),
+            };
+            let mut parts = Vec::with_capacity(call.arguments.len());
+            for argument in &call.arguments {
+                parts.push(expr::eval(argument, &ctx)?.untag_bool());
+            }
+            // A single argument keeps its own value rather than becoming text,
+            // because the DISTINCT ordering below compares it: `GROUP_CONCAT
+            // (DISTINCT n)` over 9, 10 and 100 is `9,10,100` on 8.3 and would
+            // be `10,100,9` compared as strings.
+            let value = match parts.len() {
+                1 => parts.remove(0),
+                _ if parts.iter().any(Value::is_null) => Value::Null,
+                _ => Value::Text(parts.iter().map(Value::as_text).collect()),
+            };
+            if value.is_null() {
+                continue;
+            }
+            let mut keys = Vec::with_capacity(call.order.len());
+            for key in &call.order {
+                keys.push(expr::eval(&key.expr, &ctx)?);
+            }
+            rows.push((value, keys));
+        }
+
+        if call.distinct {
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            rows.retain(|(value, _)| seen.insert(value.collation_key()));
+        }
+
+        if !call.order.is_empty() {
+            let descending: Vec<bool> = call.order.iter().map(|k| k.descending).collect();
+            rows.sort_by(|a, b| compare_keys(&a.1, &b.1, &descending));
+        } else if call.distinct {
+            // Sorted only because DISTINCT sorts on 8.3; without it the rows
+            // come back in arrival order, which is why this is not simply
+            // always done. `sort_cmp` is what `compare_keys` reaches for once
+            // it has ruled the NULLs out, and every NULL is already gone here.
+            rows.sort_by(|a, b| a.0.sort_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        if rows.is_empty() {
+            return Ok(Value::Null);
+        }
+
+        let joined = rows
+            .iter()
+            .map(|(value, _)| value.as_text())
+            .collect::<Vec<_>>()
+            .join(&call.separator);
+        Ok(Value::Text(truncate_bytes(
+            joined,
+            session.group_concat_max_len(),
+        )))
     }
 
     /// Sorts an already-projected result, for ORDER BY over output aliases.
@@ -7582,6 +7664,12 @@ fn function_result_type(name: &str) -> Option<ColumnType> {
         // sends it as a long blob.
         "json_object" | "json_array" | "json_extract" | "json_set" | "json_array_append"
         | "json_merge_patch" | "json_keys" | "json_arrayagg" => ColumnType::Json,
+        // One gap left here deliberately: 8.3 describes `GROUP_CONCAT` as a
+        // `VAR_STRING` rather than a `LONG_BLOB` when `group_concat_max_len`
+        // is 512 or less — measured, 512 is a `VAR_STRING` and 513 is a
+        // `LONG_BLOB` — and this walk has no session to ask. Threading one
+        // through its twenty-odd call sites is a change about the type, not
+        // about #0088, and until somebody lowers the variable the two agree.
         "json_unquote" | "group_concat" => ColumnType::LongBlob,
         // Every predicate answers an integer. `regexp_like` had been left out
         // and was described VAR_STRING while answering 0 or 1 — the same
@@ -8636,6 +8724,13 @@ fn unresolved_column(e: &Expr, refs: &[ColumnRef]) -> Option<String> {
         // parses as an identifier — refusing it would reject a legal
         // statement for naming a column `DAY`, which the suite caught.
         //
+        // An aggregate's own ORDER BY is read in this scope too, and named the
+        // same way: `SELECT GROUP_CONCAT(s ORDER BY zz) FROM t` is 1054 "in
+        // 'field list'" on 8.3, and it is that over an empty table, under
+        // `WHERE 1=0` and with a GROUP BY that makes no groups — so the clause
+        // is settled here and not when a row reaches it. The whole clause was
+        // being discarded before #0088, so this answered.
+        //
         // The OVER clause's own PARTITION BY and ORDER BY are left alone.
         // MySQL resolves them too, but names them `window partition by` and
         // `window order by` in the message rather than `field list`, and a
@@ -8643,6 +8738,7 @@ fn unresolved_column(e: &Expr, refs: &[ColumnRef]) -> Option<String> {
         // a divergence.
         Expr::Function(f) => value_arguments(f)
             .iter()
+            .chain(own_order_by(f).iter().map(|i| &i.expr))
             .find_map(|a| unresolved_column(a, refs)),
         // A subquery resolves its own columns in its own scope, which is why
         // `subexpressions` does not descend into one.
@@ -8726,15 +8822,9 @@ fn malformed_escape(e: &Expr) -> Option<EngineError> {
 /// A frame's bounds are deliberately absent: `ROWS 2 PRECEDING` takes a
 /// literal count and not an expression, so there is nothing there to settle.
 fn function_carried(f: &sqlparser::ast::Function) -> Vec<Expr> {
-    use sqlparser::ast::{FunctionArgumentClause, FunctionArguments, WindowType};
+    use sqlparser::ast::WindowType;
     let mut carried = value_arguments(f);
-    if let FunctionArguments::List(list) = &f.args {
-        for clause in &list.clauses {
-            if let FunctionArgumentClause::OrderBy(items) = clause {
-                carried.extend(items.iter().map(|i| i.expr.clone()));
-            }
-        }
-    }
+    carried.extend(own_order_by(f).iter().map(|i| i.expr.clone()));
     if let Some(WindowType::WindowSpec(spec)) = &f.over {
         carried.extend(spec.partition_by.iter().cloned());
         carried.extend(spec.order_by.iter().map(|i| i.expr.clone()));
@@ -8793,8 +8883,76 @@ fn wrong_parameter_count(e: &Expr) -> Option<EngineError> {
     }
 }
 
+/// The first aggregate in `e` whose own `ORDER BY` names a position no
+/// argument of the call answers to.
+///
+/// The position counts the call's *arguments*, not the query's output columns:
+/// `GROUP_CONCAT(s, n ORDER BY 2)` sorts by `n` on 8.3, and `GROUP_CONCAT(s
+/// ORDER BY 2)` is `Unknown column '2' in 'order clause'` there. `ORDER BY 0`
+/// is the same error, which is why this reads `written_position` rather than
+/// `ordinal_of` — and why it quotes the digits back rather than the number.
+///
+/// Here rather than in the fold for the reason the two refusals above are:
+/// with a GROUP BY over an empty table nothing is folded at all, and 8.3 still
+/// raises. `AggregateCall::read` raises it too, so the fold does not have to
+/// assume this ran.
+fn bad_aggregate_order_position(e: &Expr) -> Option<EngineError> {
+    if let Expr::Function(f) = e {
+        let arguments = value_arguments(f).len();
+        for item in own_order_by(f) {
+            if let Some((position, written)) = written_position(&item.expr) {
+                if position == 0 || position > arguments {
+                    return Some(EngineError::unknown_column(written, "order clause"));
+                }
+            }
+        }
+    }
+    match e {
+        Expr::Function(f) => function_carried(f)
+            .iter()
+            .find_map(bad_aggregate_order_position),
+        other => subexpressions(other)
+            .into_iter()
+            .find_map(bad_aggregate_order_position),
+    }
+}
+
+/// The first `GROUP_CONCAT` in `e` written as a window function.
+///
+/// 8.3 has none, and says so with this exact wording whatever the OVER clause
+/// holds: a bare `OVER ()`, a `PARTITION BY`, a frame and a named window are
+/// all 1235 there. It settles it while resolving the item, not when a row
+/// reaches one — `SELECT GROUP_CONCAT('a') OVER ()` with no FROM at all,
+/// `... FROM t WHERE 1=0`, an untaken `CASE` branch and an `ORDER BY` are each
+/// 1235 — which is why this is here beside the other resolve-time refusals
+/// rather than in `compute_window`, where it only covered a projection over a
+/// FROM clause and let the other four answer.
+///
+/// This engine can fold one: every other aggregate here works as a window.
+/// Answering where the reference server refuses is still a divergence, so it
+/// says what 8.3 says.
+fn group_concat_as_window(e: &Expr) -> Option<EngineError> {
+    if let Expr::Function(f) = e {
+        if f.over.is_some() && f.name.to_string().eq_ignore_ascii_case("group_concat") {
+            return Some(EngineError::new(
+                1235,
+                "42000",
+                "This version of MySQL doesn't yet support 'group_concat as window function'",
+            ));
+        }
+    }
+    match e {
+        Expr::Function(f) => function_carried(f).iter().find_map(group_concat_as_window),
+        other => subexpressions(other)
+            .into_iter()
+            .find_map(group_concat_as_window),
+    }
+}
+
 /// Refuses a clause 8.3 settles before it evaluates a row: an ESCAPE that
-/// cannot be one, and a native function called with the wrong parameter count.
+/// cannot be one, a native function called with the wrong parameter count, an
+/// aggregate's own `ORDER BY` naming a position it has no argument for, and
+/// `GROUP_CONCAT` written as a window function.
 ///
 /// One function rather than the `if let Some(bad)` written out at each clause,
 /// because the number of clauses is the whole problem this has: #0093 wired
@@ -8816,11 +8974,30 @@ fn wrong_parameter_count(e: &Expr) -> Option<EngineError> {
 /// 8.3 — the same ordering gap `wrong_parameter_count` records against 1146,
 /// and for the same reason. Both answers are refusals, which is the half that
 /// matters.
+///
+/// The ORDER BY position is asked last, which is also 8.3's order within one
+/// expression: `SELECT CONCAT(GROUP_CONCAT(s ORDER BY 2), SIGN()) FROM t` is
+/// 1582 there and `SELECT GROUP_CONCAT(s ORDER BY 2, s LIKE 'a' ESCAPE '!!')
+/// FROM t` is 1210, and both are those here. An unresolvable *name* beats it
+/// as well — `ORDER BY 2, zz` is 1054 for `zz` — which falls out of
+/// `resolve_projected_expr` asking `unresolved_column` before it calls this.
+/// Across a list it is the same gap as above: `SELECT GROUP_CONCAT(s ORDER BY
+/// 2), SIGN() FROM t` is 1582 on 8.3 and 1054 here, because the first item's
+/// problem wins.
+///
+/// `GROUP_CONCAT` as a window function is asked last of all, which is 8.3's
+/// order again: measured against each of the three above, 1582, 1210 and the
+/// order-clause 1054 all beat the 1235 — `SELECT GROUP_CONCAT('a' ORDER BY 2)
+/// OVER ()` is `Unknown column '2' in 'order clause'` there and not 1235 —
+/// and so does a name, which `resolve_projected_expr` settles first.
 pub(crate) fn refuse_at_resolve<'a>(
     clauses: impl IntoIterator<Item = &'a Expr>,
 ) -> EngineResult<()> {
     let refusal = |e: &Expr| -> Option<EngineError> {
-        wrong_parameter_count(e).or_else(|| malformed_escape(e))
+        wrong_parameter_count(e)
+            .or_else(|| malformed_escape(e))
+            .or_else(|| bad_aggregate_order_position(e))
+            .or_else(|| group_concat_as_window(e))
     };
     match clauses.into_iter().find_map(refusal) {
         Some(bad) => Err(bad),
@@ -9063,8 +9240,14 @@ fn check_having_scope(
         // FROM t HAVING SUM(id) > 1` resolves `id` on 8.3 and refuses on the
         // select list instead. One that resolves against nothing at all is
         // still 1054, under this clause's name.
+        //
+        // The call's own ORDER BY is read the same way and named the same way:
+        // `HAVING GROUP_CONCAT(s ORDER BY zz) = 'x'` is 1054 "in 'having
+        // clause'" on 8.3. Without it here the name reached the fold and came
+        // back under `field list`, which is the clause it is not in.
         Expr::Function(f) if is_aggregate(&f.name.to_string()) => value_arguments(f)
             .iter()
+            .chain(own_order_by(f).iter().map(|i| &i.expr))
             .find_map(|a| unresolved_column(a, refs))
             .map_or(Ok(()), |name| {
                 Err(EngineError::unknown_column(&name, "having clause"))
@@ -9528,6 +9711,150 @@ fn aggregate_argument(f: &sqlparser::ast::Function) -> Option<Expr> {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.clone()),
         _ => None,
     })
+}
+
+/// `text` cut to at most `limit` **bytes**, never through a character.
+///
+/// What `group_concat_max_len` measures is bytes, measured: at 4 a
+/// `GROUP_CONCAT` of `'éé'` and `'ab'` is `'éé'`, four bytes and two
+/// characters. But the cut lands on a character boundary — at 5 the answer for
+/// `'ab'` then `'éé'` is `61622CC3A9`, and at 6 it is *still* that, because
+/// the next character needs two bytes and only one is left. So this is a byte
+/// budget spent a character at a time, not a byte offset.
+fn truncate_bytes(mut text: String, limit: u64) -> String {
+    if text.len() as u64 <= limit {
+        return text;
+    }
+    // The end of the last character that fits whole. Every character is
+    // measured, rather than the byte offset being clamped, because
+    // `String::truncate` panics on an index inside one — and the answer would
+    // be a broken character even if it did not.
+    let mut end = 0usize;
+    for (offset, ch) in text.char_indices() {
+        if (offset + ch.len_utf8()) as u64 > limit {
+            break;
+        }
+        end = offset + ch.len_utf8();
+    }
+    text.truncate(end);
+    text
+}
+
+/// The `ORDER BY` an aggregate carries *inside its own parentheses*.
+///
+/// `GROUP_CONCAT(x ORDER BY y)` is the only spelling MySQL's grammar allows,
+/// and it is not the window's `ORDER BY`: a window's belongs to the frame and
+/// is reported under `window order by`, while this one is resolved as part of
+/// the field list. Callers that mean both take `function_carried`.
+fn own_order_by(f: &sqlparser::ast::Function) -> &[sqlparser::ast::OrderByExpr] {
+    use sqlparser::ast::{FunctionArgumentClause, FunctionArguments};
+    let FunctionArguments::List(list) = &f.args else {
+        return &[];
+    };
+    list.clauses
+        .iter()
+        .find_map(|clause| match clause {
+            FunctionArgumentClause::OrderBy(items) => Some(items.as_slice()),
+            _ => None,
+        })
+        .unwrap_or(&[])
+}
+
+/// The separator `GROUP_CONCAT` was written with, or `,` for a call with no
+/// `SEPARATOR` clause.
+///
+/// MySQL's grammar takes a *literal* here and nothing else — `SEPARATOR s`,
+/// `SEPARATOR 1`, `SEPARATOR CONCAT('a')`, `SEPARATOR NULL`, `SEPARATOR
+/// _utf8mb4'--'` and two adjacent literals are all 1064 on 8.3 — which is why
+/// this reads a literal rather than evaluating an expression.
+///
+/// But the grammar's `text_string` is wider than a quoted string: a hex or bit
+/// literal is a string of bytes and is taken. Measured on 8.3, `SEPARATOR
+/// 0x2D`, `SEPARATOR X'2D'` and `SEPARATOR b'101101'` all join with `-`, and
+/// `SEPARATOR 0x2D2D` with `--`. Reading the quoted forms and rendering
+/// anything else through `Display` joined with the literal characters `X'2D'`
+/// instead — the same shape of plausible wrong answer #0088 is about — so this
+/// goes through `expr::literal`, which is the one definition of what a literal
+/// means here.
+///
+/// That covers the hex forms and leaves the *bit* one refused with 1235, which
+/// is deliberate: `expr::literal` has no value for a bit string, so `SELECT
+/// b'101101'` is 1235 here as well. Giving the separator its own decoder would
+/// make this one clause disagree with the rest of the engine about what
+/// `b'101101'` is; #0141 is where that gap gets closed for all of them. A
+/// refusal is the honest answer until then, and it is what the old code did
+/// not do.
+fn aggregate_separator(f: &sqlparser::ast::Function) -> EngineResult<String> {
+    use sqlparser::ast::{FunctionArgumentClause, FunctionArguments};
+    let FunctionArguments::List(list) = &f.args else {
+        return Ok(",".to_owned());
+    };
+    for clause in &list.clauses {
+        if let FunctionArgumentClause::Separator(literal) = clause {
+            return Ok(crate::expr::literal(&literal.value)?.as_text());
+        }
+    }
+    Ok(",".to_owned())
+}
+
+/// How an aggregate call was written, beyond its name and the rows it folds.
+///
+/// `GROUP_CONCAT` is the only aggregate here that reads more of its own call
+/// than one argument and a DISTINCT: it concatenates *every* argument per row,
+/// orders the rows by its own `ORDER BY`, and joins them with its own
+/// `SEPARATOR`. All three were parsed and thrown away — #0088 — so the answer
+/// was a plausible string in the wrong order, which a caller comparing against
+/// an expected value cannot tell from a wrong value.
+struct AggregateCall {
+    /// Every value argument, in written order. One for every aggregate here
+    /// except `COUNT(*)`, which has none, and `GROUP_CONCAT`, which may have
+    /// several.
+    arguments: Vec<Expr>,
+    distinct: bool,
+    /// The call's own `ORDER BY`, with each position already resolved to the
+    /// argument it names.
+    order: Vec<SortKey>,
+    separator: String,
+}
+
+impl AggregateCall {
+    /// Reads one call, refusing an `ORDER BY` position no argument answers to.
+    ///
+    /// The position names an *argument* of the call, not an output column:
+    /// `GROUP_CONCAT(s, n ORDER BY 2)` sorts by `n` on 8.3. Out of range is
+    /// 1054 in `'order clause'` there, and so is `ORDER BY 0`.
+    ///
+    /// The same refusal is raised at resolve time by `refuse_at_resolve`, so a
+    /// statement over an empty relation still fails; this one is what makes
+    /// the fold total rather than something that has to trust that.
+    fn read(f: &sqlparser::ast::Function) -> EngineResult<Self> {
+        let arguments = value_arguments(f);
+        let mut order = Vec::new();
+        for item in own_order_by(f) {
+            let expr = match written_position(&item.expr) {
+                Some((position, written)) => arguments
+                    .get(position.wrapping_sub(1))
+                    .ok_or_else(|| EngineError::unknown_column(written, "order clause"))?
+                    .clone(),
+                None => item.expr.clone(),
+            };
+            order.push(SortKey {
+                expr,
+                descending: item.options.asc == Some(false),
+            });
+        }
+        Ok(Self {
+            arguments,
+            distinct: aggregate_is_distinct(f),
+            order,
+            separator: aggregate_separator(f)?,
+        })
+    }
+
+    /// The one argument every aggregate but `GROUP_CONCAT` folds over.
+    fn argument(&self) -> Option<&Expr> {
+        self.arguments.first()
+    }
 }
 
 /// Every part of an assignment target, qualifier first.

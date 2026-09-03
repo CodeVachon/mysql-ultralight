@@ -352,6 +352,11 @@ fn reset(conn: &mut Conn, group: &str) {
         // ran after one which set it would be comparing arithmetic under
         // somebody else's precision. 4 is the stock 8.3 default.
         "SET SESSION div_precision_increment = 4".to_owned(),
+        // The fourth. `GROUP_CONCAT` truncates at it, so a group that ran
+        // after one which lowered it would report every long concatenation as
+        // a divergence about somebody else's limit. 1024 is the stock 8.3
+        // default.
+        "SET SESSION group_concat_max_len = 1024".to_owned(),
         format!("DROP DATABASE IF EXISTS `{DATABASE}`"),
         format!("CREATE DATABASE `{DATABASE}`"),
         format!("USE `{DATABASE}`"),

@@ -72,7 +72,7 @@ Two things fail a run:
 
 So the file only ever shrinks, and it shrinks by fixing things.
 
-**It is empty.** All 3000 statements answer exactly as MySQL 8.3 answers them,
+**It is empty.** All 2938 statements answer exactly as MySQL 8.3 answers them,
 in both protocols — the rows, and every part of the column definition listed
 under "What a column is compared on" below. It started at 108 divergences
 across 66 statements.
@@ -245,8 +245,12 @@ otherwise be counting weeks under somebody else's mode.
 
 `div_precision_increment` is the third, restored to 4. It scales every quotient
 and every average, so a group left running under somebody else's increment
-would not be asking about arithmetic at all. Any further variable a group sets
-needs the same line in `reset`, for the same reason.
+would not be asking about arithmetic at all.
+
+`group_concat_max_len` is the fourth, restored to 1024. `GROUP_CONCAT` truncates
+at it, so a group that ran after one which lowered it would report every long
+concatenation as a divergence about somebody else's limit. Any further variable
+a group sets needs the same line in `reset`, for the same reason.
 
 ## The corpus
 

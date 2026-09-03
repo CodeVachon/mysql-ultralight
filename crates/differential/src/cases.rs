@@ -287,6 +287,128 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // Everything GROUP_CONCAT reads that no other aggregate does: its own
+        // ORDER BY, its SEPARATOR, its DISTINCT and `group_concat_max_len`.
+        // All four were parsed and thrown away — #0088 — so the answer was a
+        // plausible string in the wrong order, joined with the wrong thing,
+        // missing every argument after the first.
+        //
+        // No two rows tie on a sort key anywhere here. 8.3 breaks a tie by
+        // putting the later row first, which is its insert-order tree showing
+        // through rather than an order it defines, and this engine sorts
+        // stably — so a tied case would be this file asserting a difference
+        // nobody should depend on, which is the rule about orders that are not
+        // total applied inside a value.
+        name: "group_concat clauses",
+        setup: &[
+            "CREATE TABLE Gcc (id INT NOT NULL, k INT NOT NULL, s VARCHAR(10) NULL, \
+             n INT NULL, PRIMARY KEY (id))",
+            // Arrival order is `b, a, c`, which is none of the orders the
+            // cases ask for.
+            "INSERT INTO Gcc VALUES (1,1,'b',3),(2,1,'a',1),(3,1,'c',2),(4,2,'z',9)",
+            "CREATE TABLE GccE (id INT NOT NULL, k INT NULL, s VARCHAR(10) NULL, \
+             n INT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE GccD (id INT NOT NULL, s VARCHAR(10) NULL, n INT NULL, \
+             PRIMARY KEY (id))",
+            // Two rows share an `s` and not an `n`, which is what tells
+            // "DISTINCT keeps the first row" from "DISTINCT keeps the last".
+            "INSERT INTO GccD VALUES (1,'a',5),(2,'b',2),(3,'a',1),(4,'c',9)",
+            "CREATE TABLE GccN (id INT NOT NULL, k INT NOT NULL, s VARCHAR(10) NULL, \
+             n INT NULL, PRIMARY KEY (id))",
+            "INSERT INTO GccN VALUES (1,1,'a',NULL),(2,1,'b',7),(3,2,NULL,1),(4,2,NULL,2)",
+            // 300 bytes of one character and 300 bytes of another that is two
+            // bytes wide, so a limit between them separates a byte budget from
+            // a character count and lands where a character does not fit.
+            "CREATE TABLE GccU (id INT NOT NULL, s VARCHAR(400) NULL, PRIMARY KEY (id))",
+            "INSERT INTO GccU VALUES (1, RPAD('a', 300, 'a')), (2, RPAD('é', 150, 'é'))",
+        ],
+        cases: &[
+            same("SELECT GROUP_CONCAT(s ORDER BY s), GROUP_CONCAT(s ORDER BY n), \
+                  GROUP_CONCAT(s ORDER BY s DESC), GROUP_CONCAT(s ORDER BY n DESC, s) \
+                  FROM Gcc WHERE k = 1"),
+            // A position names an argument of the call, so the second one
+            // sorts on `n` — and every argument is concatenated per row.
+            same("SELECT GROUP_CONCAT(s ORDER BY 1), GROUP_CONCAT(s, n ORDER BY 2), \
+                  GROUP_CONCAT(k, s, n), GROUP_CONCAT(s ORDER BY -n) FROM Gcc WHERE k = 1"),
+            same("SELECT k, GROUP_CONCAT(s ORDER BY s DESC) FROM Gcc GROUP BY k ORDER BY k"),
+            same("SELECT GROUP_CONCAT(s SEPARATOR ' - '), GROUP_CONCAT(s SEPARATOR ''), \
+                  GROUP_CONCAT(s ORDER BY s SEPARATOR '|'), GROUP_CONCAT(s, n SEPARATOR '') \
+                  FROM Gcc WHERE k = 1"),
+            same("SELECT k FROM Gcc GROUP BY k HAVING GROUP_CONCAT(s ORDER BY s) = 'a,b,c'"),
+            same("SELECT GROUP_CONCAT(s ORDER BY x) FROM \
+                  (SELECT s, n AS x FROM Gcc WHERE k = 1) t"),
+            // DISTINCT sorts what it keeps when nothing else says otherwise,
+            // and it sorts by the value rather than by its text.
+            same("SELECT GROUP_CONCAT(s), GROUP_CONCAT(DISTINCT s), GROUP_CONCAT(DISTINCT n), \
+                  GROUP_CONCAT(DISTINCT s SEPARATOR '-') FROM GccD"),
+            // With an ORDER BY it keeps the first row of each value and sorts
+            // on that row's key: the surviving `a` sorts on 5, not on 1.
+            same("SELECT GROUP_CONCAT(DISTINCT s ORDER BY n), \
+                  GROUP_CONCAT(DISTINCT s ORDER BY n DESC), GROUP_CONCAT(s ORDER BY n) \
+                  FROM GccD"),
+            // A NULL is dropped, an all-NULL group is NULL, and a row with one
+            // NULL argument contributes nothing rather than its other
+            // arguments.
+            same("SELECT k, GROUP_CONCAT(s ORDER BY s) FROM GccN GROUP BY k ORDER BY k"),
+            same("SELECT GROUP_CONCAT(s, n) FROM GccN WHERE k = 1"),
+            same("SELECT GROUP_CONCAT(s ORDER BY s SEPARATOR '|') FROM GccE"),
+            same("SELECT k, GROUP_CONCAT(s) FROM GccE GROUP BY k ORDER BY k"),
+            // The refusals, each also asked where nothing is folded — an empty
+            // table, and a GROUP BY that makes no groups — because a check
+            // living in the fold would not run there at all.
+            same("SELECT GROUP_CONCAT(s ORDER BY 2) FROM Gcc"),
+            same("SELECT GROUP_CONCAT(s ORDER BY 0) FROM GccE"),
+            same("SELECT GROUP_CONCAT(s, n ORDER BY 3) FROM Gcc"),
+            same("SELECT GROUP_CONCAT(s ORDER BY zz) FROM GccE"),
+            same("SELECT k, GROUP_CONCAT(s ORDER BY 2) FROM GccE GROUP BY k"),
+            same("SELECT k FROM Gcc GROUP BY k HAVING GROUP_CONCAT(s ORDER BY zz) = 'x'"),
+            // The grammar takes a `text_string` separator, which is wider than
+            // a quoted string: a hex literal is a string of bytes.
+            same("SELECT GROUP_CONCAT(s SEPARATOR 0x2D), GROUP_CONCAT(s SEPARATOR X'2D'), \
+                  GROUP_CONCAT(s SEPARATOR 0x2D2D) FROM Gcc WHERE k = 1"),
+            // 8.3 has no GROUP_CONCAT window function at all, and it settles
+            // that while resolving the item — so a FROM-less select, an
+            // untaken CASE branch, an empty relation and an ORDER BY are each
+            // 1235 there, and none of them reaches a window pass here.
+            same("SELECT GROUP_CONCAT(s) OVER () FROM Gcc"),
+            same("SELECT GROUP_CONCAT(s) OVER (PARTITION BY k) FROM GccE"),
+            same("SELECT GROUP_CONCAT('a') OVER ()"),
+            same("SELECT CASE WHEN 0 THEN GROUP_CONCAT(s) OVER () ELSE 1 END FROM Gcc"),
+            same("SELECT GROUP_CONCAT(s) OVER () FROM Gcc WHERE 1 = 0"),
+            same("SELECT 1 FROM Gcc ORDER BY GROUP_CONCAT(s) OVER ()"),
+            // And it is the last of the resolve-time refusals: each of these
+            // is the other error on 8.3 rather than the 1235.
+            same("SELECT GROUP_CONCAT('a' ORDER BY 2) OVER ()"),
+            same("SELECT GROUP_CONCAT(zz) OVER () FROM Gcc"),
+            // `group_concat_max_len` truncates the answer, in bytes and never
+            // through a character: 601 bytes of 451 characters, cut at 600, is
+            // 599 bytes of 450 — the last two-byte character did not fit.
+            //
+            // Asked through LENGTH rather than by comparing a 600-byte string,
+            // and every limit here is above 512 on purpose: at or below that
+            // 8.3 describes GROUP_CONCAT as a VAR_STRING rather than a
+            // LONG_BLOB, and this engine describes it the same way whatever
+            // the limit is. That is a gap about the *type*, which nothing here
+            // reads, and it needs an issue rather than a case that hides it.
+            same("SELECT LENGTH(GROUP_CONCAT(s ORDER BY s)), \
+                  CHAR_LENGTH(GROUP_CONCAT(s ORDER BY s)) FROM GccU"),
+            // The `SET` is a case rather than setup so the group's own limit
+            // survives it, the way the week-format group does it.
+            same("SET SESSION group_concat_max_len = 600"),
+            same("SELECT LENGTH(GROUP_CONCAT(s ORDER BY s)) AS cut, \
+                  CHAR_LENGTH(GROUP_CONCAT(s ORDER BY s)) FROM GccU"),
+            same("SET SESSION group_concat_max_len = 601"),
+            same("SELECT LENGTH(GROUP_CONCAT(s ORDER BY s)) AS whole, \
+                  CHAR_LENGTH(GROUP_CONCAT(s ORDER BY s)) FROM GccU"),
+            // A value that is not an integer is 1232 on both, a string
+            // spelling one included.
+            same("SET SESSION group_concat_max_len = 'abc'"),
+            same("SET SESSION group_concat_max_len = '3'"),
+            same("SET SESSION group_concat_max_len = 3.7"),
+            same("SET SESSION group_concat_max_len = NULL"),
+        ],
+    },
+    Group {
         // What makes a query grouped, and what a HAVING can see. Nothing here
         // asks about aggregation itself; the point is the boundary either side
         // of the clause, which is where #0103 sat.

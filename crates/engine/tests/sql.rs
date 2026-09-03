@@ -2085,6 +2085,500 @@ fn group_concat_joins_a_group() {
     );
 }
 
+/// Rows whose arrival order is not any of the orders the tests below expect.
+///
+/// That is the point of the values: `b, a, c` arrives in none of the orders
+/// `ORDER BY s`, `ORDER BY n` or `ORDER BY s DESC` asks for, so a test that
+/// passes here is not passing on the order the rows happened to be in.
+///
+/// No two rows tie on `s` or on `n` either. 8.3 orders tied rows by putting
+/// the later one first, which is its insert-order tree showing through rather
+/// than an order it defines, and this engine sorts stably instead — so a tie
+/// would be a test asserting a difference nobody should depend on.
+fn group_concat_rows(engine: &Engine, session: &mut Session) {
+    run(
+        engine,
+        session,
+        "CREATE TABLE Gc (k INT NOT NULL, s VARCHAR(10) NULL, n INT NULL)",
+    );
+    run(
+        engine,
+        session,
+        "INSERT INTO Gc (k, s, n) VALUES (1, 'b', 3), (1, 'a', 1), (1, 'c', 2), (2, 'z', 9)",
+    );
+}
+
+/// GROUP_CONCAT's own ORDER BY orders the values it concatenates.
+///
+/// Every expected string measured on 8.3. The clause was parsed and discarded
+/// — #0088 — so every one of these came back `b,a,c`, the order the rows
+/// arrived in: a plausible answer, and one a caller comparing against an
+/// expected value cannot tell from a wrong value.
+#[test]
+fn group_concat_orders_by_its_own_clause() {
+    let (engine, mut session) = engine();
+    group_concat_rows(&engine, &mut session);
+
+    for (sql, expected) in [
+        // The concatenated expression itself, and a column that is not it.
+        ("GROUP_CONCAT(s ORDER BY s)", "a,b,c"),
+        ("GROUP_CONCAT(s ORDER BY n)", "a,c,b"),
+        ("GROUP_CONCAT(s ORDER BY s DESC)", "c,b,a"),
+        ("GROUP_CONCAT(s ORDER BY n DESC)", "b,c,a"),
+        // ASC written out is the default, not a third thing.
+        ("GROUP_CONCAT(s ORDER BY s ASC)", "a,b,c"),
+        // A position names an *argument of the call*, not an output column.
+        // Parentheses and a unary plus are peeled off it, as they are in a
+        // query's own ORDER BY.
+        ("GROUP_CONCAT(s ORDER BY 1)", "a,b,c"),
+        ("GROUP_CONCAT(s ORDER BY (1))", "a,b,c"),
+        ("GROUP_CONCAT(s ORDER BY +1)", "a,b,c"),
+        ("GROUP_CONCAT(s, n ORDER BY 2)", "a1,c2,b3"),
+        // Several keys, and an expression rather than a bare column.
+        ("GROUP_CONCAT(s ORDER BY n DESC, s)", "b,c,a"),
+        ("GROUP_CONCAT(s ORDER BY -n)", "b,c,a"),
+    ] {
+        assert_eq!(
+            rows(
+                &engine,
+                &mut session,
+                &format!("SELECT {sql} FROM Gc WHERE k = 1"),
+            ),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // The clause reads a derived table's aliases, because it resolves in the
+    // same scope the field list does.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT GROUP_CONCAT(s ORDER BY x) FROM (SELECT s, n AS x FROM Gc WHERE k = 1) t",
+        ),
+        vec![vec!["a,c,b"]]
+    );
+
+    // Per group, not once over the whole result.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT GROUP_CONCAT(s ORDER BY s DESC) FROM Gc GROUP BY k ORDER BY k",
+        ),
+        vec![vec!["c,b,a"], vec!["z"]]
+    );
+
+    // And in a HAVING, where the clause decides which groups come back rather
+    // than what one of them says.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k FROM Gc GROUP BY k HAVING GROUP_CONCAT(s ORDER BY s) = 'a,b,c'",
+        ),
+        vec![vec!["1"]]
+    );
+}
+
+/// GROUP_CONCAT joins with the separator it was given, and concatenates every
+/// argument it was given.
+///
+/// Both were discarded with the ORDER BY — #0088 — so the separator was always
+/// `,` and every argument after the first was dropped. All measured on 8.3.
+#[test]
+fn group_concat_reads_its_separator_and_every_argument() {
+    let (engine, mut session) = engine();
+    group_concat_rows(&engine, &mut session);
+
+    for (sql, expected) in [
+        ("GROUP_CONCAT(s SEPARATOR ' - ')", "b - a - c"),
+        // An empty separator really does join with nothing, rather than
+        // falling back to the default.
+        ("GROUP_CONCAT(s SEPARATOR '')", "bac"),
+        ("GROUP_CONCAT(s ORDER BY s SEPARATOR '|')", "a|b|c"),
+        // Several arguments are one value per row, concatenated — so the
+        // separator goes between rows and not between arguments.
+        ("GROUP_CONCAT(s, n)", "b3,a1,c2"),
+        ("GROUP_CONCAT(s, n SEPARATOR '')", "b3a1c2"),
+        ("GROUP_CONCAT(k, s, n)", "1b3,1a1,1c2"),
+        // MySQL's grammar takes a `text_string` here, which is wider than a
+        // quoted one: a hex literal is a string of bytes and is a separator.
+        // Rendering it back through Display joined with the four characters
+        // `X'2D'` instead, which is a wrong answer wearing a plausible shape.
+        ("GROUP_CONCAT(s SEPARATOR 0x2D)", "b-a-c"),
+        ("GROUP_CONCAT(s SEPARATOR X'2D')", "b-a-c"),
+        ("GROUP_CONCAT(s SEPARATOR 0x2D2D)", "b--a--c"),
+    ] {
+        assert_eq!(
+            rows(
+                &engine,
+                &mut session,
+                &format!("SELECT {sql} FROM Gc WHERE k = 1"),
+            ),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // A row contributes under CONCAT's NULL rule: one NULL argument takes the
+    // whole row out, rather than leaving the other arguments behind.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Gc (k, s, n) VALUES (3, 'q', NULL), (3, 'r', 7)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT GROUP_CONCAT(s), GROUP_CONCAT(s, n) FROM Gc WHERE k = 3",
+        ),
+        vec![vec!["q,r", "r7"]]
+    );
+
+    // A *bit* literal is a separator on 8.3 too — `b'101101'` joins with `-`
+    // there — and this engine has no value for one anywhere: `SELECT
+    // b'101101'` is 1235 here as well, which is #0141. A refusal is the
+    // honest answer for the gap; joining with the characters `B'101101'` was
+    // not.
+    let error = refusal_of(
+        &engine,
+        &mut session,
+        "SELECT GROUP_CONCAT(s SEPARATOR b'101101') FROM Gc",
+    );
+    assert_eq!(error.code, 1235);
+    assert_eq!(
+        error.message,
+        "mysql-ultralight does not yet support literal `B'101101'`"
+    );
+}
+
+/// DISTINCT de-duplicates GROUP_CONCAT on the value a row contributes, and
+/// sorts what is left when there is no ORDER BY to say otherwise.
+///
+/// The sort is 8.3's, measured: `GROUP_CONCAT(DISTINCT s)` over `B` and `a` is
+/// `a,B` and over 10, 9 and 100 it is `9,10,100`, so it is the comparison
+/// ORDER BY uses rather than a text one. This engine de-duplicated and then
+/// answered in arrival order.
+#[test]
+fn group_concat_distinct_dedupes_and_sorts() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Dc (s VARCHAR(10) NULL, n INT NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Dc (s, n) VALUES ('a', 5), ('b', 2), ('a', 1), ('c', 9)",
+    );
+
+    for (sql, expected) in [
+        ("GROUP_CONCAT(s)", "a,b,a,c"),
+        ("GROUP_CONCAT(DISTINCT s)", "a,b,c"),
+        ("GROUP_CONCAT(DISTINCT n)", "1,2,5,9"),
+        ("GROUP_CONCAT(DISTINCT s SEPARATOR '-')", "a-b-c"),
+        // With an ORDER BY, DISTINCT keeps the *first* row of each value and
+        // orders on that row's key: the surviving `a` sorts on 5, not on 1.
+        ("GROUP_CONCAT(DISTINCT s ORDER BY n)", "b,a,c"),
+        ("GROUP_CONCAT(DISTINCT s ORDER BY n DESC)", "c,a,b"),
+        ("GROUP_CONCAT(s ORDER BY n)", "a,b,a,c"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, &format!("SELECT {sql} FROM Dc")),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // The implicit sort is by value and not by text, and it folds case the way
+    // the collation does — `B` sorts under `b`, and 100 after 10.
+    run(&engine, &mut session, "DELETE FROM Dc");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Dc (s, n) VALUES ('B', 10), ('a', 9), ('a', 100)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT GROUP_CONCAT(DISTINCT s), GROUP_CONCAT(DISTINCT n) FROM Dc",
+        ),
+        vec![vec!["a,B", "9,10,100"]]
+    );
+}
+
+/// GROUP_CONCAT truncates its answer at `group_concat_max_len`.
+///
+/// The variable existed and was answered but never read, so a result of any
+/// length came back whole. Measured on 8.3: the limit counts **bytes**, the
+/// stock value is 1024, and a `SET` below 4 is clamped up to 4.
+#[test]
+fn group_concat_truncates_at_group_concat_max_len() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Tc (s VARCHAR(10) NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Tc (s) VALUES ('ab'), ('éé')",
+    );
+
+    // The stock limit, which nothing here comes near.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @@group_concat_max_len"),
+        vec![vec!["1024"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT GROUP_CONCAT(s ORDER BY s) FROM Tc",
+        ),
+        vec![vec!["ab,éé"]]
+    );
+
+    // Bytes, and a whole character at a time: `ab,` is three bytes, and the
+    // `é` that follows needs two — so 5 and 6 give the same answer, and only
+    // 7 fits the whole string of five characters and seven bytes.
+    for (limit, expected) in [
+        ("3", "ab,"),
+        ("4", "ab,"),
+        ("5", "ab,é"),
+        ("6", "ab,é"),
+        ("7", "ab,éé"),
+        ("1024", "ab,éé"),
+    ] {
+        run(
+            &engine,
+            &mut session,
+            &format!("SET SESSION group_concat_max_len = {limit}"),
+        );
+        assert_eq!(
+            rows(
+                &engine,
+                &mut session,
+                "SELECT GROUP_CONCAT(s ORDER BY s) FROM Tc",
+            ),
+            vec![vec![expected]],
+            "at {limit}"
+        );
+    }
+
+    // 4 is the floor 8.3 clamps to, so the 3 above was really a 4 — which is
+    // why both rows say `ab,`.
+    run(
+        &engine,
+        &mut session,
+        "SET SESSION group_concat_max_len = 3",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @@group_concat_max_len"),
+        vec![vec!["4"]]
+    );
+    run(
+        &engine,
+        &mut session,
+        "SET SESSION group_concat_max_len = -1",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @@group_concat_max_len"),
+        vec![vec!["4"]]
+    );
+    // The variable really does run to the full u64 on 8.3.
+    run(
+        &engine,
+        &mut session,
+        "SET SESSION group_concat_max_len = 18446744073709551615",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @@group_concat_max_len"),
+        vec![vec!["18446744073709551615"]]
+    );
+    assert_eq!(
+        refusal_of(
+            &engine,
+            &mut session,
+            "SET SESSION group_concat_max_len = 'abc'",
+        )
+        .code,
+        1232
+    );
+}
+
+/// What GROUP_CONCAT answers where there is nothing to concatenate.
+///
+/// NULL rather than the empty string, in every shape of it. Measured on 8.3.
+#[test]
+fn group_concat_over_nothing_is_null() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Nc (k INT NOT NULL, s VARCHAR(10) NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Nc (k, s) VALUES (1, 'a'), (1, NULL), (2, NULL), (2, NULL)",
+    );
+
+    // A NULL in the group is dropped; a group that is all NULL is NULL, and
+    // its ORDER BY does not change that.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k, GROUP_CONCAT(s ORDER BY s) FROM Nc GROUP BY k ORDER BY k",
+        ),
+        vec![vec!["1", "a"], vec!["2", "NULL"]]
+    );
+
+    // Over an empty table there is one group and it is NULL, and with a GROUP
+    // BY there is no group at all.
+    run(&engine, &mut session, "DELETE FROM Nc");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT GROUP_CONCAT(s ORDER BY s SEPARATOR '|') FROM Nc",
+        ),
+        vec![vec!["NULL"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k, GROUP_CONCAT(s) FROM Nc GROUP BY k",
+        ),
+        Vec::<Vec<String>>::new()
+    );
+}
+
+/// A GROUP_CONCAT clause 8.3 settles while it resolves the item.
+///
+/// The zero-rows question from #0009 applied to a new refusal: every one of
+/// these has to raise over an empty table, under `WHERE 1=0` and behind a
+/// GROUP BY that makes no groups, because in all three nothing is ever folded
+/// and a check living in the fold would not run at all.
+#[test]
+fn group_concat_refuses_an_unresolvable_own_order_by() {
+    let (engine, mut session) = engine();
+    group_concat_rows(&engine, &mut session);
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Ec (k INT, s VARCHAR(10))",
+    );
+
+    // A position counts the call's arguments, so one argument answers to 1 and
+    // to nothing else. Zero is a position too, and the message quotes the
+    // digits as they were written.
+    for sql in [
+        "SELECT GROUP_CONCAT(s ORDER BY 2) FROM Gc",
+        "SELECT GROUP_CONCAT(s ORDER BY 2) FROM Ec",
+        "SELECT GROUP_CONCAT(s ORDER BY 2) FROM Gc WHERE 1 = 0",
+        "SELECT k, GROUP_CONCAT(s ORDER BY 2) FROM Ec GROUP BY k",
+        "SELECT k FROM Gc GROUP BY k HAVING GROUP_CONCAT(s ORDER BY 2) = 'x'",
+        "SELECT k FROM Gc GROUP BY k ORDER BY GROUP_CONCAT(s ORDER BY 2)",
+        "SELECT GROUP_CONCAT(s ORDER BY (2)) FROM Gc",
+    ] {
+        let error = refusal_of(&engine, &mut session, sql);
+        assert_eq!(error.code, 1054, "{sql}");
+        assert_eq!(
+            error.message, "Unknown column '2' in 'order clause'",
+            "{sql}"
+        );
+    }
+    for (sql, written) in [
+        ("SELECT GROUP_CONCAT(s ORDER BY 0) FROM Ec", "0"),
+        ("SELECT GROUP_CONCAT(s, n ORDER BY 3) FROM Gc", "3"),
+    ] {
+        assert_eq!(
+            refusal_of(&engine, &mut session, sql).message,
+            format!("Unknown column '{written}' in 'order clause'"),
+            "{sql}"
+        );
+    }
+
+    // A *name* the clause cannot resolve is 1054 under the clause the call is
+    // in — `field list` for a select item, `having clause` for a HAVING — and
+    // it beats the position, which is 8.3's order too.
+    for sql in [
+        "SELECT GROUP_CONCAT(s ORDER BY zz) FROM Gc",
+        "SELECT GROUP_CONCAT(s ORDER BY zz) FROM Ec",
+        "SELECT GROUP_CONCAT(s ORDER BY zz) FROM Gc WHERE 1 = 0",
+        "SELECT k, GROUP_CONCAT(s ORDER BY zz) FROM Ec GROUP BY k",
+        "SELECT GROUP_CONCAT(s ORDER BY 2, zz) FROM Gc",
+    ] {
+        let error = refusal_of(&engine, &mut session, sql);
+        assert_eq!(error.code, 1054, "{sql}");
+        assert_eq!(
+            error.message, "Unknown column 'zz' in 'field list'",
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        refusal_of(
+            &engine,
+            &mut session,
+            "SELECT k FROM Gc GROUP BY k HAVING GROUP_CONCAT(s ORDER BY zz) = 'x'",
+        )
+        .message,
+        "Unknown column 'zz' in 'having clause'"
+    );
+
+    // 8.3 has no GROUP_CONCAT window function at all, whatever the OVER clause
+    // holds. This engine could fold one, and answering where the reference
+    // server refuses is still a divergence.
+    //
+    // 8.3 settles it while it resolves the item, which is the whole reason the
+    // refusal is not in `compute_window`: the last five of these never reach
+    // one — a FROM-less select has no window pass, an untaken CASE branch and
+    // an empty relation evaluate nothing, and an ORDER BY is a different
+    // clause — and all five answered while it lived there.
+    for sql in [
+        "SELECT GROUP_CONCAT(s) OVER () FROM Gc",
+        "SELECT GROUP_CONCAT(s) OVER (PARTITION BY k) FROM Gc",
+        "SELECT GROUP_CONCAT(s) OVER (ROWS 2 PRECEDING) FROM Gc",
+        "SELECT GROUP_CONCAT('a') OVER ()",
+        "SELECT CASE WHEN 0 THEN GROUP_CONCAT('a') OVER () ELSE 1 END",
+        "SELECT CASE WHEN 0 THEN GROUP_CONCAT(s) OVER () ELSE 1 END FROM Gc",
+        "SELECT GROUP_CONCAT(s) OVER () FROM Gc WHERE 1 = 0",
+        "SELECT GROUP_CONCAT(s) OVER () FROM Ec",
+        "SELECT 1 FROM Gc ORDER BY GROUP_CONCAT(s) OVER ()",
+    ] {
+        let error = refusal_of(&engine, &mut session, sql);
+        assert_eq!(error.code, 1235, "{sql}");
+        assert_eq!(
+            error.message,
+            "This version of MySQL doesn't yet support 'group_concat as window function'",
+            "{sql}"
+        );
+    }
+
+    // And it is the *last* of the resolve-time refusals, measured: each of
+    // these is the other error on 8.3 and not the 1235.
+    for (sql, code) in [
+        ("SELECT CONCAT(GROUP_CONCAT('a') OVER (), SIGN())", 1582),
+        (
+            "SELECT CONCAT(GROUP_CONCAT('a') OVER (), 'x' LIKE 'a' ESCAPE '!!')",
+            1210,
+        ),
+        ("SELECT GROUP_CONCAT('a' ORDER BY 2) OVER ()", 1054),
+        ("SELECT GROUP_CONCAT(zz) OVER () FROM Gc", 1054),
+    ] {
+        assert_eq!(refusal_of(&engine, &mut session, sql).code, code, "{sql}");
+    }
+}
+
 #[test]
 fn union_combines_and_deduplicates() {
     let (engine, mut session) = engine();
