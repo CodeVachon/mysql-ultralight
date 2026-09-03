@@ -39,3 +39,6 @@
 {"at":"2026-09-03T02:41:33Z","id":92,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-09-03T02:41:43Z","id":132,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
 {"at":"2026-09-03T02:43:34Z","id":158,"by":"Christopher Vachon","as":"user","type":"created","title":"A FROM-less SELECT ignores its WHERE clause","state":"Todo"}
+{"at":"2026-09-03T02:58:12Z","id":116,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T02:58:24Z","id":158,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T03:22:29Z","id":159,"by":"Christopher Vachon","as":"user","type":"created","title":"A non-numeric string compared to a number answers wrongly","state":"Todo"}

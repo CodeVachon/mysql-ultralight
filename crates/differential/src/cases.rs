@@ -4024,6 +4024,198 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // A comparison's collation is resolved from *both* operands, and the
+        // binary character set beats every other one. So a single binary
+        // operand makes the whole comparison byte for byte — case-sensitive,
+        // and by the bytes rather than by the characters.
+        //
+        // This engine took its byte-exact branch only when both sides were
+        // bytes, so a binary string beside a literal fell through to the
+        // case-insensitive collation and `CAST('AB' AS BINARY) = 'ab'`
+        // answered 1 against 8.3's 0. #0139, and the reason `UNHEX('4142') =
+        // 'ab'` could not become a case when #0130 added the function.
+        //
+        // Measured rather than reasoned: `COLLATION(CAST('AB' AS BINARY))` is
+        // `binary` at coercibility 2 against `utf8mb4_0900_ai_ci` at 4 for a
+        // literal, and a hex literal is `binary` at 4 — so coercibility alone
+        // does not decide it and the character set does.
+        //
+        // The group carries the grouping and the unique key beside the
+        // operators on purpose. `Value::collation_key` decides GROUP BY and
+        // DISTINCT where `Value::compare` decides `WHERE` and a unique index,
+        // and a fix to one that does not move the other makes a query's
+        // grouping contradict its own filter.
+        name: "a binary operand decides the collation",
+        setup: &[
+            "CREATE TABLE Bcmp (id INT NOT NULL, b VARBINARY(16) NULL, t VARCHAR(16) NULL, \
+             raw VARBINARY(8) NULL, nul VARBINARY(8) NULL, PRIMARY KEY (id))",
+            "INSERT INTO Bcmp VALUES (1,'AB','ab',UNHEX('FF'),UNHEX('004E554C4C')),\
+             (2,'ab','AB',UNHEX('FE'),UNHEX('004E554C4C')),(3,'aB','Zz',UNHEX('FF'),NULL)",
+            // A binary string into three numeric columns, which is the other
+            // half of "a binary string is read as a number the way text is":
+            // an engine that reads it for one column and refuses it for
+            // another fails this *setup* rather than a case.
+            "CREATE TABLE Bnum (i INT NULL, d DOUBLE NULL, n DECIMAL(6,2) NULL)",
+            "INSERT INTO Bnum VALUES (UNHEX('3132'), UNHEX('3132'), UNHEX('3132'))",
+            "CREATE TABLE Bwide (id INT NOT NULL, bu BIGINT UNSIGNED NULL, PRIMARY KEY (id))",
+            "INSERT INTO Bwide VALUES (1, CAST('18446744073709551615' AS BINARY)), \
+             (2, '18446744073709551615')",
+        ],
+        cases: &[
+            // The three shapes the issue names: a cast, a hex literal and a
+            // column, each against a literal differing only in case. The
+            // matching spelling is asked beside each so the group cannot pass
+            // by answering 0 to everything.
+            same("SELECT CAST('AB' AS BINARY) = 'ab', CAST('AB' AS BINARY) = 'AB'"),
+            same("SELECT X'4142' = 'ab', X'4142' = 'AB'"),
+            same("SELECT b = 'ab', b = 'AB', b = t FROM Bcmp ORDER BY id"),
+            // Either side, since the rule is about the pair and not about
+            // which operand came first.
+            same("SELECT 'ab' = CAST('AB' AS BINARY), 'AB' = CAST('AB' AS BINARY)"),
+            // The ordering operators, which the collation answered 0 to in
+            // both directions because it called the two equal: 'AB' is 0x4142
+            // and 'ab' is 0x6162, so the uppercase spelling is the smaller.
+            same("SELECT CAST('AB' AS BINARY) < 'ab', CAST('AB' AS BINARY) > 'ab', \
+                  CAST('AB' AS BINARY) <> 'ab', CAST('AB' AS BINARY) >= 'AB'"),
+            // The null-safe operator goes with `=`, and a NULL operand is
+            // still unknown for the ordinary one.
+            same("SELECT CAST('AB' AS BINARY) <=> 'ab', CAST('AB' AS BINARY) <=> 'AB', \
+                  CAST('AB' AS BINARY) <=> NULL, CAST('AB' AS BINARY) = NULL"),
+            // The constructs that compare without an operator.
+            same("SELECT CAST('AB' AS BINARY) IN ('ab','zz'), \
+                  CAST('AB' AS BINARY) IN ('AB','zz'), \
+                  CAST('B' AS BINARY) BETWEEN 'a' AND 'c', \
+                  CAST('B' AS BINARY) BETWEEN 'A' AND 'C'"),
+            // Both answer a *number* rather than the string they chose,
+            // because MySQL builds a binary string out of a `CASE` or a
+            // `NULLIF` over a binary operand and this engine builds text —
+            // #0128's charset propagation, which is not what these are for.
+            // Written as strings the two cases report that gap instead of the
+            // comparison, which was measured here before they were rewritten.
+            same("SELECT CASE CAST('AB' AS BINARY) WHEN 'ab' THEN 1 ELSE 0 END, \
+                  CASE CAST('AB' AS BINARY) WHEN 'AB' THEN 1 ELSE 0 END"),
+            same("SELECT NULLIF(CAST('AB' AS BINARY),'ab') IS NULL, \
+                  NULLIF(CAST('AB' AS BINARY),'AB') IS NULL"),
+            // Two binary strings, which were already byte-exact, and the pair
+            // where the bytes really are equal.
+            same("SELECT CAST('AB' AS BINARY) = CAST('ab' AS BINARY), \
+                  CAST('AB' AS BINARY) = CAST('AB' AS BINARY)"),
+            // The functions #0130 added, which are the reason this was found.
+            same("SELECT UNHEX('4142') = 'ab', UNHEX('4142') = 'AB', \
+                  FROM_BASE64('QUI=') = 'ab', FROM_BASE64('QUI=') = 'AB'"),
+            // Bytes that are not text, which every case above avoids by using
+            // letters. A value has to equal its own cast — the cast built its
+            // bytes through a lossy decode, so a byte that is not UTF-8 came
+            // back as the three of U+FFFD and the byte-exact comparison then
+            // said the two were different. `HEX` beside it, because the
+            // equality alone would pass with both sides mangled.
+            same("SELECT CAST(UNHEX('FF') AS BINARY) = UNHEX('FF'), \
+                  HEX(CAST(UNHEX('FF') AS BINARY)), HEX(CAST(UNHEX('C3A9') AS BINARY))"),
+            same("SELECT UNHEX('FF') = UNHEX('FE'), UNHEX('FF') = UNHEX('FF'), \
+                  UNHEX('80') = '80'"),
+            // A number on the other side is *not* this rule. MySQL reads a
+            // binary string in a numeric context exactly as it reads text, so
+            // these compare as numbers; `> 3` is the one that tells the two
+            // readings apart, because by the characters '1' comes before '3'.
+            same("SELECT CAST('12' AS BINARY) > 3, CAST('1' AS BINARY) = 1, \
+                  CAST('1' AS BINARY) = 1.0"),
+            same("SELECT i, d, n FROM Bnum"),
+            // The full width, which the `i64` reading saturated: a BIGINT
+            // UNSIGNED column range-checks itself through `as_exact_int`, so a
+            // binary string spelling 18446744073709551615 was *stored* as
+            // 9223372036854775807 while the same digits as text stored the
+            // number they spell. Both rows come from the setup, so a wrong
+            // reading is a wrong stored value here and not a wrong answer.
+            same("SELECT bu FROM Bwide ORDER BY id"),
+            same("SELECT CAST(CAST('18446744073709551615' AS BINARY) AS UNSIGNED), \
+                  CAST('18446744073709551615' AS UNSIGNED)"),
+            // Trailing space, which a binary comparison never pads away: 'a'
+            // is one byte and 'a ' is two, so they differ and the shorter
+            // sorts first. The *text* half of the same question is left out
+            // deliberately — `'a' = 'a '` is 1 under this connection, whose
+            // negotiated collation is the PAD SPACE utf8mb4_general_ci, and 0
+            // under the NO PAD utf8mb4_0900_ai_ci a column would get. That is
+            // #0129's per-column collation, not this, and it was measured
+            // here: MySQL answers 1 through the harness and 0 through a
+            // client that has done `SET NAMES utf8mb4`.
+            same("SELECT CAST('a' AS BINARY) = 'a ', CAST('a' AS BINARY) < 'a ', \
+                  CAST('a' AS BINARY) = CAST('a ' AS BINARY)"),
+            // Which rows a query returns, which is what the divergence
+            // actually cost: a filter, a join and a self-join over the mixed
+            // pair.
+            same("SELECT COUNT(*) FROM Bcmp WHERE b = t"),
+            same("SELECT COUNT(*) FROM Bcmp WHERE b = 'ab'"),
+            same("SELECT COUNT(*) FROM Bcmp x JOIN Bcmp y ON x.b = y.t"),
+            // Grouping, de-duplication and sorting over the binary column,
+            // where three byte strings that differ only in case are three
+            // groups and the sort is by the bytes: 0x4142, 0x6142, 0x6162.
+            same("SELECT b, COUNT(*) FROM Bcmp GROUP BY b ORDER BY b"),
+            same("SELECT DISTINCT b FROM Bcmp ORDER BY b"),
+            same("SELECT b FROM Bcmp ORDER BY b"),
+            // And the text column beside it, which still folds case — the
+            // whole point being that the two columns answer differently.
+            same("SELECT t, COUNT(*) FROM Bcmp GROUP BY t ORDER BY t"),
+            same("SELECT b FROM Bcmp ORDER BY b DESC"),
+            // The same three questions over bytes that are not text, which is
+            // where the grouping key and the comparison came apart: the key
+            // decoded lossily, so 0xFF and 0xFE reached one key while `=`
+            // called them different. UNION's de-duplication runs on that key
+            // too. `raw` is a second column so these do not have to disturb
+            // what every case above counts over `b`.
+            same("SELECT HEX(raw), COUNT(*) FROM Bcmp GROUP BY raw ORDER BY raw"),
+            same("SELECT COUNT(DISTINCT raw) FROM Bcmp"),
+            same("SELECT COUNT(*) FROM (SELECT UNHEX('FF') AS x UNION SELECT UNHEX('FE')) u"),
+            // And the one shape that says the escaped key cannot land in the
+            // text key space: the byte 0x80 hexes to `80`, which is the key
+            // the *string* `'80'` would get.
+            same("SELECT COUNT(*) FROM (SELECT UNHEX('80') AS x UNION SELECT '80') u"),
+            // Nor in the *unescaped byte* key space, which is the harder half:
+            // `UNHEX('00584333')` is valid UTF-8 spelling the escape for the
+            // single byte 0xC3, so escaping only the invalid strings put those
+            // two in one group while `=` kept them apart.
+            same("SELECT UNHEX('C3') = UNHEX('00584333')"),
+            same("SELECT COUNT(*) FROM \
+                  (SELECT UNHEX('C3') AS x UNION SELECT UNHEX('00584333')) u"),
+            // Nor in the NULL sentinel's: `exec.rs` keys SQL NULL as `\0NULL`
+            // and `UNHEX('004E554C4C')` spells it, so a NULL row joined the
+            // value's group and the group reported itself as holding those
+            // bytes. `nul` is a column of its own for the same reason `raw`
+            // is.
+            same("SELECT HEX(nul), COUNT(*) FROM Bcmp GROUP BY nul ORDER BY nul"),
+            same("SELECT COUNT(*) FROM \
+                  (SELECT UNHEX('004E554C4C') AS x UNION SELECT NULL) u"),
+        ],
+    },
+    Group {
+        // The unique key half of #0139, in a group of its own because it is
+        // the only shape here that needs a schema the cases above must not
+        // have: a UNIQUE index cannot be added to `Bcmp` without changing
+        // what every case over it counts.
+        //
+        // #0149's original bug was a unique key, and `Catalog::check_unique`
+        // reaches `Value::compare` by a different path from `WHERE` — so the
+        // rule is asked here directly rather than inferred.
+        name: "a unique key over binary data",
+        setup: &[
+            "CREATE TABLE Ubin (b VARBINARY(16) NOT NULL, UNIQUE KEY (b))",
+            "INSERT INTO Ubin VALUES ('AB'),('ab'),('aB')",
+            "CREATE TABLE Umix (b VARBINARY(16) NOT NULL, t VARCHAR(16) NOT NULL, \
+             UNIQUE KEY (b, t))",
+            "INSERT INTO Umix VALUES ('AB','x'),('ab','X')",
+        ],
+        cases: &[
+            // Three rows, not one: the second and third INSERT above are
+            // duplicates under the collation and distinct under the bytes, so
+            // a wrong answer here fails the *setup* rather than the case.
+            same("SELECT COUNT(*) FROM Ubin"),
+            same("SELECT b FROM Ubin ORDER BY b"),
+            // The mixed key, where the text half still folds case and the two
+            // rows are distinct only because the binary half does not.
+            same("SELECT COUNT(*) FROM Umix"),
+            same("SELECT b, t FROM Umix ORDER BY b"),
+        ],
+    },
+    Group {
         // MySQL's case folding is a per-character table: one character in,
         // exactly one character or itself out, never a sequence. Rust's
         // `to_uppercase` is Unicode's *full* mapping, which expands -- so

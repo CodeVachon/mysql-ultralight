@@ -1,11 +1,11 @@
 ---
 id: 158
 title: A FROM-less SELECT ignores its WHERE clause
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor]
 created: 2026-09-03T02:43:34Z
-updated: 2026-09-03T02:43:34Z
+updated: 2026-09-03T02:58:24Z
 ---
 
 ## Description

@@ -1,6 +1,7 @@
 //! Stored values and the comparison rules over them.
 
 use std::cmp::Ordering;
+use std::fmt::Write as _;
 
 use mysql_ultralight_protocol::Value as WireValue;
 
@@ -186,6 +187,17 @@ impl Value {
                     .ok()
                     .or_else(|| t.parse::<f64>().ok().map(|f| f as i64))
             }
+            // Read the way the text arm above is, for the reason `as_float`
+            // gives: a binary string is a string, and only its collation is
+            // different. Left out, the two readings disagreed — a value that
+            // an `INT` column refused with 1366 went into the `DOUBLE` column
+            // beside it as a number, where 8.3 takes it into both.
+            Value::Bytes(v) => {
+                let t = std::str::from_utf8(v).ok()?.trim();
+                t.parse::<i64>()
+                    .ok()
+                    .or_else(|| t.parse::<f64>().ok().map(|f| f as i64))
+            }
             _ => None,
         }
     }
@@ -209,6 +221,21 @@ impl Value {
                     .ok()
                     .or_else(|| t.parse::<f64>().ok().map(|f| f as i128))
             }
+            // At the full width here as well, and not through `as_int` below.
+            // That returns an `i64`, so a binary string spelling
+            // 18446744073709551615 came back saturated at `i64::MAX` — and
+            // this is the reading a `BIGINT UNSIGNED` column range-checks
+            // itself with, so the column *stored* 9223372036854775807 where
+            // the same digits as text stored the number they spell. Refusing
+            // the value would have been wrong too; 8.3 takes it. A clear
+            // error turning into a wrong answer is the one trade this repo
+            // does not make.
+            Value::Bytes(digits) => {
+                let text = std::str::from_utf8(digits).ok()?.trim();
+                text.parse::<i128>()
+                    .ok()
+                    .or_else(|| text.parse::<f64>().ok().map(|f| f as i128))
+            }
             Value::Float(v) => Some(*v as i128),
             Value::Float32(v) => Some(*v as i128),
             other => other.as_int().map(i128::from),
@@ -221,6 +248,21 @@ impl Value {
             Value::Float(v) => Some(*v),
             Value::Float32(v) => Some(*v as f64),
             Value::Text(v) | Value::Json(v) | Value::Decimal(v) => v.trim().parse().ok(),
+            // A binary string is still a *string*: MySQL reads a `BINARY`
+            // value, a `VARBINARY` column and a `BLOB` in a numeric context
+            // exactly as it reads text, and only the collation differs.
+            // Answering `None` here sent `CAST('12' AS BINARY) > 3` to the
+            // string comparison below, which decided it by the character `1`
+            // against `3` and answered 0 where 8.3 answers 1;
+            // `CAST('1' AS BINARY) = 1.0` was 0 for the same reason. Bytes
+            // that are not UTF-8 could not spell a number anyway. See #0139.
+            //
+            // A *hex literal* is the exception, and this does not fix it: 8.3
+            // reads `X'0F'` in a numeric context as the number 15, not as the
+            // characters its byte spells, so `X'0F' = 15` is 1 there and 0
+            // here. One `Value::Bytes` and two readings — the same split
+            // `bit_operand` in `expr.rs` documents. That is #0141.
+            Value::Bytes(v) => std::str::from_utf8(v).ok()?.trim().parse().ok(),
             // Its ordinal, which is what makes `e = 1` true: a comparison
             // against a number is numeric, and reading the member's text gave
             // `None` here and sent the pair to the collation instead.
@@ -292,6 +334,23 @@ impl Value {
             // Without the sign the `i64` reading would put on it: the whole
             // point of the tag is that 18446744073709551615 is not -1.
             Value::Unsigned(v) => v.to_string(),
+        }
+    }
+
+    /// The value's *bytes*, which for everything but a binary string are the
+    /// bytes of the text it prints as.
+    ///
+    /// Not `as_text().into_bytes()`: `as_text` decodes a `Bytes` lossily, so
+    /// every byte that is not valid UTF-8 becomes U+FFFD and `UNHEX('FF')`
+    /// and `UNHEX('FE')` arrive here identical. The whole point of asking for
+    /// bytes is to get the ones that are there.
+    ///
+    /// Borrowed where there is nothing to build, because this runs per row per
+    /// comparison.
+    pub(crate) fn as_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
+        match self {
+            Value::Bytes(bytes) => std::borrow::Cow::Borrowed(bytes),
+            other => std::borrow::Cow::Owned(other.as_text().into_bytes()),
         }
     }
 
@@ -404,8 +463,24 @@ impl Value {
         }
 
         match (self, other) {
-            // Binary data is compared byte-exact; only text carries a collation.
-            (Value::Bytes(a), Value::Bytes(b)) => Some(a.cmp(b)),
+            // Binary data is compared byte-exact, and *one* binary operand is
+            // enough. MySQL resolves a comparison's collation from both sides,
+            // and the binary character set wins over any other: measured on
+            // 8.3, `COLLATION(CAST('AB' AS BINARY))` is `binary` with
+            // coercibility 2 against `utf8mb4_0900_ai_ci` at 4 for a literal,
+            // so the pair is compared as bytes and `CAST('AB' AS BINARY) =
+            // 'ab'` is 0. Requiring *both* sides to be `Bytes` sent that pair
+            // to `collate` instead, which folds case, and it answered 1 —
+            // along with `X'4142' = 'ab'` and a VARBINARY column against a
+            // string literal. See #0139.
+            //
+            // Below the numeric paths above on purpose: a binary string beside
+            // a number is still a numeric comparison there, so
+            // `CAST('12' AS BINARY) = 12` is 1 and not a comparison of `"12"`
+            // against `"12"` that would only agree by accident.
+            (Value::Bytes(_), _) | (_, Value::Bytes(_)) => {
+                Some(self.as_bytes().cmp(&other.as_bytes()))
+            }
             _ => Some(collate(&self.as_text(), &other.as_text())),
         }
     }
@@ -595,9 +670,85 @@ impl Value {
     /// beside a document as a JSON string and can call the two equal, where
     /// the keys here stay a document key and a text key. Only a query that
     /// de-duplicates a JSON column against a text one can see it.
+    ///
+    /// The binary boundary is the same shape and for the same reason. Since
+    /// #0139 `compare` reads a `Bytes` beside a `Text` byte-exactly, and the
+    /// keys below still fold the text's case, so `UNHEX('6162')` and `'AB'`
+    /// key together where `=` now separates them: `SELECT UNHEX('6162') UNION
+    /// SELECT 'AB'` is one row here and two on 8.3. A plain UNION is enough to
+    /// see it, so this is a wrong answer and not only a theoretical gap.
+    ///
+    /// Keying the two apart is not the fix, and that was measured rather than
+    /// argued: it would have to key `UNHEX('6162')` apart from `'ab'` and `2`
+    /// apart from `CAST('2' AS BINARY)` as well, and 8.3 puts *both* of those
+    /// pairs in one group. What MySQL does instead is resolve one collation
+    /// for the whole key *expression* — every value under one key is binary or
+    /// none is — which is #0128's gap and not something a per-value key can
+    /// reach. Fixing it here would trade four measured wrong answers for four
+    /// others.
+    ///
+    /// A column whose values are all of one kind is unaffected either way, and
+    /// that is every column a table produces.
     pub fn collation_key(&self) -> String {
         match self {
-            Value::Bytes(v) => String::from_utf8_lossy(v).into_owned(),
+            // Case kept, unlike the text arm at the bottom: bytes carry no
+            // collation to fold them under, so `'AB'` and `'ab'` in a
+            // VARBINARY column are two groups and two unique keys — which is
+            // what `compare` has said about them since #0139.
+            //
+            // And bytes that are not text at all get a key of their own,
+            // because a lossy decode gives every one of them U+FFFD: over a
+            // VARBINARY column holding `UNHEX('FF')` and `UNHEX('FE')`,
+            // `COUNT(DISTINCT b)` was 1 and `GROUP BY b` gave one group where
+            // 8.3 gives two — while `=` called the pair different. The same
+            // key drives UNION's de-duplication and foreign-key matching, so
+            // an FK child on one of those bytes matched a parent on the other.
+            //
+            // Only bytes that need it are escaped, so a byte string that *is*
+            // text keys as that text and goes on grouping with the `'ab'` and
+            // the `2` that MySQL puts in a group with it — see the note above.
+            // The marker is what keeps the escape out of every other arm's key
+            // space: a text key has been lowercased and a number's is digits,
+            // so neither can contain an upper-case `X`.
+            //
+            // A byte string that is valid UTF-8 and *starts with a NUL* is
+            // escaped too, because NUL is what every sentinel in this engine
+            // is built out of and a byte string can spell any of them.
+            // `UNHEX('00584333')` reads as `\0XC3`, the escape for the single
+            // byte `0xC3`; `UNHEX('004E554C4C')` reads as `\0NULL`, which is
+            // the key `exec.rs` gives SQL NULL in a GROUP BY, in a window's
+            // PARTITION BY and in a set operation's row key. That one folded a
+            // NULL row into the value's group and *reported* the group as
+            // holding those bytes, while `IS NULL` still said it was NULL.
+            //
+            // Guarding on the NUL rather than on the marker keeps every
+            // property the escape already had — an escaped key still begins
+            // with the marker, and hex is injective — and adds the one that
+            // makes them hold: no *unescaped* byte key can begin with a NUL,
+            // so no byte string can spell a sentinel at all.
+            //
+            // It costs one case of the mixed-kind gap above, and that is the
+            // trade rather than a free win. A NUL-led byte string no longer
+            // groups with the identical *text*, where 8.3 does and where the
+            // engine did: measured, `UNHEX('00616263')` against
+            // `CAST(UNHEX('00616263') AS CHAR)` is one row there and two here,
+            // beside the `'abc'` pair that still groups. Splitting a mixed
+            // UNION is the same #0128 gap one case wider; reporting a NULL row
+            // as holding bytes is a value that is not there.
+            Value::Bytes(bytes) => match std::str::from_utf8(bytes) {
+                Ok(text) if !text.starts_with('\u{0}') => text.to_owned(),
+                _ => {
+                    let mut key = String::with_capacity(BYTES_KEY_MARKER.len() + bytes.len() * 2);
+                    key.push_str(BYTES_KEY_MARKER);
+                    for byte in bytes {
+                        // `write!` rather than `push_str(&format!(..))`, which
+                        // allocates a `String` per byte. This runs per row per
+                        // group key, and a BLOB has a lot of bytes.
+                        let _ = write!(key, "{byte:02X}");
+                    }
+                    key
+                }
+            },
             // A document keeps its case and normalises its numbers, because
             // that is what comparing it does: `{"A":1}` and `{"a":1}` are two
             // documents where `'A'` and `'a'` are one string, and `1` and
@@ -677,6 +828,20 @@ impl Value {
         }
     }
 }
+
+/// What [`Value::collation_key`] prefixes a byte string it had to escape.
+///
+/// A NUL because that is how this engine spells a key that is not a value —
+/// `exec.rs` keys SQL NULL as `\0NULL` — and an upper-case `X` so an escaped
+/// byte string cannot be taken for one of those either: every other kind of
+/// value keys through `to_lowercase` or through digits, and no sentinel here
+/// carries an `X` in that position.
+///
+/// The other half of the guarantee is at the use site, which escapes *any*
+/// byte string whose text begins with a NUL rather than only one beginning
+/// with this marker. Without that, bytes spelling `\0NULL` keyed as the NULL
+/// sentinel itself.
+const BYTES_KEY_MARKER: &str = "\u{0}X";
 
 /// Whether two strings are the same under the server's collation.
 ///

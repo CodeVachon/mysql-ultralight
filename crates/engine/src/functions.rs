@@ -294,10 +294,7 @@ fn soundex_of(mut letters: impl Iterator<Item = char>) -> String {
 /// is handed back untouched, which is the whole reason `HEX` is worth having —
 /// it is the one function that shows what a binary string actually holds.
 fn argument_bytes(value: &Value) -> Vec<u8> {
-    match value {
-        Value::Bytes(bytes) => bytes.clone(),
-        other => other.as_text().into_bytes(),
-    }
+    value.as_bytes().into_owned()
 }
 
 /// Uppercase hex, two characters a byte, which is what `HEX` sends.
@@ -1091,15 +1088,13 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         // answer `EFBFBD` rather than `FF`. That is what the tag buys, and it
         // is what the test asserts.
         //
-        // What it does *not* buy, today, is the comparison. 8.3 answers
+        // It buys the comparison too, since #0139. 8.3 answers
         // `UNHEX('4142') = 'AB'` 1 and `= 'ab'` 0, because the answer carries
-        // the binary collation; this engine answers 1 to both, because
-        // `Value::compare` takes its byte-exact branch only when *both* sides
-        // are bytes and sends a bytes-against-text pair to the collation
-        // instead. That gap is older and wider than these functions — a
-        // VARBINARY column and a `CAST(x AS BINARY)` compare the same wrong
-        // way — and it is #0139. Named here so the tag is not read as having
-        // closed it.
+        // the binary collation, and `Value::compare` now takes its byte-exact
+        // branch when *either* side is bytes rather than only when both are.
+        // The tag is what puts this function on that branch — without it the
+        // answer is text and the pair goes back to the case-folding
+        // collation.
         //
         // There is no numeric branch. `UNHEX(616263)` is `abc` because the
         // number prints as those six characters, and `UNHEX(12.5)` and
@@ -1867,7 +1862,12 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
             }
             _ => json::render(&json::parse(&value)?),
         },
-        D::Binary(_) | D::Varbinary(_) | D::Blob(_) => Value::Bytes(value.as_text().into_bytes()),
+        // Through `as_bytes` rather than `as_text`, which decodes a binary
+        // string lossily: `HEX(CAST(UNHEX('FF') AS BINARY))` was EFBFBD where
+        // 8.3 answers FF, so a value did not survive a cast to the type it
+        // already had — and since #0139 made the comparison byte-exact,
+        // `CAST(UNHEX('FF') AS BINARY) = UNHEX('FF')` answered 0.
+        D::Binary(_) | D::Varbinary(_) | D::Blob(_) => Value::Bytes(value.as_bytes().into_owned()),
         other => return Err(unsupported(format!("CAST to `{other}`"))),
     })
 }

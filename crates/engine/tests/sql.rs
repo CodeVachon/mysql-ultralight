@@ -18219,6 +18219,355 @@ fn unhex_is_hex_backwards_and_null_for_anything_that_is_not_hex() {
 }
 
 #[test]
+fn one_binary_operand_makes_the_whole_comparison_binary() {
+    // #0139. MySQL resolves a comparison's collation from both sides and the
+    // binary character set wins over any other, so *one* binary operand is
+    // enough to make the pair compare byte for byte. This engine took its
+    // byte-exact branch only when both sides were bytes, and a binary string
+    // beside a literal fell through to the case-insensitive collation:
+    // `CAST('AB' AS BINARY) = 'ab'` answered 1 where 8.3 answers 0.
+    //
+    // Every expected value below was read off mysql:8.3 with the connection
+    // in utf8mb4, which is the character set this engine advertises.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Cmp (id INT NOT NULL, b VARBINARY(16), t VARCHAR(16), PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Cmp VALUES (1, 'AB', 'ab'), (2, 'ab', 'AB'), (3, 'aB', 'Zz')",
+    );
+
+    for (sql, expected) in [
+        // The three shapes the issue names: a cast, a hex literal, and a
+        // column, each against a string literal that differs only in case.
+        ("SELECT CAST('AB' AS BINARY) = 'ab'", "0"),
+        ("SELECT X'4142' = 'ab'", "0"),
+        ("SELECT b = 'ab' FROM Cmp WHERE id = 1", "0"),
+        // And the same three where the bytes do match, so the test cannot
+        // pass by answering 0 to everything.
+        ("SELECT CAST('AB' AS BINARY) = 'AB'", "1"),
+        ("SELECT X'4142' = 'AB'", "1"),
+        ("SELECT b = 'AB' FROM Cmp WHERE id = 1", "1"),
+        // Whichever side the binary operand is on.
+        ("SELECT 'ab' = CAST('AB' AS BINARY)", "0"),
+        ("SELECT 'AB' = CAST('AB' AS BINARY)", "1"),
+        // The ordering operators, not just equality: 'AB' is 0x4142 and 'ab'
+        // is 0x6162, so the uppercase one is *less* under the bytes where the
+        // collation called the two equal and answered 0 to both of these.
+        ("SELECT CAST('AB' AS BINARY) < 'ab'", "1"),
+        ("SELECT CAST('AB' AS BINARY) > 'ab'", "0"),
+        ("SELECT CAST('AB' AS BINARY) <> 'ab'", "1"),
+        // The null-safe operator goes with `=`, and still answers 0 rather
+        // than NULL against a NULL.
+        ("SELECT CAST('AB' AS BINARY) <=> 'ab'", "0"),
+        ("SELECT CAST('AB' AS BINARY) <=> 'AB'", "1"),
+        ("SELECT CAST('AB' AS BINARY) <=> NULL", "0"),
+        // A NULL operand is still unknown, not false.
+        ("SELECT CAST('AB' AS BINARY) = NULL", "NULL"),
+        // The constructs that compare without an operator: IN, BETWEEN,
+        // CASE ... WHEN and NULLIF all reach `Value::compare`.
+        ("SELECT CAST('AB' AS BINARY) IN ('ab','zz')", "0"),
+        ("SELECT CAST('AB' AS BINARY) IN ('AB','zz')", "1"),
+        ("SELECT CAST('B' AS BINARY) BETWEEN 'a' AND 'c'", "0"),
+        ("SELECT CAST('B' AS BINARY) BETWEEN 'A' AND 'C'", "1"),
+        (
+            "SELECT CASE CAST('AB' AS BINARY) WHEN 'ab' THEN 'y' ELSE 'n' END",
+            "n",
+        ),
+        ("SELECT NULLIF(CAST('AB' AS BINARY),'ab')", "AB"),
+        // GREATEST and LEAST order by the same rule, so the uppercase binary
+        // string is the smaller of the pair.
+        ("SELECT GREATEST(CAST('AB' AS BINARY),'aa')", "aa"),
+        ("SELECT LEAST(CAST('AB' AS BINARY),'aa')", "AB"),
+        // Two binary strings were already byte-exact and stay so.
+        ("SELECT CAST('AB' AS BINARY) = CAST('ab' AS BINARY)", "0"),
+        // The functions #0130 added produce bytes, and they compare as bytes.
+        ("SELECT UNHEX('4142') = 'ab'", "0"),
+        ("SELECT UNHEX('4142') = 'AB'", "1"),
+        ("SELECT FROM_BASE64('QUI=') = 'ab'", "0"),
+        ("SELECT FROM_BASE64('QUI=') = 'AB'", "1"),
+        // A value equals its own cast, which is not a tautology here: the cast
+        // built its bytes out of `as_text`, so a byte that is not UTF-8 came
+        // back as the three of U+FFFD and the byte-exact comparison then said
+        // the two were different. Asked through `HEX` as well, because the
+        // equality alone would also pass if both sides were mangled.
+        ("SELECT CAST(UNHEX('FF') AS BINARY) = UNHEX('FF')", "1"),
+        ("SELECT HEX(CAST(UNHEX('FF') AS BINARY))", "FF"),
+        ("SELECT HEX(CAST(UNHEX('C3A9') AS BINARY))", "C3A9"),
+        // A number on the other side is *not* this rule: MySQL reads a binary
+        // string in a numeric context exactly as it reads text, so these are
+        // numeric comparisons and not comparisons of two strings of digits.
+        // `> 3` is the one that tells them apart — by the characters, '1'
+        // comes before '3' and the answer is 0.
+        ("SELECT CAST('12' AS BINARY) > 3", "1"),
+        ("SELECT CAST('1' AS BINARY) = 1", "1"),
+        ("SELECT CAST('1' AS BINARY) = 1.0", "1"),
+        // Trailing space is never padded away by a binary comparison: 'a' is
+        // one byte and 'a ' is two, so they differ and the shorter sorts
+        // first. The *text* half of the same question is deliberately not
+        // asked beside it — `'a' = 'a '` is 0 under the NO PAD
+        // utf8mb4_0900_ai_ci a column gets and 1 under the PAD SPACE
+        // utf8mb4_general_ci a connection may negotiate, both measured on 8.3,
+        // and which of those this engine should answer is #0129 rather than
+        // this.
+        ("SELECT CAST('a' AS BINARY) = 'a '", "0"),
+        ("SELECT CAST('a' AS BINARY) < 'a '", "1"),
+        ("SELECT CAST('a' AS BINARY) = CAST('a ' AS BINARY)", "0"),
+        // A whole-row filter, a join and the row-count shapes, because the
+        // divergence this fixes is which rows a query returns.
+        ("SELECT COUNT(*) FROM Cmp WHERE b = t", "0"),
+        ("SELECT COUNT(*) FROM Cmp x JOIN Cmp y ON x.b = y.t", "2"),
+        ("SELECT COUNT(*) FROM Cmp WHERE b = 'ab'", "1"),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn a_binary_column_groups_and_sorts_by_its_bytes() {
+    // The other half of #0139. `Value::collation_key` decides GROUP BY and
+    // DISTINCT and `Value::compare` decides a unique key, and the two have to
+    // give the same answer or a query's grouping contradicts its own WHERE
+    // clause. #0149's original bug was a unique key, so both are asked here
+    // directly rather than inferred from `=`.
+    //
+    // Read off mysql:8.3 over the same three rows.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Grp (id INT NOT NULL, b VARBINARY(16), PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Grp VALUES (1, 'AB'), (2, 'ab'), (3, 'aB')",
+    );
+
+    // Three byte strings differing only in case are three groups and three
+    // distinct values, where a folded key would report one.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM (SELECT b FROM Grp GROUP BY b) g"
+        ),
+        vec![vec!["3"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(DISTINCT b) FROM Grp"),
+        vec![vec!["3"]]
+    );
+    // Byte order, not the alphabet folded: 0x4142 < 0x6142 < 0x6162, so the
+    // uppercase spelling sorts first and `aB` sorts before `ab`. A folding
+    // sort would have put these in the insertion order they already have,
+    // which is why the rows are not inserted in the answer's order.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT b FROM Grp ORDER BY b"),
+        vec![vec!["AB"], vec!["aB"], vec!["ab"]]
+    );
+
+    // Bytes that are not text at all, which the key could not tell apart: it
+    // decoded them lossily, so every invalid byte became U+FFFD and 0xFF and
+    // 0xFE reached one key. `=` called them different the whole time, so a
+    // GROUP BY contradicted its own WHERE — and the same key decides UNION's
+    // de-duplication and foreign-key matching.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Raw (id INT NOT NULL, b VARBINARY(8), PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Raw VALUES (1, UNHEX('FF')), (2, UNHEX('FE'))",
+    );
+    for (sql, expected) in [
+        ("SELECT UNHEX('FF') = UNHEX('FE')", "0"),
+        ("SELECT COUNT(DISTINCT b) FROM Raw", "2"),
+        ("SELECT COUNT(*) FROM (SELECT b FROM Raw GROUP BY b) g", "2"),
+        (
+            "SELECT COUNT(*) FROM (SELECT UNHEX('FF') AS x UNION SELECT UNHEX('FE')) u",
+            "2",
+        ),
+        // The escaped key is written so it cannot land in the text key space,
+        // which this asks directly: the byte 0x80 hexes to `80`, and without
+        // a marker that is the same key the *string* `'80'` gets. Two rows,
+        // and `=` says the same thing, so the key and the comparison agree.
+        ("SELECT UNHEX('80') = '80'", "0"),
+        (
+            "SELECT COUNT(*) FROM (SELECT UNHEX('80') AS x UNION SELECT '80') u",
+            "2",
+        ),
+        // And the marker cannot collide with an *unescaped* byte key either.
+        // `UNHEX('00584333')` is valid UTF-8 spelling `\0XC3`, which is the
+        // escape for the single byte 0xC3 written out — so escaping only the
+        // invalid strings put those two in one group while `=` kept them
+        // apart. A NUL byte in a VARBINARY column is ordinary data.
+        ("SELECT UNHEX('C3') = UNHEX('00584333')", "0"),
+        (
+            "SELECT COUNT(*) FROM (SELECT UNHEX('C3') AS x UNION SELECT UNHEX('00584333')) u",
+            "2",
+        ),
+        // Nor with the NULL sentinel, which is the other thing a NUL-leading
+        // byte string can spell: `exec.rs` keys SQL NULL as `\0NULL`, and
+        // `UNHEX('004E554C4C')` reads as exactly that.
+        (
+            "SELECT COUNT(*) FROM (SELECT UNHEX('004E554C4C') AS x UNION SELECT NULL) u",
+            "2",
+        ),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+
+    // Grouped, where that collision did more than miscount: the NULL row
+    // joined the value's group, and the group then *reported* itself as
+    // holding those bytes while `IS NULL` went on saying the row was NULL.
+    // `COUNT(DISTINCT b)` cannot see it — that drops NULLs — so the groups
+    // have to be read out. Both rows read off 8.3.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE NulKey (id INT NOT NULL, b VARBINARY(16), PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO NulKey VALUES (1, UNHEX('004E554C4C')), (2, UNHEX('004E554C4C')), \
+         (3, NULL)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT HEX(b), COUNT(*) FROM NulKey GROUP BY b ORDER BY b"
+        ),
+        vec![vec!["NULL", "1"], vec!["004E554C4C", "2"]]
+    );
+}
+
+#[test]
+fn a_binary_string_reads_as_a_number_the_way_text_does() {
+    // The numeric half of #0139: MySQL reads a binary string in a numeric
+    // context exactly as it reads text, so the two readings have to agree
+    // with each other as well as with 8.3. They did not — `as_float` learned
+    // to read bytes and `as_int` did not, so the same value went into a
+    // DOUBLE column as 12 and was refused by the INT column beside it.
+    //
+    // Both columns take 12 on 8.3, measured.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Num (i INT NULL, d DOUBLE NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Num VALUES (UNHEX('3132'), UNHEX('3132'))",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT i, d FROM Num"),
+        vec![vec!["12", "12"]]
+    );
+}
+
+#[test]
+fn a_binary_string_reads_a_number_too_wide_for_an_i64() {
+    // `as_exact_int` is what an integer column range-checks itself with, and
+    // it had no arm of its own for bytes — so a binary string fell through to
+    // `as_int`, which returns an `i64`, and 18446744073709551615 came back
+    // saturated at `i64::MAX`. The column then *stored* 9223372036854775807
+    // where the same digits as text stored the number they spell.
+    //
+    // That is the one trade this repo does not make: before the numeric arms
+    // existed the same INSERT was a clear 1366, and a refusal turning into a
+    // silently wrong value is worse than the refusal. 8.3 takes both spellings
+    // and stores the number, measured.
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Wide (bu BIGINT UNSIGNED NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Wide VALUES (CAST('18446744073709551615' AS BINARY)), \
+         ('18446744073709551615')",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT bu FROM Wide ORDER BY bu"),
+        vec![vec!["18446744073709551615"], vec!["18446744073709551615"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(CAST('18446744073709551615' AS BINARY) AS UNSIGNED)"
+        ),
+        vec![vec!["18446744073709551615"]]
+    );
+}
+
+#[test]
+fn a_unique_key_over_binary_data_is_byte_exact() {
+    // `Catalog::check_unique` asks `Value::compare` directly rather than
+    // going through the grouping key, so a unique index is its own path to
+    // the same rule — and #0149's original bug was a unique key. Both counts
+    // read off mysql:8.3.
+    let (engine, mut session) = engine();
+
+    // Two byte strings that differ only in case are two rows, where the
+    // collation makes the second INSERT a 1062.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE UniqBin (b VARBINARY(16) UNIQUE)",
+    );
+    run(&engine, &mut session, "INSERT INTO UniqBin VALUES ('AB')");
+    run(&engine, &mut session, "INSERT INTO UniqBin VALUES ('ab')");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM UniqBin"),
+        vec![vec!["2"]]
+    );
+    // And a key over a binary column and a text one together, which is the
+    // shape #0149 hit: the text half still folds case, so these two rows are
+    // distinct only because the binary half is byte-exact.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE UniqMix (b VARBINARY(16), t VARCHAR(16), UNIQUE KEY (b, t))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO UniqMix VALUES ('AB','x')",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO UniqMix VALUES ('ab','X')",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT COUNT(*) FROM UniqMix"),
+        vec![vec!["2"]]
+    );
+}
+
+#[test]
 fn the_base64_pair_wraps_its_output_and_refuses_bad_input() {
     let (engine, mut session) = engine();
 
