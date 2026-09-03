@@ -106,7 +106,7 @@ fn main() {
                 let r = Answer::of(&mut reference, case.sql, protocol);
                 let e = Answer::of(&mut engine, case.sql, protocol);
 
-                for d in compare::differences(&r, &e, case.widths, case.value_kind) {
+                for d in compare::differences(&r, &e, case.widths, case.value_kind, case.places) {
                     let what = format!("{} [{}]", d.what, protocol.name());
                     let entry = baseline::entry(group.name, case.sql, &what);
                     seen.insert(entry.clone());

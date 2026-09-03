@@ -38,6 +38,19 @@ pub struct Case {
     /// bytes reaches the caller as a Buffer it cannot convert to a string, and
     /// this is the only line in `compare.rs` that would catch one.
     pub value_kind: bool,
+    /// Whether this case's columns are asked to agree on how many decimal
+    /// places they show.
+    ///
+    /// True for all but one. MySQL 8's `information_schema` is a set of views
+    /// over the data dictionary, so some of its columns are *items* and report
+    /// `NOT_FIXED_DEC` where the same column read through a temporary table
+    /// reports 0 — measured on 8.3, `SELECT COLUMN_NAME FROM
+    /// information_schema.columns` is `dec 31` and the same query with an
+    /// `ORDER BY` is `dec 0`, and `information_schema.tables.TABLE_NAME` is 0
+    /// either way. Which of those columns is an expression is a table of
+    /// MySQL's own view definitions, not a rule; this engine declares them all
+    /// and reports 0.
+    pub places: bool,
 }
 
 impl Case {
@@ -52,6 +65,13 @@ impl Case {
     /// `Case::value_kind`, and give every use a reason of its own.
     const fn without_value_kind(mut self) -> Case {
         self.value_kind = false;
+        self
+    }
+
+    /// Stops asking how many places this case's columns show. See
+    /// `Case::places`, and give every use a reason of its own.
+    const fn without_places(mut self) -> Case {
+        self.places = false;
         self
     }
 }
@@ -70,6 +90,7 @@ const fn same(sql: &'static str) -> Case {
         sql,
         widths: true,
         value_kind: true,
+        places: true,
     }
 }
 
@@ -6438,8 +6459,15 @@ pub const GROUPS: &[Group] = &[
             // report all 64 of it.
             same("CREATE TABLE Idok (`aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` INT)"),
             same("SELECT `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` FROM Idok"),
+            // Without the places: `information_schema.COLUMNS` is a view over
+            // the data dictionary on 8.3 and `COLUMN_NAME` is an expression in
+            // it, so it comes back `dec 31` where every declared column
+            // reports its own scale. See `Case::places`. What this case is
+            // *for* — that a 64-character name survives into the catalog — is
+            // answered either way.
             same("SELECT COLUMN_NAME FROM information_schema.columns \
-                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Idok'"),
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Idok'")
+            .without_places(),
             // Characters and not bytes: 64 two-byte characters are 128 bytes
             // and are taken, 65 of them are refused.
             same("CREATE TABLE Idw (`éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé` INT)"),
@@ -7435,6 +7463,181 @@ pub const GROUPS: &[Group] = &[
             same("ALTER TABLE RenA RENAME TO RenBB"),
             same("SELECT b, c FROM RenBB ORDER BY b"),
             same("SELECT a FROM RenA ORDER BY a"),
+        ],
+    },
+    Group {
+        // #0111. A number's precision and scale, which a client reads to
+        // decide how to decode — and, for an ORM, how to *type* — the values
+        // that follow. Every column here was described `len 20 dec 0` before
+        // it, whatever it held.
+        //
+        // The declared half is what this harness can see: `decimals` is
+        // compared on a column that came out of a table, so every row of the
+        // `SELECT`s below is a claim about one declaration. The computed half
+        // — `a + b` is `len 14 dec 3` — is out of the harness's scope for the
+        // same reason a computed *width* is, and is pinned in
+        // `crates/engine/tests/describe.rs` instead. What the cases here hold
+        // the computed side to is the type code and the digits, which is what
+        // stops a scale rule that describes one thing and prints another.
+        name: "the precision and scale a number is described with",
+        setup: &[
+            "CREATE TABLE Prec (
+                 id INT NOT NULL,
+                 a DECIMAL(10,2) NOT NULL,
+                 b DECIMAL(7,3) NOT NULL,
+                 whole DECIMAL(5,0) NOT NULL,
+                 u DECIMAL(8,3) UNSIGNED NOT NULL,
+                 widest DECIMAL(65,30) NOT NULL,
+                 tiny DECIMAL(3,3) NOT NULL,
+                 f FLOAT NOT NULL,
+                 fm FLOAT(10,4) NOT NULL,
+                 d DOUBLE NOT NULL,
+                 dm DOUBLE(20,7) NOT NULL,
+                 i INT NOT NULL,
+                 at DATETIME(3) NOT NULL,
+                 tm TIME(6) NOT NULL,
+                 plain DATETIME NOT NULL,
+                 PRIMARY KEY (id)
+             )",
+            // `d` is 2.75 and not 2.5 deliberately: `ROUND` over an
+            // approximate value rounds half to *even* on 8.3 — `ROUND(2.5e0)`
+            // is 2 there and 3 here — and a tie in this data would make these
+            // cases ask about that gap instead of about the shape they are
+            // for. It is a divergence in the *value* — `ROUND(0.5e0)` is 0
+            // there and 1 here, and `ROUND(-2.5e0)` is -2 against -3 — and a
+            // gap of its own; the exact half is simply not what this group
+            // measures.
+            "INSERT INTO Prec VALUES
+                 (1, 10.25, 2.125, 7, 3.500, 1.5, 0.125, 1.5, 1.5, 2.75, 2.5, 4,
+                  '2026-01-02 03:04:05.678', '03:04:05.678901', '2026-01-02 03:04:05')",
+        ],
+        cases: &[
+            // The declarations, which is where the places are compared.
+            same("SELECT a, b, whole, u, widest, tiny FROM Prec"),
+            // An approximate column with no declared scale reports 31 and one
+            // with a scale reports it, which is the split that makes 31 a real
+            // answer rather than a missing one.
+            same("SELECT f, fm, d, dm FROM Prec"),
+            // A temporal's places are its fractional seconds, and an integer
+            // has none at all.
+            same("SELECT at, tm, plain, i, id FROM Prec"),
+            // The same columns through a derived table, which re-describes
+            // them from a stored shape rather than from the table. No temporal
+            // among them: one that has been through a temporary table comes
+            // back in the connection's character set on 8.3 where the same
+            // column read from its table is binary, which is the gap
+            // `Case::value_kind` names and not this one.
+            same("SELECT a, u, fm FROM (SELECT a, u, fm FROM Prec) z"),
+            same("SELECT COALESCE(a, 0) AS c, a + b AS s, a * b AS p, a / b AS q, \
+                  a MOD b AS r FROM Prec"),
+            same("SELECT SUM(a) AS t, AVG(a) AS m, MIN(a) AS lo, MAX(b) AS hi FROM Prec"),
+            same("SELECT ROUND(a, 1) AS r1, ROUND(a) AS r0, TRUNCATE(a, 1) AS t1, \
+                  CAST(a AS DECIMAL(12,4)) AS c, ABS(b) AS ab, -a AS neg FROM Prec"),
+            // No `u + u`: arithmetic over two UNSIGNED decimals keeps the
+            // flag on 8.3 and loses it here, which is a gap in
+            // `unsigned_answer` rather than in the scale rules — `a + u`
+            // beside it is signed on both.
+            same("SELECT whole + whole AS w, a + u AS au, widest + tiny AS wt, \
+                  a + 1 AS one, a * 2 AS two, a / 2 AS half FROM Prec"),
+            // An integer operand carries its own precision into the
+            // arithmetic, which is its display width less its sign.
+            same("SELECT i + 1.5 AS x, i * 1.5 AS y, i / 1.5 AS z, i / 2 AS q, \
+                  AVG(i) AS a FROM Prec"),
+            // A view over a computed decimal stores the shape rather than
+            // widening it to a bare `decimal`.
+            // Asked of the catalog rather than of the wire: reading the view
+            // back re-describes its columns as *fields*, where 8.3 merges the
+            // view into the reading query and answers with the expressions
+            // themselves — BINARY flag and all. That is a gap of its own, and
+            // the declaration is the half this issue is about.
+            same("CREATE VIEW PrecV AS SELECT a + b AS s, a / b AS q, i + i AS n FROM Prec"),
+            same("SELECT NUMERIC_PRECISION, NUMERIC_SCALE, COLUMN_TYPE \
+                  FROM information_schema.columns \
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'PrecV' \
+                  ORDER BY ORDINAL_POSITION"),
+            // A number keeps at least one digit. Rounding away all three
+            // places of a `DECIMAL(3,3)` leaves none by the arithmetic, and
+            // 8.3 declares one digit rather than a precision of nothing.
+            same("SELECT ROUND(tiny, 0) AS a, TRUNCATE(tiny, 0) AS b, ROUND(a, 5) AS c, \
+                  TRUNCATE(a, 3) AS d FROM Prec"),
+            // `NOT_FIXED_DEC` is an answer and not a scale, and reading it as
+            // one gave this subject a shape no number has — 21 digits and 31
+            // places — and an arithmetic that went under zero.
+            same("SELECT ROUND((SELECT AVG(d) FROM Prec), 0) AS a, \
+                  TRUNCATE((SELECT AVG(d) FROM Prec), 0) AS b, \
+                  (SELECT AVG(d) FROM Prec) AS c FROM Prec"),
+        ],
+    },
+    Group {
+        // #0142. A string function's type code comes from how wide its answer
+        // can be, so the same call is a VAR_STRING over a `CHAR(10)` and a
+        // MEDIUM_BLOB over a `TEXT`. Every one of these was a VAR_STRING here
+        // before, which is what a client reads to size a buffer.
+        //
+        // The type code *is* compared on a computed column, so these cases
+        // carry themselves; the widths behind them are in
+        // `crates/engine/tests/describe.rs`.
+        name: "a string function's type widens with its argument",
+        setup: &[
+            "CREATE TABLE Wide (
+                 id INT NOT NULL,
+                 c CHAR(10) NOT NULL,
+                 v VARCHAR(20) NOT NULL,
+                 tt TINYTEXT NOT NULL,
+                 tx TEXT NOT NULL,
+                 mt MEDIUMTEXT NOT NULL,
+                 lt LONGTEXT NOT NULL,
+                 tb TINYBLOB NOT NULL,
+                 bl BLOB NOT NULL,
+                 mb MEDIUMBLOB NOT NULL,
+                 js JSON NOT NULL,
+                 en ENUM('one','two') NOT NULL,
+                 PRIMARY KEY (id)
+             )",
+            "INSERT INTO Wide VALUES
+                 (1, 'ab', 'cd', 'ef', 'gh', 'ij', 'kl', 'mn', 'op', 'qr', '{\"a\": 1}', 'one')",
+        ],
+        cases: &[
+            // The threshold, both sides of it: a TINYTEXT still fits a
+            // VARCHAR and a TEXT does not.
+            same("SELECT UPPER(c) AS a, UPPER(v) AS b, UPPER(tt) AS d, UPPER(en) AS e FROM Wide"),
+            same("SELECT UPPER(tx) AS a, UPPER(mt) AS b, UPPER(lt) AS c FROM Wide"),
+            same("SELECT LOWER(tx) AS a, LTRIM(tx) AS b, RTRIM(tx) AS c, REVERSE(tx) AS d, \
+                  REPLACE(tx, 'g', 'z') AS e FROM Wide"),
+            // `HEX` doubles the *bytes*, which is what puts a `BLOB` over the
+            // line and leaves a `TINYBLOB` under it.
+            same("SELECT HEX(tb) AS a, HEX(c) AS b, HEX(v) AS c FROM Wide"),
+            same("SELECT HEX(bl) AS a, HEX(mb) AS b, HEX(js) AS c FROM Wide"),
+            // Joined widths add up, so two columns that each fit alone need
+            // not fit together.
+            same("SELECT CONCAT(c, c) AS a, CONCAT(v, v) AS b, CONCAT(c, 'x') AS c FROM Wide"),
+            same("SELECT CONCAT(tx, tx) AS a, CONCAT(v, tx) AS b, CONCAT_WS(',', c, v) AS c \
+                  FROM Wide"),
+            // A count asked for in the statement is the whole answer, however
+            // wide the column behind it.
+            same("SELECT SUBSTRING(tx, 1, 3) AS a, LEFT(tx, 2) AS b, RIGHT(tx, 2) AS c, \
+                  LPAD(tx, 5, 'x') AS d, TRIM(tx) AS e FROM Wide"),
+            // And with no length, which takes what is left after the start.
+            same("SELECT SUBSTRING(tx, 2) AS a, SUBSTRING(c, 2) AS b FROM Wide"),
+            same("SELECT GROUP_CONCAT(tx) AS a, GROUP_CONCAT(c) AS b FROM Wide"),
+            // `MID` is `SUBSTRING` under another name, so its second argument
+            // is a position and not a count. Asked beside the spelling it is a
+            // synonym of: the two answering different codes for the same slice
+            // is what a rule read off the argument list rather than off the
+            // manual produced.
+            same("SELECT MID(tx, 2, 5) AS a, MID(tx, 2) AS b, SUBSTRING(tx, 2, 5) AS c, \
+                  RIGHT(tx, 2) AS d, REVERSE(c) AS e FROM Wide"),
+            // A replacement longer than what it replaces widens the answer.
+            same("SELECT REPLACE(c, 'a', 'zzz') AS a, REPLACE(c, 'a', 'z') AS b, \
+                  REPLACE(tx, 'a', 'zz') AS c, CONCAT_WS(',', tx, tx) AS d FROM Wide"),
+            // The three byte-and-character conversions. `UNHEX` and
+            // `FROM_BASE64` answer *bytes*, so their widths are not multiplied
+            // by the character set — and the difference decides a type code:
+            // `UNHEX(bl)` over a `BLOB` still fits a VARCHAR where four times
+            // it would not.
+            same("SELECT UNHEX(c) AS a, UNHEX(bl) AS b, UNHEX(tx) AS c, HEX(tb) AS d FROM Wide"),
+            same("SELECT TO_BASE64(c) AS a, TO_BASE64(bl) AS b, FROM_BASE64(c) AS c, \
+                  FROM_BASE64(bl) AS d FROM Wide"),
         ],
     },
 ];

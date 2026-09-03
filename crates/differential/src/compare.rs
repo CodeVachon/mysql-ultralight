@@ -16,13 +16,15 @@ pub struct Difference {
 /// is a bigger fact than a column type, and reporting the type mismatch first
 /// buries it.
 ///
-/// `widths` and `value_kind` are off for the few cases that ask something one
-/// of those two would drown out; see `Case::widths` and `Case::value_kind`.
+/// `widths`, `value_kind` and `places` are off for the few cases that ask
+/// something one of those three would drown out; see `Case::widths`,
+/// `Case::value_kind` and `Case::places`.
 pub fn differences(
     reference: &Answer,
     engine: &Answer,
     widths: bool,
     value_kind: bool,
+    places: bool,
 ) -> Vec<Difference> {
     let mut found = Vec::new();
     let mut note = |what: &str, r: String, e: String| {
@@ -185,6 +187,27 @@ pub fn differences(
                         b.length.to_string(),
                     );
                 }
+                // The declared places. MySQL reports a DECIMAL's scale and a
+                // temporal's fractional digits here, and this engine reported
+                // 0 for every column there was until #0111 — 1148 divergences
+                // over 260 statements when that was measured. An ORM maps a
+                // column to a type from this, so a money column described with
+                // no places is read as a whole number.
+                //
+                // Asked of a declared column only, alongside the width and for
+                // the same reason: an *expression's* places are
+                // `Item::decimals` arithmetic, and #0111 models the exact and
+                // the string families of it but not the approximate one — a
+                // `FLOAT(M,D)` propagates its scale through `+`, `SUM` and
+                // `AVG` — nor a temporal's through arithmetic. What that
+                // leaves is counted in `README.md`.
+                if places && a.decimals != b.decimals {
+                    note(
+                        &format!("decimals of column {i}"),
+                        a.decimals.to_string(),
+                        b.decimals.to_string(),
+                    );
+                }
             }
             if ra.len() != rb.len() {
                 note("row count", ra.len().to_string(), rb.len().to_string());
@@ -281,8 +304,17 @@ mod tests {
             ty: ColumnType::MYSQL_TYPE_VAR_STRING,
             flags,
             length,
+            decimals: 0,
             org_table: "t".to_owned(),
             binary_values: false,
+        }
+    }
+
+    /// The same column as each server described its places.
+    fn with_decimals(decimals: u8) -> Column {
+        Column {
+            decimals,
+            ..column(0, 40)
         }
     }
 
@@ -294,7 +326,7 @@ mod tests {
     }
 
     fn what(reference: &Answer, engine: &Answer, widths: bool) -> Vec<String> {
-        differences(reference, engine, widths, true)
+        differences(reference, engine, widths, true, true)
             .into_iter()
             .map(|d| format!("{}: mysql {} engine {}", d.what, d.reference, d.engine))
             .collect()
@@ -434,7 +466,29 @@ mod tests {
         );
         // And a case may decline it, which eleven do — a string function over
         // a NULL literal is binary on 8.3 by its operand's collation.
-        assert!(differences(&mysql, &engine, true, false).is_empty());
+        assert!(differences(&mysql, &engine, true, false, true).is_empty());
+    }
+
+    /// #0111's half of the harness: a column's places are compared, and they
+    /// are the one field of the definition nothing else here can see — the
+    /// name, the type code, the flags and the width are all equal between
+    /// these two, which is exactly how a `DECIMAL(10,2)` described with no
+    /// scale stayed green for a year.
+    #[test]
+    fn the_places_a_column_shows_are_reported() {
+        let mysql = rows(vec![with_decimals(2)]);
+        let engine = rows(vec![with_decimals(0)]);
+        assert_eq!(
+            what(&mysql, &engine, true),
+            vec!["decimals of column 0: mysql 2 engine 0"]
+        );
+        // And `NOT_FIXED_DEC`, which is a real answer rather than a missing
+        // one: an approximate column with no declared scale reports 31.
+        let mysql = rows(vec![with_decimals(31)]);
+        assert_eq!(
+            what(&mysql, &engine, true),
+            vec!["decimals of column 0: mysql 31 engine 0"]
+        );
     }
 
     /// A case that opts out of widths keeps everything else. The handful that

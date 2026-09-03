@@ -108,7 +108,7 @@ impl Engine {
         let normalised = std::rc::Rc::new(rewrite::normalise(&bound, session.sql_mode()));
         // Held for the whole call: a computed column is named after the text
         // it was written as, and that text is only available here.
-        let _source = Source::set(&normalised, session.sql_mode());
+        let _source = Source::set(&normalised, session);
         let Ok(statements) = Parser::parse_sql(&MySqlDialect {}, &normalised.sql) else {
             return Ok(None);
         };
@@ -578,7 +578,7 @@ impl Engine {
         }
 
         let normalised = std::rc::Rc::new(rewrite::normalise(&bound, mode));
-        let _source = Source::set(&normalised, mode);
+        let _source = Source::set(&normalised, session);
         let statements = Parser::parse_sql(&MySqlDialect {}, &normalised.sql)
             .map_err(|e| EngineError::parse(format!("{e}")))?;
 
@@ -1467,10 +1467,19 @@ impl Engine {
                     // Prisma reads to pick a field type. Cleared before the
                     // NULL arms below, so every path out of this loop drops
                     // it.
-                    column.int_width = None;
+                    column.max_length = None;
                     let Some(right) = right.columns.get(i) else {
                         continue;
                     };
+                    // The places are not dropped with the width, because a set
+                    // operation aggregates them: measured on 8.3, `SELECT a + b
+                    // ... UNION ALL SELECT a - b` over a `DECIMAL(10,2)` and a
+                    // `DECIMAL(7,3)` is `dec 3`, the same three places each
+                    // branch has. The wider of the two, for the reason
+                    // `nullable` takes either branch's — a column that must
+                    // describe both cannot show fewer places than one of them
+                    // carries.
+                    column.decimals = column.decimals.max(right.decimals);
                     // A branch that can produce NULL makes the whole column
                     // able to, whatever the other side declared. Only visible
                     // once NOT NULL was reported at all: while every string
@@ -2874,7 +2883,9 @@ impl Engine {
             column.nullable = !never_null(e, &implicit_schema, &[], sub);
             column.unsigned = unsigned_answer(e, &implicit_schema, &[], sub);
             column.binary_values = binary_answer(e, &implicit_schema, sub);
-            column.int_width = integer_width(e, &implicit_schema, &[], sub);
+            let shape = item_shape(e, &implicit_schema, &[], sub);
+            column.max_length = shape.max_length;
+            column.decimals = shape.decimals;
             columns.push(column);
             row.push(value);
         }
@@ -3004,7 +3015,9 @@ impl Engine {
                             column.nullable = !never_null(e, refs, &relation.columns, sub);
                             column.unsigned = unsigned_answer(e, refs, &relation.columns, sub);
                             column.binary_values = binary_answer(e, refs, sub);
-                            column.int_width = integer_width(e, refs, &relation.columns, sub);
+                            let shape = item_shape(e, refs, &relation.columns, sub);
+                            column.max_length = shape.max_length;
+                            column.decimals = shape.decimals;
                             columns.push(column);
                             plan.push(Projection::Window(windows.len()));
                             windows.push(values);
@@ -3360,7 +3373,9 @@ impl Engine {
         column.nullable = !never_null(e, refs, &relation.columns, sub);
         column.unsigned = unsigned_answer(e, refs, &relation.columns, sub);
         column.binary_values = binary_answer(e, refs, sub);
-        column.int_width = integer_width(e, refs, &relation.columns, sub);
+        let shape = item_shape(e, refs, &relation.columns, sub);
+        column.max_length = shape.max_length;
+        column.decimals = shape.decimals;
         Ok((column, Projection::Expr(Box::new(e.clone()))))
     }
 
@@ -3569,7 +3584,9 @@ impl Engine {
                     column.nullable = !never_null(e, refs, input_columns, sub);
                     column.unsigned = unsigned_answer(e, refs, input_columns, sub);
                     column.binary_values = binary_answer(e, refs, sub);
-                    column.int_width = integer_width(e, refs, input_columns, sub);
+                    let shape = item_shape(e, refs, input_columns, sub);
+                    column.max_length = shape.max_length;
+                    column.decimals = shape.decimals;
                     column
                 }
             })
@@ -5910,7 +5927,7 @@ impl Engine {
         // costs a rewrite and a parse of the definition, on top of the one
         // `execute_at_depth` has just done, and no column narrows without a
         // width -- which almost none have.
-        let narrowed = rows.columns.iter().any(|c| c.int_width.is_some())
+        let narrowed = rows.columns.iter().any(OutColumn::narrows)
             && definition_materialised_by_mysql(&scoped, &view.definition);
 
         // Explicit column names from `CREATE VIEW v (a, b)` rename the output.
@@ -8626,17 +8643,12 @@ fn function_result_type(name: &str) -> Option<ColumnType> {
         // The byte-and-character conversions. `BIN` is a VAR_STRING whatever
         // it was given, because its answer is at most sixty-four digits.
         //
-        // The other four are a VAR_STRING only while the answer fits one.
-        // MySQL sizes them from the argument — `HEX` doubles its width and
-        // `FROM_BASE64` takes three quarters of it — and reaches for a blob
-        // code when the product outgrows a VARCHAR, so `HEX(bl)` over a `BLOB`
-        // is a MEDIUM_BLOB there and `HEX(j)` over a document a LONG_BLOB.
-        // That is `Item::max_length` arithmetic, which this engine models
-        // for one thing and one thing only — the type code a materialised
-        // *integer* takes, in `integer_width`. Nothing sizes a string:
-        // `CONCAT(tx, tx)` and `UPPER(tx)` over a `TEXT` column are already
-        // MEDIUM_BLOB on 8.3 and VAR_STRING here. These join that gap —
-        // #0142 — rather than widening it.
+        // The other four are a VAR_STRING only while the answer fits one, and
+        // this arm is never reached for them: `widens_with_argument` names all
+        // four, so `computed_column_type` sizes them from their argument
+        // before it asks here. They stay listed so the table covers the family
+        // rather than half of it, and `VAR_STRING` is what the widening falls
+        // back to for a width it cannot model. #0142.
         "hex" | "unhex" | "to_base64" | "from_base64" | "bin" => ColumnType::VarString,
         _ => return None,
     })
@@ -8964,13 +8976,1057 @@ fn merged_approximate(
     })
 }
 
+/// What a computed column is described with beyond its type code: MySQL's
+/// `Item::max_length` and `Item::decimals`.
+///
+/// Both are read by a client to decide how to decode — and, for a generated
+/// one, how to *type* — the values that follow, which is why a `DECIMAL`
+/// column described with no places is a wrong answer even where the digits
+/// that arrive are right. #0111.
+///
+/// `None` in either field means "not modelled", and reads as the type's
+/// default: 20 characters and no places for a number, 4096 for a string. That
+/// is the answer this engine gave for every expression before this walk
+/// existed, so a shape left out here keeps the old answer rather than
+/// inventing a new one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ItemShape {
+    max_length: Option<u32>,
+    decimals: Option<u8>,
+}
+
+/// The width and the places to describe an expression with.
+///
+/// Dispatched on the type code the column is going out under, because that is
+/// what decides which arithmetic applies — MySQL settles an item's type first
+/// and sizes it second, and so does this.
+fn item_shape(
+    e: &Expr,
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+    sub: Option<Sub<'_>>,
+) -> ItemShape {
+    let ty = computed_column_type(e, refs, input, sub);
+    // Asked once here rather than once per node: `computed_column_type` runs
+    // a probe query for a scalar subquery, so asking it once per expression is
+    // the cost this is worth and asking it once per *node* is not. The walks
+    // below dispatch on the shape of the tree instead.
+    if is_integer(ty) {
+        return ItemShape {
+            max_length: printed_width(e, refs, input),
+            decimals: Some(0),
+        };
+    }
+    match ty {
+        ColumnType::NewDecimal | ColumnType::Decimal => {
+            let exact = exact_shape(e, refs, input, sub);
+            ItemShape {
+                max_length: exact.length,
+                decimals: exact.scale.map(places),
+            }
+        }
+        // An approximate number has no fixed places unless a `FLOAT(M,D)` or
+        // `DOUBLE(M,D)` puts some on it, and a declared scale propagates
+        // through arithmetic exactly as an exact one does — measured on 8.3,
+        // `fm + fm` and `SUM(fm)` over a `FLOAT(10,4)` both still show four
+        // places and `fm / 2` shows eight, which is the increment again.
+        //
+        // The *width* of one that does is deliberately not modelled. It is not
+        // the exact arithmetic: an approximate item's width has no column for
+        // the point or the sign and gains none for a carry, so `fm + fm` is 10
+        // on 8.3 where the same shape read exactly would be 11, and `SUM(fm)`
+        // is 21 against `SUM`'s exact 32. Carrying `exact_shape`'s number here
+        // would be a measured-wrong answer where `None` is the type's default
+        // and the answer this engine already gave.
+        ColumnType::Float | ColumnType::Double => {
+            let approximate = exact_shape(e, refs, input, sub);
+            match approximate.scale {
+                Some(scale) => ItemShape {
+                    max_length: None,
+                    decimals: Some(places(scale)),
+                },
+                None => ItemShape {
+                    max_length: unfixed_real_width(e, ty),
+                    decimals: Some(mysql_ultralight_protocol::column::NOT_FIXED_DEC),
+                },
+            }
+        }
+        // A temporal's places are its fractional seconds, which is the same
+        // number `arithmetic_operand_type` reads to decide whether arithmetic
+        // over it is exact. Measured on 8.3: `DATETIME(3)` is `dec 3`,
+        // `TIME(6)` is 6, `CAST(dt3 AS DATETIME(6))` is 6 and `SEC_TO_TIME(1)`
+        // is 0.
+        t if is_temporal(t) => ItemShape {
+            max_length: None,
+            decimals: u8::try_from(temporal_precision(e, refs, input, sub)).ok(),
+        },
+        // Every string an *item* produces reports `NOT_FIXED_DEC`, where a
+        // declared string column reports 0 — measured both ways, and the split
+        // is a field against an item rather than anything about the text.
+        //
+        // A width is what says this really is a string. `VAR_STRING` is also
+        // `computed_column_type`'s answer for an expression it cannot type at
+        // all — see `is_textual_code` — so claiming 31 places on the strength
+        // of the code alone would describe an unknown as a string. A document
+        // is left out for the same reason in reverse: `JSON_OBJECT` has a
+        // width this walk does not model, and 31 for it is unmeasured.
+        t if is_textual_code(t) || t == ColumnType::VarString => {
+            match string_width(e, refs, input, sub) {
+                Some(bytes) => ItemShape {
+                    max_length: Some(wire_string_width(bytes, binary_answer(e, refs, sub))),
+                    decimals: Some(mysql_ultralight_protocol::column::NOT_FIXED_DEC),
+                },
+                None => ItemShape::default(),
+            }
+        }
+        // A materialised NULL has no width at all: `SELECT NULL` is `len 0` on
+        // 8.3 where this engine sent the numeric default of 20.
+        ColumnType::Null => ItemShape {
+            max_length: Some(0),
+            decimals: Some(0),
+        },
+        _ => ItemShape::default(),
+    }
+}
+
+/// A scale as the wire's `decimals`, saturating at what a byte holds.
+///
+/// Nothing reaches 255: MySQL's own cap is 30 places for an exact number and
+/// 31 for `NOT_FIXED_DEC`. The saturation is here so a bug in the arithmetic
+/// above cannot wrap a wide scale round to a narrow one, which would read as
+/// a plausible answer.
+fn places(scale: u32) -> u8 {
+    u8::try_from(scale).unwrap_or(u8::MAX)
+}
+
+/// The width of an approximate number with no fixed places.
+///
+/// Measured on 8.3, and it is a width per *type* rather than per expression:
+/// every DOUBLE-valued operator, aggregate and function reports 23 — `f + f`,
+/// `SUM(dd)`, `AVG(dd)`, `dd / 2`, `ROUND(dd, 2)`, `ABS(f)`, `-dd`,
+/// `CAST(dd AS DOUBLE)`, `POW(a, 2)` and `SQRT(a)` all do — and a FLOAT-valued
+/// one reports 12, which is what `MIN(f)` over a `FLOAT` answers.
+///
+/// A *literal* is the exception and is deliberately left unmodelled: `1.5e0` is
+/// 5 on 8.3, its own digits, and there is no reason to think the rule for one
+/// is the rule for the other. `None` keeps the type's default.
+fn unfixed_real_width(e: &Expr, ty: ColumnType) -> Option<u32> {
+    if matches!(e, Expr::Value(_)) {
+        return None;
+    }
+    Some(if ty == ColumnType::Float { 12 } else { 23 })
+}
+
+/// The width a computed string goes out with, from the bytes its widest value
+/// can hold.
+///
+/// MySQL sends `Item::max_length` for a VARCHAR-coded item and four times it —
+/// the connection character set's bytes per character — for a blob-coded one,
+/// which is why `UPPER(tx)` over a utf8mb4 `TEXT` is 1048560 and not the
+/// 262140 the arithmetic produced. Measured on 8.3 across both sides of the
+/// threshold: `HEX(a)` over a `CHAR(255)` is 8160 and `HEX(b)` over a
+/// `VARCHAR(16000)` is 2048000, which is four times its own 512000.
+///
+/// Not for an answer that is bytes, which is not converted into anything on
+/// the way out: `UNHEX(tx)` over a `TEXT` is 131070 on 8.3, its own arithmetic
+/// and not four times it, where `TO_BASE64(tx)` beside it — the same width
+/// class, characters rather than bytes — is multiplied.
+///
+/// What this cannot follow is a *text* answer MySQL calls binary by its
+/// operand's collation: `CONCAT(bl, bl)` over a `BLOB` is 131070 there and
+/// 524280 here, because this engine describes it as characters. That is the
+/// same collation gap `OutColumn::to_wire` records and not a second one.
+fn wire_string_width(bytes: u32, binary: bool) -> u32 {
+    if binary || string_code_for(bytes) == ColumnType::VarString {
+        return bytes;
+    }
+    bytes.saturating_mul(4)
+}
+
+/// The type code a computed string of this many bytes goes out under.
+///
+/// MySQL picks a string item's code from its width, not from what produced it,
+/// which is why the same function answers three different codes over three
+/// different columns. Measured on 8.3, over utf8mb4:
+///
+/// | argument | `UPPER` of it | `HEX` of it |
+/// |---|---|---|
+/// | `CHAR(10)`, `VARCHAR(20)`, `TINYTEXT`, `ENUM` | VAR_STRING | VAR_STRING |
+/// | `TINYBLOB` | — | VAR_STRING |
+/// | `TEXT` | MEDIUM_BLOB | MEDIUM_BLOB |
+/// | `BLOB` | — | MEDIUM_BLOB |
+/// | `MEDIUMTEXT`, `LONGTEXT`, `JSON` | LONG_BLOB | LONG_BLOB |
+/// | `MEDIUMBLOB` | — | LONG_BLOB |
+///
+/// The two thresholds are the widths a `VARCHAR` and a `MEDIUMBLOB` hold. A
+/// TINY_BLOB or a plain BLOB code is never reached, measured: an item that
+/// outgrows a VARCHAR at all goes straight to MEDIUM_BLOB. #0142.
+fn string_code_for(bytes: u32) -> ColumnType {
+    /// The widest a `VARCHAR` is, and therefore the widest an item MySQL
+    /// describes as one can be.
+    const VARCHAR_MAX: u32 = 65535;
+    /// The widest a `MEDIUMBLOB` holds.
+    const MEDIUM_MAX: u32 = 16777215;
+    if bytes <= VARCHAR_MAX {
+        ColumnType::VarString
+    } else if bytes <= MEDIUM_MAX {
+        ColumnType::MediumBlob
+    } else {
+        ColumnType::LongBlob
+    }
+}
+
+/// Whether a function's result width — and therefore its type code — is sized
+/// from its arguments.
+///
+/// The list is measured rather than reasoned about, and the exclusions are the
+/// point: `MD5` is 32 characters whatever it hashed, `SPACE` and `BIN` have
+/// widths of their own, and `GROUP_CONCAT` is a LONG_BLOB by
+/// `group_concat_max_len` rather than by its argument — see the note where
+/// `function_result_type` names it.
+fn widens_with_argument(name: &str) -> bool {
+    matches!(
+        name,
+        "concat"
+            | "concat_ws"
+            | "upper"
+            | "ucase"
+            | "lower"
+            | "lcase"
+            | "ltrim"
+            | "rtrim"
+            | "mid"
+            | "left"
+            | "right"
+            | "replace"
+            | "reverse"
+            | "lpad"
+            | "rpad"
+            | "hex"
+            | "unhex"
+            | "to_base64"
+            | "from_base64"
+    )
+}
+
+/// The type code a string expression takes, from the width of its answer.
+///
+/// `VAR_STRING` where the width is not modelled, which is what this engine
+/// answered for every string function before #0142 — so a function whose
+/// arithmetic is missing keeps the old answer rather than getting a guessed
+/// one.
+fn widened_string_type(
+    e: &Expr,
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+    sub: Option<Sub<'_>>,
+) -> ColumnType {
+    string_width(e, refs, input, sub).map_or(ColumnType::VarString, string_code_for)
+}
+
+/// How many bytes a computed string's widest value can hold, in the result's
+/// character set.
+///
+/// MySQL's `Item::max_length` for a string, which is what decides both the
+/// width on the wire and the type code — see [`string_code_for`]. The
+/// arithmetic is per function and is measured, over a `CHAR(10)`, a `TEXT`
+/// `tx` and a `BLOB` `bl` on 8.3:
+///
+/// | expression | characters | bytes |
+/// |---|---|---|
+/// | `'x'` | 1 | 4 |
+/// | `UPPER(c)`, `LTRIM(tx)`, `REVERSE(tx)` | the argument's | ×4 |
+/// | `CONCAT(c, 'x')` | 10 + 1 | 44 |
+/// | `LEFT(tx, 2)`, `LPAD(tx, 5, 'x')` | the count asked for | 8, 20 |
+/// | `HEX(c)` | twice the argument's **bytes** | 320 |
+///
+/// `HEX` is the one that has to be read carefully: it doubles the bytes, not
+/// the characters, so over a utf8mb4 `CHAR(10)` it is 80 characters and not
+/// 20. That is what makes `HEX(bl)` over a `BLOB` a MEDIUM_BLOB where
+/// `HEX(tb)` over a `TINYBLOB` is a VAR_STRING.
+///
+/// Everything is counted in characters and multiplied at the end, because this
+/// engine speaks one character set: a character is four bytes here, always. It
+/// is the same constant `SqlType::wire_length` uses and it stops being one on
+/// the day a second character set exists.
+///
+/// `None` is "not modelled", and it is also the answer for an expression that
+/// may not be a string at all — `VAR_STRING` is `computed_column_type`'s reply
+/// for anything it cannot type, so a width is the evidence that this really is
+/// one.
+fn string_width(
+    e: &Expr,
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+    sub: Option<Sub<'_>>,
+) -> Option<u32> {
+    /// utf8mb4, the only character set this engine has.
+    const BYTES_PER_CHAR: u32 = 4;
+    let counted = string_chars(e, refs, input)?;
+    // An answer that is bytes is already in bytes, and multiplying it would
+    // widen a `VARBINARY` into a blob: `UNHEX(bl)` over a `BLOB` is a
+    // VAR_STRING of 32768 on 8.3, where four times that would have crossed
+    // into MEDIUM_BLOB. `binary_answer` is the same question `binary_values`
+    // asks, so the width and the charset cannot disagree about one column.
+    if binary_answer(e, refs, sub) {
+        return Some(counted);
+    }
+    Some(counted.saturating_mul(BYTES_PER_CHAR))
+}
+
+/// The character count behind [`string_width`], before the character set's
+/// multiplier is applied.
+///
+/// No `Sub`, unlike the walks around it, because nothing here resolves a
+/// scalar subquery: `(SELECT tx)` is unmodelled and keeps the old answer. 8.3
+/// describes one as the *field* behind it — `BLOB len 262140` over a `TEXT`
+/// column, with the BLOB flag a function's answer does not carry — which is a
+/// different rule from the one this file models and not #0142's.
+fn string_chars(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColumn]) -> Option<u32> {
+    let recur = |inner: &Expr| string_chars(inner, refs, input);
+    // The bytes an operand holds, which is what `HEX` doubles. A text column's
+    // wire width is already in bytes and a binary one's is bytes by
+    // definition, so this is the character count times the multiplier again
+    // only for the textual kinds.
+    let bytes = |inner: &Expr| -> Option<u32> {
+        let chars = string_chars(inner, refs, input)?;
+        let textual = match inner {
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                direct_column(inner, refs, input).is_some_and(|column| column.ty.is_textual())
+            }
+            _ => true,
+        };
+        Some(if textual {
+            chars.saturating_mul(4)
+        } else {
+            chars
+        })
+    };
+    match e {
+        Expr::Nested(inner) => recur(inner),
+        // A column's own width, in the units MySQL counts it in: characters
+        // for text, bytes for a BLOB — which is what `wire_length` already
+        // answers, divided back out for the textual kinds.
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            let column = direct_column(e, refs, input)?;
+            let width = column.ty.wire_length();
+            Some(if column.ty.is_textual() {
+                width / 4
+            } else {
+                width
+            })
+        }
+        Expr::Value(v) => match &v.value {
+            sqlparser::ast::Value::SingleQuotedString(text)
+            | sqlparser::ast::Value::DoubleQuotedString(text) => {
+                u32::try_from(text.chars().count()).ok()
+            }
+            // A NULL contributes nothing to a width, which is `Item_null`'s
+            // own zero.
+            sqlparser::ast::Value::Null => Some(0),
+            _ => None,
+        },
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_ascii_lowercase();
+            let args = function_arguments(f);
+            let first = args.first()?;
+            match name.as_str() {
+                // The shape-preserving ones: the answer is at most as long as
+                // what it was given.
+                "upper" | "ucase" | "lower" | "lcase" | "ltrim" | "rtrim" | "reverse" => {
+                    recur(first)
+                }
+                // A replacement longer than what it replaces makes the answer
+                // longer, and by a rule that reads oddly and is measured
+                // rather than derived: the width is the subject's *times one
+                // less than the replacement*, and the pattern's own length
+                // does not enter it. Over a `CHAR(10)` on 8.3, `REPLACE(c,
+                // 'a', 'zz')` is 40 bytes, `'zzz'` is 80, `'zzzz'` is 120 and
+                // a `VARCHAR(20)` replacement is 760 — and swapping the
+                // pattern for `'ab'`, `'abc'` or `'abcd'` changes none of
+                // them. Thirteen shapes measured, over a `CHAR(4)` as well as
+                // a `CHAR(10)`.
+                //
+                // Only where the answer can grow at all: an empty pattern and
+                // a replacement no longer than the pattern both leave the
+                // subject's own width, measured.
+                "replace" => {
+                    let subject = recur(first)?;
+                    let pattern = args.get(1).and_then(&recur)?;
+                    let replacement = args.get(2).and_then(&recur)?;
+                    if pattern == 0 || replacement <= pattern {
+                        return Some(subject);
+                    }
+                    Some(subject.saturating_mul(replacement - 1))
+                }
+                // Everything joined, and for `CONCAT_WS` the separator once
+                // between each pair.
+                "concat" => args.iter().try_fold(0u32, |total, argument| {
+                    Some(total.saturating_add(recur(argument)?))
+                }),
+                "concat_ws" => {
+                    let joined = args[1..].iter().try_fold(0u32, |total, argument| {
+                        Some(total.saturating_add(recur(argument)?))
+                    })?;
+                    let separators = u32::try_from(args.len().saturating_sub(2)).ok()?;
+                    Some(joined.saturating_add(recur(first)?.saturating_mul(separators)))
+                }
+                // A count asked for in the statement, which cannot be more
+                // than what there is to take.
+                "left" | "right" => match args.get(1).and_then(literal_scale) {
+                    Some(count) if count >= 0 => {
+                        Some(u32::try_from(count).ok()?.min(recur(first)?))
+                    }
+                    _ => recur(first),
+                },
+                // `MID` is `SUBSTRING` under another name, so its second
+                // argument is a *position* and its third is the length —
+                // reading the second as a count made `MID(tx, 2, 5)` eight
+                // bytes wide where `SUBSTRING(tx, 2, 5)` beside it is twenty,
+                // the same call answering two things. Measured on 8.3: the two
+                // spellings agree on both, including `MID(tx, 2)`, which is a
+                // MEDIUM_BLOB.
+                "mid" => Some(sliced(
+                    recur(first)?,
+                    args.get(1).and_then(literal_scale),
+                    args.get(2).and_then(literal_scale),
+                )),
+                // A pad is exactly the width asked for.
+                "lpad" | "rpad" => match args.get(1).and_then(literal_scale) {
+                    Some(count) if count >= 0 => u32::try_from(count).ok(),
+                    _ => None,
+                },
+                // Two characters per byte, and the inverse for the two that
+                // read one back. Every number measured on 8.3 over a
+                // `CHAR(10)` (40 bytes), a `TEXT` (262140) and a `BLOB`
+                // (65535):
+                //
+                // | call | bytes |
+                // |---|---|
+                // | `HEX(c)`, `HEX(tx)` | 320, 2097120 |
+                // | `UNHEX(c)`, `UNHEX(bl)` | 20, 32768 |
+                // | `TO_BASE64(c)`, `TO_BASE64(bl)` | 224, 1416464 |
+                // | `FROM_BASE64(c)`, `FROM_BASE64(bl)` | 30, 49151 |
+                //
+                // `UNHEX` rounds *up*, which is what makes a `BLOB` 32768
+                // rather than 32767 — and the difference decides a type code,
+                // since 32768 characters of bytes still fit a VARCHAR.
+                "hex" => Some(bytes(first)?.saturating_mul(2)),
+                "unhex" => Some(bytes(first)?.div_ceil(2)),
+                // Four characters per three bytes, plus a newline every
+                // seventy-six of them. The wrapping is not decoration: it is
+                // the difference between 1416464 and 1398144 for a `BLOB`.
+                "to_base64" => {
+                    let encoded = bytes(first)?.div_ceil(3).saturating_mul(4);
+                    Some(encoded.saturating_add(encoded / 76))
+                }
+                "from_base64" => Some(bytes(first)?.saturating_mul(3) / 4),
+                _ => None,
+            }
+        }
+        // `SUBSTRING` has its own grammar. With a length it is that length;
+        // with only a start it is what is left after it — measured,
+        // `SUBSTRING(tx, 2)` over a `TEXT` is one character narrower than `tx`.
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => Some(sliced(
+            recur(expr)?,
+            substring_from.as_deref().and_then(literal_scale),
+            substring_for.as_deref().and_then(literal_scale),
+        )),
+        Expr::Trim { expr, .. } => recur(expr),
+        _ => None,
+    }
+}
+
+/// How wide a slice of a string can be, for the `SUBSTRING` family.
+///
+/// With a length it is that length, which cannot be more than there is to
+/// take; with only a start it is what is left after it — measured on 8.3,
+/// `SUBSTRING(tx, 2)` over a `TEXT` is one character narrower than `tx`, which
+/// is what keeps it a MEDIUM_BLOB where `SUBSTRING(tx, 1, 3)` is a VAR_STRING.
+/// A start or a length that is not a literal is not known here, and the whole
+/// width stands.
+fn sliced(whole: u32, start: Option<i64>, length: Option<i64>) -> u32 {
+    if let Some(length) = length.filter(|length| *length >= 0) {
+        return u32::try_from(length).unwrap_or(u32::MAX).min(whole);
+    }
+    match start.filter(|start| *start >= 1) {
+        Some(start) => whole.saturating_sub(u32::try_from(start - 1).unwrap_or(u32::MAX)),
+        None => whole,
+    }
+}
+
+/// An expression's width and places, in the two numbers MySQL keeps on an
+/// item: `max_length` counts the characters the widest value prints — the
+/// digits, a column for the point where there is a scale, and a column for the
+/// sign where the value can be negative — and `decimals` counts the places.
+///
+/// The *precision* is not a third field, because it is not independent:
+/// MySQL's `my_decimal_length_to_precision` recovers it from these two and the
+/// sign, and carrying it separately is how the width on the wire and the width
+/// in a view come to disagree.
+///
+/// Either half may be unknown on its own, which is what lets a shape be
+/// partly modelled. A `DATETIME(3)` in arithmetic is the case that needs it:
+/// its places are its fractional seconds — `dt3 + 0` shows three on 8.3 — and
+/// its width is the *packed* number's, which is not its display width and is
+/// not measured here. So the scale travels and the width does not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Exact {
+    length: Option<u32>,
+    scale: Option<u32>,
+}
+
+impl Exact {
+    /// The scale is clamped here and nowhere else, so every shape this walk
+    /// produces carries a number of places MySQL can hold. It is not only a
+    /// guard: MySQL clamps on the *item*, so the digits before the point widen
+    /// to match — a `DECIMAL(40,20)` squared is `decimal(65,30)` there, and 35
+    /// integral digits is what the next operator over it reads.
+    ///
+    /// The width is unaffected either way, because only *whether* there are
+    /// places reaches it — see `exact_length`.
+    ///
+    /// The one thing that can arrive over the cap is a literal: nothing stops
+    /// a client writing forty digits after a point.
+    fn new(length: u32, scale: u32) -> Self {
+        Self {
+            length: Some(length),
+            scale: Some(scale.min(MAX_SCALE)),
+        }
+    }
+
+    /// The places alone, for an operand whose width is not modelled.
+    fn scale_only(scale: u32) -> Self {
+        Self {
+            length: None,
+            scale: Some(scale.min(MAX_SCALE)),
+        }
+    }
+}
+
+/// MySQL's largest exact precision, which every rule below clamps to.
+/// Measured on 8.3 over two `DECIMAL(40,20)` columns: the product is
+/// `decimal(65,30)` where the arithmetic asks for 80 and 40.
+///
+/// The matching cap on the *scale* is not here, because the scale rules are
+/// not here: `crate::decimal` owns them, and the clamp travels with each.
+const MAX_PRECISION: u32 = 65;
+
+/// The scale rules, read from the module that owns them.
+///
+/// A sum's, a product's and a quotient's number of places is one rule with two
+/// readers — the scale a value is *shown* at and the scale its column is
+/// *described* with are the same number, and #0118 measured it for the first.
+/// These wrappers exist only to move between `usize` and the `u32` this walk
+/// counts digits in; the rules themselves are in one place, so a measurement
+/// that corrects one corrects both.
+fn widest_scale(a: u32, b: u32) -> u32 {
+    crate::decimal::widest_display_scale(a as usize, b as usize) as u32
+}
+
+fn product_scale(a: u32, b: u32) -> u32 {
+    crate::decimal::product_display_scale(a as usize, b as usize) as u32
+}
+
+fn quotient_scale(a: u32, increment: u32) -> u32 {
+    crate::decimal::quotient_display_scale(a as usize, increment as usize) as u32
+}
+
+/// The widest scale any of those rules can answer, for the places a shape is
+/// carried at where no rule applies.
+const MAX_SCALE: u32 = crate::decimal::MAX_SCALE as u32;
+
+/// The digits an item can hold, recovered from its width and its places.
+///
+/// `None` where the two do not describe an exact number between them, which is
+/// where the whole walk stops rather than carrying a shape it cannot mean. Two
+/// ways in: a width too narrow for its own point and sign, and a *scale wider
+/// than the precision*, which `NOT_FIXED_DEC` is — 31 places against the 21
+/// digits a DOUBLE's width leaves. Every rule below subtracts one of these
+/// from the other, so an impossible pair is checked here once instead of at
+/// each of them, and `ROUND` over an approximate scalar subquery is the shape
+/// that found it.
+fn exact_precision(shape: Exact, unsigned: bool) -> Option<u32> {
+    let scale = shape.scale?;
+    let precision = shape
+        .length?
+        .checked_sub(u32::from(scale > 0) + u32::from(!unsigned))?;
+    (precision >= scale).then_some(precision)
+}
+
+/// The digits *before* the point, which is what the additive and conditional
+/// rules take the widest of.
+fn exact_integral(shape: Exact, unsigned: bool) -> Option<u32> {
+    exact_precision(shape, unsigned)?.checked_sub(shape.scale?)
+}
+
+/// The width a precision and a scale print in, which is `exact_precision`
+/// backwards.
+fn exact_length(precision: u32, scale: u32, unsigned: bool) -> u32 {
+    precision
+        .saturating_add(u32::from(scale > 0))
+        .saturating_add(u32::from(!unsigned))
+}
+
+/// The width and places an expression that computes exactly is described with.
+///
+/// Every rule measured against 8.3 rather than read, over a `DECIMAL(10,2)`
+/// `a`, a `DECIMAL(7,3)` `b` and a `DECIMAL(6,2) UNSIGNED` `u`:
+///
+/// | expression | precision | scale | width |
+/// |---|---|---|---|
+/// | `a`, `b` | 10, 7 | 2, 3 | 12, 9 |
+/// | `a + b`, `a - b` | max integral + 1 + scale = 12 | max = 3 | 14 |
+/// | `a * b` | 10 + 7 = 17 | 2 + 3 = 5 | 19 |
+/// | `a / b` | 10 + 3 + increment = 17 | 2 + increment = 6 | 19 |
+/// | `a MOD b` | from the wider *width* | max = 3 | max(12, 9) = 12 |
+/// | `SUM(a)` | 10 + 22 = 32 | 2 | 34 |
+/// | `AVG(a)` | 10 + increment = 14 | 2 + increment = 6 | 16 |
+/// | `MIN(a)`, `MAX(a)`, `ABS(a)` | 10 | 2 | 12 |
+/// | `ROUND(a, 1)` | 10 - 1 + 1 = 10 | 1 | 12 |
+/// | `TRUNCATE(a, 1)` | 10 - 2 + 1 = 9 | 1 | 11 |
+/// | `GREATEST(a, b)` | max integral + scale = 11 | max = 3 | 13 |
+///
+/// The two asymmetries are the ones worth having written down. Addition does
+/// *not* clamp its precision where multiplication does — `DECIMAL(65,30) +
+/// DECIMAL(3,3)` is 68 wide on 8.3, a precision of 66 — and `MOD` works on the
+/// two *widths* rather than on the two precisions, which is the only way to
+/// get its measured answer for `a MOD b`: the precisions give 8 + 3 = 11 and a
+/// width of 13, and MySQL says 12.
+///
+/// An operand whose shape is not modelled makes the answer not modelled, which
+/// is what keeps this a subset: `None` reads as the type's default width, the
+/// answer the engine already gave.
+fn exact_shape(
+    e: &Expr,
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+    sub: Option<Sub<'_>>,
+) -> Exact {
+    use sqlparser::ast::BinaryOperator as B;
+    use sqlparser::ast::UnaryOperator as U;
+
+    /// What `SUM` adds to its argument's precision, `DECIMAL_LONGLONG_DIGITS`
+    /// in the server: measured, `SUM` over a `DECIMAL(10,2)` is 34 wide and
+    /// over an `INT` 33.
+    const SUM_DIGITS: u32 = 22;
+
+    let recur = |inner: &Expr| exact_shape(inner, refs, input, sub);
+    // Read once, on the paths that need it. Every walker here is recursive, so
+    // a question asked at each node about that node's whole subtree is asked a
+    // quadratic number of times; asking it lazily keeps it off the arms that
+    // answer "not modelled" and walk no further.
+    let signed_here = || !unsigned_answer(e, refs, input, sub);
+    // The width of a precision and a scale under *this* node's sign, which is
+    // where a negation gets its extra column: `-u` over an unsigned
+    // `DECIMAL(6,2)` is 8 wide on 8.3 against the column's own 7.
+    //
+    // The scale arrives already clamped, by whichever rule produced it. Only
+    // *whether there are any* places reaches the width, so the clamp cannot
+    // move it: 8.3 reports `DECIMAL(40,20) * DECIMAL(40,20)` as `len 67
+    // dec 30`, and 65 digits with a point and a sign is 67 at either scale.
+    let sized = |precision: u32, scale: u32| {
+        Exact::new(exact_length(precision, scale, !signed_here()), scale)
+    };
+    // The parts of one operand, under *its* own sign rather than the node's:
+    // `u + u` is unsigned and `a + u` is not, and each operand's precision has
+    // to be read the way that operand prints.
+    //
+    // Takes the shape already walked rather than walking it again. It used to
+    // take the expression, and the arms below then walked each child twice —
+    // once here and once for the scale in the fallback — which is 2^n over a
+    // chain of operators whose shape is not modelled. Measured before the fix:
+    // twenty `+ 0` terms over a `DATETIME(3)` column took 2.3 seconds to
+    // describe, and twenty-two took eight.
+    let parts = |inner: &Expr, shape: Exact| {
+        let unsigned = unsigned_answer(inner, refs, input, sub);
+        Some((
+            exact_precision(shape, unsigned)?,
+            exact_integral(shape, unsigned)?,
+            shape.scale?,
+        ))
+    };
+    // The corrected shape, for the reason `printed_width` asks for it: the
+    // operator at the root as parsed is often not the operator that decides,
+    // and a walk that reads a different tree than `eval` describes a different
+    // expression than the one that runs.
+    if let Some(fixed) = crate::expr::reassociated_postfix(e) {
+        return exact_shape(&fixed, refs, input, sub);
+    }
+    match e {
+        Expr::Nested(inner) => recur(inner),
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            let Some(column) = direct_column(e, refs, input) else {
+                return Exact::default();
+            };
+            let ty = &column.ty;
+            match ty.kind {
+                // A declared scale, or none at all for a `FLOAT` that has one
+                // — the approximate arm in `item_shape` reads the difference.
+                crate::types::TypeKind::Decimal => {
+                    Exact::new(ty.wire_length(), ty.scale.unwrap_or(0) as u32)
+                }
+                crate::types::TypeKind::Float => match ty.scale {
+                    Some(scale) => Exact::new(ty.wire_length(), scale as u32),
+                    None => Exact::default(),
+                },
+                crate::types::TypeKind::Int
+                | crate::types::TypeKind::Bool
+                | crate::types::TypeKind::Year => Exact::new(ty.wire_length(), 0),
+                // A temporal computes in its packed form, whose width is not
+                // its display width — see the note on `Exact` — so only the
+                // places travel.
+                crate::types::TypeKind::DateTime | crate::types::TypeKind::Time => {
+                    Exact::scale_only(ty.length.unwrap_or(0) as u32)
+                }
+                crate::types::TypeKind::Date => Exact::scale_only(0),
+                _ => Exact::default(),
+            }
+        }
+        // A scalar subquery is described exactly as the column behind it is,
+        // and reading it back off the wire definition is what keeps the two
+        // from drifting: `(SELECT a FROM T) + 1` sizes from `a`'s own 12 and 2.
+        Expr::Subquery(query) => match subquery_column(sub, query, refs) {
+            // A column with a *fixed* number of places only. `NOT_FIXED_DEC`
+            // is an answer and not a scale — an approximate or string column
+            // reports it — and reading it as one gave `(SELECT AVG(d) FROM T)`
+            // over a `DOUBLE` a shape of 21 digits and 31 places, which is not
+            // a number. 8.3 describes both it and `ROUND` of it `len 23
+            // dec 31`, which is what the approximate arm answers once this
+            // hands back nothing.
+            Some(column) => match column.to_wire() {
+                def if u32::from(def.decimals) <= MAX_SCALE => {
+                    Exact::new(def.column_length, u32::from(def.decimals))
+                }
+                _ => Exact::default(),
+            },
+            None => Exact::default(),
+        },
+        Expr::Value(v) => match &v.value {
+            // The digits as written, plus a column for the sign. The *token*
+            // is what counts and not the value: `0.25` is 5 wide on 8.3 and
+            // `.25` would be 4, because the leading zero is a digit MySQL was
+            // given. An exponent is not an exact literal at all.
+            sqlparser::ast::Value::Number(text, _) => {
+                let digits = text.strip_prefix('-').unwrap_or(text);
+                let (whole, fraction) = match digits.split_once('.') {
+                    Some((whole, fraction)) => (whole, fraction),
+                    None => (digits, ""),
+                };
+                let numeric = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+                if whole.is_empty() && fraction.is_empty() || !numeric(whole) || !numeric(fraction)
+                {
+                    return Exact::default();
+                }
+                let width = u32::try_from(digits.len()).ok();
+                let scale = u32::try_from(fraction.len()).ok();
+                match (width, scale) {
+                    (Some(width), Some(scale)) => Exact::new(width.saturating_add(1), scale),
+                    _ => Exact::default(),
+                }
+            }
+            sqlparser::ast::Value::Boolean(_) => Exact::new(1, 0),
+            _ => Exact::default(),
+        },
+        // The target names the shape outright. `DECIMAL` with nothing after it
+        // is `DECIMAL(10,0)`, which is MySQL's default and measures 11 wide.
+        Expr::Cast {
+            data_type:
+                sqlparser::ast::DataType::Decimal(info)
+                | sqlparser::ast::DataType::Numeric(info)
+                | sqlparser::ast::DataType::Dec(info),
+            ..
+        } => {
+            let (precision, scale) = match info {
+                sqlparser::ast::ExactNumberInfo::None => (10, 0),
+                sqlparser::ast::ExactNumberInfo::Precision(p) => (*p as u32, 0),
+                sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => (*p as u32, *s as u32),
+            };
+            sized(precision.min(MAX_PRECISION), scale.min(MAX_SCALE))
+        }
+        Expr::UnaryOp { op, expr } => {
+            if let Some(fixed) = crate::expr::reassociated_unary(op, expr) {
+                return exact_shape(&fixed, refs, input, sub);
+            }
+            match op {
+                U::Plus | U::Minus => {
+                    let shape = recur(expr);
+                    match parts(expr, shape) {
+                        Some((precision, _, scale)) => sized(precision, scale),
+                        None => scale_only_or_default(shape.scale),
+                    }
+                }
+                _ => Exact::default(),
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            if let Some(fixed) = crate::expr::reassociated(op, left, right) {
+                return exact_shape(&fixed, refs, input, sub);
+            }
+            // Each child walked once, whatever the arm below does with it.
+            // Two of them fall back to the scales alone, and reading those off
+            // a second walk is what made a chain of unmodelled operators cost
+            // exponential time.
+            let (left_shape, right_shape) = (recur(left), recur(right));
+            let scales = || Some(left_shape.scale?.max(right_shape.scale?));
+            match op {
+                B::Plus | B::Minus => {
+                    match (parts(left, left_shape), parts(right, right_shape)) {
+                        (
+                            Some((_, left_integral, left_scale)),
+                            Some((_, right_integral, right_scale)),
+                        ) => {
+                            let scale = widest_scale(left_scale, right_scale);
+                            // One more than the wider integral part, for the
+                            // carry. Deliberately unclamped: 8.3 reports a
+                            // precision of 66 for `DECIMAL(65,30) +
+                            // DECIMAL(3,3)`, past its own maximum.
+                            let precision = left_integral.max(right_integral) + 1 + scale;
+                            sized(precision, scale)
+                        }
+                        _ => scale_only_or_default(scales()),
+                    }
+                }
+                B::Multiply => match (parts(left, left_shape), parts(right, right_shape)) {
+                    (
+                        Some((left_precision, _, left_scale)),
+                        Some((right_precision, _, right_scale)),
+                    ) => sized(
+                        (left_precision + right_precision).min(MAX_PRECISION),
+                        product_scale(left_scale, right_scale),
+                    ),
+                    _ => Exact::default(),
+                },
+                B::Divide => {
+                    let increment = u32::try_from(div_precision_increment()).unwrap_or(0);
+                    match (parts(left, left_shape), parts(right, right_shape)) {
+                        (Some((left_precision, _, left_scale)), Some((_, _, right_scale))) => {
+                            sized(
+                                (left_precision + right_scale + increment).min(MAX_PRECISION),
+                                quotient_scale(left_scale, increment),
+                            )
+                        }
+                        _ => Exact::default(),
+                    }
+                }
+                // The wider of the two *widths*, converted back to a precision
+                // under this node's sign. See the note above.
+                B::Modulo => match (left_shape, right_shape) {
+                    (
+                        Exact {
+                            length: Some(left_length),
+                            scale: Some(left_scale),
+                        },
+                        Exact {
+                            length: Some(right_length),
+                            scale: Some(right_scale),
+                        },
+                    ) => Exact::new(
+                        left_length.max(right_length),
+                        widest_scale(left_scale, right_scale),
+                    ),
+                    _ => scale_only_or_default(scales()),
+                },
+                _ => Exact::default(),
+            }
+        }
+        // The conditional family builds a new item out of several candidates
+        // and takes the widest integral part and the widest scale, with no
+        // carry — `GREATEST(a, b)` is 13 wide where `a + b` is 14.
+        Expr::Case {
+            conditions,
+            else_result,
+            ..
+        } => {
+            let mut candidates: Vec<Expr> = conditions.iter().map(|w| w.result.clone()).collect();
+            candidates.extend(else_result.as_deref().cloned());
+            widest_candidate(&candidates, refs, input, sub, signed_here())
+        }
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_ascii_lowercase();
+            let args = function_arguments(f);
+            let increment = || u32::try_from(div_precision_increment()).unwrap_or(0);
+            // Walked once and handed to whichever arm wants it, for the
+            // reason the binary operators above do the same.
+            let folded = aggregate_argument(f);
+            let folded_shape = folded.as_ref().map(&recur);
+            let folded_parts = || {
+                let argument = folded.as_ref()?;
+                parts(argument, folded_shape?)
+            };
+            match name.as_str() {
+                // A total needs room for every row it adds up.
+                "sum" => match folded_parts() {
+                    Some((precision, _, scale)) => {
+                        sized((precision + SUM_DIGITS).min(MAX_PRECISION), scale)
+                    }
+                    None => scale_only_or_default(folded_shape.and_then(|shape| shape.scale)),
+                },
+                // An average gains the same places a quotient does, because it
+                // is one.
+                "avg" => match folded_parts() {
+                    Some((precision, _, scale)) => sized(
+                        (precision + increment()).min(MAX_PRECISION),
+                        quotient_scale(scale, increment()),
+                    ),
+                    None => Exact::default(),
+                },
+                // These hand one of their operands back rather than computing
+                // a new number, so the shape is the operand's — under this
+                // node's sign, which is what `ABS` of a signed column changes.
+                "min" | "max" | "abs" => match folded_parts() {
+                    Some((precision, _, scale)) => sized(precision, scale),
+                    None => scale_only_or_default(folded_shape.and_then(|shape| shape.scale)),
+                },
+                "round" | "truncate" => {
+                    rounded_shape(&name, &args, refs, input, sub, signed_here())
+                }
+                "coalesce" | "ifnull" | "nvl" | "greatest" | "least" | "nullif" => {
+                    widest_candidate(&args, refs, input, sub, signed_here())
+                }
+                // `IF` chooses between its second and third arguments; the
+                // condition contributes nothing to the shape.
+                "if" if args.len() == 3 => {
+                    widest_candidate(&args[1..], refs, input, sub, signed_here())
+                }
+                _ => Exact::default(),
+            }
+        }
+        _ => Exact::default(),
+    }
+}
+
+/// A shape with places but no width, or nothing at all.
+fn scale_only_or_default(scale: Option<u32>) -> Exact {
+    match scale {
+        Some(scale) => Exact::scale_only(scale),
+        None => Exact::default(),
+    }
+}
+
+/// The shape a family that picks one of several candidates takes: the widest
+/// integral part and the widest scale, with no room added for a carry.
+///
+/// Measured on 8.3 over a `DECIMAL(10,2)` and a `DECIMAL(7,3)`: `GREATEST`,
+/// `LEAST`, `COALESCE`, `IFNULL`, `IF` and `CASE` all report `len 13 dec 3`,
+/// where the addition of the same two is 14.
+fn widest_candidate(
+    candidates: &[Expr],
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+    sub: Option<Sub<'_>>,
+    signed: bool,
+) -> Exact {
+    // Before the fold rather than after it: over no candidates at all the
+    // fold answers a shape of nothing, which would describe the column as a
+    // `decimal(0,0)` rather than leave it alone.
+    if candidates.is_empty() {
+        return Exact::default();
+    }
+    let mut integral = 0;
+    let mut scale = 0;
+    for candidate in candidates {
+        let shape = exact_shape(candidate, refs, input, sub);
+        let unsigned = unsigned_answer(candidate, refs, input, sub);
+        let (Some(candidate_integral), Some(candidate_scale)) =
+            (exact_integral(shape, unsigned), shape.scale)
+        else {
+            return Exact::default();
+        };
+        integral = integral.max(candidate_integral);
+        scale = widest_scale(scale, candidate_scale);
+    }
+    Exact::new(
+        exact_length((integral + scale).min(MAX_PRECISION), scale, !signed),
+        scale,
+    )
+}
+
+/// The shape `ROUND` and `TRUNCATE` take, which differ by one digit.
+///
+/// Both cut the scale to what was asked for, and neither can widen it past the
+/// argument's: `ROUND(a, 5)` over a `DECIMAL(10,2)` is still `len 12 dec 2` on
+/// 8.3. What they do with the digits they gave up is where they part company —
+/// `ROUND` hands one back, because rounding up can carry into a new one, and
+/// `TRUNCATE` does not. Measured: `ROUND(a, 1)` is 12 wide and `TRUNCATE(a, 1)`
+/// is 11.
+///
+/// A negative scale rounds to a whole number, and a scale that is not a
+/// literal is not known here at all — `ROUND(a, k)` over a column keeps the
+/// argument's shape, which is what `None` from `literal_scale` falls to.
+fn rounded_shape(
+    name: &str,
+    args: &[Expr],
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+    sub: Option<Sub<'_>>,
+    signed: bool,
+) -> Exact {
+    let Some(subject) = args.first() else {
+        return Exact::default();
+    };
+    let shape = exact_shape(subject, refs, input, sub);
+    let unsigned = unsigned_answer(subject, refs, input, sub);
+    let (Some(precision), Some(scale)) = (exact_precision(shape, unsigned), shape.scale) else {
+        return Exact::default();
+    };
+    // One argument means "to a whole number", which is `ROUND(a)`.
+    let asked = match args.get(1) {
+        None => Some(0),
+        Some(second) => literal_scale(second),
+    };
+    let Some(asked) = asked else {
+        return Exact::new(exact_length(precision, scale, !signed), scale);
+    };
+    let kept = asked.clamp(0, i64::from(scale)) as u32;
+    // Neither subtraction below can go under zero: `kept` is clamped to
+    // `scale`, and `exact_precision` hands back a precision only where it is
+    // at least the scale.
+    let given_up = scale - kept;
+    let width = if name == "round" {
+        // MySQL's `length_increase`: a carry needs a digit, and it needs one
+        // per nine-digit word given up, which is why the test is a remainder.
+        precision - given_up + u32::from(given_up % 9 > 0)
+    } else {
+        precision - scale + kept
+    };
+    // A number has at least one digit. Giving up every place of a
+    // `DECIMAL(9,9)` leaves none by the arithmetic above — nine is a whole
+    // word, so nothing is handed back for the carry — and 8.3 declares
+    // `decimal(1,0)` there rather than a precision of nothing, for both
+    // spellings. Measured; `DECIMAL(4,4)` is the case that separates them,
+    // where `ROUND` reaches 1 on its own and `TRUNCATE` does not.
+    Exact::new(exact_length(width.max(1), kept, !signed), kept)
+}
+
+/// The scale a `ROUND` or `TRUNCATE` was written with, where it was written as
+/// a number.
+fn literal_scale(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Nested(inner) => literal_scale(inner),
+        Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Minus,
+            expr,
+        } => Some(-literal_scale(expr)?),
+        Expr::Value(v) => match &v.value {
+            sqlparser::ast::Value::Number(text, _) => text.parse().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// How many characters an integer expression's widest value can print.
 ///
-/// MySQL's `Item::max_length`, for the corner of it that decides a type code:
-/// a materialised integer column is an `int` where this is nine or fewer and a
-/// `bigint` where it is more. See [`OutColumn::materialised_sql_type`], which
-/// is the only reader — nothing here reaches the wire width, which is #0126
-/// and a wider gap than this.
+/// MySQL's `Item::max_length` for the integer family, and it decides two
+/// things: the width the column goes out with, and — where it is nine or fewer
+/// — that a materialised copy of the column is an `int` rather than a
+/// `bigint`. See [`OutColumn::materialised_sql_type`].
 ///
 /// Every number below is measured on 8.3 by selecting the expression and
 /// reading `Length` off the column definition:
@@ -8998,37 +10054,16 @@ fn merged_approximate(
 /// and every bitwise operator are `bigint` there too, and answering `None` for
 /// them is the right answer by the shortest route. The functions that are
 /// *not* — `MONTH` is 3, `LENGTH` is 10, `ASCII` is 3 — are a width per
-/// function, the same arithmetic #0142 records for the string ones, and are
-/// left to it: a missing width keeps the answer this engine already gave,
-/// where a wrong one would invent a new divergence.
-fn integer_width(
-    e: &Expr,
-    refs: &[ColumnRef],
-    input: &[crate::relation::RelColumn],
-    sub: Option<Sub<'_>>,
-) -> Option<u32> {
-    // Only an integer has a width of this shape, and the check is made here
-    // rather than inside the walk: `computed_column_type` runs a probe query
-    // for a scalar subquery, so asking it once per expression is the cost this
-    // is worth and asking it once per *node* is not. Nothing below can narrow
-    // a column this rejects anyway — `materialised_sql_type` only ever
-    // narrows a `bigint` — so the guard states the rule rather than enforcing
-    // it twice.
-    if !is_integer(computed_column_type(e, refs, input, sub)) {
-        return None;
-    }
-    printed_width(e, refs, input)
-}
-
-/// The walk behind [`integer_width`].
+/// function, and are #0188: a missing width keeps the answer this engine
+/// already gave, where a wrong one would invent a new divergence.
 ///
-/// The *root* is known to be an integer, because `integer_width` checked it;
-/// a subexpression is not, and does not have to be. A width that comes back
-/// from one can only reach a caller through an operator, and an operator over
-/// something that is not an integer does not answer one either — so the
-/// column is not a `bigint` and `materialised_sql_type` leaves it alone
-/// whatever number arrives here. Nothing below re-asks the type for that
-/// reason: `computed_column_type` is not free.
+/// The *root* is known to be an integer, because [`item_shape`] checked it; a
+/// subexpression is not, and does not have to be. A width that comes back from
+/// one can only reach a caller through an operator, and an operator over
+/// something that is not an integer does not answer one either — so the column
+/// is not a `bigint` and `materialised_sql_type` leaves it alone whatever
+/// number arrives here. Nothing below re-asks the type for that reason:
+/// `computed_column_type` is not free.
 fn printed_width(
     e: &Expr,
     refs: &[ColumnRef],
@@ -9609,6 +10644,11 @@ fn computed_column_type(
                     .map(|argument| computed_column_type(argument, refs, input, sub))
                     .unwrap_or(ColumnType::VarString),
                 "isnull" => ColumnType::LongLong,
+                // A string function MySQL sizes from its arguments takes its
+                // *code* from that width too, so the same call is a
+                // VAR_STRING over a `CHAR(10)` and a MEDIUM_BLOB over a
+                // `TEXT`. #0142.
+                other if widens_with_argument(other) => widened_string_type(e, refs, input, sub),
                 // The ones whose answer does not depend on what they were
                 // given, and then everything unrecognised, which stays a
                 // string because nothing here knows better.
@@ -9655,7 +10695,10 @@ fn computed_column_type(
         Expr::Floor { expr, .. } | Expr::Ceil { expr, .. } => {
             numeric_answer(computed_column_type(expr, refs, input, sub), true)
         }
-        Expr::Substring { .. } | Expr::Trim { .. } | Expr::Overlay { .. } => ColumnType::VarString,
+        // `SUBSTRING` and `TRIM` are sized from their argument as the calls
+        // above are; `OVERLAY` is not modelled and keeps the old answer.
+        Expr::Substring { .. } | Expr::Trim { .. } => widened_string_type(e, refs, input, sub),
+        Expr::Overlay { .. } => ColumnType::VarString,
         // Anything that answers a yes-or-no question is an integer, which is
         // the largest single group MySQL types differently from this engine.
         Expr::IsNull(_)
@@ -12081,6 +13124,13 @@ struct Origin {
     no_unsigned_subtraction: bool,
     /// Whether a write that would truncate or clamp a value fails instead.
     strict: bool,
+    /// How many extra places a quotient and an average are computed to. Not a
+    /// mode but a session variable, read here for the same reason the modes
+    /// are: it decides the *scale a column is described with* — `a / b` over a
+    /// `DECIMAL(10,2)` shows six places at the default and two at 0 — and the
+    /// describing happens several recursions below the only place that holds
+    /// the session.
+    div_precision_increment: usize,
 }
 
 thread_local! {
@@ -12125,6 +13175,27 @@ pub(crate) fn real_as_float() -> bool {
     })
 }
 
+/// How many extra places a quotient and an average carry in the statement
+/// being handled.
+///
+/// Read here rather than passed to the walk that describes a column for the
+/// reason the modes above are: `computed_column_type` and the shape walk
+/// beside it run several recursions below the only place that holds the
+/// session, through paths — a derived table, a view, a `DESCRIBE` — that have
+/// no session argument at all.
+///
+/// The documented default without a statement in scope, which is what the
+/// arithmetic itself falls back to.
+pub(crate) fn div_precision_increment() -> usize {
+    SOURCE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .map_or(crate::decimal::DEFAULT_DIV_PRECISION_INCREMENT, |current| {
+                current.div_precision_increment
+            })
+    })
+}
+
 /// Whether a write that would lose data fails in the statement being handled.
 ///
 /// Read here rather than passed to `SqlType::store` for the same reason as
@@ -12166,7 +13237,8 @@ pub(crate) fn no_unsigned_subtraction() -> bool {
 struct Source(Option<Origin>);
 
 impl Source {
-    fn set(normalised: &std::rc::Rc<rewrite::Normalised>, mode: crate::dialect::SqlMode) -> Self {
+    fn set(normalised: &std::rc::Rc<rewrite::Normalised>, session: &Session) -> Self {
+        let mode = session.sql_mode();
         let current = Origin {
             source: std::rc::Rc::clone(normalised),
             names: std::cell::RefCell::new(std::collections::HashMap::new()),
@@ -12174,6 +13246,7 @@ impl Source {
             real_as_float: mode.real_as_float,
             no_unsigned_subtraction: mode.no_unsigned_subtraction,
             strict: mode.strict,
+            div_precision_increment: session.div_precision_increment(),
         };
         Self(SOURCE.with(|s| s.replace(Some(current))))
     }

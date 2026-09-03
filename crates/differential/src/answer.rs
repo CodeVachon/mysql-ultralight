@@ -14,8 +14,6 @@ use mysql::{Conn, Row, Value};
 /// The rest of the packet is audited and not read, which is a decision rather
 /// than an oversight, and `README.md` carries the count behind each:
 ///
-/// - `decimals`, a DECIMAL's places and a temporal's fractional digits: the
-///   engine reports 0 for every column, 1148 divergences over 260 statements.
 /// - `character_set` as an id: the engine ignores the connection's result
 ///   charset and answers 255 where MySQL converts to 45, on 458 divergences
 ///   over 118 statements. Whether that id is the *binary* one is compared,
@@ -39,6 +37,12 @@ pub struct Column {
     /// The declared width, in bytes of the connection's result charset — so a
     /// `VARCHAR(10)` under utf8mb4 is 40 and not 10.
     pub length: u32,
+    /// How many decimal places the column shows: a DECIMAL's scale, a
+    /// temporal's fractional digits, and 31 — `NOT_FIXED_DEC` — where there is
+    /// no fixed number of them. It is what an ORM maps a column to a type
+    /// with, so a `DECIMAL(10,2)` described with no places is read as a whole
+    /// number. #0111.
+    pub decimals: u8,
     /// The table the column was read out of, which MySQL leaves empty for
     /// anything computed. Not compared; it decides *what* is compared, because
     /// a column with a table behind it has a declared shape and one without it
@@ -188,6 +192,7 @@ impl Answer {
                 // exactly the kind this harness kept missing.
                 flags: c.flags().bits(),
                 length: c.column_length(),
+                decimals: c.decimals(),
                 org_table: c.org_table_str().into_owned(),
                 binary_values: c.character_set() == 63,
             })

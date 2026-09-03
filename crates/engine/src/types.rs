@@ -445,6 +445,43 @@ impl SqlType {
         }
     }
 
+    /// The `decimals` a result set reports for a column of this type.
+    ///
+    /// A *declaration's* places, which is not the same question as an
+    /// expression's — see `OutColumn::decimals` for that one. Every number
+    /// measured against 8.3:
+    ///
+    /// | declared | decimals |
+    /// |---|---|
+    /// | `DECIMAL(10,2)`, `DECIMAL(3,3)` | 2, 3 |
+    /// | `DECIMAL(10,0)` | 0 |
+    /// | `FLOAT(10,4)`, `DOUBLE(20,7)` | 4, 7 |
+    /// | `FLOAT`, `DOUBLE` | 31 |
+    /// | `DATETIME(3)`, `TIME(6)` | 3, 6 |
+    /// | `DATE`, `DATETIME`, `YEAR`, every integer, every string | 0 |
+    ///
+    /// The asymmetry worth keeping is the last row against the float one: an
+    /// approximate column with no declared scale has no fixed number of places
+    /// and says so with [`NOT_FIXED_DEC`], where a `VARCHAR` — which has none
+    /// either — says 0, because MySQL answers this off the field and a field
+    /// only ever carries the number for a type that has one.
+    ///
+    /// [`NOT_FIXED_DEC`]: mysql_ultralight_protocol::column::NOT_FIXED_DEC
+    pub fn wire_decimals(&self) -> u8 {
+        let places = |n: Option<u64>| u8::try_from(n.unwrap_or(0)).unwrap_or(0);
+        match self.kind {
+            TypeKind::Decimal => places(self.scale),
+            TypeKind::Float => match self.scale {
+                Some(scale) => places(Some(scale)),
+                None => mysql_ultralight_protocol::column::NOT_FIXED_DEC,
+            },
+            // A temporal's fractional seconds are parsed into `length`, the
+            // same field `wire_length` reads them from.
+            TypeKind::DateTime | TypeKind::Time => places(self.length),
+            _ => 0,
+        }
+    }
+
     /// Whether the column is declared as a list of members, and which kind.
     ///
     /// Separate from `column_type`, because that answer is `STRING` for both

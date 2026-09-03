@@ -88,22 +88,39 @@ pub struct OutColumn {
     /// nothing declared. `ROW_NUMBER()` counts from one and MySQL marks it
     /// UNSIGNED; so does `CAST(x AS UNSIGNED)`, which says so in the statement.
     pub unsigned: bool,
-    /// How many characters an integer expression's widest value can print,
-    /// where this engine models it.
+    /// How wide a computed column's widest value can print, where this engine
+    /// models it.
     ///
-    /// MySQL calls this `Item::max_length`, and for an integer it counts the
-    /// digits plus a column for the sign: `SELECT 1` is 2, `SELECT 127` is 4
-    /// and `SELECT 9223372036854775807` is 20. It is the whole of what decides
-    /// the *type code* a materialised copy of the column gets — see
-    /// [`Self::materialised_sql_type`] — which is why it is carried here
-    /// rather than recomputed: a view stores its shape from these columns and
-    /// has no expression left to ask.
+    /// MySQL calls this `Item::max_length`. For a number it counts the
+    /// characters — `SELECT 1` is 2, `SELECT 127` is 4, a `DECIMAL(10,2)` sum
+    /// is its precision plus a point and a sign — and for a string it counts
+    /// the bytes of the result's character set. It decides two things: the
+    /// width on the wire, and the *type code* a materialised copy of an
+    /// integer column gets — see [`Self::materialised_sql_type`]. It is
+    /// carried here rather than recomputed because a view stores its shape
+    /// from these columns and has no expression left to ask.
     ///
-    /// `None` for everything else — a declared column, a non-integer, and the
-    /// integer expressions whose width `integer_width` does not model. None
-    /// means "as wide as an integer gets", which is the answer this engine
-    /// gave for every expression before this field existed.
-    pub int_width: Option<u32>,
+    /// `None` for a declared column, which answers from its declaration, and
+    /// for every expression whose width this engine does not model. None means
+    /// "the type's default width", which is the answer this engine gave for
+    /// every expression before this field existed — 20 for a number and 4096
+    /// for a string.
+    pub max_length: Option<u32>,
+    /// How many decimal places a computed column shows, where this engine
+    /// models it.
+    ///
+    /// MySQL's `Item::decimals`, which is a fact about the *expression* and
+    /// not about any column behind it: `a + b` over a `DECIMAL(10,2)` and a
+    /// `DECIMAL(7,3)` shows three places on 8.3, and `SELECT 'x'` shows
+    /// `NOT_FIXED_DEC`. A declared column answers this from its own type in
+    /// [`SqlType::wire_decimals`] instead, and the two are deliberately
+    /// separate: a field with no scale reports 0 where an item with none
+    /// reports 31.
+    ///
+    /// `None` for a declared column and for the expressions this engine does
+    /// not model, which then report 0 — what every column here reported before
+    /// this field existed.
+    pub decimals: Option<u8>,
 }
 
 impl OutColumn {
@@ -119,7 +136,8 @@ impl OutColumn {
             declared: None,
             origin: None,
             origin_table: None,
-            int_width: None,
+            max_length: None,
+            decimals: None,
         }
     }
 
@@ -137,11 +155,13 @@ impl OutColumn {
             declared: Some(ty.clone()),
             origin: None,
             origin_table: None,
-            // A declared column carries its own width in `declared`, and
-            // materialising one copies the field rather than deriving a new
-            // one: `SELECT ti FROM (SELECT ti FROM t) d` is a TINY on 8.3
-            // where `SELECT ti + 0` through the same derived table is not.
-            int_width: None,
+            // A declared column carries its own width and places in
+            // `declared`, and materialising one copies the field rather than
+            // deriving a new one: `SELECT ti FROM (SELECT ti FROM t) d` is a
+            // TINY on 8.3 where `SELECT ti + 0` through the same derived table
+            // is not.
+            max_length: None,
+            decimals: None,
         }
     }
 
@@ -179,14 +199,27 @@ impl OutColumn {
     /// come back `cs=63 flags=[BINARY]`.
     ///
     /// The width is 512 rather than 8 for the same reason the textual
-    /// widening is `varchar(512)` — this engine has no `Item::max_length`
-    /// arithmetic for a string — and the two are kept the same shape
-    /// deliberately. It has one for an integer, and it decides a type code
-    /// rather than a width; see [`Self::materialised_sql_type`].
+    /// widening is `varchar(512)` — the byte width a string function's answer
+    /// has is not a *declaration* this engine can spell, since the codes it
+    /// reaches for have none between `varchar` and the four blob sizes — and
+    /// the two are kept the same shape deliberately. The exact widths are in
+    /// `max_length`, which the wire reads and this does not.
+    ///
+    /// A decimal is the one widening that is not a guess. Its precision and
+    /// scale are the arithmetic in `exec`'s `exact_shape`, reassembled by
+    /// [`Self::widened_decimal`] just below, and MySQL declares exactly
+    /// them: `CREATE TABLE t AS SELECT a + b` over a `DECIMAL(10,2)` and a
+    /// `DECIMAL(7,3)` is a `decimal(12,3)` on 8.3, where this engine used to
+    /// widen every computed decimal to a bare `decimal` — precision 10, scale
+    /// 0 — and report a view over a money sum with no places at all.
     pub fn sql_type(&self) -> SqlType {
         self.declared.clone().unwrap_or_else(|| {
             let mut widened = if self.binary_values {
                 SqlType::widened_binary()
+            } else if let Some(decimal) = self.widened_decimal() {
+                decimal
+            } else if let Some(text) = self.widened_text() {
+                text
             } else {
                 SqlType::from_column_type(self.ty)
             };
@@ -211,6 +244,100 @@ impl OutColumn {
         })
     }
 
+    /// The `DECIMAL(M,D)` a computed decimal column widens to, where its shape
+    /// is known.
+    ///
+    /// The precision is recovered from the width and the places rather than
+    /// carried as a third field, which is MySQL's own arithmetic — its
+    /// `my_decimal_length_to_precision` is exactly this, and its inverse is
+    /// what `SqlType::wire_length` already does for a declared column. Keeping
+    /// one number instead of two means the width on the wire and the width in
+    /// a view cannot disagree.
+    fn widened_decimal(&self) -> Option<SqlType> {
+        if !matches!(self.ty, ColumnType::NewDecimal | ColumnType::Decimal) {
+            return None;
+        }
+        let length = u64::from(self.max_length?);
+        let scale = u64::from(self.decimals?);
+        let point = u64::from(scale > 0);
+        let sign = u64::from(!self.unsigned);
+        // Not `saturating_sub`: a width that cannot hold its own point and
+        // sign is not a decimal shape at all, and inventing a zero precision
+        // for it would declare `decimal(0,3)`. Widening as before says less.
+        let precision = length.checked_sub(point + sign)?;
+        Some(SqlType {
+            kind: crate::types::TypeKind::Decimal,
+            declared: format!("decimal({precision},{scale})"),
+            length: Some(precision),
+            scale: Some(scale),
+            unsigned: self.unsigned,
+            variants: Vec::new(),
+            binary_collation: false,
+            collation: crate::collation::Collation::Ai0900Ci,
+        })
+    }
+
+    /// The TEXT type a computed column under a blob code widens to.
+    ///
+    /// A string function reaches for a blob code once its answer outgrows a
+    /// VARCHAR — `UPPER(tx)` over a `TEXT` is a MEDIUM_BLOB on 8.3 — and the
+    /// answer is still *characters*. Without this arm the widening runs
+    /// through `SqlType::from_column_type`, which reads a blob code as a
+    /// `blob` and therefore as bytes, and a derived table over `UPPER(tx)`
+    /// would hand the caller a Buffer it cannot convert. That is the
+    /// `GROUP_CONCAT` defect the differential harness exists to catch, and
+    /// widening the type codes is what would have re-introduced it.
+    ///
+    /// `longtext` whichever blob code it was, which is measured rather than
+    /// matched size for size: `CREATE TABLE t AS SELECT UPPER(tx)` over a
+    /// `TEXT` column declares `ut longtext` on 8.3, and the item it was built
+    /// from is a MEDIUM_BLOB. MySQL sizes the *item* from the argument and the
+    /// *field* it materialises into to the largest of the family.
+    ///
+    /// `None` where the values really are bytes, which `binary_values` states
+    /// and the caller checks first, and for a computed JSON document, which
+    /// MySQL does describe with the binary character set.
+    fn widened_text(&self) -> Option<SqlType> {
+        if !matches!(
+            self.ty,
+            ColumnType::TinyBlob | ColumnType::Blob | ColumnType::MediumBlob | ColumnType::LongBlob
+        ) {
+            return None;
+        }
+        Some(SqlType {
+            kind: crate::types::TypeKind::Text,
+            declared: "longtext".to_owned(),
+            length: None,
+            scale: None,
+            unsigned: false,
+            variants: Vec::new(),
+            binary_collation: false,
+            collation: crate::collation::Collation::Ai0900Ci,
+        })
+    }
+
+    /// Whether materialising this column narrows the type code it goes out
+    /// under.
+    ///
+    /// Asked before [`Self::materialised_sql_type`] by the callers for whom
+    /// answering "is this block materialised at all?" costs a parse: no column
+    /// narrows without a width, and almost none have one.
+    /// The type code is checked as well as the width, and it holds today for
+    /// free: everything `printed_width` models is typed LONGLONG by
+    /// `computed_column_type`, so this can only ever be looking at a `bigint`.
+    /// It is here for the day that stops being true — `max_length` now carries
+    /// a decimal's width and a string's too, and neither narrows. This engine
+    /// types `CASE WHEN 1 THEN ti END` over a `TINYINT` as a TINY, and a width
+    /// for that shape — which 8.3 declares `int`, so one is worth having —
+    /// would otherwise relabel a `tinyint(1)` as an `int` while leaving the
+    /// wire code a TINY, and the binary protocol would send one byte for a
+    /// column announced as four.
+    pub(crate) fn narrows(&self) -> bool {
+        self.max_length.is_some_and(|w| w <= INT_MAX_LENGTH)
+            && self.declared.is_none()
+            && self.ty == ColumnType::LongLong
+    }
+
     /// The type this column takes in a temporary table MySQL builds from it.
     ///
     /// [`Self::sql_type`] plus the one narrowing a materialisation performs:
@@ -224,7 +351,7 @@ impl OutColumn {
     /// MOD 3` an `int` there where this engine said `bigint`. That was #0110.
     ///
     /// Only an expression narrows, and the *spelling* is what says so. A
-    /// column reference carries a width like anything else — `integer_width`
+    /// column reference carries a width like anything else — `printed_width`
     /// reads one so that `ti + 1` can be sized from it — but it also carries
     /// its declaration, and MySQL copies that field rather than deriving a new
     /// one: `SELECT ti FROM (SELECT ti FROM t) d` is a TINY on 8.3 and not a
@@ -239,18 +366,7 @@ impl OutColumn {
     /// and all. See `materialised_by_mysql`.
     pub fn materialised_sql_type(&self) -> SqlType {
         let mut ty = self.sql_type();
-        // The spelling is checked as well as the width, and it holds today
-        // for free: everything `integer_width` models is typed LONGLONG by
-        // `computed_column_type`, so this can only ever be looking at a
-        // `bigint`. It is here for the day that stops being true. This engine
-        // types `CASE WHEN 1 THEN ti END` over a `TINYINT` as a TINY, and a
-        // width for that shape -- which 8.3 declares `int`, so one is worth
-        // having -- would otherwise relabel a `tinyint(1)` as an `int` while
-        // leaving the wire code a TINY, and the binary protocol would send one
-        // byte for a column announced as four.
-        let narrows =
-            self.int_width.is_some_and(|w| w <= INT_MAX_LENGTH) && ty.base_name() == "bigint";
-        if narrows {
+        if self.narrows() {
             ty.declared = if ty.unsigned {
                 "int unsigned".to_owned()
             } else {
@@ -278,12 +394,23 @@ impl OutColumn {
         if let Some(declared) = &self.declared {
             def = def.as_text(declared.is_textual());
             // The width MySQL sends is the one the column was declared with.
-            // Everything without a declaration keeps the type's default, which
-            // is a guess: MySQL takes an expression's width from
-            // `Item::max_length`, and `int_width` models only the corner of
-            // that arithmetic a type code depends on — nothing here reads it,
-            // so a computed column's width is still the type's default. #0126.
+            // #0126.
             def = def.with_length(declared.wire_length());
+            // And the places, which is a *declaration's* question and not an
+            // expression's — see `SqlType::wire_decimals`. #0111.
+            def = def.with_decimals(declared.wire_decimals());
+        } else {
+            // A computed column has no declaration to read, so it answers from
+            // the `Item::max_length` and `Item::decimals` arithmetic the walk
+            // in `exec` models. Where it models neither, the type's default
+            // stands — 20 for a number, 4096 for a string, 0 places — which is
+            // what every expression here reported before #0111.
+            if let Some(length) = self.max_length {
+                def = def.with_length(length);
+            }
+            if let Some(decimals) = self.decimals {
+                def = def.with_decimals(decimals);
+            }
         }
         // Without this the binary protocol reads the bytes back signed, so an
         // `INT UNSIGNED` holding three billion arrives as a negative number. It

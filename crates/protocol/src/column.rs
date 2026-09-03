@@ -86,6 +86,16 @@ pub mod charset {
     pub const UTF8MB4_0900_AI_CI: u16 = 255;
 }
 
+/// The `decimals` MySQL sends for a column whose places are not fixed.
+///
+/// `NOT_FIXED_DEC` in the server, and it is a real answer rather than a
+/// missing one: 8.3 sends 31 for a `DOUBLE` with no declared `(M,D)`, for
+/// every string an expression produces, and for a string *literal* — measured,
+/// `SELECT 'x'` is `dec 31` — while a *declared* `VARCHAR` column sends 0.
+/// The difference is a field against an item, which is why the two are decided
+/// in different places in `OutColumn::to_wire`.
+pub const NOT_FIXED_DEC: u8 = 31;
+
 /// One column in a result set.
 ///
 /// Compared field by field to decide whether a prepared statement's cached
@@ -204,6 +214,18 @@ impl ColumnDef {
     /// 4096 until the differential harness learned to compare it.
     pub fn with_length(mut self, column_length: u32) -> Self {
         self.column_length = column_length;
+        self
+    }
+
+    /// How many decimal places the column shows.
+    ///
+    /// MySQL's `decimals`, and a client reads it to decide how to render — and
+    /// in the case of an ORM, how to *type* — a number: a `DECIMAL(10,2)` says
+    /// 2 and a `DECIMAL(10,0)` says 0, which is the difference between money
+    /// and a count. [`NOT_FIXED_DEC`] is the answer where there is no fixed
+    /// number of them.
+    pub fn with_decimals(mut self, decimals: u8) -> Self {
+        self.decimals = decimals;
         self
     }
 

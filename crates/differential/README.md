@@ -72,7 +72,7 @@ Two things fail a run:
 
 So the file only ever shrinks, and it shrinks by fixing things.
 
-**It is empty.** All 4366 statements answer exactly as MySQL 8.3 answers them,
+**It is empty.** All 4420 statements answer exactly as MySQL 8.3 answers them,
 in both protocols — the rows, and every part of the column definition listed
 under "What a column is compared on" below. It started at 108 divergences
 across 66 statements.
@@ -107,17 +107,22 @@ the exercise, and it is recorded here rather than smoothed away.
 | `column_type` | yes | |
 | `flags` | most bits, on a column from a table | see below |
 | `column_length` | on a column from a table | see below |
-| `decimals` | **no** | 1148 divergences over 260 statements |
+| `decimals` | on a column from a table | see below |
 | `character_set` | as bytes-or-characters, on every column | the id itself: 458 over 118 |
 | `schema`, `table`, `org_table`, `org_name` | **no** | 2924 over 583 |
 | `catalog` | no | the constant `def` on both servers |
 
-The three left out are left out because each is a gap of its own and not this
+`decimals` joined the compared list for #0111, the same way ENUM and SET joined
+it for #0087: it was excluded and *counted* while the engine reported 0 for
+every column there was — **1148 divergences over 260 statements**, measured
+against the engine as it stood — and the engine then had to empty the list
+rather than the baseline absorb it. MySQL reports a DECIMAL's scale, a
+temporal's fractional digits, and 31 — `NOT_FIXED_DEC` — for a string and for a
+FLOAT with no declared scale.
+
+The two left out are left out because each is a gap of its own and not this
 one, and each needs an issue rather than a silence:
 
-- **`decimals`** is 0 for every column this engine describes. MySQL reports a
-  DECIMAL's places, a temporal's fractional digits, and 31 — `NOT_FIXED_DEC` —
-  for a string and for a FLOAT with no declared scale. #0111 has the numbers.
 - **`character_set`** is 255 here and 45 there, because MySQL converts a result
   into the connection's character set and reports the collation it converted
   to, and this engine reports the column's own. The id says as much about the
@@ -157,15 +162,20 @@ view). They are `Case::value_kind`.
 
 ### Only a column that came from a table
 
-`column_length` and the rest of the flags word are asked only where MySQL
-reports a non-empty `org_table` — a column read out of a table or a view, whose
-shape is a *declaration*. A computed column's shape is `Item::max_length` and
-the collation arithmetic around it, a width per function, per operator and per
-literal, and this engine models none of it as a width: asking would report the
-same missing feature on 560 statements and drown every other signal in the
-file. It models just enough of `Item::max_length` to pick the *type code* a
-materialised integer takes — #0110 — and the type code is compared on every
-column, computed ones included.
+`column_length`, `decimals` and the rest of the flags word are asked only where
+MySQL reports a non-empty `org_table` — a column read out of a table or a view,
+whose shape is a *declaration*. A computed column's shape is `Item::max_length`
+and the collation arithmetic around it, a width per function, per operator and
+per literal, and this engine models a subset of it: asking would report the same
+missing feature on 560 statements and drown every other signal in the file.
+
+What it does model is compared everywhere it shows: the *type code* a
+materialised integer takes (#0110) and the one a string function's width picks
+(#0142) are read off every column, computed ones included. The widths and
+places behind those codes — that `a + b` over a `DECIMAL(10,2)` and a
+`DECIMAL(7,3)` is `len 14 dec 3`, and `UPPER(tx)` over a `TEXT` is 1048560 wide
+— are pinned in `crates/engine/tests/describe.rs` instead, which can ask a
+column what it was described with without needing a table behind it.
 
 The scope is read off the reference's answer alone, so an engine that wrongly
 claimed a table for a computed column could not exempt itself from the
@@ -177,6 +187,15 @@ that expression's width — `varchar(2)` for a view over `'ab'`, where this
 engine declares `varchar(512)`, and 2 for a view over `1 MOD 3` against 11.
 They are `Case::widths`, and like the baseline that list only ever gets
 shorter.
+
+One case opts out of the *places* alone. MySQL 8's `information_schema` is a
+set of views over the data dictionary, so some of its columns are items and
+report `NOT_FIXED_DEC` where the same column read through a temporary table
+reports 0 — `SELECT COLUMN_NAME FROM information_schema.columns` is `dec 31` on
+8.3 and the same query with an `ORDER BY` is `dec 0`, while
+`information_schema.tables.TABLE_NAME` is 0 either way. Which of those columns
+is an expression is a table of MySQL's own view definitions rather than a rule.
+It is `Case::places`.
 
 ### The bits of the flags word
 
