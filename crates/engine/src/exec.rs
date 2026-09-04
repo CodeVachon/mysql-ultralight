@@ -2202,7 +2202,6 @@ impl Engine {
                     refs: &refs,
                     columns: &input,
                     own: relation.columns.len(),
-                    columns: &relation.columns,
                     keys: &keys,
                     matching: &matching,
                 },
