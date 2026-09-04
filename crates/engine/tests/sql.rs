@@ -31626,3 +31626,572 @@ fn a_union_shows_every_branch_at_the_widest_scale() {
         vec![vec!["2.5"], vec!["abc"]]
     );
 }
+
+/// `information_schema` names compare as bytes, and not every column of it
+/// does.
+///
+/// Measured on 8.3 over tables `apple`, `Bee` and `cherry`, with the
+/// connection collated `utf8mb4_0900_ai_ci`: `ORDER BY TABLE_NAME` puts `Bee`
+/// first because `utf8mb3_bin` compares the bytes, `WHERE TABLE_NAME = 'bee'`
+/// matches nothing, and `LIKE 'b%'` matches nothing either. This engine sorted
+/// `apple` first and matched `Bee` for both. #0148.
+///
+/// The non-binary half is the part a rule would get wrong. Reading 8.3's own
+/// `information_schema.COLUMNS`, three collations appear across the tables
+/// this engine serves: `utf8mb3_bin` on the names of schemas, tables and
+/// types; `utf8mb3_tolower_ci` on `COLUMN_NAME`, `INDEX_NAME` and
+/// `CONSTRAINT_NAME`; and `utf8mb3_general_ci` on `IS_NULLABLE` and the rest.
+/// Only the first is case-sensitive, so a fix that made every name binary
+/// would pass the first half of this test and fail the second.
+#[test]
+fn information_schema_names_compare_as_bytes() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE apple (id INT NOT NULL, Alpha INT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Bee (id INT NOT NULL, Gamma INT NULL, PRIMARY KEY (id), \
+         UNIQUE KEY UniqIdx (Gamma))",
+    );
+
+    // The bytes decide the order, so a capital sorts before a small letter.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = 'testdb' ORDER BY TABLE_NAME"
+        ),
+        vec![vec!["Bee"], vec!["apple"]]
+    );
+    // And the match. Both spellings, so a comparison that had simply stopped
+    // matching anything would fail the second.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'bee'"
+        ),
+        vec![vec!["0"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Bee'"
+        ),
+        vec![vec!["1"]]
+    );
+    // The schema's own name is one of them too.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'TESTDB'"
+        ),
+        vec![vec!["0"]]
+    );
+    // `LIKE` folds under the collation `=` folds under, so it is
+    // case-sensitive here as well.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME LIKE 'b%'"
+        ),
+        Vec::<Vec<String>>::new()
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME LIKE 'B%'"
+        ),
+        vec![vec!["Bee"]]
+    );
+    // PAD SPACE, which is what makes this a collation and not a
+    // `case_sensitive` flag: `utf8mb3_bin` ignores a trailing space where the
+    // NO PAD `utf8mb4_0900_ai_ci` this session is collated with would not.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'Bee '"
+        ),
+        vec![vec!["1"]]
+    );
+    // Two binary columns that are not names: `DATA_TYPE` is `int` and
+    // `TABLE_TYPE` is `BASE TABLE`, both lower-cased in the question.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'testdb' AND DATA_TYPE = 'INT'"
+        ),
+        vec![vec!["0"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_TYPE = 'base table'"
+        ),
+        vec![vec!["0"]]
+    );
+
+    // The columns 8.3 does *not* declare `utf8mb3_bin`, which still match
+    // whatever case they are asked in.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'apple' \
+             AND COLUMN_NAME = 'ALPHA'"
+        ),
+        vec![vec!["Alpha"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT INDEX_NAME FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = 'testdb' AND INDEX_NAME = 'uniqidx'"
+        ),
+        vec![vec!["UniqIdx"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'testdb' AND IS_NULLABLE = 'yes'"
+        ),
+        vec![vec!["2"]]
+    );
+    // And the collation these columns *report* is unchanged by any of it: a
+    // user column that names none is still `utf8mb4_0900_ai_ci`, which is what
+    // separates a value comparing as bytes from a column declared binary.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLLATION_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = 'testdb' AND TABLE_NAME = 'apple' \
+             AND COLUMN_NAME = 'id'"
+        ),
+        vec![vec!["NULL"]]
+    );
+}
+
+/// A literal is collated by the *connection*, so the same statement has two
+/// right answers and the client's handshake picks one.
+///
+/// All measured on 8.3 in one session either side of a `SET NAMES`, with the
+/// value of `@@collation_connection` stated for each: `'a ' = 'a'` is 0 under
+/// `utf8mb4_0900_ai_ci` and 1 under `utf8mb4_general_ci`, because the `_0900_`
+/// collations are the only ones that do not pad. #0154.
+#[test]
+fn a_literals_collation_is_the_connections() {
+    let (engine, mut session) = engine();
+
+    // The stock connection, which is the server's default.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @@collation_connection"),
+        vec![vec!["utf8mb4_0900_ai_ci"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 'a ' = 'a'"),
+        vec![vec!["0"]]
+    );
+
+    // `SET NAMES` moves it, and the answer moves with it.
+    run(
+        &engine,
+        &mut session,
+        "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @@collation_connection"),
+        vec![vec!["utf8mb4_general_ci"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 'a ' = 'a'"),
+        vec![vec!["1"]]
+    );
+
+    // A literal that has been through a function, a cast or a concatenation
+    // still carries it: without that the two sides of the comparison resolve
+    // to no collation at all and this engine raised 1267.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TRIM('a ') = 'a', CONCAT('a', ' ') = 'a', CAST('a ' AS CHAR) = 'a'"
+        ),
+        vec![vec!["1", "1", "1"]]
+    );
+
+    // A value that carries no character collation of its own — an ENUM member
+    // out of its tag — has to *lose* to the literal rather than tie with it,
+    // because a tie is a 1267 8.3 cannot raise: there the ENUM is IMPLICIT and
+    // the literal simply loses. Still under the `utf8mb4_general_ci`
+    // connection set above, which is what makes the two differ at all.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE En (e ENUM('a','b') NULL)",
+    );
+    run(&engine, &mut session, "INSERT INTO En VALUES ('b')");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT (SELECT e FROM En) + 0, (SELECT e FROM En) = 'b'"
+        ),
+        // 0 and not 2: a scalar subquery drops the ordinal, which
+        // `Value::untag_enum` records and the differential corpus holds
+        // against 8.3. It is here so the comparison beside it cannot be read
+        // as a comparison of ordinals.
+        vec![vec!["0", "1"]]
+    );
+
+    // `GROUP_CONCAT` builds a string of its own rather than handing one of its
+    // inputs back, so it has to carry the connection's collation out with it —
+    // the only aggregate that does, which was checked against the rest.
+    // `HAVING GROUP_CONCAT(s) = 'a'` was 1267 here where 8.3 answers a row.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Gc (k INT NOT NULL, s VARCHAR(10) NOT NULL)",
+    );
+    run(&engine, &mut session, "INSERT INTO Gc VALUES (1, 'a ')");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k FROM Gc GROUP BY k HAVING GROUP_CONCAT(s) = 'a'"
+        ),
+        vec![vec!["1"]]
+    );
+
+    // `SET collation_connection` moves it too, written without quotes — which
+    // is how anyone writes it, and which this engine answered 1054 for.
+    run(
+        &engine,
+        &mut session,
+        "SET collation_connection = utf8mb4_0900_ai_ci",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 'a ' = 'a'"),
+        vec![vec!["0"]]
+    );
+    // And quoted, which is the same statement.
+    run(
+        &engine,
+        &mut session,
+        "SET collation_connection = 'utf8mb4_general_ci'",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 'a ' = 'a'"),
+        vec![vec!["1"]]
+    );
+    // A name no collation has is 1273, exactly as a `COLLATE` clause naming it
+    // would be, rather than being stored and then read back as the default.
+    let err = engine
+        .execute(&mut session, "SET collation_connection = bogus_ci", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1273);
+    // A *user* variable of the same name is not the system variable, and the
+    // bare name on its right really is an expression there: 8.3 answers 1054,
+    // measured beside the statement above.
+    let err = engine
+        .execute(&mut session, "SET @collation_connection = utf8mb4_bin", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1054);
+    // And the qualified spellings name the same variable this engine reads.
+    run(
+        &engine,
+        &mut session,
+        "SET @@session.collation_connection = utf8mb4_general_ci",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 'a ' = 'a'"),
+        vec![vec!["1"]]
+    );
+
+    // A column's collation beats the connection's, whichever way round they
+    // are: this is the rule that keeps a `SET NAMES` from re-deciding what a
+    // stored column compares as.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Lit (a VARCHAR(20) COLLATE utf8mb4_0900_ai_ci, \
+         b VARCHAR(20) COLLATE utf8mb4_general_ci)",
+    );
+    run(&engine, &mut session, "INSERT INTO Lit VALUES ('a ', 'a ')");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a = 'a', b = 'a' FROM Lit"),
+        vec![vec!["0", "1"]]
+    );
+    // An explicit `COLLATE` beats both.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT a = 'a' COLLATE utf8mb4_general_ci FROM Lit"
+        ),
+        vec![vec!["1"]]
+    );
+
+    // A row built by `information_schema` never met the connection either, and
+    // every client that introspects compares one against a literal. With the
+    // connection collated `utf8mb4_general_ci` and the row still carrying the
+    // server's default, the pair resolved to neither collation and this engine
+    // answered 1267 for a query 8.3 answers with a row. Asked over a populated
+    // schema on purpose: the check runs per row, so an empty one would pass
+    // whether the fix were there or not.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = 'testdb' AND ENGINE = 'InnoDB'"
+        ),
+        vec![vec!["3"]]
+    );
+}
+
+/// The connection collation a client asks for in its handshake is the one its
+/// literals get, with no `SET NAMES` anywhere.
+///
+/// Most clients say it once and never again — the `mysql` crate the
+/// differential harness uses sends 45, `utf8mb4_general_ci`, and issues no
+/// `SET NAMES` at all — so a server that ignores that byte answers
+/// `SELECT 'a ' = 'a'` 0 where 8.3 answers 1 for the same client. Measured
+/// against 8.3 from both that crate and the `mysql` command line, which land
+/// on different collations. #0154.
+#[test]
+fn the_handshakes_charset_settles_the_connections_collation() {
+    let (engine, mut session) = engine();
+    session.negotiated_charset(45);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @@collation_connection"),
+        vec![vec!["utf8mb4_general_ci"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 'a ' = 'a'"),
+        vec![vec!["1"]]
+    );
+
+    // 255 is `utf8mb4_0900_ai_ci`, which is a different answer and not merely
+    // a different name.
+    let (engine, mut session) = fresh_engine();
+    session.negotiated_charset(255);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 'a ' = 'a'"),
+        vec![vec!["0"]]
+    );
+
+    // A charset this engine cannot compare in leaves the default alone rather
+    // than refusing the connection: 8 is `latin1_swedish_ci`, and a client
+    // asking for it still gets utf8mb4 answers here.
+    let (engine, mut session) = fresh_engine();
+    session.negotiated_charset(8);
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @@collation_connection"),
+        vec![vec!["utf8mb4_0900_ai_ci"]]
+    );
+}
+
+/// `UPPER` and `LOWER` fold through the table their argument's collation
+/// names, which is the column's for a column and the connection's for a
+/// literal.
+///
+/// utf8mb4 has two case tables on 8.3 and they disagree on 616 characters
+/// upward and 608 downward, so `SELECT UPPER('𐐨')` and `SELECT UPPER(col)`
+/// are different answers on the same server. Measured with the connection
+/// stated: `HEX(LOWER('ẞ'))` is `C39F` under `utf8mb4_0900_ai_ci` and
+/// `E1BA9E` under `utf8mb4_general_ci`, and `HEX(UPPER('𐐨'))` is `F0909080`
+/// against `F09090A8` — the legacy table never folds above the BMP. #0154.
+#[test]
+fn the_case_fold_table_is_the_arguments_collation() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Cf (d900 VARCHAR(20) COLLATE utf8mb4_0900_ai_ci, \
+         gen VARCHAR(20) COLLATE utf8mb4_general_ci)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Cf VALUES ('\u{1e9e}\u{10428}', '\u{1e9e}\u{10428}')",
+    );
+
+    // Under the default connection a literal folds by the `_0900_` table.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT HEX(LOWER('\u{1e9e}')), HEX(UPPER('\u{10428}'))"
+        ),
+        vec![vec!["C39F", "F0909080"]]
+    );
+    // The two columns of the same row fold differently, which is the whole
+    // claim: the table belongs to the collation and not to the character set.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT HEX(LOWER(d900)), HEX(LOWER(gen)), HEX(UPPER(d900)), HEX(UPPER(gen)) FROM Cf"
+        ),
+        vec![vec![
+            "C39FF09090A8",
+            "E1BA9EF09090A8",
+            "E1BA9EF0909080",
+            "E1BA9EF09090A8"
+        ]]
+    );
+
+    // Moving the connection moves the literal's table and leaves the columns
+    // where they were.
+    run(
+        &engine,
+        &mut session,
+        "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT HEX(LOWER('\u{1e9e}')), HEX(UPPER('\u{10428}'))"
+        ),
+        vec![vec!["E1BA9E", "F09090A8"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT HEX(LOWER(d900)), HEX(UPPER(d900)) FROM Cf"
+        ),
+        vec![vec!["C39FF09090A8", "E1BA9EF0909080"]]
+    );
+    // The ordinary case is the same under both tables, so a test made only of
+    // ASCII would pass whichever one ran.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT UPPER('stra\u{df}e')"),
+        vec![vec!["STRA\u{df}E"]]
+    );
+}
+
+/// The three values that are strings but not literals, and what each carries
+/// once a literal carries the connection's collation.
+///
+/// All measured on 8.3 with `COERCIBILITY` and `COLLATION` asked beside the
+/// answer, under a connection moved to `utf8mb4_general_ci` after the value
+/// was made:
+///
+/// ```text
+///     @x        after SET @x = 'a '   coercibility 2, utf8mb4_0900_ai_ci   @x = 'a' is 0
+///     @@sql_mode                      coercibility 3, utf8mb3_general_ci
+///     'a' || ' ' under PIPES_AS_CONCAT                                     = 'a' is 1
+/// ```
+///
+/// A user variable holds the collation it was *assigned* under and holds it
+/// firmly, so a later `SET NAMES` does not re-decide what it compares as; a
+/// system variable holds its own, which is PAD SPACE where the `_0900_`
+/// connection is not; and `||` builds a string like any other builder, so it
+/// takes the connection's. Left as they were — the server's default at
+/// COERCIBLE — each of the three met a literal at equal strength with a
+/// different collation, and this engine answered 1267 for a pair 8.3 compares
+/// without complaint. #0154.
+#[test]
+fn a_string_that_is_not_a_literal_carries_its_own_collation() {
+    let (engine, mut session) = engine();
+
+    // Assigned under the stock `utf8mb4_0900_ai_ci`, which is NO PAD.
+    run(&engine, &mut session, "SET @x = 'a '");
+    run(
+        &engine,
+        &mut session,
+        "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci",
+    );
+    // 0, not 1: the variable kept the collation it was assigned under and
+    // beats the literal, so the PAD SPACE connection does not decide it.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @x = 'a'"),
+        vec![vec!["0"]]
+    );
+    // Assigned *under* the moved connection it keeps that one instead.
+    run(&engine, &mut session, "SET @y = 'a '");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @y = 'a'"),
+        vec![vec!["1"]]
+    );
+
+    // A system variable is SYSCONST and PAD SPACE, whatever the connection is:
+    // both of these are 1 on 8.3, under either connection.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT @@version_comment = CONCAT(@@version_comment, ' ')"
+        ),
+        vec![vec!["1"]]
+    );
+    run(&engine, &mut session, "SET NAMES utf8mb4");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT @@version_comment = CONCAT(@@version_comment, ' ')"
+        ),
+        vec![vec!["1"]]
+    );
+
+    // `SET collation_connection = DEFAULT` is the one bare identifier on the
+    // right of a `SET` that is not a name: 8.3 puts the session default back.
+    run(
+        &engine,
+        &mut session,
+        "SET collation_connection = utf8mb4_general_ci",
+    );
+    run(&engine, &mut session, "SET collation_connection = DEFAULT");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT @@collation_connection"),
+        vec![vec!["utf8mb4_0900_ai_ci"]]
+    );
+
+    // `||` concatenates under PIPES_AS_CONCAT, and the string it builds takes
+    // the connection's collation like every other built string.
+    run(&engine, &mut session, "SET sql_mode = 'PIPES_AS_CONCAT'");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT ('a' || ' ') = 'a'"),
+        vec![vec!["0"]]
+    );
+    run(
+        &engine,
+        &mut session,
+        "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ('a' || 'b') = 'ab', ('a' || ' ') = 'a'"
+        ),
+        vec![vec!["1", "1"]]
+    );
+}

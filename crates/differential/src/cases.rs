@@ -5400,12 +5400,12 @@ pub const GROUPS: &[Group] = &[
             // Trailing space, which a binary comparison never pads away: 'a'
             // is one byte and 'a ' is two, so they differ and the shorter
             // sorts first. The *text* half of the same question is left out
-            // deliberately — `'a' = 'a '` is 1 under this connection, whose
-            // negotiated collation is the PAD SPACE utf8mb4_general_ci, and 0
-            // under the NO PAD utf8mb4_0900_ai_ci a column would get. That is
-            // #0129's per-column collation, not this, and it was measured
-            // here: MySQL answers 1 through the harness and 0 through a
-            // client that has done `SET NAMES utf8mb4`.
+            // deliberately — `'a' = 'a '` is 1 under this connection, which
+            // `main::reset` pins to the PAD SPACE utf8mb4_general_ci, and 0
+            // under the NO PAD utf8mb4_0900_ai_ci a column would get. Measured
+            // both ways: MySQL answers 1 under this connection and 0 through a
+            // client that has done `SET NAMES utf8mb4`, and since #0154 so
+            // does this engine.
             same("SELECT CAST('a' AS BINARY) = 'a ', CAST('a' AS BINARY) < 'a ', \
                   CAST('a' AS BINARY) = CAST('a ' AS BINARY)"),
             // Which rows a query returns, which is what the divergence
@@ -5498,10 +5498,12 @@ pub const GROUPS: &[Group] = &[
         // **Which table is a property of the collation.** 8.3 has two for
         // utf8mb4 and they disagree on 616 characters upward and 608 downward.
         // A column declared without a `COLLATE` clause gets
-        // `utf8mb4_0900_ai_ci`, which is what this engine encodes; a *literal*
-        // takes the connection's, and the client here negotiates 45,
-        // `utf8mb4_general_ci`. Where the two disagree, this engine can only
-        // match one of them, and #0129 is what would let it match both.
+        // `utf8mb4_0900_ai_ci`; a *literal* takes the connection's, which
+        // `main::reset` pins to `utf8mb4_general_ci` before every group. Since
+        // #0154 this engine has both tables and picks by the argument's
+        // collation, so the two forms are two different questions here rather
+        // than one question this engine could only half answer -- and the
+        // group below asks the literal half again under the other connection.
         //
         // So which form a character is asked in here is decided per character
         // and by measuring, not by a rule: the ~1200 disagreements are
@@ -5570,10 +5572,11 @@ pub const GROUPS: &[Group] = &[
             // are. 8.3 folds into a buffer the size of the argument and
             // truncates when one of them overflows it, so over a *column*
             // `UPPER('a\u{23f}b')` there is `A\u{2c7e}` with the `b` gone.
-            // This engine declines the fold instead, which is what
-            // `general_ci` answers and therefore what 8.3 answers here -- so
-            // these are literals, and the column form is the one that
-            // diverges. #0154.
+            // This engine declines the fold instead. All nineteen are in the
+            // `_0900_` table and none is in the legacy one, so under this
+            // group's pinned `utf8mb4_general_ci` connection the two agree
+            // exactly -- which is why these may be asked as literals here and
+            // are not asked as literals in the group below. #0154.
             same("SELECT HEX(UPPER('\u{23f}')), HEX(UPPER('a\u{23f}b')), \
                   HEX(UPPER('\u{23f}aa')), HEX(LOWER('\u{23a}'))"),
             same("SELECT HEX(UPPER('\u{23f}\u{23f}a')), HEX(UPPER('aa\u{23f}a')), \
@@ -7884,6 +7887,227 @@ pub const GROUPS: &[Group] = &[
             same("SELECT UNHEX(c) AS a, UNHEX(bl) AS b, UNHEX(tx) AS c, HEX(tb) AS d FROM Wide"),
             same("SELECT TO_BASE64(c) AS a, TO_BASE64(bl) AS b, FROM_BASE64(c) AS c, \
                   FROM_BASE64(bl) AS d FROM Wide"),
+        ],
+    },
+    Group {
+        // `information_schema` names are case-*sensitive* on 8.3, and this
+        // engine compared them the way it compares everything else -- so a
+        // client that introspects the catalog before emitting DDL, which is
+        // what Prisma does, got a wrong order and a wrong match. #0148.
+        //
+        // The tables here are deliberately mixed-case, which every other group
+        // in this corpus deliberately avoids: `Bee` sorts *before* `apple` on
+        // 8.3 because `utf8mb3_bin` compares the bytes, and no group written
+        // in lower case can see that.
+        //
+        // **Not every text column, which is the half a rule would get wrong.**
+        // Read off 8.3's own `information_schema.COLUMNS`, the twelve tables
+        // this engine serves carry three collations: `utf8mb3_bin` for the
+        // names of schemas, tables and types; `utf8mb3_tolower_ci` for
+        // `COLUMN_NAME`, `INDEX_NAME` and `CONSTRAINT_NAME`; and
+        // `utf8mb3_general_ci` for `IS_NULLABLE`, `EXTRA` and the rest. Only
+        // the first is case-sensitive, so the second and third are asked here
+        // too -- a fix that turned every name binary would pass the cases
+        // above and fail these.
+        //
+        // `utf8mb3_bin` is also PAD SPACE where this connection is not, so a
+        // trailing space is asked as well: it is the half that separates a
+        // collation from a `case_sensitive` flag.
+        name: "information_schema names compare as bytes",
+        setup: &[
+            "CREATE TABLE apple (id INT NOT NULL, Alpha INT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE Bee (id INT NOT NULL, Gamma INT NULL, PRIMARY KEY (id), \
+             UNIQUE KEY UniqIdx (Gamma))",
+            "CREATE TABLE cherry (id INT NOT NULL, ref INT NULL, PRIMARY KEY (id), \
+             CONSTRAINT FkRef FOREIGN KEY (ref) REFERENCES apple (id))",
+        ],
+        cases: &[
+            // The order, which is the half that needs no predicate to see.
+            same(
+                "SELECT TABLE_NAME FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = 'differential' ORDER BY TABLE_NAME",
+            ),
+            // And the match. Both spellings, so a comparison that had simply
+            // stopped matching anything would fail the second.
+            same(
+                "SELECT COUNT(*) FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = 'differential' AND TABLE_NAME = 'bee'",
+            ),
+            same(
+                "SELECT COUNT(*) FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = 'differential' AND TABLE_NAME = 'Bee'",
+            ),
+            // The schema's own name, on the two tables that report it.
+            same(
+                "SELECT COUNT(*) FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = 'DIFFERENTIAL'",
+            ),
+            same(
+                "SELECT COUNT(*) FROM information_schema.SCHEMATA \
+                 WHERE SCHEMA_NAME = 'DIFFERENTIAL'",
+            ),
+            // PAD SPACE: `utf8mb3_bin` ignores a trailing space where this
+            // group's connection collation would not.
+            same(
+                "SELECT COUNT(*) FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = 'differential' AND TABLE_NAME = 'Bee '",
+            ),
+            // `LIKE` folds under the same collation `=` does, so it is
+            // case-sensitive here too.
+            same(
+                "SELECT TABLE_NAME FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = 'differential' AND TABLE_NAME LIKE 'b%' \
+                 ORDER BY TABLE_NAME",
+            ),
+            same(
+                "SELECT TABLE_NAME FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = 'differential' AND TABLE_NAME LIKE 'B%' \
+                 ORDER BY TABLE_NAME",
+            ),
+            // Two more `utf8mb3_bin` columns that are not names at all, and
+            // whose values are lower case: `DATA_TYPE` is `int` and
+            // `TABLE_TYPE` is `BASE TABLE`.
+            same(
+                "SELECT COUNT(*) FROM information_schema.COLUMNS \
+                 WHERE TABLE_SCHEMA = 'differential' AND DATA_TYPE = 'INT'",
+            ),
+            same(
+                "SELECT COUNT(*) FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = 'differential' AND TABLE_TYPE = 'base table'",
+            ),
+            // The columns that are *not* binary, which is what keeps the fix
+            // from being "make every name a byte string": `COLUMN_NAME` is
+            // `utf8mb3_tolower_ci` and `IS_NULLABLE` is `utf8mb3_general_ci`,
+            // and both still match whatever case they are asked in.
+            // Without the places, for the reason `Case::places` records: 8.3's
+            // `information_schema` is a set of views, and a column that is an
+            // *expression* in one reports NOT_FIXED_DEC where a stored column
+            // reports 0. `COLUMN_NAME` and `INDEX_NAME` are two of those and
+            // `TABLE_NAME` is not, which is why the cases above ask it.
+            same(
+                "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+                 WHERE TABLE_SCHEMA = 'differential' AND TABLE_NAME = 'apple' \
+                 AND COLUMN_NAME = 'ALPHA'",
+            )
+            .without_places(),
+            same(
+                "SELECT COUNT(*) FROM information_schema.COLUMNS \
+                 WHERE TABLE_SCHEMA = 'differential' AND IS_NULLABLE = 'yes'",
+            ),
+            // The same, and for the same reason.
+            same(
+                "SELECT INDEX_NAME FROM information_schema.STATISTICS \
+                 WHERE TABLE_SCHEMA = 'differential' AND INDEX_NAME = 'uniqidx' \
+                 ORDER BY INDEX_NAME",
+            )
+            .without_places(),
+            same(
+                "SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS \
+                 WHERE TABLE_SCHEMA = 'differential' AND CONSTRAINT_NAME = 'fkref' \
+                 ORDER BY CONSTRAINT_NAME",
+            ),
+            // A join between two of these tables, which is the shape an
+            // introspecting client actually sends: both sides of the `ON` are
+            // binary, so a fix that touched one table and not the other would
+            // show here.
+            same(
+                "SELECT t.TABLE_NAME, COUNT(c.COLUMN_NAME) FROM information_schema.TABLES t \
+                 JOIN information_schema.COLUMNS c ON c.TABLE_NAME = t.TABLE_NAME \
+                 AND c.TABLE_SCHEMA = t.TABLE_SCHEMA \
+                 WHERE t.TABLE_SCHEMA = 'differential' GROUP BY t.TABLE_NAME \
+                 ORDER BY t.TABLE_NAME",
+            ),
+        ],
+    },
+    Group {
+        // A literal's collation is the *connection's*, so one statement has
+        // two right answers on one server and which it gets depends on how the
+        // client connected. #0154.
+        //
+        // Every other group runs under the `utf8mb4_general_ci` that
+        // `main::reset` pins; this one moves the connection to
+        // `utf8mb4_0900_ai_ci` in its setup and asks the same questions again.
+        // Neither half implies the other: 8.3's two utf8mb4 case tables
+        // disagree on 616 characters upward and 608 downward, and the `_0900_`
+        // collations are the only ones that do not pad.
+        //
+        // The `SET NAMES` in the setup is also the mechanism under test. It
+        // runs *after* `reset` has pinned the other collation, so a server
+        // that swallowed the statement -- which this engine did until #0154 --
+        // answers every case below under the wrong one.
+        //
+        // What this group deliberately does **not** ask as a literal: the
+        // nineteen characters whose `_0900_` fold is wider in UTF-8 than they
+        // are. 8.3 truncates those in place and this engine declines the fold,
+        // which is the one part of #0154 left open on purpose -- the reason is
+        // in `crate::casefold`, and it is measured. The case-folding group
+        // asks them under the connection where the two agree.
+        name: "a literal takes the connection's collation",
+        setup: &[
+            "CREATE TABLE Lit (id INT NOT NULL, t VARCHAR(30) NULL, PRIMARY KEY (id))",
+            "INSERT INTO Lit VALUES (1,'a '),(2,'\u{1e9e}'),(3,'\u{10428}')",
+            // Assigned *before* the `SET NAMES` below, so it is holding the
+            // `utf8mb4_general_ci` `main::reset` pinned while every literal in
+            // the group holds the other one. That is the whole of the case
+            // that reads it back.
+            "SET @lit154 = 'a '",
+            "SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci",
+        ],
+        cases: &[
+            // The premise, stated in the corpus rather than in a comment: a
+            // case below means nothing if this is not what both servers say.
+            same("SELECT @@collation_connection"),
+            // PAD SPACE, which the `_0900_` collations alone do not do: 0 here
+            // and 1 under the connection every other group runs on. `LIKE`
+            // never pads under any of them, which is what the last one holds.
+            same("SELECT 'a ' = 'a', 'a ' < 'a', 'a' = 'a ', 'a' LIKE 'a '"),
+            // The case table, on two characters that separate the two tables
+            // without needing the truncating nineteen.
+            // Aliased, and every column here is: 8.3 sends a *column name*
+            // in utf8mb3, so a supplementary character in the derived name
+            // comes back as `?` there and as itself here -- a divergence
+            // about the metadata character set rather than about the fold.
+            same(
+                "SELECT HEX(LOWER('\u{1e9e}')) AS a, HEX(UPPER('\u{10428}')) AS b, \
+                 HEX(UPPER('\u{1e9e}')) AS c, HEX(LOWER('\u{10428}')) AS d",
+            ),
+            // The same characters through a column, which folds by the
+            // column's own `utf8mb4_0900_ai_ci` whatever the connection is --
+            // so this case and the one above agree here and disagree under the
+            // other connection, which is the whole claim.
+            same("SELECT id, HEX(UPPER(t)), HEX(LOWER(t)) FROM Lit ORDER BY id"),
+            // Coercibility: the column's collation beats the literal's, so a
+            // NO PAD connection does not stop a PAD SPACE column padding, and
+            // a `COLLATE` clause beats both.
+            same("SELECT COUNT(*) FROM Lit WHERE t = 'a'"),
+            same("SELECT COUNT(*) FROM Lit WHERE t = 'a' COLLATE utf8mb4_general_ci"),
+            // Through a function, so a literal that has been somewhere still
+            // carries the connection's collation: without that the two sides
+            // of the comparison resolve to no collation at all.
+            same(
+                "SELECT TRIM('a ') = 'a', CONCAT('a', ' ') = 'a', \
+                 CAST('a ' AS CHAR) = 'a', UPPER('a ') = 'A'",
+            ),
+            // Grouping and de-duplication read the collation `=` reads, so
+            // `'a '` and `'a'` are two groups here and one under a padding
+            // connection.
+            same(
+                "SELECT x, COUNT(*) FROM (SELECT 'a ' AS x UNION ALL SELECT 'a') u \
+                 GROUP BY x ORDER BY x",
+            ),
+            // A user variable keeps the collation it was assigned under and
+            // holds it at IMPLICIT strength, so this answers 1 where the bare
+            // literal pair two cases up answers 0 -- same session, same
+            // statement shape, and the only difference is when the string was
+            // made. Measured on 8.3, where `COERCIBILITY(@lit154)` is 2 and
+            // `COLLATION(@lit154)` is still the collation of the assignment.
+            same("SELECT @lit154 = 'a'"),
+            // A system variable's value is SYSCONST at coercibility 3 and
+            // collated `utf8mb3_general_ci`, which is PAD SPACE where this
+            // group's connection is not -- so the variable's own collation
+            // decides and this is 1. The value itself differs between the two
+            // servers, which is why it is compared with itself.
+            same("SELECT @@version_comment = CONCAT(@@version_comment, ' ')"),
         ],
     },
 ];

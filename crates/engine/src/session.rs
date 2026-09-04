@@ -256,9 +256,17 @@ impl Session {
     /// `CAST('true' AS JSON) = @x` is 0, where the bare keyword answers
     /// `[true]` and 1. A variable is somewhere to *put* a value, and the tag
     /// does not survive being put anywhere.
+    ///
+    /// And it keeps the collation it was assigned under, at IMPLICIT strength.
+    /// Measured on 8.3: after `SET @x = 'a '` on a `utf8mb4_0900_ai_ci`
+    /// connection, `COERCIBILITY(@x)` is 2 and `COLLATION(@x)` is
+    /// `utf8mb4_0900_ai_ci` — still, after a `SET NAMES` to something else —
+    /// so `@x = 'a'` stays 0 rather than becoming 1 under the new connection's
+    /// PAD SPACE. Left COERCIBLE it was a collation nothing re-derived, which
+    /// after #0154 is a 1267 against any literal on a moved connection.
     pub fn set_user_variable(&mut self, name: &str, value: Value) {
         self.user_variables
-            .insert(name.to_ascii_lowercase(), value.untag_bool());
+            .insert(name.to_ascii_lowercase(), value.untag_bool().assigned());
     }
 
     /// Unset user variables read as NULL rather than erroring, as in MySQL.
@@ -332,6 +340,14 @@ impl Session {
                     format!("Variable '{name}' is a read only variable"),
                 ))
             }
+            // Read by every literal, so a value taken unchecked is a wrong
+            // comparison rather than an unread string: `collation_connection`
+            // decides what `'a ' = 'a'` and `UPPER('ẞ')` answer. Checked
+            // through the same reader a `COLLATE` clause goes through, so a
+            // name 8.3 does not have is 1273 here as it is there, and one it
+            // has that this engine cannot compare in is refused as
+            // unsupported rather than stored and then ignored.
+            "collation_connection" => crate::collation::named(&value.as_text())?,
             _ => value.as_text(),
         };
         if name == "sql_mode" {
@@ -339,6 +355,72 @@ impl Session {
             self.refresh_mode();
         }
         self.overrides.insert(name, text);
+        Ok(())
+    }
+
+    /// The collation every *literal* in this session compares and folds under.
+    ///
+    /// MySQL's `collation_connection`, and it is not decoration: a literal
+    /// takes the connection's collation at COERCIBLE strength, so `'a ' = 'a'`
+    /// is 0 under `utf8mb4_0900_ai_ci` and 1 under `utf8mb4_general_ci`, and
+    /// `HEX(LOWER('ẞ'))` is `C39F` under the first and `E1BA9E` under the
+    /// second. Both measured on 8.3 in one session either side of a `SET
+    /// NAMES`. #0154.
+    ///
+    /// Read straight off the override for the reason the four below give: it
+    /// cannot change while the statement runs, and this is asked once per
+    /// evaluated expression.
+    ///
+    /// The lookup cannot fail for anything this engine stored:
+    /// `set_system_variable` puts a name here only after
+    /// `crate::collation::named` has accepted it, so an unknown or
+    /// unhonourable collation was refused rather than recorded. The default is
+    /// the server's own, which is what a client that negotiated nothing this
+    /// engine has gets.
+    pub fn collation_connection(&self) -> crate::collation::Collation {
+        self.overrides
+            .get("collation_connection")
+            .and_then(|name| crate::collation::Collation::from_name(name))
+            .unwrap_or_default()
+    }
+
+    /// Applies the collation a client asked for in its handshake.
+    ///
+    /// The connection's collation is settled before the first statement, and
+    /// for most clients it is settled *only* there — the `mysql` crate the
+    /// differential harness uses sends 45 and never issues a `SET NAMES`. So a
+    /// server that reads the handshake's charset byte and a server that
+    /// ignores it give different answers to `SELECT 'a ' = 'a'` for the same
+    /// client. Ignored where this engine has no such collation, which
+    /// `Collation::from_client_charset` explains.
+    pub fn negotiated_charset(&mut self, id: u8) {
+        if let Some(collation) = crate::collation::Collation::from_client_charset(id) {
+            self.overrides.insert(
+                "collation_connection".to_owned(),
+                collation.name().to_owned(),
+            );
+        }
+    }
+
+    /// Applies a `SET NAMES`, which is how a session changes that collation
+    /// after the handshake.
+    ///
+    /// `SET NAMES utf8mb4` resets the connection to the character set's
+    /// default collation and `SET NAMES utf8mb4 COLLATE c` names one, both
+    /// measured on 8.3 by reading `@@collation_connection` back. A character
+    /// set this engine does not serve is left alone rather than refused: it
+    /// answers utf8mb4 whatever the client asked for, and turning `SET NAMES
+    /// latin1` into an error would refuse a connection it currently serves.
+    pub fn set_names(&mut self, charset: &str, collation: Option<&str>) -> EngineResult<()> {
+        if !charset.eq_ignore_ascii_case("utf8mb4") {
+            return Ok(());
+        }
+        let name = match collation {
+            Some(named) => crate::collation::named(named)?,
+            None => crate::collation::Collation::default().name().to_owned(),
+        };
+        self.overrides
+            .insert("collation_connection".to_owned(), name);
         Ok(())
     }
 
@@ -429,10 +511,10 @@ impl Session {
     pub fn system_variable(&self, name: &str) -> Option<Value> {
         let name = normalize_scope(name);
         if let Some(value) = self.overrides.get(&name) {
-            return Some(Value::text(value.clone()));
+            return Some(sysconst(value.clone()));
         }
 
-        let text = |s: &str| Some(Value::text(s.to_owned()));
+        let text = |s: &str| Some(sysconst(s.to_owned()));
         let int = |v: i64| Some(Value::Int(v));
 
         match name.as_str() {
@@ -652,6 +734,16 @@ fn clamped_integer(name: &str, value: &Value, low: i128, high: i128) -> EngineRe
     }
 }
 
+/// A system variable's value, which is SYSCONST rather than a literal.
+///
+/// Coercibility 3 on 8.3 and collated `utf8mb3_general_ci`, both measured, and
+/// both decide answers: `@@version_comment = CONCAT(@@version_comment, ' ')`
+/// is 1 there because the variable's own PAD SPACE collation beats a NO PAD
+/// connection. See [`crate::collation::Coercibility::SysConst`].
+fn sysconst(text: String) -> Value {
+    Value::Text(text, crate::collation::Collated::SYSCONST)
+}
+
 /// Strips a `GLOBAL.` / `SESSION.` / `LOCAL.` prefix and lowercases the rest.
 ///
 /// This engine has one session and no server-wide configuration to differ from
@@ -735,14 +827,14 @@ mod tests {
         let s = Session::new(first.clone(), 1);
         assert_eq!(
             s.system_variable("ultralight_instance"),
-            Some(Value::text(first.instance.clone()))
+            Some(sysconst(first.instance.clone()))
         );
         // Every connection to one server must answer the same, or the harness
         // would be checking the connection rather than the server.
         let other_connection = Session::new(first.clone(), 2);
         assert_eq!(
             other_connection.system_variable("@@ultralight_instance"),
-            Some(Value::text(first.instance))
+            Some(sysconst(first.instance))
         );
     }
 
@@ -760,9 +852,12 @@ mod tests {
         s.set_system_variable("sql_mode", &Value::text("ANSI_QUOTES"))
             .unwrap();
         assert_eq!(s.config.sql_mode, "ANSI_QUOTES");
+        // SYSCONST, not a literal: a system variable's value carries its own
+        // collation at coercibility 3, which is what keeps `@@sql_mode = ''`
+        // from being an illegal mix on a moved connection.
         assert_eq!(
             s.system_variable("sql_mode"),
-            Some(Value::text("ANSI_QUOTES".to_owned()))
+            Some(sysconst("ANSI_QUOTES".to_owned()))
         );
     }
 }

@@ -5,6 +5,7 @@ use sqlparser::ast::{
     Query, SelectItem, SetExpr, UnaryOperator, Value as AstValue, ValueWithSpan,
 };
 
+use crate::collation::Collation;
 use crate::error::{unsupported, EngineError, EngineResult};
 use crate::functions;
 use crate::session::Session;
@@ -443,7 +444,7 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
                 .map_err(|_| EngineError::unknown_column(&shown(), ctx.clause))
         }
 
-        Expr::Value(v) => literal(&v.value),
+        Expr::Value(v) => literal(&v.value, ctx.session.collation_connection()),
 
         Expr::Nested(inner) => eval(inner, ctx),
 
@@ -708,7 +709,12 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
             expr, data_type, ..
         } => {
             let value = eval(expr, ctx)?;
-            functions::cast(value, data_type, &expr.to_string())
+            functions::cast(
+                value,
+                data_type,
+                &expr.to_string(),
+                ctx.session.collation_connection(),
+            )
         }
 
         // A scalar subquery: one row, one column.
@@ -852,7 +858,7 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
                     }
                 }
             }
-            Ok(Value::text(text))
+            Ok(coercible_text(text, ctx))
         }
 
         Expr::Position { expr, r#in } => {
@@ -1009,7 +1015,7 @@ pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
                 let Some(engine) = ctx.executor else {
                     return Err(unsupported("uuid() here"));
                 };
-                return Ok(Value::text(engine.next_uuid()));
+                return Ok(coercible_text(engine.next_uuid(), ctx));
             }
 
             if let Some(op) = op {
@@ -1158,7 +1164,7 @@ pub(crate) fn like_escape(clause: Option<&ValueWithSpan>) -> EngineResult<Option
     let Some(clause) = clause else {
         return Ok(DEFAULT);
     };
-    let named = literal(&clause.value)?;
+    let named = literal(&clause.value, Collation::default())?;
     if named.is_null() {
         return Ok(DEFAULT);
     }
@@ -1202,8 +1208,34 @@ fn wrong_escape() -> EngineError {
     EngineError::new(1210, "HY000", "Incorrect arguments to ESCAPE")
 }
 
-/// Converts a literal from the AST.
-pub fn literal(value: &AstValue) -> EngineResult<Value> {
+/// Text built here rather than by a literal or a function, carrying the
+/// connection's collation.
+///
+/// A separate function and not an expression in the arm that needs it: the
+/// evaluator's stack frame is the one a deep nest of scalar subqueries
+/// recurses through, and `a_deep_nest_of_scalar_subqueries_still_answers`
+/// aborts on a few hundred bytes more of it.
+fn coercible_text(text: String, ctx: &Context<'_>) -> Value {
+    Value::Text(
+        text,
+        crate::collation::Collated::coercible(ctx.session.collation_connection()),
+    )
+}
+
+/// Converts a literal from the AST, under the collation it is written in.
+///
+/// A string literal's collation is the *connection's*, not the server's, so it
+/// is settled here at the one place a literal is born rather than at the
+/// several hundred that build a `Value::Text` from something else. Measured on
+/// 8.3 either side of one `SET NAMES`: `COLLATION('x')` follows
+/// `@@collation_connection` while `COERCIBILITY('x')` stays 4. #0154.
+///
+/// The collation is a parameter and not read from a session because two
+/// callers have no session to read: a column `DEFAULT` is a literal read once
+/// when the table is declared, and a `LIKE ... ESCAPE` clause is one character
+/// that nothing compares. Both pass the server default, which is what 8.3
+/// records for a default too.
+pub fn literal(value: &AstValue, collation: Collation) -> EngineResult<Value> {
     Ok(match value {
         AstValue::Number(n, _) => number_literal(n),
         AstValue::SingleQuotedString(s)
@@ -1211,7 +1243,9 @@ pub fn literal(value: &AstValue) -> EngineResult<Value> {
         | AstValue::TripleSingleQuotedString(s)
         | AstValue::TripleDoubleQuotedString(s)
         | AstValue::EscapedStringLiteral(s)
-        | AstValue::NationalStringLiteral(s) => Value::text(s.clone()),
+        | AstValue::NationalStringLiteral(s) => {
+            Value::Text(s.clone(), crate::collation::Collated::coercible(collation))
+        }
         AstValue::HexStringLiteral(s) => {
             let bytes = (0..s.len())
                 .step_by(2)
@@ -1257,7 +1291,7 @@ fn variable(name: &str, ctx: &Context<'_>) -> EngineResult<Value> {
 /// evaluated per row, such as `CURRENT_TIMESTAMP`.
 pub fn literal_of(e: &Expr) -> Option<Value> {
     match e {
-        Expr::Value(v) => literal(&v.value).ok(),
+        Expr::Value(v) => literal(&v.value, Collation::default()).ok(),
         Expr::Nested(inner) => literal_of(inner),
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
@@ -1497,7 +1531,7 @@ fn binary(
                 if left.is_null() || right.is_null() {
                     Value::Null
                 } else {
-                    Value::text(format!("{}{}", left.as_text(), right.as_text()))
+                    coercible_text(format!("{}{}", left.as_text(), right.as_text()), ctx)
                 }
             } else {
                 match (left.truthy(), right.truthy()) {

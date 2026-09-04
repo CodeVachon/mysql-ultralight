@@ -300,11 +300,15 @@ impl Value {
 
     /// The collation this value brings to a comparison.
     ///
-    /// Everything that is not text is coercible: MySQL types a number's
-    /// collation NUMERIC at coercibility 5, weaker than a literal's, and this
-    /// engine never compares two of those as strings anyway — the numeric
-    /// paths in [`Value::compare`] take that pairing first. Collapsing them
-    /// keeps one rule rather than a second ladder that has to agree with it.
+    /// Everything that is not text is NUMERIC: MySQL's coercibility 5, weaker
+    /// than a literal's 4, which is what makes a literal win against it rather
+    /// than tie. It used to be COERCIBLE here, on the grounds that two of
+    /// these never meet as strings anyway — true, and beside the point once a
+    /// literal started carrying the *connection's* collation instead of the
+    /// server's. An ENUM member compared with a literal was then two COERCIBLE
+    /// operands with two different collations, which [`crate::collation::resolve`]
+    /// refuses with 1267: `SELECT (SELECT e FROM t) = 'b'` raised where 8.3
+    /// answers a row. See [`crate::collation::Coercibility::Numeric`].
     pub(crate) fn collated_as(&self) -> Collated {
         match self {
             Value::Text(_, collated) => *collated,
@@ -319,7 +323,47 @@ impl Value {
             // character set, because the two ask for the same comparison and
             // only one of them is a comparison this engine has.
             Value::Bytes(_) => Collated::implicit(Collation::Bin),
-            _ => Collated::COERCIBLE,
+            _ => Collated::NUMERIC,
+        }
+    }
+
+    /// This value with the connection's collation on it, where it holds none
+    /// of its own.
+    ///
+    /// A literal's collation is `collation_connection`, not the server's
+    /// default: measured on 8.3 either side of one `SET NAMES`,
+    /// `COLLATION('x')` follows the connection while `COERCIBILITY('x')` stays
+    /// 4. So only COERCIBLE is touched — a column keeps the IMPLICIT collation
+    /// it was declared with and a `COLLATE` clause keeps its EXPLICIT one, and
+    /// both go on winning the resolution against a literal.
+    ///
+    /// Applied where a string is *built* — a literal, a function's answer, a
+    /// cast, an aggregate — rather than at every site that builds a
+    /// `Value::Text`. See #0154.
+    pub(crate) fn on_connection(&mut self, collation: Collation) {
+        if let Value::Text(_, collated) = self {
+            if collated.coercibility == crate::collation::Coercibility::Coercible {
+                collated.collation = collation;
+            }
+        }
+    }
+
+    /// This value as a user variable holds it, which is at IMPLICIT strength.
+    ///
+    /// A user variable keeps the collation of whatever was assigned to it and
+    /// holds it firmly: measured on 8.3, `COERCIBILITY(@x)` is 2 and
+    /// `COLLATION(@x)` is the connection's collation *at assignment*, unchanged
+    /// by a later `SET NAMES`. So a literal loses to it, and `SET @x = 'a '`
+    /// under `utf8mb4_0900_ai_ci` keeps `@x = 'a'` at 0 however the connection
+    /// moves afterwards.
+    ///
+    /// Only text carries a collation, so everything else passes through.
+    pub(crate) fn assigned(self) -> Value {
+        match self {
+            Value::Text(text, collated) => {
+                Value::Text(text, Collated::implicit(collated.collation))
+            }
+            other => other,
         }
     }
 
@@ -761,9 +805,22 @@ impl Value {
     /// `GREATEST`, `LEAST`, `MIN` and `MAX` build a string result and
     /// `COALESCE(e) + 0` is 0 — with one argument, so it is the function and
     /// not a mixture of types that does it. All measured on 8.3.
+    ///
+    /// The member comes out at NUMERIC strength rather than COERCIBLE, which
+    /// is the same "holds no collation of its own" [`Value::collated_as`]
+    /// gives the tagged form: this engine's `Value::Enum` does not carry the
+    /// column's collation, so the untagged member has none to keep either, and
+    /// it must *lose* to whatever it meets rather than tie with it. Tying is a
+    /// 1267 — `SELECT (SELECT e FROM t) = 'b'` raised one here where 8.3
+    /// answers a row, because a literal now carries the connection's collation
+    /// and this carried the server's. Losing gives the literal's, which is
+    /// 8.3's answer whenever the column's collation and the connection's
+    /// agree; where they do not, 8.3 uses the column's and this does not. That
+    /// residue is an ENUM that cannot say what it is collated as, not this
+    /// rule.
     pub fn untag_enum(self) -> Value {
         match self {
-            Value::Enum { member, .. } => Value::text(member),
+            Value::Enum { member, .. } => Value::Text(member, Collated::NUMERIC),
             other => other,
         }
     }

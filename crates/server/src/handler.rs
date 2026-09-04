@@ -115,6 +115,22 @@ pub trait Handler: Send {
         let _ = capabilities;
     }
 
+    /// The collation the client asked for in its handshake response.
+    ///
+    /// One byte of `HandshakeResponse41`, and MySQL takes the session's
+    /// `collation_connection` from it — which decides what every string
+    /// *literal* in every statement of the connection compares and folds
+    /// under. Most clients say it once here and never again: the `mysql` crate
+    /// sends 45, `utf8mb4_general_ci`, and issues no `SET NAMES` at all, while
+    /// the `mysql` command line with `--default-character-set=utf8mb4` lands
+    /// on `utf8mb4_0900_ai_ci`. Measured against 8.3 from both, and the two
+    /// get different answers to `SELECT 'a ' = 'a'` on the same server.
+    ///
+    /// Called once, beside [`Handler::negotiated`] and for the same reason.
+    fn connected_charset(&mut self, charset: u8) {
+        let _ = charset;
+    }
+
     /// Executes a statement arriving via `COM_QUERY`.
     fn query(&mut self, sql: &str) -> HandlerResult;
 

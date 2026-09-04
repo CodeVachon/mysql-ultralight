@@ -108,13 +108,64 @@ impl Collation {
         .find(|c| c.name() == name)
     }
 
+    /// The collation a client asks for in its handshake, where this engine has
+    /// it.
+    ///
+    /// The one byte a `HandshakeResponse41` carries, and it decides the
+    /// session's `collation_connection` — so it decides what every *literal*
+    /// in every statement of that connection compares and folds under. A
+    /// client that never issues `SET NAMES` still chose a collation, and the
+    /// two clients this repository asks MySQL with choose differently: the
+    /// `mysql` command line with `--default-character-set=utf8mb4` lands on
+    /// `utf8mb4_0900_ai_ci`, while the `mysql` crate the differential harness
+    /// uses sends 45 in the handshake and never says another word about it.
+    /// Measured on 8.3 from both — `@@collation_connection` is
+    /// `utf8mb4_0900_ai_ci` under the first and `utf8mb4_general_ci` under the
+    /// second — which is why #0154's measurements are unreproducible without
+    /// naming the client.
+    ///
+    /// `None` for an id this engine cannot compare in, which the caller reads
+    /// as "leave the default alone": a client asking for `latin1_swedish_ci`
+    /// gets utf8mb4 answers here either way, and refusing its handshake would
+    /// be a worse wrong answer than ignoring one field of it.
+    pub fn from_client_charset(id: u8) -> Option<Self> {
+        match id {
+            45 => Some(Collation::GeneralCi),
+            46 => Some(Collation::Bin),
+            224 => Some(Collation::UnicodeCi),
+            255 => Some(Collation::Ai0900Ci),
+            _ => None,
+        }
+    }
+
+    /// Whether `UPPER` and `LOWER` fold through UCA 9.0's table rather than
+    /// the utf8mb4 character set's older one.
+    ///
+    /// The case table belongs to the collation, not the character set, and
+    /// utf8mb4 has exactly two on 8.3. Measured by folding all 1,112,064
+    /// codepoints under a column of each of the four collations this engine
+    /// has: `utf8mb4_0900_ai_ci` changes 1321 characters upward and 1304
+    /// downward, and `utf8mb4_general_ci`, `utf8mb4_unicode_ci` and
+    /// `utf8mb4_bin` change 706 and 696 — and those three agree with each
+    /// other on every one of the 1,112,064, in both directions. So this is one
+    /// bit and not a table of four.
+    ///
+    /// It is what makes `SELECT UPPER('𐐨')` and `SELECT UPPER(col)` different
+    /// answers on the same server: the literal folds under the connection's
+    /// collation and the column under its own. See [`crate::casefold`].
+    pub fn folds_by_uca_900(self) -> bool {
+        matches!(self, Collation::Ai0900Ci)
+    }
+
     /// Whether trailing spaces are ignored when comparing.
     ///
     /// PAD SPACE for everything but the `_0900_` collations, which is measured
     /// rather than remembered: `'a ' = 'a'` under a column of each is 0 for
     /// `utf8mb4_0900_ai_ci` and 1 for `utf8mb4_unicode_ci`,
-    /// `utf8mb4_general_ci` and `utf8mb4_bin`. A literal pair `'a ' = 'a'` is
-    /// 0, because both literals carry the connection's `_0900_` collation.
+    /// `utf8mb4_general_ci` and `utf8mb4_bin`. A literal pair `'a ' = 'a'`
+    /// follows the *connection*: 0 under a connection of `utf8mb4_0900_ai_ci`
+    /// and 1 under one of `utf8mb4_general_ci`, both measured on 8.3 in one
+    /// session either side of a `SET NAMES`.
     ///
     /// Only the space pads. `'a' = 'a\t'` is 0 under all four.
     pub fn pads(self) -> bool {
@@ -592,8 +643,34 @@ pub enum Coercibility {
     Explicit,
     /// A column's declaration carries it. 2 on 8.3.
     Implicit,
+    /// A system variable's value. 3 on 8.3, where it is spelled SYSCONST —
+    /// stronger than a literal and weaker than a column.
+    ///
+    /// Measured, because it decides answers rather than only a number:
+    /// `COERCIBILITY(@@sql_mode)` is 3 and `COLLATION(@@sql_mode)` is
+    /// `utf8mb3_general_ci`, whatever the connection is collated with. So
+    /// `@@version_comment = CONCAT(@@version_comment, ' ')` is 1 on 8.3 — the
+    /// variable's own PAD SPACE collation wins over a NO PAD connection — and
+    /// leaving these COERCIBLE at the server default made the pair two
+    /// COERCIBLE operands with different collations, which is a 1267 8.3
+    /// cannot raise.
+    SysConst,
     /// A literal, which takes whichever collation it is compared against. 4.
     Coercible,
+    /// A value with no character collation at all — a number, an ENUM ordinal,
+    /// a temporal — read as a string because something compared it to one. 5
+    /// on 8.3, where it is spelled NUMERIC and is weaker than a literal's 4.
+    ///
+    /// Weaker matters. Everything here used to be COERCIBLE, which was
+    /// harmless while every literal carried the server's default collation and
+    /// became a wrong answer the moment they carried the *connection's*: an
+    /// ENUM member beside a literal is two COERCIBLE operands with two
+    /// different collations, which [`resolve`] refuses with 1267 — and 8.3
+    /// cannot raise that pair, because there the ENUM is IMPLICIT and the
+    /// literal simply loses. `SELECT (SELECT e FROM t) = 'b'` is where it
+    /// showed. At 5 the literal wins instead, which is the same answer 8.3
+    /// gives by a different route.
+    Numeric,
 }
 
 impl Coercibility {
@@ -602,7 +679,9 @@ impl Coercibility {
         match self {
             Coercibility::Explicit => "EXPLICIT",
             Coercibility::Implicit => "IMPLICIT",
+            Coercibility::SysConst => "SYSCONST",
             Coercibility::Coercible => "COERCIBLE",
+            Coercibility::Numeric => "NUMERIC",
         }
     }
 }
@@ -615,14 +694,57 @@ pub struct Collated {
 }
 
 impl Collated {
-    /// What a literal, and anything computed from one, carries.
+    /// What a literal, and anything computed from one, carries *before* the
+    /// connection has had its say.
     ///
     /// The server's default collation at the weakest coercibility, so any
     /// column it meets decides the comparison. `SELECT COLLATION('x')` is
-    /// `utf8mb4_0900_ai_ci` on 8.3 and `COERCIBILITY('x')` is 4.
+    /// `utf8mb4_0900_ai_ci` on a stock 8.3 and `COERCIBILITY('x')` is 4.
+    ///
+    /// The collation here is the server's, which is right only for a
+    /// connection that kept it — and that is the whole of #0154: a literal's
+    /// collation is the *connection's*, and the two differ for any client that
+    /// negotiated something else. [`Collated::coercible`] is what carries the
+    /// connection's, and `crate::expr::literal` is where a string literal gets
+    /// it. This constant is what a `Value::Text` built with no connection in
+    /// scope still gets — a column default, a `LIKE ... ESCAPE` character —
+    /// and `crate::value::Value::on_connection` is what a builder that *does*
+    /// have one calls to replace it.
     pub const COERCIBLE: Collated = Collated {
         collation: Collation::Ai0900Ci,
         coercibility: Coercibility::Coercible,
+    };
+
+    /// What a literal carries on a connection collated `collation`.
+    ///
+    /// Measured on 8.3 in one session either side of a `SET NAMES`:
+    /// `COLLATION('x')` follows `@@collation_connection` and
+    /// `COERCIBILITY('x')` stays 4, so the collation moves and the strength
+    /// does not — a column still beats a literal whatever the connection is.
+    pub fn coercible(collation: Collation) -> Self {
+        Collated {
+            collation,
+            coercibility: Coercibility::Coercible,
+        }
+    }
+
+    /// What a system variable's value brings.
+    ///
+    /// `utf8mb4_general_ci` stands in for the `utf8mb3_general_ci` 8.3 reports
+    /// for one: this engine has no utf8mb3, and the two compare identically
+    /// over the ASCII these variables hold — both case-insensitive and both
+    /// PAD SPACE, which is the half that decides an answer. See
+    /// [`Coercibility::SysConst`].
+    pub const SYSCONST: Collated = Collated {
+        collation: Collation::GeneralCi,
+        coercibility: Coercibility::SysConst,
+    };
+
+    /// What a value carrying no character collation at all brings, which is
+    /// weaker than a literal. See [`Coercibility::Numeric`].
+    pub const NUMERIC: Collated = Collated {
+        collation: Collation::Ai0900Ci,
+        coercibility: Coercibility::Numeric,
     };
 
     /// What a value read out of a column carries.

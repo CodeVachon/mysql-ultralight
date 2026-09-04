@@ -200,6 +200,7 @@ where
         // the only window: a rejected connection never reaches the handler,
         // and `USE <db>` below is already a statement the handler answers.
         self.handler.negotiated(self.caps);
+        self.handler.connected_charset(response.charset);
 
         if let Some(db) = &response.database {
             if let Err(err) = self.handler.init_db(db) {

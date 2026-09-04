@@ -94,6 +94,10 @@ impl Handler for EngineHandler {
         self.session.found_rows = capabilities.contains(Capabilities::FOUND_ROWS);
     }
 
+    fn connected_charset(&mut self, charset: u8) {
+        self.session.negotiated_charset(charset);
+    }
+
     fn query(&mut self, sql: &str) -> HandlerResult {
         self.run(sql, &[])
     }

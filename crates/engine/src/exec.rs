@@ -3928,7 +3928,15 @@ impl Engine {
         // with its own separator. Sharing the pass would mean evaluating the
         // first argument twice and dropping the rest.
         if name == "group_concat" {
-            return self.fold_group_concat(session, call, refs, matching);
+            // The connection's collation onto the answer, for the reason
+            // `functions::call` gives: a string this engine built somewhere
+            // carries none of its own, and beside a literal that carries the
+            // connection's the pair resolves to neither -- `HAVING
+            // GROUP_CONCAT(s) = 'a,b,c'` was 1267 where 8.3 answers a row.
+            // #0154.
+            let mut out = self.fold_group_concat(session, call, refs, matching)?;
+            out.on_connection(session.collation_connection());
+            return Ok(out);
         }
 
         let argument = call.argument();
@@ -4074,6 +4082,12 @@ impl Engine {
                     crate::json::render(&serde_json::Value::Array(items))
                 }
             }
+            // Nothing here needs the connection's collation put on it the way
+            // `GROUP_CONCAT` above does, and that was checked rather than
+            // assumed: `COUNT`, `SUM` and `AVG` answer numbers, `JSON_ARRAYAGG`
+            // answers a `Value::Json`, and `MIN` and `MAX` hand back one of
+            // their inputs, which arrived carrying whatever collation it had.
+            // `GROUP_CONCAT` is the only one that builds a string of its own.
             other => return Err(unsupported(format!("aggregate `{other}()`"))),
         })
     }
@@ -5632,7 +5646,10 @@ impl Engine {
                 // silent NULL: the variable would then carry a wrong answer
                 // into whatever reads it next.
                 let value = match values.first() {
-                    Some(e) => expr::eval(e, &ctx)?,
+                    Some(e) => match unquoted_collation(&name, e) {
+                        Some(named) => named,
+                        None => expr::eval(e, &ctx)?,
+                    },
                     None => Value::Null,
                 };
                 self.assign(session, &name, value)?;
@@ -5642,12 +5659,33 @@ impl Engine {
                 for assignment in assignments {
                     let name = name::dotted(&assignment.name);
                     let ctx = Context::rowless(session).with_executor(self);
-                    let value = expr::eval(&assignment.value, &ctx)?;
+                    let value = match unquoted_collation(&name, &assignment.value) {
+                        Some(named) => named,
+                        None => expr::eval(&assignment.value, &ctx)?,
+                    };
                     self.assign(session, &name, value)?;
                 }
                 Ok(Outcome::ok())
             }
-            // SET NAMES, SET TRANSACTION and friends need no state here.
+            // `SET NAMES` settles the connection's collation, which is what
+            // every literal in the session compares and folds under — so it
+            // changes answers rather than only what `@@collation_connection`
+            // reports. Measured on 8.3 across one `SET NAMES`: `'a ' = 'a'`
+            // goes from 0 to 1 and `HEX(LOWER('ẞ'))` from `C39F` to `E1BA9E`.
+            // It was swallowed here with the rest, which is half of #0154.
+            S::SetNames {
+                charset_name,
+                collation_name,
+            } => {
+                session.set_names(&charset_name.value, collation_name.as_deref())?;
+                Ok(Outcome::ok())
+            }
+            // `SET NAMES DEFAULT` restores the server's, measured.
+            S::SetNamesDefault {} => {
+                session.set_names("utf8mb4", None)?;
+                Ok(Outcome::ok())
+            }
+            // SET TRANSACTION and friends need no state here.
             _ => Ok(Outcome::ok()),
         }
     }
@@ -11551,6 +11589,54 @@ fn group_concat_as_window(e: &Expr) -> Option<EngineError> {
     }
 }
 
+/// The collation name in `SET collation_connection = utf8mb4_general_ci`,
+/// where it is written without quotes.
+///
+/// MySQL takes a bare identifier on the right of a `SET` as the *name* it is
+/// written as; there is no table in scope, so it can never be a column
+/// reference. This engine evaluates it as an expression and answers 1054,
+/// `Unknown column 'utf8mb4_general_ci' in 'field list'` — measured against
+/// 8.3, which sets the variable.
+///
+/// Narrowed to this one variable on purpose, rather than fixed for `SET` in
+/// general. The general form is #0095's, and doing it here would turn a loud
+/// refusal into a silent wrong answer for the variables this engine reports
+/// and does not honour: `SET foreign_key_checks = OFF` would start succeeding
+/// while foreign keys went on being checked. The connection's collation is
+/// different because the engine now *reads* it, so accepting the spelling and
+/// acting on it are the same thing.
+///
+/// A *user* variable of the same name is not this: `SET @collation_connection
+/// = utf8mb4_bin` is 1054 on 8.3, because the right-hand side of a
+/// user-variable assignment really is an expression. Only a bare name or an
+/// `@@`-prefixed one is a system variable.
+fn unquoted_collation(variable: &str, value: &Expr) -> Option<Value> {
+    // Only `@@` is stripped, which is what keeps a *user* variable out: `SET
+    // @collation_connection = utf8mb4_bin` keeps its `@` here, so the name
+    // below cannot match and the assignment goes on being an expression — 1054
+    // on 8.3, measured beside the system-variable form.
+    let system = variable.strip_prefix("@@").unwrap_or(variable);
+    let name = system.to_ascii_lowercase();
+    // A `GLOBAL.` / `SESSION.` / `LOCAL.` prefix names the same variable here,
+    // as `Session::set_system_variable` also resolves it.
+    let name = name.rsplit('.').next().unwrap_or(&name);
+    if name != "collation_connection" {
+        return None;
+    }
+    match value {
+        // `DEFAULT` is the one bare identifier that is not a name: 8.3 resets
+        // the variable to the session default, measured — `SET
+        // collation_connection = DEFAULT` puts `utf8mb4_0900_ai_ci` back.
+        Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case("default") => {
+            Some(Value::text(crate::collation::Collation::default().name()))
+        }
+        Expr::Identifier(ident) if !ident.value.starts_with('@') => {
+            Some(Value::text(ident.value.clone()))
+        }
+        _ => None,
+    }
+}
+
 /// Refuses a clause 8.3 settles before it evaluates a row: an ESCAPE that
 /// cannot be one, a native function called with the wrong parameter count, an
 /// aggregate's own `ORDER BY` naming a position it has no argument for, and
@@ -12411,7 +12497,14 @@ fn aggregate_separator(f: &sqlparser::ast::Function) -> EngineResult<String> {
     };
     for clause in &list.clauses {
         if let FunctionArgumentClause::Separator(literal) = clause {
-            return Ok(crate::expr::literal(&literal.value)?.as_text());
+            // The server default, and the collation is never read: only
+            // the separator's *text* is taken, and a `GROUP_CONCAT`
+            // separator is never compared against anything.
+            return Ok(crate::expr::literal(
+                &literal.value,
+                crate::collation::Collation::default(),
+            )?
+            .as_text());
         }
     }
     Ok(",".to_owned())

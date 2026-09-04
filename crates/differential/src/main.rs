@@ -302,6 +302,39 @@ fn check_identities(reference: &mut Conn, engine: &mut Conn, expected_instance: 
         eprintln!("{complaint}");
         std::process::exit(2);
     }
+
+    // Asked *before* the first `reset`, which is the only moment it can be
+    // asked: this is the collation the client chose in its handshake and
+    // nothing has overridden yet. It decides what every string literal in
+    // every case below compares and folds under — `'a ' = 'a'` is 1 under
+    // `utf8mb4_general_ci` and 0 under `utf8mb4_0900_ai_ci`, measured — so two
+    // servers that disagree here are being asked different questions, and the
+    // whole corpus would report divergences about the *client*.
+    //
+    // This driver sends 45 in its handshake and never issues a `SET NAMES`, so
+    // a server that ignores that byte lands on its own default instead. That
+    // was this engine until #0154, and a run against it compared answers to
+    // two different questions and called the difference the engine's.
+    let negotiated = |conn: &mut Conn, which: &str| -> String {
+        conn.query_first::<String, _>("SELECT @@collation_connection")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                eprintln!("the {which} server would not say what collation it negotiated");
+                std::process::exit(2);
+            })
+    };
+    let theirs = negotiated(reference, "reference");
+    let ours = negotiated(engine, "engine");
+    if theirs != ours {
+        eprintln!(
+            "the two servers negotiated different connection collations — reference \
+             {theirs}, engine {ours}. A literal takes the connection's collation, so \
+             every case below would be asked under a different one on each side and \
+             the divergences would be about the client rather than the engine."
+        );
+        std::process::exit(2);
+    }
 }
 
 /// Says why the engine on the other end is not the one that was started, or
@@ -357,6 +390,21 @@ fn reset(conn: &mut Conn, group: &str) {
         // a divergence about somebody else's limit. 1024 is the stock 8.3
         // default.
         "SET SESSION group_concat_max_len = 1024".to_owned(),
+        // The fifth, and the one a group can change without any `SET` of a
+        // variable at all: `SET NAMES` moves it. Every string *literal* takes
+        // the connection's collation, so `'a ' = 'a'` is 1 under
+        // `utf8mb4_general_ci` and 0 under `utf8mb4_0900_ai_ci`, and
+        // `HEX(LOWER('ẞ'))` is `E1BA9E` against `C39F` — all measured on 8.3
+        // in one session either side of one `SET NAMES`.
+        //
+        // Pinned to what this driver's handshake asks for rather than to 8.3's
+        // server default, because the corpus was written under it: the case
+        // folding group says in as many words which of its characters may be
+        // asked as a literal, and the answer is different under the other
+        // collation. Written down here so a driver that changes its default
+        // cannot silently re-aim a hundred cases; `check_identities` is what
+        // checks the handshake itself, before this runs.
+        "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci".to_owned(),
         format!("DROP DATABASE IF EXISTS `{DATABASE}`"),
         format!("CREATE DATABASE `{DATABASE}`"),
         format!("USE `{DATABASE}`"),

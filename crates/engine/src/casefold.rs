@@ -24,20 +24,28 @@
 //! | `HEX(UPPER('ȿ'))` | `''` — see below | `C8BF` |
 //! | `HEX(LOWER('ẞ'))` | `C39F` | `E1BA9E` |
 //!
-//! `utf8mb4_0900_ai_ci` is the one encoded here. It is what a column declared
-//! without a `COLLATE` clause gets on 8.3 — so it is the collation of every
-//! column Prisma creates, and the one that folds in `WHERE UPPER(col) = ?` —
-//! and it is what this engine's own `information_schema.COLLATIONS` reports as
-//! its default.
+//! **Both** are encoded here, and which one runs is
+//! [`crate::collation::Collation::folds_by_uca_900`]. Two and not four:
+//! folding all 1,112,064 codepoints under a column of each of the four
+//! collations this engine has, `utf8mb4_general_ci`, `utf8mb4_unicode_ci` and
+//! `utf8mb4_bin` agree with each other on every one of them in both
+//! directions, and only `utf8mb4_0900_ai_ci` stands apart.
 //!
-//! It is *not* what a string literal folds under. MySQL takes a literal's
-//! collation from the connection, and the drivers negotiate 45,
-//! `utf8mb4_general_ci`, which is why `SELECT UPPER('𐐨')` differs from
-//! `SELECT UPPER(col)` over the same character on the same server. This engine
-//! has one table for both. Both halves are measured and the split is #0129's
-//! and #0152's to close; the differential corpus asks the characters where the
-//! two collations disagree through a *column*, where this table is the one
-//! MySQL uses too.
+//! [`UPPER`] and [`LOWER`] are UCA 9.0's, which is what a column declared
+//! without a `COLLATE` clause gets on 8.3 — so it is the collation of every
+//! column Prisma creates, and the one that folds in `WHERE UPPER(col) = ?`.
+//! [`UPPER_LEGACY`] and [`LOWER_LEGACY`] are the utf8mb4 character set's own,
+//! which the other three share.
+//!
+//! A *literal* folds under neither by default: it folds under the
+//! **connection's** collation, which the client chooses in its handshake and
+//! can change with `SET NAMES`. That is why `SELECT UPPER('𐐨')` and
+//! `SELECT UPPER(col)` are different answers on the same 8.3 for the same
+//! character, and it is why a measurement here is unreproducible unless it
+//! names the connection collation. This engine had one table for both, which
+//! was #0154; the argument's own collation now picks the table, and
+//! `crate::collation::Collation::from_client_charset` is what gets the
+//! connection's onto a literal.
 //!
 //! ## Why the whole table rather than Rust's with patches
 //!
@@ -75,9 +83,7 @@
 //! ```
 //!
 //! `fold` deliberately does **not** reproduce that. It leaves a character
-//! alone when its fold would be wider, which is what `utf8mb4_general_ci` does
-//! — that table has no entry for any of the nineteen — and therefore exactly
-//! what 8.3 answers for a *literal*.
+//! alone when its fold would be wider.
 //!
 //! The choice was measured rather than argued. Over 304 strings built round
 //! the nineteen, in both directions and eight contexts, reproducing the
@@ -87,11 +93,17 @@
 //! deletes none, because no answer here is ever shorter than its argument:
 //!
 //! ```text
-//! UPPER('aȿb')   8.3 column  AȾ    8.3 literal  AȿB    this engine  AȿB
+//! UPPER('aȿb')   8.3, 0900_ai_ci  AȾ    8.3, general_ci  AȿB    this engine  AȿB
 //! ```
 //!
-//! So the engine is wrong for these nineteen over a *column*, where it answers
-//! the unfolded character and 8.3 truncates. That is #0154, and it is the
+//! Once the collation picks the table that stops being a guess for half the
+//! cases: the legacy table has no entry for any of the nineteen and never
+//! widens *at all* — checked over every one of its 706 upward and 696 downward
+//! mappings — so under `utf8mb4_general_ci`, `utf8mb4_unicode_ci` or
+//! `utf8mb4_bin` this engine now answers exactly what 8.3 answers, and the
+//! guard below never fires. What remains is the nineteen under
+//! `utf8mb4_0900_ai_ci`, where the engine answers the unfolded character and
+//! 8.3 answers a truncated string. That gap is deliberate and it is the
 //! direction to be wrong in: `UPDATE t SET c = UPPER(c)` cannot lose bytes a
 //! caller handed it, and a test double that silently drops the tail of a
 //! string is a worse failure than one that leaves an IPA letter unfolded.
@@ -100,6 +112,8 @@
 //! per-character path, so `UPPER(col)` would succeed over an empty table and
 //! raise over a populated one — #0009's zero-rows pattern, which this epic has
 //! now found three times.
+
+use crate::collation::Collation;
 
 /// `UPPER` under `utf8mb4_0900_ai_ci`, as `(first, last, step, first's
 /// answer)`: every `step`-th character from `first` through `last` maps to
@@ -487,14 +501,269 @@ const LOWER: &[(char, char, u32, char)] = &[
     ('\u{1E900}', '\u{1E921}', 1, '\u{1E922}'), // Adlam
 ];
 
-/// MySQL's `UPPER` over a character string.
-pub fn upper(s: &str) -> String {
-    fold(s, UPPER)
+/// `UPPER` under every collation that is not `_0900_`, in the same shape as
+/// [`UPPER`] above.
+///
+/// The utf8mb4 character set's own table, which `utf8mb4_general_ci`,
+/// `utf8mb4_unicode_ci` and `utf8mb4_bin` all fold through — measured under a
+/// column of each on 8.3 over all 1,112,064 codepoints, where the three agree
+/// with each other everywhere and with `utf8mb4_0900_ai_ci` on 616 fewer
+/// characters. 706 mappings in 113 runs.
+///
+/// Two properties of it are relied on elsewhere and were checked over every
+/// mapping rather than assumed: nothing here maps above the BMP, and no fold
+/// here is wider in UTF-8 than the character it replaces — so the widening
+/// guard in [`fold`], which is what makes this engine part company with 8.3
+/// over the nineteen `_0900_` mappings that truncate, never fires for this
+/// table at all.
+const UPPER_LEGACY: &[(char, char, u32, char)] = &[
+    ('\u{0061}', '\u{007A}', 1, '\u{0041}'),
+    ('\u{00B5}', '\u{00B5}', 1, '\u{039C}'),
+    ('\u{00E0}', '\u{00F6}', 1, '\u{00C0}'),
+    ('\u{00F8}', '\u{00FE}', 1, '\u{00D8}'),
+    ('\u{00FF}', '\u{00FF}', 1, '\u{0178}'),
+    ('\u{0101}', '\u{012F}', 2, '\u{0100}'),
+    ('\u{0131}', '\u{0131}', 1, '\u{0049}'),
+    ('\u{0133}', '\u{0137}', 2, '\u{0132}'),
+    ('\u{013A}', '\u{0148}', 2, '\u{0139}'),
+    ('\u{014B}', '\u{0177}', 2, '\u{014A}'),
+    ('\u{017A}', '\u{017E}', 2, '\u{0179}'),
+    ('\u{017F}', '\u{017F}', 1, '\u{0053}'),
+    ('\u{0183}', '\u{0185}', 2, '\u{0182}'),
+    ('\u{0188}', '\u{0188}', 1, '\u{0187}'),
+    ('\u{018C}', '\u{018C}', 1, '\u{018B}'),
+    ('\u{0192}', '\u{0192}', 1, '\u{0191}'),
+    ('\u{0195}', '\u{0195}', 1, '\u{01F6}'),
+    ('\u{0199}', '\u{0199}', 1, '\u{0198}'),
+    ('\u{01A1}', '\u{01A5}', 2, '\u{01A0}'),
+    ('\u{01A8}', '\u{01A8}', 1, '\u{01A7}'),
+    ('\u{01AD}', '\u{01AD}', 1, '\u{01AC}'),
+    ('\u{01B0}', '\u{01B0}', 1, '\u{01AF}'),
+    ('\u{01B4}', '\u{01B6}', 2, '\u{01B3}'),
+    ('\u{01B9}', '\u{01B9}', 1, '\u{01B8}'),
+    ('\u{01BD}', '\u{01BD}', 1, '\u{01BC}'),
+    ('\u{01BF}', '\u{01BF}', 1, '\u{01F7}'),
+    ('\u{01C5}', '\u{01C5}', 1, '\u{01C4}'),
+    ('\u{01C6}', '\u{01C6}', 1, '\u{01C4}'),
+    ('\u{01C8}', '\u{01C8}', 1, '\u{01C7}'),
+    ('\u{01C9}', '\u{01C9}', 1, '\u{01C7}'),
+    ('\u{01CB}', '\u{01CB}', 1, '\u{01CA}'),
+    ('\u{01CC}', '\u{01CC}', 1, '\u{01CA}'),
+    ('\u{01CE}', '\u{01DC}', 2, '\u{01CD}'),
+    ('\u{01DD}', '\u{01DD}', 1, '\u{018E}'),
+    ('\u{01DF}', '\u{01EF}', 2, '\u{01DE}'),
+    ('\u{01F2}', '\u{01F2}', 1, '\u{01F1}'),
+    ('\u{01F3}', '\u{01F3}', 1, '\u{01F1}'),
+    ('\u{01F5}', '\u{01F5}', 1, '\u{01F4}'),
+    ('\u{01F9}', '\u{021F}', 2, '\u{01F8}'),
+    ('\u{0223}', '\u{0233}', 2, '\u{0222}'),
+    ('\u{0253}', '\u{0253}', 1, '\u{0181}'),
+    ('\u{0254}', '\u{0254}', 1, '\u{0186}'),
+    ('\u{0256}', '\u{0257}', 1, '\u{0189}'),
+    ('\u{0259}', '\u{0259}', 1, '\u{018F}'),
+    ('\u{025B}', '\u{025B}', 1, '\u{0190}'),
+    ('\u{0260}', '\u{0260}', 1, '\u{0193}'),
+    ('\u{0263}', '\u{0263}', 1, '\u{0194}'),
+    ('\u{0268}', '\u{0268}', 1, '\u{0197}'),
+    ('\u{0269}', '\u{0269}', 1, '\u{0196}'),
+    ('\u{026F}', '\u{026F}', 1, '\u{019C}'),
+    ('\u{0272}', '\u{0272}', 1, '\u{019D}'),
+    ('\u{0275}', '\u{0275}', 1, '\u{019F}'),
+    ('\u{0280}', '\u{0280}', 1, '\u{01A6}'),
+    ('\u{0283}', '\u{0283}', 1, '\u{01A9}'),
+    ('\u{0288}', '\u{0288}', 1, '\u{01AE}'),
+    ('\u{028A}', '\u{028B}', 1, '\u{01B1}'),
+    ('\u{0292}', '\u{0292}', 1, '\u{01B7}'),
+    ('\u{0345}', '\u{0345}', 1, '\u{0399}'),
+    ('\u{03AC}', '\u{03AC}', 1, '\u{0386}'),
+    ('\u{03AD}', '\u{03AF}', 1, '\u{0388}'),
+    ('\u{03B1}', '\u{03C1}', 1, '\u{0391}'),
+    ('\u{03C2}', '\u{03C2}', 1, '\u{03A3}'),
+    ('\u{03C3}', '\u{03CB}', 1, '\u{03A3}'),
+    ('\u{03CC}', '\u{03CC}', 1, '\u{038C}'),
+    ('\u{03CD}', '\u{03CE}', 1, '\u{038E}'),
+    ('\u{03D0}', '\u{03D0}', 1, '\u{0392}'),
+    ('\u{03D1}', '\u{03D1}', 1, '\u{0398}'),
+    ('\u{03D5}', '\u{03D5}', 1, '\u{03A6}'),
+    ('\u{03D6}', '\u{03D6}', 1, '\u{03A0}'),
+    ('\u{03DB}', '\u{03EF}', 2, '\u{03DA}'),
+    ('\u{03F0}', '\u{03F0}', 1, '\u{039A}'),
+    ('\u{03F1}', '\u{03F1}', 1, '\u{03A1}'),
+    ('\u{03F2}', '\u{03F2}', 1, '\u{03A3}'),
+    ('\u{0430}', '\u{044F}', 1, '\u{0410}'),
+    ('\u{0450}', '\u{045F}', 1, '\u{0400}'),
+    ('\u{0461}', '\u{0481}', 2, '\u{0460}'),
+    ('\u{048D}', '\u{04BF}', 2, '\u{048C}'),
+    ('\u{04C2}', '\u{04C4}', 2, '\u{04C1}'),
+    ('\u{04C8}', '\u{04C8}', 1, '\u{04C7}'),
+    ('\u{04CC}', '\u{04CC}', 1, '\u{04CB}'),
+    ('\u{04D1}', '\u{04F5}', 2, '\u{04D0}'),
+    ('\u{04F9}', '\u{04F9}', 1, '\u{04F8}'),
+    ('\u{0561}', '\u{0586}', 1, '\u{0531}'),
+    ('\u{1E01}', '\u{1E95}', 2, '\u{1E00}'),
+    ('\u{1E9B}', '\u{1E9B}', 1, '\u{1E60}'),
+    ('\u{1EA1}', '\u{1EF9}', 2, '\u{1EA0}'),
+    ('\u{1F00}', '\u{1F07}', 1, '\u{1F08}'),
+    ('\u{1F10}', '\u{1F15}', 1, '\u{1F18}'),
+    ('\u{1F20}', '\u{1F27}', 1, '\u{1F28}'),
+    ('\u{1F30}', '\u{1F37}', 1, '\u{1F38}'),
+    ('\u{1F40}', '\u{1F45}', 1, '\u{1F48}'),
+    ('\u{1F51}', '\u{1F57}', 2, '\u{1F59}'),
+    ('\u{1F60}', '\u{1F67}', 1, '\u{1F68}'),
+    ('\u{1F70}', '\u{1F71}', 1, '\u{1FBA}'),
+    ('\u{1F72}', '\u{1F75}', 1, '\u{1FC8}'),
+    ('\u{1F76}', '\u{1F77}', 1, '\u{1FDA}'),
+    ('\u{1F78}', '\u{1F79}', 1, '\u{1FF8}'),
+    ('\u{1F7A}', '\u{1F7B}', 1, '\u{1FEA}'),
+    ('\u{1F7C}', '\u{1F7D}', 1, '\u{1FFA}'),
+    ('\u{1F80}', '\u{1F87}', 1, '\u{1F88}'),
+    ('\u{1F90}', '\u{1F97}', 1, '\u{1F98}'),
+    ('\u{1FA0}', '\u{1FA7}', 1, '\u{1FA8}'),
+    ('\u{1FB0}', '\u{1FB1}', 1, '\u{1FB8}'),
+    ('\u{1FB3}', '\u{1FB3}', 1, '\u{1FBC}'),
+    ('\u{1FBE}', '\u{1FBE}', 1, '\u{0399}'),
+    ('\u{1FC3}', '\u{1FC3}', 1, '\u{1FCC}'),
+    ('\u{1FD0}', '\u{1FD1}', 1, '\u{1FD8}'),
+    ('\u{1FE0}', '\u{1FE1}', 1, '\u{1FE8}'),
+    ('\u{1FE5}', '\u{1FE5}', 1, '\u{1FEC}'),
+    ('\u{1FF3}', '\u{1FF3}', 1, '\u{1FFC}'),
+    ('\u{2170}', '\u{217F}', 1, '\u{2160}'),
+    ('\u{24D0}', '\u{24E9}', 1, '\u{24B6}'),
+    ('\u{FF41}', '\u{FF5A}', 1, '\u{FF21}'),
+];
+
+/// `LOWER` under every collation that is not `_0900_`. 696 mappings in 101
+/// runs, measured the same way as [`UPPER_LEGACY`].
+const LOWER_LEGACY: &[(char, char, u32, char)] = &[
+    ('\u{0041}', '\u{005A}', 1, '\u{0061}'),
+    ('\u{00C0}', '\u{00D6}', 1, '\u{00E0}'),
+    ('\u{00D8}', '\u{00DE}', 1, '\u{00F8}'),
+    ('\u{0100}', '\u{012E}', 2, '\u{0101}'),
+    ('\u{0130}', '\u{0130}', 1, '\u{0069}'),
+    ('\u{0132}', '\u{0136}', 2, '\u{0133}'),
+    ('\u{0139}', '\u{0147}', 2, '\u{013A}'),
+    ('\u{014A}', '\u{0176}', 2, '\u{014B}'),
+    ('\u{0178}', '\u{0178}', 1, '\u{00FF}'),
+    ('\u{0179}', '\u{017D}', 2, '\u{017A}'),
+    ('\u{0181}', '\u{0181}', 1, '\u{0253}'),
+    ('\u{0182}', '\u{0184}', 2, '\u{0183}'),
+    ('\u{0186}', '\u{0186}', 1, '\u{0254}'),
+    ('\u{0187}', '\u{0187}', 1, '\u{0188}'),
+    ('\u{0189}', '\u{018A}', 1, '\u{0256}'),
+    ('\u{018B}', '\u{018B}', 1, '\u{018C}'),
+    ('\u{018E}', '\u{018E}', 1, '\u{01DD}'),
+    ('\u{018F}', '\u{018F}', 1, '\u{0259}'),
+    ('\u{0190}', '\u{0190}', 1, '\u{025B}'),
+    ('\u{0191}', '\u{0191}', 1, '\u{0192}'),
+    ('\u{0193}', '\u{0193}', 1, '\u{0260}'),
+    ('\u{0194}', '\u{0194}', 1, '\u{0263}'),
+    ('\u{0196}', '\u{0196}', 1, '\u{0269}'),
+    ('\u{0197}', '\u{0197}', 1, '\u{0268}'),
+    ('\u{0198}', '\u{0198}', 1, '\u{0199}'),
+    ('\u{019C}', '\u{019C}', 1, '\u{026F}'),
+    ('\u{019D}', '\u{019D}', 1, '\u{0272}'),
+    ('\u{019F}', '\u{019F}', 1, '\u{0275}'),
+    ('\u{01A0}', '\u{01A4}', 2, '\u{01A1}'),
+    ('\u{01A6}', '\u{01A6}', 1, '\u{0280}'),
+    ('\u{01A7}', '\u{01A7}', 1, '\u{01A8}'),
+    ('\u{01A9}', '\u{01A9}', 1, '\u{0283}'),
+    ('\u{01AC}', '\u{01AC}', 1, '\u{01AD}'),
+    ('\u{01AE}', '\u{01AE}', 1, '\u{0288}'),
+    ('\u{01AF}', '\u{01AF}', 1, '\u{01B0}'),
+    ('\u{01B1}', '\u{01B2}', 1, '\u{028A}'),
+    ('\u{01B3}', '\u{01B5}', 2, '\u{01B4}'),
+    ('\u{01B7}', '\u{01B7}', 1, '\u{0292}'),
+    ('\u{01B8}', '\u{01B8}', 1, '\u{01B9}'),
+    ('\u{01BC}', '\u{01BC}', 1, '\u{01BD}'),
+    ('\u{01C4}', '\u{01C4}', 1, '\u{01C6}'),
+    ('\u{01C5}', '\u{01C5}', 1, '\u{01C6}'),
+    ('\u{01C7}', '\u{01C7}', 1, '\u{01C9}'),
+    ('\u{01C8}', '\u{01C8}', 1, '\u{01C9}'),
+    ('\u{01CA}', '\u{01CA}', 1, '\u{01CC}'),
+    ('\u{01CB}', '\u{01DB}', 2, '\u{01CC}'),
+    ('\u{01DE}', '\u{01EE}', 2, '\u{01DF}'),
+    ('\u{01F1}', '\u{01F1}', 1, '\u{01F3}'),
+    ('\u{01F2}', '\u{01F4}', 2, '\u{01F3}'),
+    ('\u{01F6}', '\u{01F6}', 1, '\u{0195}'),
+    ('\u{01F7}', '\u{01F7}', 1, '\u{01BF}'),
+    ('\u{01F8}', '\u{021E}', 2, '\u{01F9}'),
+    ('\u{0222}', '\u{0232}', 2, '\u{0223}'),
+    ('\u{0386}', '\u{0386}', 1, '\u{03AC}'),
+    ('\u{0388}', '\u{038A}', 1, '\u{03AD}'),
+    ('\u{038C}', '\u{038C}', 1, '\u{03CC}'),
+    ('\u{038E}', '\u{038F}', 1, '\u{03CD}'),
+    ('\u{0391}', '\u{03A1}', 1, '\u{03B1}'),
+    ('\u{03A3}', '\u{03AB}', 1, '\u{03C3}'),
+    ('\u{03DA}', '\u{03EE}', 2, '\u{03DB}'),
+    ('\u{0400}', '\u{040F}', 1, '\u{0450}'),
+    ('\u{0410}', '\u{042F}', 1, '\u{0430}'),
+    ('\u{0460}', '\u{0480}', 2, '\u{0461}'),
+    ('\u{048C}', '\u{04BE}', 2, '\u{048D}'),
+    ('\u{04C1}', '\u{04C3}', 2, '\u{04C2}'),
+    ('\u{04C7}', '\u{04C7}', 1, '\u{04C8}'),
+    ('\u{04CB}', '\u{04CB}', 1, '\u{04CC}'),
+    ('\u{04D0}', '\u{04F4}', 2, '\u{04D1}'),
+    ('\u{04F8}', '\u{04F8}', 1, '\u{04F9}'),
+    ('\u{0531}', '\u{0556}', 1, '\u{0561}'),
+    ('\u{1E00}', '\u{1E94}', 2, '\u{1E01}'),
+    ('\u{1EA0}', '\u{1EF8}', 2, '\u{1EA1}'),
+    ('\u{1F08}', '\u{1F0F}', 1, '\u{1F00}'),
+    ('\u{1F18}', '\u{1F1D}', 1, '\u{1F10}'),
+    ('\u{1F28}', '\u{1F2F}', 1, '\u{1F20}'),
+    ('\u{1F38}', '\u{1F3F}', 1, '\u{1F30}'),
+    ('\u{1F48}', '\u{1F4D}', 1, '\u{1F40}'),
+    ('\u{1F59}', '\u{1F5F}', 2, '\u{1F51}'),
+    ('\u{1F68}', '\u{1F6F}', 1, '\u{1F60}'),
+    ('\u{1F88}', '\u{1F8F}', 1, '\u{1F80}'),
+    ('\u{1F98}', '\u{1F9F}', 1, '\u{1F90}'),
+    ('\u{1FA8}', '\u{1FAF}', 1, '\u{1FA0}'),
+    ('\u{1FB8}', '\u{1FB9}', 1, '\u{1FB0}'),
+    ('\u{1FBA}', '\u{1FBB}', 1, '\u{1F70}'),
+    ('\u{1FBC}', '\u{1FBC}', 1, '\u{1FB3}'),
+    ('\u{1FC8}', '\u{1FCB}', 1, '\u{1F72}'),
+    ('\u{1FCC}', '\u{1FCC}', 1, '\u{1FC3}'),
+    ('\u{1FD8}', '\u{1FD9}', 1, '\u{1FD0}'),
+    ('\u{1FDA}', '\u{1FDB}', 1, '\u{1F76}'),
+    ('\u{1FE8}', '\u{1FE9}', 1, '\u{1FE0}'),
+    ('\u{1FEA}', '\u{1FEB}', 1, '\u{1F7A}'),
+    ('\u{1FEC}', '\u{1FEC}', 1, '\u{1FE5}'),
+    ('\u{1FF8}', '\u{1FF9}', 1, '\u{1F78}'),
+    ('\u{1FFA}', '\u{1FFB}', 1, '\u{1F7C}'),
+    ('\u{1FFC}', '\u{1FFC}', 1, '\u{1FF3}'),
+    ('\u{2126}', '\u{2126}', 1, '\u{03C9}'),
+    ('\u{212A}', '\u{212A}', 1, '\u{006B}'),
+    ('\u{212B}', '\u{212B}', 1, '\u{00E5}'),
+    ('\u{2160}', '\u{216F}', 1, '\u{2170}'),
+    ('\u{24B6}', '\u{24CF}', 1, '\u{24D0}'),
+    ('\u{FF21}', '\u{FF3A}', 1, '\u{FF41}'),
+];
+
+/// MySQL's `UPPER` over a character string, under `collation`.
+///
+/// The collation and not the character set decides the table — see the module
+/// doc — so this takes the collation of the *argument*: its column's for a
+/// column, the connection's for a literal.
+pub fn upper(s: &str, collation: Collation) -> String {
+    fold(
+        s,
+        if collation.folds_by_uca_900() {
+            UPPER
+        } else {
+            UPPER_LEGACY
+        },
+    )
 }
 
-/// MySQL's `LOWER` over a character string.
-pub fn lower(s: &str) -> String {
-    fold(s, LOWER)
+/// MySQL's `LOWER` over a character string, under `collation`.
+pub fn lower(s: &str, collation: Collation) -> String {
+    fold(
+        s,
+        if collation.folds_by_uca_900() {
+            LOWER
+        } else {
+            LOWER_LEGACY
+        },
+    )
 }
 
 /// The one character `table` gives for `c`, or `c` where it has no entry.
@@ -520,11 +789,12 @@ fn mapped(table: &[(char, char, u32, char)], c: char) -> char {
 /// the character it replaces is declined and the character kept.
 ///
 /// The exception is what keeps this from being `chars().map(...)`, and it is
-/// nineteen characters wide. 8.3 folds into a buffer the size of the argument
-/// and truncates when one of them overflows it; this returns the unfolded
-/// character instead, which is `utf8mb4_general_ci`'s answer and so 8.3's own
-/// answer for a literal. The module doc has the measurement the choice was
-/// made on, and #0154 has what it costs over a column.
+/// nineteen characters wide — all nineteen in [`UPPER`] and [`LOWER`], none in
+/// [`UPPER_LEGACY`] or [`LOWER_LEGACY`], so it fires only under
+/// `utf8mb4_0900_ai_ci`. 8.3 folds into a buffer the size of the argument and
+/// truncates when one of them overflows it; this returns the unfolded
+/// character instead. The module doc has the measurement the choice was made
+/// on.
 ///
 /// One consequence worth stating where it is relied on: the answer has exactly
 /// as many characters as the argument, and never more bytes.
@@ -545,61 +815,72 @@ fn fold(s: &str, table: &[(char, char, u32, char)]) -> String {
 mod tests {
     use super::*;
 
+    /// `UPPER` under `utf8mb4_0900_ai_ci`, which is what every expectation in
+    /// this module is 8.3's answer for unless it says otherwise.
+    fn up900(s: &str) -> String {
+        upper(s, Collation::Ai0900Ci)
+    }
+
+    /// `LOWER` under the same.
+    fn lo900(s: &str) -> String {
+        lower(s, Collation::Ai0900Ci)
+    }
+
     /// Everything the tables say that Unicode would say differently. Every
     /// expectation is 8.3's answer under `utf8mb4_0900_ai_ci`.
     #[test]
     fn matches_mysql_where_unicode_disagrees() {
         // A sequence in Unicode's full mapping, itself here.
-        assert_eq!(upper("stra\u{df}e"), "STRA\u{df}E");
-        assert_eq!(upper("\u{fb01}"), "\u{fb01}"); // ﬁ, not FI
-        assert_eq!(upper("\u{1f0}"), "\u{1f0}"); // ǰ, not J + U+030C
-        assert_eq!(upper("\u{149}"), "\u{149}"); // ŉ, not ʼN
-        assert_eq!(upper("\u{1e96}"), "\u{1e96}"); // ẖ, not H + U+0331
-        assert_eq!(upper("\u{390}"), "\u{390}"); // ΐ, not three characters
-        assert_eq!(lower("\u{130}"), "i"); // İ, not i + U+0307
+        assert_eq!(up900("stra\u{df}e"), "STRA\u{df}E");
+        assert_eq!(up900("\u{fb01}"), "\u{fb01}"); // ﬁ, not FI
+        assert_eq!(up900("\u{1f0}"), "\u{1f0}"); // ǰ, not J + U+030C
+        assert_eq!(up900("\u{149}"), "\u{149}"); // ŉ, not ʼN
+        assert_eq!(up900("\u{1e96}"), "\u{1e96}"); // ẖ, not H + U+0331
+        assert_eq!(up900("\u{390}"), "\u{390}"); // ΐ, not three characters
+        assert_eq!(lo900("\u{130}"), "i"); // İ, not i + U+0307
 
         // A sequence in Unicode and one character here, so "leave a sequence
         // alone" is not the rule either.
-        assert_eq!(upper("\u{1f80}"), "\u{1f88}");
-        assert_eq!(upper("\u{1fb3}"), "\u{1fbc}");
+        assert_eq!(up900("\u{1f80}"), "\u{1f88}");
+        assert_eq!(up900("\u{1fb3}"), "\u{1fbc}");
         // Case pairs 8.3's tables stop short of: they are Unicode 9.0, and
         // Georgian's Mtavruli capitals are Unicode 11.
-        assert_eq!(upper("\u{10d0}"), "\u{10d0}"); // Georgian ა stays put
-        assert_eq!(lower("\u{1c90}"), "\u{1c90}"); // and so does Ა
-        assert_eq!(upper("\u{a7b9}"), "\u{a7b9}");
+        assert_eq!(up900("\u{10d0}"), "\u{10d0}"); // Georgian ა stays put
+        assert_eq!(lo900("\u{1c90}"), "\u{1c90}"); // and so does Ა
+        assert_eq!(up900("\u{a7b9}"), "\u{a7b9}");
         // The ordinary case, which the table must not have broken.
-        assert_eq!(upper("stra\u{df}e ab\u{e9}"), "STRA\u{df}E AB\u{c9}");
-        assert_eq!(lower("STRA\u{df}E AB\u{c9}"), "stra\u{df}e ab\u{e9}");
-        assert_eq!(upper(""), "");
+        assert_eq!(up900("stra\u{df}e ab\u{e9}"), "STRA\u{df}E AB\u{c9}");
+        assert_eq!(lo900("STRA\u{df}E AB\u{c9}"), "stra\u{df}e ab\u{e9}");
+        assert_eq!(up900(""), "");
     }
 
     /// Above the BMP, where `utf8mb4_0900_ai_ci` still folds and its four
     /// bytes stay four.
     #[test]
     fn a_supplementary_character_folds() {
-        assert_eq!(upper("\u{10428}"), "\u{10400}"); // Deseret
-        assert_eq!(lower("\u{10400}"), "\u{10428}");
-        assert_eq!(upper("\u{1e922}"), "\u{1e900}"); // Adlam
-        assert_eq!(upper("\u{1f600}"), "\u{1f600}"); // and one with no case
+        assert_eq!(up900("\u{10428}"), "\u{10400}"); // Deseret
+        assert_eq!(lo900("\u{10400}"), "\u{10428}");
+        assert_eq!(up900("\u{1e922}"), "\u{1e900}"); // Adlam
+        assert_eq!(up900("\u{1f600}"), "\u{1f600}"); // and one with no case
     }
 
     /// Neither direction may be derived from the other.
     #[test]
     fn upper_and_lower_are_separate_tables() {
-        assert_eq!(lower("\u{b5}"), "\u{b5}");
-        assert_eq!(upper("\u{b5}"), "\u{39c}");
-        assert_eq!(lower(&upper("\u{b5}")), "\u{3bc}");
-        assert_eq!(upper("\u{130}"), "\u{130}");
-        assert_eq!(upper(&lower("\u{130}")), "I");
-        assert_eq!(lower("\u{212a}"), "k"); // the Kelvin sign
-        assert_eq!(upper("\u{212a}"), "\u{212a}");
-        assert_eq!(lower("\u{17f}"), "\u{17f}");
-        assert_eq!(lower(&upper("\u{17f}")), "s");
+        assert_eq!(lo900("\u{b5}"), "\u{b5}");
+        assert_eq!(up900("\u{b5}"), "\u{39c}");
+        assert_eq!(lo900(&up900("\u{b5}")), "\u{3bc}");
+        assert_eq!(up900("\u{130}"), "\u{130}");
+        assert_eq!(up900(&lo900("\u{130}")), "I");
+        assert_eq!(lo900("\u{212a}"), "k"); // the Kelvin sign
+        assert_eq!(up900("\u{212a}"), "\u{212a}");
+        assert_eq!(lo900("\u{17f}"), "\u{17f}");
+        assert_eq!(lo900(&up900("\u{17f}")), "s");
         // `ß` uppercases to itself and `ẞ` lowercases to `ß`, so the pair is
         // one-way.
-        assert_eq!(upper("\u{df}"), "\u{df}");
-        assert_eq!(lower("\u{1e9e}"), "\u{df}");
-        assert_eq!(upper("\u{1e9e}"), "\u{1e9e}");
+        assert_eq!(up900("\u{df}"), "\u{df}");
+        assert_eq!(lo900("\u{1e9e}"), "\u{df}");
+        assert_eq!(up900("\u{1e9e}"), "\u{1e9e}");
     }
 
     /// A run with a step of 2 answers for its members and not for what falls
@@ -608,46 +889,47 @@ mod tests {
     #[test]
     fn a_stepped_run_skips_what_lies_between_its_members() {
         // U+0100..U+012E step 2 downward, U+0101..U+012F step 2 upward.
-        assert_eq!(lower("\u{100}"), "\u{101}");
-        assert_eq!(lower("\u{102}"), "\u{103}");
-        assert_eq!(upper("\u{101}"), "\u{100}");
-        assert_eq!(upper("\u{103}"), "\u{102}");
+        assert_eq!(lo900("\u{100}"), "\u{101}");
+        assert_eq!(lo900("\u{102}"), "\u{103}");
+        assert_eq!(up900("\u{101}"), "\u{100}");
+        assert_eq!(up900("\u{103}"), "\u{102}");
         // The other member of each pair is already folded and must not move.
-        assert_eq!(lower("\u{101}"), "\u{101}");
-        assert_eq!(upper("\u{100}"), "\u{100}");
+        assert_eq!(lo900("\u{101}"), "\u{101}");
+        assert_eq!(up900("\u{100}"), "\u{100}");
     }
 
     /// The nineteen characters whose fold is wider in UTF-8 than they are.
     ///
-    /// 8.3 folds into a buffer the size of the argument and truncates when one
-    /// of these overflows it — `UPPER('ȿ')` is the empty string over a column
-    /// there. This engine declines the fold instead, which is
-    /// `utf8mb4_general_ci`'s answer and so 8.3's own for a literal. Every
-    /// expectation *for one of the nineteen* below is that literal answer,
-    /// read off 8.3; the module doc carries the column answers and the
-    /// measurement the choice rests on.
+    /// All nineteen are in the `_0900_` tables and none is in the legacy pair,
+    /// so this is the one place where knowing the collation does not close the
+    /// gap. 8.3 folds into a buffer the size of the argument and truncates
+    /// when one of these overflows it — under `utf8mb4_0900_ai_ci`,
+    /// `HEX(UPPER('ȿ'))` there is the empty string, measured with the
+    /// connection pinned to that collation. This engine declines the fold and
+    /// keeps the character, which the module doc has the measurement for.
     #[test]
     fn a_fold_that_would_grow_is_declined_rather_than_truncated() {
-        assert_eq!(upper("\u{23f}"), "\u{23f}"); // two bytes in, three needed
-        assert_eq!(upper("a\u{23f}b"), "A\u{23f}B"); // and the `b` survives
-        assert_eq!(upper("\u{23f}aa"), "\u{23f}AA");
-        assert_eq!(upper("\u{23f}\u{23f}a"), "\u{23f}\u{23f}A");
-        assert_eq!(upper("aa\u{23f}a"), "AA\u{23f}A");
-        assert_eq!(lower("\u{23a}"), "\u{23a}"); // Ⱥ, the same thing downward
-        assert_eq!(lower("\u{23e}"), "\u{23e}");
-        assert_eq!(lower("\u{130}\u{23a}"), "i\u{23a}");
+        assert_eq!(up900("\u{23f}"), "\u{23f}"); // two bytes in, three needed
+        assert_eq!(up900("a\u{23f}b"), "A\u{23f}B"); // and the `b` survives
+        assert_eq!(up900("\u{23f}aa"), "\u{23f}AA");
+        assert_eq!(up900("\u{23f}\u{23f}a"), "\u{23f}\u{23f}A");
+        assert_eq!(up900("aa\u{23f}a"), "AA\u{23f}A");
+        assert_eq!(lo900("\u{23a}"), "\u{23a}"); // Ⱥ, the same thing downward
+        assert_eq!(lo900("\u{23e}"), "\u{23e}");
+        assert_eq!(lo900("\u{130}\u{23a}"), "i\u{23a}");
 
         // The character each of them would have folded *into* is not itself
         // affected: this is a rule about the fold's width, not a hole in the
         // table. `Ȿ` lowercases back to `ȿ` because that fold is three bytes
         // to two, so it fits.
         //
-        // Not a literal answer, and the one line here that is not: 8.3 answers
-        // `E2B1BE` for `LOWER('Ȿ')` under `general_ci` and `C8BF` under
-        // `0900_ai_ci`, both measured. `Ȿ` is one of the 616 characters the
-        // two collations simply disagree about, not one of the nineteen.
-        assert_eq!(upper("\u{2c7e}"), "\u{2c7e}");
-        assert_eq!(lower("\u{2c7e}"), "\u{23f}");
+        // `Ȿ` is one of the 616 characters the two tables simply disagree
+        // about rather than one of the nineteen, so both answers are asked
+        // for: 8.3 gives `C8BF` for `LOWER('Ȿ')` under `0900_ai_ci` and
+        // `E2B1BE` — the character unchanged — under `general_ci`.
+        assert_eq!(up900("\u{2c7e}"), "\u{2c7e}");
+        assert_eq!(lo900("\u{2c7e}"), "\u{23f}");
+        assert_eq!(lower("\u{2c7e}", Collation::GeneralCi), "\u{2c7e}");
 
         // Nothing is ever lost and nothing ever grows, which is the property
         // the choice was made for.
@@ -657,20 +939,20 @@ mod tests {
             "stra\u{df}e",
             "\u{10428}\u{1f600}",
         ] {
-            for folded in [upper(text), lower(text)] {
+            for folded in [up900(text), lo900(text)] {
                 assert_eq!(folded.chars().count(), text.chars().count(), "{text}");
                 assert!(folded.len() <= text.len(), "{text}");
             }
         }
         let long: String = std::iter::repeat_n('\u{e9}', 500).collect();
-        assert_eq!(upper(&long).chars().count(), 500);
+        assert_eq!(up900(&long).chars().count(), 500);
     }
 
     /// `mapped` binary-searches, so an unsorted or overlapping table is a
     /// silent wrong answer rather than a failure.
     #[test]
     fn the_tables_are_sorted_and_disjoint() {
-        for table in [UPPER, LOWER] {
+        for table in [UPPER, LOWER, UPPER_LEGACY, LOWER_LEGACY] {
             for pair in table.windows(2) {
                 let (first, last, step, _) = pair[0];
                 assert!(first <= last, "{:?} is inverted", pair[0]);
@@ -714,5 +996,77 @@ mod tests {
         // 1321 upward and 1304 downward, counted off 8.3.
         assert_eq!(mappings, 2625);
         assert_eq!(grew, 19);
+    }
+
+    /// The legacy pair, counted the same way, and the two properties the rest
+    /// of this module leans on.
+    ///
+    /// 706 upward and 696 downward is what 8.3 changes under a column of
+    /// `utf8mb4_general_ci`, `utf8mb4_unicode_ci` or `utf8mb4_bin` — the same
+    /// number under each, over all 1,112,064 codepoints. Nothing above the BMP
+    /// and nothing that grows, both of which were checked against the
+    /// measurement before being written down here: the first is why
+    /// `UPPER('𐐨')` is the character itself under those collations, and the
+    /// second is why `fold`'s widening guard cannot fire for them.
+    #[test]
+    fn the_legacy_tables_never_grow_and_never_leave_the_bmp() {
+        let mut mappings = 0;
+        for table in [UPPER_LEGACY, LOWER_LEGACY] {
+            for &(first, last, step, to) in table {
+                let mut point = first as u32;
+                while point <= last as u32 {
+                    let from = char::from_u32(point).expect("a run member is a character");
+                    let into = char::from_u32(to as u32 + (point - first as u32))
+                        .unwrap_or_else(|| panic!("U+{point:04X} maps to no character"));
+                    assert_eq!(mapped(table, from), into, "U+{point:04X}");
+                    assert!(into.len_utf8() <= from.len_utf8(), "U+{point:04X} grows");
+                    assert!(from <= '\u{ffff}' && into <= '\u{ffff}', "U+{point:04X}");
+                    mappings += 1;
+                    point += step;
+                }
+            }
+        }
+        assert_eq!(mappings, 706 + 696);
+    }
+
+    /// The characters the two tables disagree about, each expectation read off
+    /// 8.3 under a column of the collation named.
+    ///
+    /// These are #0154 itself: the same three characters, the same server, two
+    /// answers, and which one is right depends on nothing but the collation of
+    /// the string being folded.
+    #[test]
+    fn the_collation_and_not_the_character_set_picks_the_table() {
+        for legacy in [Collation::GeneralCi, Collation::UnicodeCi, Collation::Bin] {
+            // `ȿ`: `C8BF` under the legacy table, and `''` on 8.3 under
+            // `_0900_` because the fold there widens and truncates.
+            assert_eq!(upper("\u{23f}", legacy), "\u{23f}");
+            // `ẞ`: `E1BA9E` — untouched — against `C39F` under `_0900_`.
+            assert_eq!(lower("\u{1e9e}", legacy), "\u{1e9e}");
+            assert_eq!(lo900("\u{1e9e}"), "\u{df}");
+            // `𐐨`: the legacy table stops at the BMP, so Deseret does not
+            // fold. `F09090A8` against `F0909080`.
+            assert_eq!(upper("\u{10428}", legacy), "\u{10428}");
+            assert_eq!(up900("\u{10428}"), "\u{10400}");
+            // `aȿb`: `41C8BF62` against 8.3's truncated `41E2B1BE` under
+            // `_0900_`, which is the gap this engine keeps on purpose.
+            assert_eq!(upper("a\u{23f}b", legacy), "A\u{23f}B");
+            // Georgian Mtavruli is Unicode 11 and neither table has it.
+            assert_eq!(lower("\u{1c90}", legacy), "\u{1c90}");
+            // The ordinary case still works under the legacy table, which is
+            // what makes the rest of it worth having.
+            assert_eq!(
+                upper("stra\u{df}e ab\u{e9}", legacy),
+                "STRA\u{df}E AB\u{c9}"
+            );
+            assert_eq!(
+                lower("STRA\u{df}E AB\u{c9}", legacy),
+                "stra\u{df}e ab\u{e9}"
+            );
+        }
+        // µ is in both tables and folds the same way in each, so a test that
+        // only ever asked about it would pass whichever table ran.
+        assert_eq!(upper("\u{b5}", Collation::GeneralCi), "\u{39c}");
+        assert_eq!(up900("\u{b5}"), "\u{39c}");
     }
 }

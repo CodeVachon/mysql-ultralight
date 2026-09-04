@@ -572,8 +572,24 @@ fn whole(n: f64) -> Value {
 
 /// Dispatches a scalar function call.
 pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Value> {
+    // The connection's collation goes onto the answer, below, and the
+    // arguments arrive with it already: they were evaluated by
+    // `crate::expr::eval`, where a literal is born carrying it. `UPPER` and
+    // `LOWER` read it off the argument, because the case table belongs to the
+    // collation — `HEX(UPPER('𐐨'))` is `F0909080` on a connection collated
+    // `utf8mb4_0900_ai_ci` and `F09090A8` on one collated
+    // `utf8mb4_general_ci`, same server, same statement, measured on 8.3.
+    // #0154.
+    let connection = session.collation_connection();
     let arg = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
     let text = |i: usize| arg(i).as_text();
+    // Borrowed rather than through `arg`, which clones the whole value: this
+    // is asked per row by `UPPER` and `LOWER` and all it wants is one byte.
+    let collation_of = |i: usize| {
+        args.get(i)
+            .map(|v| v.collated_as().collation)
+            .unwrap_or_default()
+    };
 
     // A NULL argument makes the answer NULL, before the function is reached.
     //
@@ -591,7 +607,7 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         return Ok(Value::Null);
     }
 
-    Ok(match name {
+    let mut out = match name {
         // -- dates and times ---------------------------------------------------
         //
         // `DATE_ADD`, `DATE_SUB` and `TIMESTAMPDIFF` are not here: their
@@ -1171,14 +1187,19 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         // mapping and expands: `UPPER('stra\u{df}e')` was `STRASSE` where 8.3
         // answers `STRA\u{df}E`. MySQL's is a per-character table, and *which*
         // table is a property of the collation rather than of the character
-        // set -- see that module.
+        // set -- so the *argument's* collation picks it, which is the
+        // column's for a column and the connection's for a literal. Measured
+        // on 8.3: `HEX(UPPER('𐐨'))` is `F0909080` on a connection collated
+        // `utf8mb4_0900_ai_ci` and `F09090A8` on one collated
+        // `utf8mb4_general_ci`, same server, same statement. #0154.
         //
         // A fold that would be wider in UTF-8 than the character it replaces
         // is declined rather than applied, which is where this engine parts
-        // company with 8.3 over a *column*: 8.3 folds into a buffer the size
-        // of the argument and truncates, so `UPPER('a\u{23f}b')` there is
-        // `A\u{2c7e}` with the `b` gone. Nineteen characters, #0154, and the
-        // measurement behind choosing not to lose bytes is in `casefold`.
+        // company with 8.3 under `utf8mb4_0900_ai_ci`: 8.3 folds into a buffer
+        // the size of the argument and truncates, so `UPPER('a\u{23f}b')`
+        // there is `A\u{2c7e}` with the `b` gone. Nineteen characters, all of
+        // them in that one table, and the measurement behind choosing not to
+        // lose bytes is in `casefold`.
         //
         // Both still fold a binary string, which 8.3 does not touch at all:
         // `UPPER(CAST('str' AS BINARY))` is `str` there. That is #0128 and
@@ -1186,8 +1207,8 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         // decoded and nothing left says it was bytes. It does narrow the gap
         // by accident -- a `\u{df}` in a VARBINARY now survives, where the
         // full mapping used to turn it into `SS`.
-        "upper" | "ucase" => Value::text(crate::casefold::upper(&text(0))),
-        "lower" | "lcase" => Value::text(crate::casefold::lower(&text(0))),
+        "upper" | "ucase" => Value::text(crate::casefold::upper(&text(0), collation_of(0))),
+        "lower" | "lcase" => Value::text(crate::casefold::lower(&text(0), collation_of(0))),
         "trim" => Value::text(text(0).trim().to_owned()),
         "ltrim" => Value::text(text(0).trim_start().to_owned()),
         "rtrim" => Value::text(text(0).trim_end().to_owned()),
@@ -1460,7 +1481,9 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         "day" | "dayofmonth" => date_part(&arg(0), |s| i64::from(s.day)),
 
         other => return Err(unsupported(format!("function `{other}()`"))),
-    })
+    };
+    out.on_connection(connection);
+    Ok(out)
 }
 
 /// Drops the temporal tag where the arguments beside it were not temporals.
@@ -1637,12 +1660,17 @@ pub fn format_unix(secs: u64) -> String {
 }
 
 /// Applies a CAST.
-pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
+pub fn cast(
+    value: Value,
+    ty: &DataType,
+    source: &str,
+    collation: Collation,
+) -> EngineResult<Value> {
     use DataType as D;
     if value.is_null() {
         return Ok(Value::Null);
     }
-    Ok(match ty {
+    let mut out = match ty {
         D::TinyInt(_)
         | D::SmallInt(_)
         | D::Int(_)
@@ -1836,7 +1864,14 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
         // `CAST(UNHEX('FF') AS BINARY) = UNHEX('FF')` answered 0.
         D::Binary(_) | D::Varbinary(_) | D::Blob(_) => Value::Bytes(value.as_bytes().into_owned()),
         other => return Err(unsupported(format!("CAST to `{other}`"))),
-    })
+    };
+    // A cast builds a fresh string, so the connection's collation goes onto it
+    // for the reason `call` above gives: text that holds none of its own beside
+    // a literal that holds the connection's resolves to neither, and 8.3
+    // compares that pair without complaint. `CAST('a ' AS CHAR) = 'a'` is where
+    // it shows.
+    out.on_connection(collation);
+    Ok(out)
 }
 
 /// The limits MySQL puts on the `(M,D)` of a cast target.

@@ -34,9 +34,12 @@ pub struct SqlType {
     /// `collation::BINARY`. A DDL `COLLATE utf8mb4_bin` — at column, table or
     /// database level — sets it through `ddl::resolve_collations`, and such a
     /// column reports `utf8mb4_bin`; `information_schema` sets it for its own
-    /// columns, which MySQL declares `utf8mb3_bin` and which this engine
-    /// still compares case-insensitively (#0148). `collation` below is what
-    /// separates them, in `info_schema::collation_name` and nowhere else.
+    /// columns, which MySQL declares `utf8mb3_bin`. `collation` below is what
+    /// separates the two *names*, in `info_schema::collation_name` and nowhere
+    /// else. Since #0148 the flag also decides the comparison for the second
+    /// kind: `info_schema::collate` reads it to put a byte comparison on those
+    /// columns' values, which is where they are case-sensitive rather than
+    /// here.
     pub binary_collation: bool,
     /// The collation the column's text compares under.
     ///
@@ -51,9 +54,10 @@ pub struct SqlType {
     /// Not the same fact as `binary_collation` above, which is a *wire* flag.
     /// A `utf8mb4_bin` column carries both; `information_schema`'s own text
     /// columns carry the flag alone, because 8.3 declares them `utf8mb3_bin`
-    /// and this engine still compares their names case-insensitively — that
-    /// gap is #0148, and it stays open here rather than being closed by a
-    /// side effect of this field existing.
+    /// and this engine has no utf8mb3 to name. Their values still compare as
+    /// bytes — #0148 — but through `info_schema::collate` rather than through
+    /// this field, so that a `CREATE TABLE ... AS SELECT` copying one of them
+    /// goes on reporting `utf8mb3_bin` as 8.3 does.
     pub collation: crate::collation::Collation,
 }
 

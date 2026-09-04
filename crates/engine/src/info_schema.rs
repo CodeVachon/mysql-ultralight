@@ -26,7 +26,14 @@ pub fn shape(session: &Session, name: &str) -> EngineResult<Table> {
 
 pub fn table(catalog: &Catalog, session: &Session, name: &str) -> EngineResult<Table> {
     let lower = name.to_ascii_lowercase();
-    Ok(match lower.as_str() {
+    let mut table = built(catalog, session, &lower)?;
+    collate(&mut table, session);
+    Ok(table)
+}
+
+/// The table before its text is collated. See [`collate`].
+fn built(catalog: &Catalog, session: &Session, lower: &str) -> EngineResult<Table> {
+    Ok(match lower {
         "schemata" => schemata(catalog),
         "tables" => tables(catalog),
         "columns" => columns(catalog),
@@ -140,6 +147,90 @@ fn build(name: &str, headers: &[&str], rows: Vec<Vec<Value>>) -> Table {
         .collect();
     table.rows = rows;
     table
+}
+
+/// Puts a byte comparison on the values of the columns MySQL declares
+/// `utf8mb3_bin`.
+///
+/// Names in `information_schema` are case-*sensitive* on 8.3, and this engine
+/// compared them the way it compares everything else. Two wrong answers,
+/// reachable by any client that introspects the catalog before it emits DDL —
+/// which is what Prisma does. Measured on 8.3 against tables `apple`, `Bee`
+/// and `cherry`, with the connection collated `utf8mb4_0900_ai_ci`:
+///
+/// ```text
+///     ORDER BY TABLE_NAME            mysql Bee,apple,cherry   engine apple,Bee,cherry
+///     WHERE TABLE_NAME = 'bee'       mysql no rows            engine Bee
+///     WHERE TABLE_NAME LIKE 'b%'     mysql no rows            engine Bee
+///     WHERE TABLE_SCHEMA = 'PROBE'   mysql 0                  engine 3
+///     WHERE SCHEMA_NAME = 'PROBE'    mysql no rows            engine probe
+///     WHERE DATA_TYPE = 'INT'        mysql 0                  engine 7
+///     WHERE TABLE_TYPE = 'base table' mysql 0                 engine 3
+///     WHERE TABLE_NAME = 'Bee '      mysql Bee                engine no rows
+/// ```
+///
+/// The last is the other half of the same fact and the reason this is a
+/// collation rather than a `case_sensitive` flag: `utf8mb3_bin` is PAD SPACE,
+/// so a trailing space is ignored where the connection's NO PAD
+/// `utf8mb4_0900_ai_ci` counts it. [`crate::collation::Collation::Bin`] pads,
+/// so both halves come from the one change.
+///
+/// **Not every text column, and the exceptions are measured, not guessed.**
+/// Reading `information_schema.COLUMNS` on a stock 8.3 for the twelve tables
+/// this engine serves gives three collations: `utf8mb3_bin` for the names of
+/// schemas, tables and types; `utf8mb3_tolower_ci` for `COLUMN_NAME`,
+/// `INDEX_NAME`, `CONSTRAINT_NAME`, `UNIQUE_CONSTRAINT_NAME` and
+/// `REFERENCED_COLUMN_NAME`; and `utf8mb3_general_ci` for the rest —
+/// `IS_NULLABLE`, `EXTRA`, `COLLATION_NAME`, `ENGINE`, `TABLE_COMMENT`. Both
+/// of the latter two are case-*insensitive*, which is what this engine already
+/// does, so only the first set changes. `COLUMN_SPEC`'s trailing ` binary`
+/// marks exactly that set and no other, which was checked column by column
+/// against the measurement.
+///
+/// The values and not the declaration, deliberately. `SqlType::collation` is
+/// what `info_schema::collation_name` reads to tell `information_schema`'s own
+/// `utf8mb3_bin` columns from a user column resolved to `utf8mb4_bin`, and
+/// 8.3 reports those two names differently — `CREATE TABLE c AS SELECT
+/// COLUMN_TYPE FROM information_schema.COLUMNS` gives a `utf8mb3_bin` column
+/// there. Moving the declaration would have made the copy claim `utf8mb4_bin`,
+/// trading this wrong answer for that one.
+///
+/// Every other text column keeps the coercibility it had and gains the
+/// *connection's* collation, which is where it was already being compared. Not
+/// a change of answer: it is what a literal now carries too, so the two go on
+/// resolving to one collation instead of to none. Without it a
+/// `utf8mb4_general_ci` connection asking `WHERE ENGINE = 'InnoDB'` met a
+/// literal collated `utf8mb4_general_ci` beside a row value still carrying the
+/// server default, and this engine raised 1267 for a pair 8.3 compares
+/// happily.
+///
+/// COERCIBLE rather than IMPLICIT, and that is measured rather than tidy. 8.3
+/// declares these columns `utf8mb3_general_ci` and `utf8mb3_tolower_ci`, but
+/// `information_schema` there is a set of *views*, and a column that is an
+/// expression in one behaves as an item and not as a column. Both appear:
+/// with the connection collated `utf8mb4_0900_ai_ci`, `WHERE ENGINE =
+/// 'InnoDB  '` matches on 8.3 — the trailing spaces pad, so the column's own
+/// PAD SPACE collation decided it — while `WHERE IS_NULLABLE = 'NO '` matches
+/// nothing, which is the connection's NO PAD deciding instead. Two columns of
+/// the same declared collation in the same table, so which of them is an
+/// expression is a table of MySQL's view definitions rather than a rule this
+/// engine could apply. Leaving them all COERCIBLE keeps the second answer
+/// right and the first wrong, which is where they already were.
+fn collate(table: &mut Table, session: &Session) {
+    let connection = crate::collation::Collated::coercible(session.collation_connection());
+    let binary = crate::collation::Collated::implicit(crate::collation::Collation::Bin);
+    for (i, column) in table.columns.iter().enumerate() {
+        let want = if column.ty.binary_collation {
+            binary
+        } else {
+            connection
+        };
+        for row in &mut table.rows {
+            if let Some(Value::Text(_, collated)) = row.get_mut(i) {
+                *collated = want;
+            }
+        }
+    }
 }
 
 /// How MySQL describes each `information_schema` column on the wire.
