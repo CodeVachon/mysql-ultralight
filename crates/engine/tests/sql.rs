@@ -33446,3 +33446,427 @@ fn unique_constraint_name_names_the_key_on_the_parent() {
         vec![vec!["Up2", "uq"]]
     );
 }
+
+/// A GROUP BY resolves a select-list alias, and groups on what it resolved.
+///
+/// #0229. `SELECT k AS a FROM Cl GROUP BY a` answers two rows on 8.3 and was
+/// `Unknown column 'a' in 'group statement'` here: #0100 put the output names
+/// in scope for the *resolver*, so the clause stopped refusing before the
+/// first row, and then the row arrived and the per-row key evaluation looked
+/// for a column called `a` and raised the 1054 the resolver had just declined
+/// to raise. Every expectation below was measured on 8.3 with `scripts/ask.sh`.
+///
+/// The empty table is asserted beside the full one throughout, because the two
+/// halves of this clause used to disagree: over an empty table nothing was
+/// grouped, so the alias was admitted and never read, and the statement came
+/// back 1055 where 8.3 answers an empty set.
+#[test]
+fn a_group_by_resolves_a_select_alias() {
+    let (engine, mut session) = engine();
+    for ddl in [
+        "CREATE TABLE Cl (id INT NOT NULL, k INT NULL, b INT NULL, s VARCHAR(20) NULL, \
+         PRIMARY KEY (id))",
+        "CREATE TABLE Emp (id INT NOT NULL, k INT NULL, b INT NULL, s VARCHAR(20) NULL, \
+         PRIMARY KEY (id))",
+        "INSERT INTO Cl VALUES (1, 10, 100, 'x'), (2, 20, 200, 'y'), (3, 10, 300, 'z')",
+    ] {
+        run(&engine, &mut session, ddl);
+    }
+
+    // The issue's own statement, and the same statement over an empty table.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k AS a FROM Cl GROUP BY a ORDER BY 1"
+        ),
+        vec![vec!["10"], vec!["20"]]
+    );
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT k AS a FROM Emp GROUP BY a ORDER BY 1"
+    )
+    .is_empty());
+
+    // An alias over an expression, which is the shape a reporting query
+    // writes: the group is the computed value and not the column behind it.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k + 1 AS a FROM Cl GROUP BY a ORDER BY 1"
+        ),
+        vec![vec!["11"], vec!["21"]]
+    );
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT k + 1 AS a FROM Emp GROUP BY a ORDER BY 1"
+    )
+    .is_empty());
+
+    // The same alias reached by three clauses at once. HAVING and ORDER BY
+    // already resolved one; the GROUP BY is what did not.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k AS a, COUNT(*) AS n FROM Cl GROUP BY a HAVING a > 5 ORDER BY a DESC"
+        ),
+        vec![vec!["20", "1"], vec!["10", "2"]]
+    );
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT k AS a, COUNT(*) AS n FROM Emp GROUP BY a HAVING a > 5 ORDER BY a DESC"
+    )
+    .is_empty());
+
+    // An alias written after another select item, and one written inside an
+    // expression rather than alone.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT 1 AS x, k AS a FROM Cl GROUP BY a ORDER BY 2"
+        ),
+        vec![vec!["1", "10"], vec!["1", "20"]]
+    );
+    // Inside an expression the alias is reached too, and reaching it is what
+    // makes the answer 1055: the clause groups on `k + 0`, which leaves the
+    // selected `k` ungrouped. A 1054 here would mean the name was never
+    // substituted at all. Measured on 8.3, over a full table and an empty one.
+    for table in ["Cl", "Emp"] {
+        let sql = format!("SELECT k AS a, COUNT(*) FROM {table} GROUP BY a + 0");
+        let err = engine.execute(&mut session, &sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1055, "{sql} -> {err}");
+    }
+
+    // A position still means the item at that position, which is the other
+    // thing this clause resolves and must keep resolving.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k AS a, COUNT(*) FROM Cl GROUP BY 1 ORDER BY 1"
+        ),
+        vec![vec!["10", "2"], vec!["20", "1"]]
+    );
+
+    // The relation wins over the select list, which is the preference 8.3
+    // documents for this clause and the opposite of the one ORDER BY has:
+    // grouping on the *column* `b` leaves the selected `k` ungrouped, so the
+    // answer is 1055 rather than the two rows the alias would have given.
+    // Asserted through the code rather than the rows for that reason — if the
+    // alias won here the statement would answer instead of refusing.
+    for table in ["Cl", "Emp"] {
+        let sql = format!("SELECT k AS b FROM {table} GROUP BY b ORDER BY 1");
+        let err = engine.execute(&mut session, &sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1055, "{sql} -> {err}");
+    }
+
+    // Two *columns* under one alias are ambiguous, and are ambiguous whether
+    // or not the relation has a column of that name — the select list is
+    // searched before the relation answers, even though the relation wins.
+    for (sql, name) in [
+        ("SELECT k AS a, b AS a FROM Cl GROUP BY a", "a"),
+        ("SELECT k AS a, b AS a FROM Emp GROUP BY a", "a"),
+        ("SELECT k AS b, s AS b FROM Cl GROUP BY b", "b"),
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1052, "{sql} -> {err}");
+        assert_eq!(
+            err.message,
+            format!("Column '{name}' in group statement is ambiguous"),
+            "{sql}"
+        );
+    }
+
+    // The same column twice under one alias is not ambiguous, and it is not
+    // ambiguous however the two are spelled — what is compared is which column
+    // each item resolves to, not the text it was written as.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k AS a, k AS a, COUNT(*) FROM Cl GROUP BY a ORDER BY 1"
+        ),
+        vec![vec!["10", "10", "2"], vec!["20", "20", "1"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT Cl.k AS a, k AS a, COUNT(*) FROM Cl GROUP BY a ORDER BY 1"
+        ),
+        vec![vec!["10", "10", "2"], vec!["20", "20", "1"]]
+    );
+
+    // An item that aggregates or windows cannot be grouped on at all, and 8.3
+    // says so with 1056 rather than the 1054 an unknown name gets. A position
+    // reaches the same item and meets the same rule, reported by the item's
+    // output name rather than by the digits — the alias where it has one, and
+    // the text it was written as where it does not.
+    for (sql, name) in [
+        ("SELECT COUNT(*) AS n FROM Cl GROUP BY n", "n"),
+        ("SELECT COUNT(*) AS n FROM Emp GROUP BY n", "n"),
+        ("SELECT ROW_NUMBER() OVER () AS w FROM Cl GROUP BY w", "w"),
+        ("SELECT COUNT(*) AS n GROUP BY n", "n"),
+        ("SELECT COUNT(*) AS n FROM Cl GROUP BY 1", "n"),
+        ("SELECT COUNT(*) AS n FROM Emp GROUP BY 1", "n"),
+        ("SELECT k AS a, COUNT(*) AS n FROM Cl GROUP BY 2", "n"),
+        ("SELECT ROW_NUMBER() OVER () AS w FROM Cl GROUP BY 1", "w"),
+        ("SELECT COUNT(*) AS n GROUP BY 1", "n"),
+        ("SELECT COUNT(*) FROM Cl GROUP BY 1", "COUNT(*)"),
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1056, "{sql} -> {err}");
+        assert_eq!(err.message, format!("Can't group on '{name}'"), "{sql}");
+    }
+
+    // The substitution reaches an identifier through an operator and not
+    // through a call, so an alias written inside one survives as a name — and
+    // has to stay resolvable, or the clause answers 1054 where 8.3 answers the
+    // 1055 for the ungrouped column behind it. Over a full table and an empty
+    // one, which is the pair the resolution and the grouping used to disagree
+    // on.
+    for table in ["Cl", "Emp"] {
+        for shape in ["ABS(a)", "CONCAT(a, '')"] {
+            let sql = format!("SELECT k AS a, COUNT(*) FROM {table} GROUP BY {shape}");
+            let err = engine.execute(&mut session, &sql, &[]).unwrap_err();
+            assert_eq!(err.code, 1055, "{sql} -> {err}");
+        }
+    }
+
+    // A qualified name is not an alias: the select list is only searched for
+    // an unqualified one, so `Cl.a` is the 1054 it would be without the alias.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT k AS a, COUNT(*) FROM Cl GROUP BY Cl.a",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1054);
+    assert_eq!(err.message, "Unknown column 'Cl.a' in 'group statement'");
+
+    // A name that is neither a column nor an alias is still 1054 under this
+    // clause's own name, over a full table and an empty one alike.
+    for table in ["Cl", "Emp"] {
+        let sql = format!("SELECT k FROM {table} GROUP BY zz");
+        let err = engine.execute(&mut session, &sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1054, "{sql} -> {err}");
+        assert_eq!(
+            err.message, "Unknown column 'zz' in 'group statement'",
+            "{sql}"
+        );
+    }
+
+    // The list is read left to right, so which of two faults is reported is
+    // decided by which was written first — and the select list beats the whole
+    // clause however it is written.
+    let cases: [(&str, u16); 3] = [
+        ("SELECT k AS a, b AS a FROM Cl GROUP BY a, 9", 1052),
+        ("SELECT k AS a, b AS a FROM Cl GROUP BY 9, a", 1054),
+        ("SELECT nope, COUNT(*) AS n FROM Cl GROUP BY n", 1054),
+    ];
+    for (sql, code) in cases {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, code, "{sql} -> {err}");
+    }
+}
+
+/// A join's ON is read against the enclosing query's row as well as its own.
+///
+/// #0230. `SELECT k FROM Cl WHERE EXISTS (SELECT 1 FROM Cr JOIN Cr c3 ON c3.id
+/// = Cl.id)` answers on 8.3 and was `Unknown column 'Cl.id' in 'on clause'`
+/// here the moment the inner side had rows: #0100 widened the *resolution* to
+/// carry `session.lateral`'s schema, so the clause stopped refusing before the
+/// first pair of rows, and then a pair arrived and the evaluator looked the
+/// reference up in the join's own columns alone and raised the identical 1054.
+///
+/// The inner side is given rows on purpose — an empty one produces no pair, so
+/// the condition is never evaluated and the bug does not appear. The empty
+/// cases are asserted too, because that is the half #0100 settled and this
+/// must not unsettle it.
+#[test]
+fn a_correlated_on_is_read_against_the_enclosing_row() {
+    let (engine, mut session) = engine();
+    for ddl in [
+        "CREATE TABLE Cl (id INT NOT NULL, k INT NULL, b INT NULL, PRIMARY KEY (id))",
+        "CREATE TABLE Cr (id INT NOT NULL, v INT NULL, PRIMARY KEY (id))",
+        "CREATE TABLE Cempty (id INT NOT NULL, v INT NULL, PRIMARY KEY (id))",
+        "CREATE TABLE Lempty (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+        "CREATE TABLE Doc (id INT NOT NULL, j JSON NULL, PRIMARY KEY (id))",
+        "INSERT INTO Cl VALUES (1, 10, 100), (2, 20, 200)",
+        "INSERT INTO Cr VALUES (1, 7), (3, 9)",
+        "INSERT INTO Doc VALUES (1, '[1,2]'), (2, '[3]')",
+    ] {
+        run(&engine, &mut session, ddl);
+    }
+
+    // The issue's statement, and the same correlation with the sides of the
+    // comparison swapped — the reference is resolved wherever it is written.
+    for sql in [
+        "SELECT k FROM Cl WHERE EXISTS (SELECT 1 FROM Cr JOIN Cr c3 ON c3.id = Cl.id) ORDER BY 1",
+        "SELECT k FROM Cl WHERE EXISTS (SELECT 1 FROM Cr JOIN Cr c3 ON Cl.id = c3.id) ORDER BY 1",
+    ] {
+        assert_eq!(rows(&engine, &mut session, sql), vec![vec!["10"]], "{sql}");
+    }
+
+    // An unqualified name the inner side cannot answer to resolves outwards,
+    // which is the same scope rule with the qualifier left off.
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT k FROM Cl WHERE EXISTS (SELECT 1 FROM Cr JOIN Cr c3 ON c3.id = b) ORDER BY 1"
+    )
+    .is_empty());
+
+    // A LEFT JOIN reads its ON the same way, and keeps every left row when the
+    // correlation matches nothing.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k FROM Cl \
+             WHERE EXISTS (SELECT 1 FROM Cr LEFT JOIN Cr c3 ON c3.id = Cl.id) ORDER BY 1"
+        ),
+        vec![vec!["10"], vec!["20"]]
+    );
+
+    // Every other position a correlated subquery is written in: a scalar one,
+    // an IN list, a CTE inside one, and a UNION branch of one.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k, (SELECT COUNT(*) FROM Cr JOIN Cr c3 ON c3.id = Cl.id) AS n \
+             FROM Cl ORDER BY 1"
+        ),
+        vec![vec!["10", "2"], vec!["20", "0"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k FROM Cl \
+             WHERE id IN (SELECT c3.id FROM Cr JOIN Cr c3 ON c3.id = Cl.id) ORDER BY 1"
+        ),
+        vec![vec!["10"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k FROM Cl WHERE EXISTS \
+             (WITH q AS (SELECT c3.id AS z FROM Cr JOIN Cr c3 ON c3.id = Cl.id) \
+              SELECT 1 FROM q) ORDER BY 1"
+        ),
+        vec![vec!["10"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k FROM Cl WHERE EXISTS \
+             (SELECT 1 FROM Cr JOIN Cr c3 ON c3.id = Cl.id UNION SELECT 2) ORDER BY 1"
+        ),
+        vec![vec!["10"], vec!["20"]]
+    );
+
+    // Two levels out, because the outer row a subquery is handed already
+    // carries the level above it.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k FROM Cl WHERE EXISTS (SELECT 1 FROM Cr WHERE EXISTS \
+             (SELECT 1 FROM Cr c4 JOIN Cr c5 ON c5.id = Cl.id)) ORDER BY 1"
+        ),
+        vec![vec!["10"]]
+    );
+
+    // The empty halves, which is what #0100 settled: an empty inner side
+    // answers an empty set rather than refusing, and so does an empty outer
+    // one.
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT k FROM Cl \
+         WHERE EXISTS (SELECT 1 FROM Cempty JOIN Cempty c3 ON c3.id = Cl.id) ORDER BY 1"
+    )
+    .is_empty());
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT k FROM Lempty \
+         WHERE EXISTS (SELECT 1 FROM Cr JOIN Cr c3 ON c3.id = Lempty.id) ORDER BY 1"
+    )
+    .is_empty());
+
+    // A name in neither scope is still 1054 in the ON, whether the inner side
+    // has rows to reach the condition with or not. Widening the scope must not
+    // widen it to everything.
+    for sql in [
+        "SELECT k FROM Cl WHERE EXISTS (SELECT 1 FROM Cr JOIN Cr c3 ON c3.id = zz.q)",
+        "SELECT k FROM Cl WHERE EXISTS (SELECT 1 FROM Cempty JOIN Cempty c3 ON c3.id = zz.q)",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1054, "{sql} -> {err}");
+        assert_eq!(err.message, "Unknown column 'zz.q' in 'on clause'", "{sql}");
+    }
+
+    // A derived table *inside* the subquery reads the outer row, and one
+    // beside `Cl` in the same FROM does not. The pair looks contradictory
+    // until it is measured: an outer-query reference is legal from any depth,
+    // and LATERAL is only about a FROM item naming its own siblings. Both are
+    // asserted so a change that collapses the distinction — in either
+    // direction — shows up here rather than as a wrong answer.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k FROM Cl WHERE EXISTS \
+             (SELECT 1 FROM (SELECT c3.id AS z FROM Cr JOIN Cr c3 ON c3.id = Cl.id) d) ORDER BY 1"
+        ),
+        vec![vec!["10"]]
+    );
+    let sql = "SELECT k FROM Cl, (SELECT c3.id AS d FROM Cr JOIN Cr c3 ON c3.id = Cl.id) t";
+    let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+    assert_eq!(err.code, 1054, "{sql} -> {err}");
+    assert_eq!(err.message, "Unknown column 'Cl.id' in 'on clause'");
+
+    // A join that is not inside a subquery at all still answers over its own
+    // two sides, which the widened scope must leave alone.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT Cl.k FROM Cl JOIN Cr ON Cr.id = Cl.id ORDER BY 1"
+        ),
+        vec![vec!["10"]]
+    );
+
+    // A JSON_TABLE is joined a row at a time rather than once for the whole
+    // relation, so its ON is evaluated somewhere else entirely — and it needs
+    // the enclosing row for the same reason. Asserted separately because a
+    // fix applied to only one of the two joins leaves this one refusing and
+    // reads exactly like a fix applied to both.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k FROM Cl WHERE EXISTS (SELECT 1 FROM Doc \
+             JOIN JSON_TABLE(Doc.j, '$[*]' COLUMNS (v INT PATH '$')) jt ON jt.v = Cl.id) \
+             ORDER BY 1"
+        ),
+        vec![vec!["10"], vec!["20"]]
+    );
+    let sql = "SELECT k FROM Cl WHERE EXISTS (SELECT 1 FROM Doc \
+               JOIN JSON_TABLE(Doc.j, '$[*]' COLUMNS (v INT PATH '$')) jt ON jt.v = zz.q)";
+    let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+    assert_eq!(err.code, 1054, "{sql} -> {err}");
+    assert_eq!(err.message, "Unknown column 'zz.q' in 'on clause'");
+}

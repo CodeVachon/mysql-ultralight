@@ -1342,6 +1342,18 @@ impl Engine {
         // table.
         if query.with.is_some() {
             let mut scoped = session.clone();
+            // The enclosing row is put in scope before the entries are run,
+            // the same way `select` puts it in scope before a FROM is built: a
+            // CTE belongs to the query block that writes it, so one written
+            // inside a correlated subquery may name the row that subquery is
+            // being run for. Measured: `SELECT k FROM Cl WHERE EXISTS (WITH q
+            // AS (SELECT 1 FROM Cr JOIN Cr c3 ON c3.id = Cl.id) SELECT 1 FROM
+            // q)` answers on 8.3 and was 1054 in the ON here, because the
+            // entry was materialised before anything had put the row anywhere
+            // the join could read it.
+            if let Some(outer) = outer {
+                scoped.lateral = Some(outer.clone());
+            }
             self.materialise_ctes(&mut scoped, query)?;
             let mut without = query.clone();
             // Cleared so the recursive call does not run them a second time.
@@ -2402,6 +2414,12 @@ impl Engine {
             // The ON clause is evaluated against the joined row, exactly as it
             // is for an ordinary join. Ignoring it would turn every
             // `JOIN JSON_TABLE(...) ON ...` into a cross join.
+            //
+            // The enclosing query's columns are appended to the scope for the
+            // same reason `join` appends them: a `JOIN JSON_TABLE(...) ON` in
+            // a correlated subquery may name the row the subquery is being
+            // run for. `session` and not `scoped` — `scoped` carries the row
+            // on the *left* of this join, which the joined row already has.
             let mut joined_refs = refs.clone();
             joined_refs.extend(
                 expanded
@@ -2409,6 +2427,8 @@ impl Engine {
                     .iter()
                     .map(crate::relation::RelColumn::reference),
             );
+            let (outer_schema, outer_values) = correlated_scope(session);
+            joined_refs.extend(outer_schema.iter().cloned());
 
             let mut matched = false;
             for produced in expanded.rows {
@@ -2419,8 +2439,10 @@ impl Engine {
                     None | Some(JoinConstraint::None) => true,
                     Some(JoinConstraint::On(predicate)) => {
                         // The lateral half of the pair below, named the same
-                        // way and for the same reason.
-                        let ctx = Context::for_row(&joined_refs, &joined, session)
+                        // way and for the same reason — including the
+                        // enclosing row read beside the joined one.
+                        let values = with_outer(&joined, outer_values);
+                        let ctx = Context::for_row(&joined_refs, &values, session)
                             .with_executor(self)
                             .in_clause("on clause");
                         expr::eval(predicate, &ctx)?.truthy() == Some(true)
@@ -2484,6 +2506,10 @@ impl Engine {
     }
 
     /// Nested-loop join of two materialised relations.
+    ///
+    /// `session.lateral` is read for the ON, so a join inside a correlated
+    /// subquery can name the row the subquery is being run for. See
+    /// [`correlated_scope`].
     fn join(
         &self,
         session: &Session,
@@ -2504,7 +2530,7 @@ impl Engine {
         // A LEFT JOIN pads the right side and a RIGHT JOIN the left, so each
         // relaxes the one the other keeps.
         let columns = left.joined_columns(&right, outer_right, outer_left);
-        let refs: Vec<ColumnRef> = columns
+        let own_refs: Vec<ColumnRef> = columns
             .iter()
             .map(crate::relation::RelColumn::reference)
             .collect();
@@ -2545,25 +2571,26 @@ impl Engine {
         // So one of the two orders has to be wrong, and arguments first — the
         // order that was already here — is right for three of those four.
         refuse_at_resolve(condition.as_ref())?;
+
+        // The enclosing query's columns as well as this join's, or an ON that
+        // correlates outwards is refused for naming something that *is* in
+        // scope: `SELECT k FROM A WHERE EXISTS (SELECT 1 FROM B JOIN C ON C.id
+        // = A.id)` answers on 8.3, and reading only this join's columns turned
+        // it into a 1054. `session.lateral` is where `select` puts the outer
+        // row while a relation is being built.
+        //
+        // The same scope for the resolution below and for every row's
+        // evaluation, which is #0230: #0100 widened the resolution alone, so
+        // the clause stopped refusing a correlated ON before the first row and
+        // then raised the identical 1054 on reaching one — a refusal moved
+        // rather than removed, and only visible once the inner side had rows
+        // to reach. Appended rather than prepended, so a name this join
+        // answers to wins over the enclosing query's, which is MySQL's scoping
+        // rule and the one `select` already applies to its own clauses.
+        let (outer_schema, outer_values) = correlated_scope(session);
+        let mut scope = own_refs;
+        scope.extend(outer_schema.iter().cloned());
         if let Some(e) = &condition {
-            // The enclosing query's columns as well as this join's, or an ON
-            // that correlates outwards is refused for naming something that
-            // *is* in scope: `SELECT k FROM A WHERE EXISTS (SELECT 1 FROM B
-            // JOIN C ON C.id = A.id)` answers on 8.3, and reading only this
-            // join's columns turned it into a 1054 the moment either inner
-            // side was empty. `session.lateral` is where `select_from` puts
-            // the outer row while a relation is being built, for the
-            // JSON_TABLE case; a correlated ON needs the same thing.
-            //
-            // Only the *names*. Whether the evaluator can then read one is a
-            // separate gap — over a pair of rows it looks the reference up in
-            // this join's columns alone and raises the same 1054 — and this
-            // must not turn that into a refusal for the queries it does not
-            // already reach.
-            let mut scope = refs.clone();
-            if let Some(enclosing) = &session.lateral {
-                scope.extend(enclosing.schema.iter().cloned());
-            }
             if let Some(name) = unresolved_column(e, &scope) {
                 return Err(EngineError::unknown_column(&name, "on clause"));
             }
@@ -2601,7 +2628,13 @@ impl Engine {
                         // on 8.3 and `'yy.r'` here — the wrong name in either
                         // spelling of the clause, and the fix is to settle an
                         // ON before its first row, which is #0100's.
-                        let ctx = Context::for_row(&refs, &combined, session)
+                        //
+                        // The enclosing row is read beside the pair, and only
+                        // for the evaluation: what the join *produces* is its
+                        // own two sides and nothing else, so the correlation
+                        // is never appended to the row that gets kept.
+                        let values = with_outer(&combined, outer_values);
+                        let ctx = Context::for_row(&scope, &values, session)
                             .with_executor(self)
                             .in_clause("on clause");
                         expr::eval(e, &ctx)?.truthy() == Some(true)
@@ -2929,15 +2962,15 @@ impl Engine {
         // GROUP BY 2 HAVING zz > 1` is 1054 for the position.
         //
         // The clause reads the select list's names as well as the relation's,
-        // so `SELECT 1 AS a GROUP BY a` answers rather than raising.
+        // so `SELECT 1 AS a GROUP BY a` answers rather than raising, and
+        // `SELECT COUNT(*) AS n GROUP BY n` is the 1056 8.3 raises for it.
+        //
+        // The resolved list is dropped: one implicit row is one group whatever
+        // it is grouped on, so this clause can only ever refuse here. Resolved
+        // all the same, because a refusal it reaches only after substituting
+        // an alias is a refusal the two paths have to share.
         if !group_exprs.is_empty() {
-            let aliases = items.iter().map(|(alias, _)| alias.as_str());
-            // The positions before the rest, which is the order `grouped`
-            // reads them in — the two paths answer the same statement and a
-            // clause settled one way here and another way there is a bug
-            // nothing but a FROM clause could tell apart.
-            check_group_positions(group_exprs, items.len())?;
-            resolve_group_by(group_exprs, &implicit_schema, aliases)?;
+            resolve_group_by(group_exprs, &select.projection, &items, &implicit_schema)?;
         }
 
         // Every item is evaluated even where the WHERE has already discarded
@@ -3547,56 +3580,13 @@ impl Engine {
             engine: self,
             session,
         });
-        // `GROUP BY 1` means the first select column, not the literal 1.
-        // Treating it as a literal gives every row the same key and collapses
-        // the whole table into one group.
-        //
-        // Kept as written as well as resolved, because a position that names
-        // nothing has to be told apart from a select item that *is* a number:
-        // after this map both are a bare literal, and `SELECT 5 FROM t GROUP
-        // BY 1` is a legal query whose group expression is `5`.
+        // Kept under its own name because `resolve_group_by` returns a second
+        // list — the same clause with its positions and aliases resolved — and
+        // a position that names nothing has to be told apart from a select
+        // item that *is* a number: after resolution both are a bare literal,
+        // and `SELECT 5 FROM t GROUP BY 1` is a legal query whose group
+        // expression is `5`.
         let written_groups = group_exprs;
-        let group_exprs: Vec<Expr> = group_exprs
-            .iter()
-            .map(|e| resolve_ordinal(e, &select.projection).unwrap_or_else(|| e.clone()))
-            .collect();
-
-        let mut keys: Vec<Vec<String>> = Vec::new();
-        let mut groups: Vec<Vec<&Vec<Value>>> = Vec::new();
-
-        if group_exprs.is_empty() {
-            // Ungrouped aggregation always produces exactly one row, even over
-            // no rows at all: `SELECT COUNT(*)` on an empty table returns 0.
-            groups.push(matching.to_vec());
-        } else {
-            for row in matching {
-                // `'group statement'` — MySQL's name for the GROUP BY clause
-                // in this message, and not `'group clause'` as the pattern of
-                // the others would suggest. Measured: `SELECT k FROM T GROUP
-                // BY zz.q` is `Unknown column 'zz.q' in 'group statement'`.
-                let ctx = Context::for_row(refs, row, session)
-                    .with_executor(self)
-                    .in_clause("group statement");
-                let mut key = Vec::with_capacity(group_exprs.len());
-                for e in &group_exprs {
-                    let value = expr::eval(e, &ctx)?;
-                    // Grouping treats NULLs as equal to one another, unlike
-                    // comparison, so they need a key of their own.
-                    key.push(if value.is_null() {
-                        "\u{0}NULL".to_owned()
-                    } else {
-                        value.collation_key()
-                    });
-                }
-                match keys.iter().position(|k| *k == key) {
-                    Some(index) => groups[index].push(row),
-                    None => {
-                        keys.push(key);
-                        groups.push(vec![*row]);
-                    }
-                }
-            }
-        }
 
         let items = projected_items(&select.projection)?;
         let names: Vec<String> = items.iter().map(|(alias, _)| alias.clone()).collect();
@@ -3604,15 +3594,16 @@ impl Engine {
         // Before the grouping rules, because MySQL resolves names first:
         // `SELECT a.b, COUNT(*) FROM J2 GROUP BY b` is 1054 there and would
         // be 1055 if this ran after `check_full_group_by`.
+        //
+        // Before the GROUP BY as well, and before any row is grouped, which is
+        // 8.3's order too: `SELECT nope, COUNT(*) AS n FROM Cl GROUP BY n` is
+        // 1054 for `nope` there rather than the 1056 the clause below raises,
+        // and `SELECT nope, k AS a, b AS a FROM Cl GROUP BY a` is 1054 rather
+        // than 1052.
         if let Some(name) = items.iter().find_map(|(_, e)| unresolved_column(e, refs)) {
             return Err(EngineError::unknown_column(&name, "field list"));
         }
         refuse_at_resolve(items.iter().map(|(_, e)| e))?;
-        // After the field list and before everything else, which is the order
-        // 8.3 answers in: `SELECT nope FROM t GROUP BY 5` is 1054 for `nope`
-        // there, and `SELECT id FROM t GROUP BY 5 ORDER BY 9` complains about
-        // the GROUP BY's position rather than the ORDER BY's.
-        check_group_positions(written_groups, items.len())?;
         // GROUP BY and HAVING, the two clauses #0093 left behind. Both are
         // only otherwise settled inside `for group in &groups`, so a query
         // that produces no groups never settles them: over an empty table
@@ -3635,13 +3626,20 @@ impl Engine {
         // LIKE 'a' ESCAPE '!!'` is 1054.
         //
         // Its names as well as its arguments now, and here rather than in the
-        // grouping loop above because that loop runs once per row: over an
+        // grouping loop below because that loop runs once per row: over an
         // empty table `GROUP BY zz.q` came back as an empty set where 8.3
         // raises 1054, and a prepared statement was accepted that MySQL
         // refuses at prepare. #0100. `resolve_group_by` reads the list item by
         // item so the clause answers the same over an empty table as over a
         // full one, which the loop's own reading already did.
-        resolve_group_by(&group_exprs, refs, names.iter().map(String::as_str))?;
+        //
+        // What it hands back is the list with its positions and its select
+        // aliases resolved, which is what the rest of this — the grouping
+        // rules, the grouping loop, and the HAVING's scope — has to read.
+        // #0229: `SELECT k AS a FROM Cl GROUP BY a` answers two rows on 8.3
+        // and was 1054 here, because only the *resolver* admitted the alias
+        // and the per-row evaluation still looked for a column called `a`.
+        let group_exprs = resolve_group_by(written_groups, &select.projection, &items, refs)?;
         if let Some(having) = &select.having {
             check_having_scope(
                 having,
@@ -3709,6 +3707,55 @@ impl Engine {
             settled.extend(refs.len()..scope.len());
             for key in &order_items {
                 check_full_group_by(&key.expr, &key.expr, &group_exprs, &scope, &settled)?;
+            }
+        }
+
+        // Every refusal above is settled before a single row is read, which is
+        // 8.3's order and not a tidiness: it resolves the whole statement at
+        // prepare, so a clause it refuses is refused over an empty table too.
+        //
+        // Grouping here rather than at the top of this function is what makes
+        // the two agree. `GROUP BY ABS(a)` is the case that shows it: the
+        // substitution reaches an identifier through an operator and not
+        // through a call, so that `a` survives as a name — the resolver
+        // admits it, and the 1055 for the ungrouped column behind it is what
+        // 8.3 answers, over a full table and an empty one alike. With the
+        // grouping first, the full table reached the key evaluation before
+        // that check and answered 1054 instead.
+        let mut keys: Vec<Vec<String>> = Vec::new();
+        let mut groups: Vec<Vec<&Vec<Value>>> = Vec::new();
+
+        if group_exprs.is_empty() {
+            // Ungrouped aggregation always produces exactly one row, even over
+            // no rows at all: `SELECT COUNT(*)` on an empty table returns 0.
+            groups.push(matching.to_vec());
+        } else {
+            for row in matching {
+                // `'group statement'` — MySQL's name for the GROUP BY clause
+                // in this message, and not `'group clause'` as the pattern of
+                // the others would suggest. Measured: `SELECT k FROM T GROUP
+                // BY zz.q` is `Unknown column 'zz.q' in 'group statement'`.
+                let ctx = Context::for_row(refs, row, session)
+                    .with_executor(self)
+                    .in_clause("group statement");
+                let mut key = Vec::with_capacity(group_exprs.len());
+                for e in &group_exprs {
+                    let value = expr::eval(e, &ctx)?;
+                    // Grouping treats NULLs as equal to one another, unlike
+                    // comparison, so they need a key of their own.
+                    key.push(if value.is_null() {
+                        "\u{0}NULL".to_owned()
+                    } else {
+                        value.collation_key()
+                    });
+                }
+                match keys.iter().position(|k| *k == key) {
+                    Some(index) => groups[index].push(row),
+                    None => {
+                        keys.push(key);
+                        groups.push(vec![*row]);
+                    }
+                }
             }
         }
 
@@ -6330,6 +6377,45 @@ fn base_collation(catalog: &Catalog, column: &OutColumn) -> Option<String> {
     .then(|| source.ty.collation.name().to_owned())
 }
 
+/// The enclosing query's row, as a scope a join condition can be read in.
+///
+/// A join's ON is evaluated while the relation is being built, before the
+/// query has anything to hand a correlated expression, so the outer row cannot
+/// arrive the way a WHERE's does — `select` leaves it on the session for the
+/// duration instead, and this is where the two joins pick it up.
+///
+/// Empty slices rather than an `Option` so the callers append unconditionally:
+/// a scope that is only widened on one branch is a scope that gets widened for
+/// the resolution and not for the evaluation, which is exactly the split #0230
+/// was filed for.
+///
+/// One definition for both joins so a mutation to it neuters both at once.
+fn correlated_scope(session: &Session) -> (&[ColumnRef], &[Value]) {
+    match &session.lateral {
+        Some(outer) => (&outer.schema, &outer.values),
+        None => (&[], &[]),
+    }
+}
+
+/// One join's row with the enclosing query's values behind it.
+///
+/// Borrowed where there is no correlation, which is nearly every join: this
+/// runs once per pair of rows considered, and copying the pair to append
+/// nothing to it would make every join in the suite pay for the one shape that
+/// needs it.
+///
+/// Behind and not in front, matching the order [`correlated_scope`]'s schema
+/// is appended in — the two have to line up index for index or a name resolves
+/// to the wrong value rather than to none at all.
+fn with_outer<'a>(row: &'a [Value], outer: &[Value]) -> std::borrow::Cow<'a, [Value]> {
+    if outer.is_empty() {
+        return std::borrow::Cow::Borrowed(row);
+    }
+    let mut widened = row.to_vec();
+    widened.extend_from_slice(outer);
+    std::borrow::Cow::Owned(widened)
+}
+
 /// Builds the equality condition a `USING (a, b)` join clause implies.
 fn using_condition(
     names: &[sqlparser::ast::ObjectName],
@@ -7546,24 +7632,6 @@ fn resolve_ordinal(e: &Expr, projection: &[SelectItem]) -> Option<Expr> {
         SelectItem::ExprWithAlias { expr, .. } => Some(expr.clone()),
         _ => None,
     }
-}
-
-/// Refuses a `GROUP BY <position>` that names no select item.
-///
-/// `resolve_ordinal` leaves an unresolvable position as the literal it was
-/// written as, which groups every row under one constant key and answers a
-/// different query than the one asked. On 8.3 both ends are 1054 under this
-/// clause's own name: `GROUP BY 5` over one select item, and `GROUP BY 0`,
-/// are `Unknown column '5'` and `'0'` `in 'group statement'`.
-fn check_group_positions(group_exprs: &[Expr], projected: usize) -> EngineResult<()> {
-    for e in group_exprs {
-        if let Some((position, written)) = written_position(e) {
-            if position == 0 || position > projected {
-                return Err(EngineError::unknown_column(written, "group statement"));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// One column a select list projects: the name it answers to, the expression
@@ -11896,22 +11964,26 @@ fn resolve_dml_where(selection: Option<&Expr>, refs: &[ColumnRef]) -> EngineResu
 /// `'group statement'` — MySQL's name for this clause in this message, and not
 /// the `'group clause'` the pattern of the others would suggest.
 ///
-/// `aliases` is the select list's output names, which the clause admits beside
-/// the relation's columns: `SELECT k AS a FROM t GROUP BY a` is legal on 8.3
-/// and `SELECT 1 AS a GROUP BY a` is too. They are in scope here so this
-/// cannot refuse ahead of the first row what the row would have allowed —
-/// which is the trap #0100 records against this clause. Resolving such an
-/// alias to the item it names, once a row does arrive, is a separate matter
-/// and one the table-backed path still gets wrong.
+/// What comes back is the clause with its positions and its select aliases
+/// resolved, because admitting a name is only half of reading it: #0100 put
+/// the select list's output names in scope here so the clause could not refuse
+/// ahead of the first row what a row would have allowed, but the row that then
+/// arrived still looked for a column of that name and raised the 1054 this had
+/// just declined to raise. #0229. Handing the resolved list back is what makes
+/// the two halves one decision — the caller groups on what this resolved, so a
+/// name cannot be admitted here and lost there.
 ///
 /// Item by item, because 8.3 reads the list left to right and answers whatever
-/// is wrong with the first item that is — a name or an argument, whichever the
-/// item carries. Measured both ways, over a table with rows and over an empty
-/// one, with the same answer each time:
+/// is wrong with the first item that is — a position, a name, an ambiguity or
+/// an argument, whichever the item carries. Measured both ways, over a table
+/// with rows and over an empty one, with the same answer each time:
 ///
 /// ```sql
 /// GROUP BY nope, s LIKE 'a' ESCAPE '!!'   -- 1054
 /// GROUP BY s LIKE 'a' ESCAPE '!!', nope   -- 1210
+/// GROUP BY a, 9        -- 1052 for the ambiguous alias, over two select items
+/// GROUP BY 9, a        -- 1054 for the position
+/// GROUP BY n, s LIKE 'a' ESCAPE '!!'      -- 1056, for `n` an aggregate alias
 /// ```
 ///
 /// Checking every name and then every argument gets the second of those
@@ -11923,20 +11995,210 @@ fn resolve_dml_where(selection: Option<&Expr>, refs: &[ColumnRef]) -> EngineResu
 /// One definition for the two paths that group — `grouped` for a query with a
 /// FROM and `select_without_table` for one without — so a mutation to it
 /// neuters both at once.
-fn resolve_group_by<'a>(
-    group_exprs: &[Expr],
+fn resolve_group_by<E: std::borrow::Borrow<Expr>>(
+    written_groups: &[Expr],
+    projection: &[SelectItem],
+    items: &[(String, E)],
     refs: &[ColumnRef],
-    aliases: impl Iterator<Item = &'a str>,
-) -> EngineResult<()> {
-    let mut scope = refs.to_vec();
-    scope.extend(aliases.map(|alias| ColumnRef::new("", alias)));
-    for e in group_exprs {
-        if let Some(name) = unresolved_column(e, &scope) {
+) -> EngineResult<Vec<Expr>> {
+    // The select list's output names beside the relation's columns, for the
+    // resolution below. Nearly every alias is substituted before it gets
+    // there — but `substitute_names` reaches an identifier through an
+    // operator and not through a call, so `GROUP BY ABS(a)` arrives with its
+    // `a` intact. 8.3 resolves an alias at any depth, so refusing that name
+    // would answer 1054 where 8.3 answers 1055 for the ungrouped column
+    // behind it: measured, `SELECT k AS a, COUNT(*) FROM Cl GROUP BY ABS(a)`
+    // is 1055 over a full table and over an empty one alike, and so is the
+    // same query over `CONCAT(a, '')`.
+    let mut named = refs.to_vec();
+    named.extend(items.iter().map(|(alias, _)| ColumnRef::new("", alias)));
+
+    let mut resolved = Vec::with_capacity(written_groups.len());
+    for written in written_groups {
+        // The position first, because a position out of range beats an alias
+        // written after it and loses to one written before: `GROUP BY 9, a` is
+        // 1054 for `9` on 8.3 and `GROUP BY a, 9` is 1052 for `a`.
+        //
+        // Zero is a position too, and out of range: `resolve_ordinal` leaves
+        // an unresolvable one as the literal it was written as, which groups
+        // every row under one constant key and answers a different query than
+        // the one asked. Both ends are 1054 under this clause's own name on
+        // 8.3 — `GROUP BY 5` over one select item, and `GROUP BY 0`.
+        let at = written_position(written);
+        if let Some((position, digits)) = at {
+            if position == 0 || position > items.len() {
+                return Err(EngineError::unknown_column(digits, "group statement"));
+            }
+        }
+        let e = match resolve_ordinal(written, projection) {
+            Some(item) => {
+                // A position reaches the same select item an alias does, so it
+                // meets the same rule about what can be grouped on — and it is
+                // reported by the item's *output name* rather than by the
+                // digits. Measured: `SELECT COUNT(*) AS n FROM Cl GROUP BY 1`
+                // is `Can't group on 'n'` on 8.3, and the same query with the
+                // alias left off is `Can't group on 'COUNT(*)'`.
+                if let Some((name, _)) = at.and_then(|(position, _)| items.get(position - 1)) {
+                    refuse_ungroupable(&item, name)?;
+                }
+                item
+            }
+            None => substitute_group_aliases(written, items, refs)?,
+        };
+        if let Some(name) = unresolved_column(&e, &named) {
             return Err(EngineError::unknown_column(&name, "group statement"));
         }
-        refuse_at_resolve([e])?;
+        refuse_at_resolve([&e])?;
+        resolved.push(e);
+    }
+    Ok(resolved)
+}
+
+/// Refuses a select item a GROUP BY cannot group on.
+///
+/// An aggregate is folded over the group and a window is computed across the
+/// whole partition once the groups exist, so neither can be a key: 8.3 answers
+/// `Can't group on '<name>'` — 1056 — rather than the 1054 an unknown name
+/// gets or the 1055 an ungrouped column gets.
+///
+/// One definition for the two spellings that reach it, an alias and a
+/// position, so a mutation to it neuters both at once. `<name>` is the item's
+/// output name in each — the alias where it has one, the text it was written
+/// as where it does not.
+fn refuse_ungroupable(e: &Expr, name: &str) -> EngineResult<()> {
+    if contains_aggregate(e) || contains_window(e) {
+        return Err(EngineError::new(
+            1056,
+            "42000",
+            format!("Can't group on '{name}'"),
+        ));
     }
     Ok(())
+}
+
+/// Rewrites a GROUP BY's references to a select-list item into the expression
+/// written for it.
+///
+/// The relation's columns win, which is the preference 8.3 documents for this
+/// clause and the opposite of the one ORDER BY has. Measured: `SELECT k AS b
+/// FROM Cl GROUP BY b`, over a table that has a column `b` of its own, groups
+/// on the *column* and is 1055 for the ungrouped `k` — and `SELECT Cl.k AS s
+/// ... GROUP BY s` is the same. Only a name the relation cannot answer to
+/// reaches the select list at all.
+fn substitute_group_aliases<E: std::borrow::Borrow<Expr>>(
+    e: &Expr,
+    items: &[(String, E)],
+    refs: &[ColumnRef],
+) -> EngineResult<Expr> {
+    // The walk cannot fail, so the ambiguity and the aggregate are carried out
+    // of it rather than returned from it. First one wins, which is the same
+    // left-to-right reading the loop above does.
+    let failure: std::cell::RefCell<Option<EngineError>> = std::cell::RefCell::new(None);
+    let record = |error| {
+        let mut slot = failure.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(error);
+        }
+    };
+    let substituted = substitute_names(e, &|written| {
+        // The select list is searched *before* the relation answers, even
+        // though the relation wins: an alias written twice is ambiguous
+        // whether the table has a column of that name or not. Measured, over
+        // a `Cl` that has a column `b`: `SELECT k AS b, s AS b FROM Cl GROUP
+        // BY b` is 1052 on 8.3, where the single-alias `SELECT k AS b FROM Cl
+        // GROUP BY b` groups on the column and is 1055 for the ungrouped `k`.
+        let found = match group_alias(written, items, refs) {
+            Ok(found) => found,
+            Err(error) => {
+                record(error);
+                return None;
+            }
+        };
+        let taken_by_the_relation =
+            column_slot(refs, &Expr::Identifier(sqlparser::ast::Ident::new(written))).is_some();
+        if taken_by_the_relation {
+            return None;
+        }
+        let found = found?;
+        // Asked of whichever expression won, and so not asked at all when the
+        // relation took the name: `GROUP BY b` beside `SELECT COUNT(*) AS b`
+        // is 1056 only where nothing is called `b` in the FROM.
+        if let Err(error) = refuse_ungroupable(&found, written) {
+            record(error);
+            return None;
+        }
+        Some(found)
+    });
+    match failure.into_inner() {
+        Some(error) => Err(error),
+        None => Ok(substituted),
+    }
+}
+
+/// The select item a GROUP BY name resolves to, once the relation has declined
+/// it.
+///
+/// 8.3 walks the select list and treats a plain column reference differently
+/// from everything else, which is visible from outside and had to be measured
+/// rather than guessed. A second *column* under the same alias is ambiguous;
+/// anything else settles the name where it stands and stops the walk. All four
+/// orders, over `Cl(id, k, b, s)`:
+///
+/// ```sql
+/// SELECT k AS a, b AS a, COUNT(*) FROM Cl GROUP BY a  -- 1052, two columns
+/// SELECT k AS a, k AS a, COUNT(*) FROM Cl GROUP BY a  -- answers; the same one twice
+/// SELECT k AS a, 2 AS a, COUNT(*) FROM Cl GROUP BY a  -- groups on 2
+/// SELECT 2 AS a, k AS a, COUNT(*) FROM Cl GROUP BY a  -- groups on 2
+/// ```
+///
+/// The last two are 1055 there for the ungrouped `k`, which is how the grouped
+/// expression is visible at all — the constant won in both, so the walk does
+/// not stop at the first match and does not prefer a column either.
+///
+/// Two items that are the same column are not ambiguous however they are
+/// spelled, which is the rule `OutItem` states for ORDER BY and which this
+/// clause shares: `SELECT Cl.k AS a, k AS a, COUNT(*) FROM Cl GROUP BY a`
+/// answers on 8.3, where the two *different* columns above are 1052. So the
+/// comparison is which column each item resolves to and not how it was
+/// written; where neither resolves to one — a correlated reference, or a
+/// query with no FROM — the spelling is all there is to compare.
+///
+/// The ambiguity is the only thing this raises. Whether the item can be
+/// grouped on at all is the caller's, because it is asked of whatever finally
+/// won the name and the relation may still take it.
+fn group_alias<E: std::borrow::Borrow<Expr>>(
+    written: &str,
+    items: &[(String, E)],
+    refs: &[ColumnRef],
+) -> EngineResult<Option<Expr>> {
+    let mut found: Option<&Expr> = None;
+    for (name, item) in items {
+        let e = item.borrow();
+        if !name.eq_ignore_ascii_case(written) {
+            continue;
+        }
+        if matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+            match found {
+                Some(previous) if !same_column(previous, e, refs) => {
+                    return Err(EngineError::ambiguous(written, "group statement"))
+                }
+                Some(_) => {}
+                None => found = Some(e),
+            }
+        } else {
+            found = Some(e);
+            break;
+        }
+    }
+    Ok(found.cloned())
+}
+
+/// Whether two select items name the same column of the same relation.
+fn same_column(left: &Expr, right: &Expr, refs: &[ColumnRef]) -> bool {
+    match (column_slot(refs, left), column_slot(refs, right)) {
+        (Some(a), Some(b)) => a == b,
+        _ => left == right,
+    }
 }
 
 /// Resolves the ORDER BY of an UPDATE or a DELETE, before any row is chosen.

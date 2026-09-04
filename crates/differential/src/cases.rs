@@ -8666,4 +8666,211 @@ pub const GROUPS: &[Group] = &[
                   ORDER BY CONSTRAINT_NAME"),
         ],
     },
+    Group {
+        // #0229. `SELECT k AS a FROM Cl GROUP BY a` answers two rows on 8.3
+        // and was 1054 here. #0100 had put the select list's output names in
+        // scope for the resolver, so the clause no longer refused ahead of the
+        // first row — and then the row arrived and the per-row key evaluation
+        // looked for a column called `a` and raised the same 1054. The two
+        // halves are one decision now: the resolver hands the substituted list
+        // back and the grouping reads what it resolved.
+        //
+        // The empty table is asked beside the full one throughout, because the
+        // two halves disagreed over it: with nothing to group, the alias was
+        // admitted and never read, and the statement was 1055 where 8.3
+        // answers an empty set.
+        //
+        // Which side wins when an alias shadows a column had to be measured:
+        // 8.3 documents the *relation* winning for this clause, which is the
+        // opposite of ORDER BY, and it is visible only through the 1055 the
+        // ungrouped column then draws. The select list is still searched first
+        // all the same — two columns under one alias are 1052 whether the
+        // relation has a column of that name or not.
+        name: "a GROUP BY that names a select alias",
+        setup: &[
+            "CREATE TABLE Cl (id INT NOT NULL, k INT NULL, b INT NULL, s VARCHAR(20) NULL, \
+             PRIMARY KEY (id))",
+            "CREATE TABLE Emp (id INT NOT NULL, k INT NULL, b INT NULL, s VARCHAR(20) NULL, \
+             PRIMARY KEY (id))",
+            "INSERT INTO Cl VALUES (1, 10, 100, 'x'), (2, 20, 200, 'y'), (3, 10, 300, 'z')",
+        ],
+        cases: &[
+            // The issue's own statement, over a table with rows and over one
+            // without.
+            same("SELECT k AS a FROM Cl GROUP BY a ORDER BY 1"),
+            same("SELECT k AS a FROM Emp GROUP BY a ORDER BY 1"),
+            // An alias over an expression, which is what a reporting query
+            // writes.
+            same("SELECT k + 1 AS a FROM Cl GROUP BY a ORDER BY 1"),
+            same("SELECT k + 1 AS a FROM Emp GROUP BY a ORDER BY 1"),
+            // The same alias reached from three clauses at once. HAVING and
+            // ORDER BY already resolved one; the GROUP BY is what did not.
+            same("SELECT k AS a, COUNT(*) AS n FROM Cl GROUP BY a HAVING a > 5 ORDER BY a DESC"),
+            same("SELECT k AS a, COUNT(*) AS n FROM Emp GROUP BY a HAVING a > 5 ORDER BY a DESC"),
+            // Written after another item, spelled in another case, and spelled
+            // with a space in it.
+            same("SELECT 1 AS x, k AS a FROM Cl GROUP BY a ORDER BY 2"),
+            same("SELECT k AS aB, COUNT(*) FROM Cl GROUP BY Ab ORDER BY 1"),
+            same("SELECT k AS `my a`, COUNT(*) FROM Cl GROUP BY `my a` ORDER BY 1"),
+            // An item with no alias answers to the text it was written as,
+            // which is the other half of the same select-list search.
+            same("SELECT k + 1, COUNT(*) FROM Cl GROUP BY `k + 1` ORDER BY 1"),
+            // A position still means the item at that position.
+            same("SELECT k AS a, COUNT(*) FROM Cl GROUP BY 1 ORDER BY 1"),
+            same("SELECT k AS a, COUNT(*) FROM Emp GROUP BY 1 ORDER BY 1"),
+            // A string alias, so the grouping key is not only ever a number.
+            same("SELECT s AS a, COUNT(*) FROM Cl GROUP BY a ORDER BY 1"),
+            // The relation wins over the select list: these group on the
+            // *column* and are 1055 for the ungrouped `k`, where the alias
+            // would have answered rows.
+            same("SELECT k AS b FROM Cl GROUP BY b ORDER BY 1"),
+            same("SELECT k AS b FROM Emp GROUP BY b ORDER BY 1"),
+            same("SELECT Cl.k AS s, COUNT(*) FROM Cl GROUP BY s"),
+            // Reached inside an expression, which is what makes these 1055 and
+            // not the 1054 an unsubstituted name would be.
+            same("SELECT k AS a, COUNT(*) FROM Cl GROUP BY a + 0"),
+            same("SELECT k AS a, COUNT(*) FROM Emp GROUP BY a + 0"),
+            // Two columns under one alias are ambiguous; the same column twice
+            // is not; and an item that is not a column settles the name where
+            // it stands, whichever side of the collision it is written on.
+            same("SELECT k AS a, b AS a FROM Cl GROUP BY a"),
+            same("SELECT k AS a, b AS a FROM Emp GROUP BY a"),
+            same("SELECT k AS b, s AS b FROM Cl GROUP BY b"),
+            same("SELECT k AS a, k AS a, COUNT(*) FROM Cl GROUP BY a ORDER BY 1"),
+            same("SELECT Cl.k AS a, k AS a, COUNT(*) FROM Cl GROUP BY a ORDER BY 1"),
+            same("SELECT k AS a, 2 AS a, COUNT(*) FROM Cl GROUP BY a"),
+            same("SELECT 2 AS a, k AS a, COUNT(*) FROM Cl GROUP BY a"),
+            // An item that aggregates or windows cannot be grouped on at all,
+            // and 8.3 says so with 1056 rather than 1054. A position reaches
+            // the same item and meets the same rule.
+            same("SELECT COUNT(*) AS n FROM Cl GROUP BY n"),
+            same("SELECT COUNT(*) AS n FROM Emp GROUP BY n"),
+            same("SELECT ROW_NUMBER() OVER () AS w FROM Cl GROUP BY w"),
+            same("SELECT COUNT(*) AS n FROM Cl GROUP BY 1"),
+            same("SELECT COUNT(*) AS n FROM Emp GROUP BY 1"),
+            same("SELECT k AS a, COUNT(*) AS n FROM Cl GROUP BY 2"),
+            same("SELECT ROW_NUMBER() OVER () AS w FROM Cl GROUP BY 1"),
+            same("SELECT COUNT(*) FROM Cl GROUP BY 1"),
+            // An alias written inside a call survives the substitution as a
+            // name, so it has to stay resolvable — the answer is the 1055 for
+            // the ungrouped column behind it, not a 1054 for the name.
+            same("SELECT k AS a, COUNT(*) FROM Cl GROUP BY ABS(a)"),
+            same("SELECT k AS a, COUNT(*) FROM Emp GROUP BY ABS(a)"),
+            same("SELECT k AS a, COUNT(*) FROM Cl GROUP BY CONCAT(a, '')"),
+            // The same clause with no FROM at all, which is a second code path
+            // and answers the same way.
+            same("SELECT 5 AS a GROUP BY a"),
+            same("SELECT 5 AS a GROUP BY a + 0"),
+            same("SELECT COUNT(*) AS n GROUP BY n"),
+            same("SELECT COUNT(*) AS n GROUP BY 1"),
+            // A qualified name is not an alias, and a name that is neither a
+            // column nor an alias is still 1054 under this clause's own name
+            // whether the table has rows or not.
+            same("SELECT k AS a, COUNT(*) FROM Cl GROUP BY Cl.a"),
+            same("SELECT k FROM Cl GROUP BY zz"),
+            same("SELECT k FROM Emp GROUP BY zz"),
+            // The list is read left to right, so which of two faults is
+            // reported is decided by which was written first — and the select
+            // list beats the whole clause however it is written.
+            same("SELECT k AS a, b AS a FROM Cl GROUP BY a, 9"),
+            same("SELECT k AS a, b AS a FROM Cl GROUP BY 9, a"),
+            same("SELECT nope, COUNT(*) AS n FROM Cl GROUP BY n"),
+            same("SELECT nope, k AS a, b AS a FROM Cl GROUP BY a"),
+        ],
+    },
+    Group {
+        // #0230. A join condition inside a correlated subquery may name the
+        // row the subquery is being run for: `SELECT k FROM Cl WHERE EXISTS
+        // (SELECT 1 FROM Cr JOIN Cr c3 ON c3.id = Cl.id)` answers on 8.3 and
+        // was `Unknown column 'Cl.id' in 'on clause'` here. #0100 widened the
+        // *resolution* to carry the enclosing row's schema, so the clause
+        // stopped refusing before the first pair of rows — and then a pair
+        // arrived and the evaluator looked the reference up in the join's own
+        // columns alone and raised the identical 1054.
+        //
+        // The inner side has rows on purpose. An empty one produces no pair,
+        // so the condition is never evaluated and the divergence does not
+        // appear at all: this is the case #0100 could not see, and the reason
+        // it was filed as still open rather than closed with that work.
+        name: "a correlated join condition",
+        setup: &[
+            "CREATE TABLE Cl (id INT NOT NULL, k INT NULL, b INT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE Cr (id INT NOT NULL, v INT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE Cempty (id INT NOT NULL, v INT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE Lempty (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Cl VALUES (1, 10, 100), (2, 20, 200)",
+            "INSERT INTO Cr VALUES (1, 7), (3, 9)",
+        ],
+        cases: &[
+            // The issue's statement, and the same correlation with the sides
+            // of the comparison swapped.
+            same("SELECT k FROM Cl WHERE EXISTS \
+                  (SELECT 1 FROM Cr JOIN Cr c3 ON c3.id = Cl.id) ORDER BY 1"),
+            same("SELECT k FROM Cl WHERE EXISTS \
+                  (SELECT 1 FROM Cr JOIN Cr c3 ON Cl.id = c3.id) ORDER BY 1"),
+            // With the outer column named on both sides, and with no inner
+            // column in the condition at all.
+            same("SELECT k FROM Cl WHERE EXISTS \
+                  (SELECT 1 FROM Cr JOIN Cr c3 ON Cl.id = Cl.id AND c3.id = 1) ORDER BY 1"),
+            same("SELECT k FROM Cl WHERE EXISTS \
+                  (SELECT 1 FROM Cr JOIN Cr c3 ON Cl.id = 1) ORDER BY 1"),
+            // Unqualified, which resolves outwards only because the inner side
+            // cannot answer to it.
+            same("SELECT k FROM Cl WHERE EXISTS \
+                  (SELECT 1 FROM Cr JOIN Cr c3 ON c3.id = b) ORDER BY 1"),
+            // A LEFT JOIN reads its ON the same way.
+            same("SELECT k FROM Cl WHERE EXISTS \
+                  (SELECT 1 FROM Cr LEFT JOIN Cr c3 ON c3.id = Cl.id) ORDER BY 1"),
+            // A three-way join, so the correlation is not only ever in the
+            // first ON the relation builds.
+            same("SELECT k FROM Cl WHERE EXISTS \
+                  (SELECT 1 FROM Cr a JOIN Cr b ON b.id = a.id JOIN Cr c ON c.id = Cl.id) \
+                  ORDER BY 1"),
+            // Every other position a correlated subquery is written in.
+            same("SELECT k, (SELECT COUNT(*) FROM Cr JOIN Cr c3 ON c3.id = Cl.id) AS n \
+                  FROM Cl ORDER BY 1"),
+            same("SELECT k FROM Cl \
+                  WHERE id IN (SELECT c3.id FROM Cr JOIN Cr c3 ON c3.id = Cl.id) ORDER BY 1"),
+            same("SELECT k FROM Cl WHERE EXISTS \
+                  (WITH q AS (SELECT c3.id AS z FROM Cr JOIN Cr c3 ON c3.id = Cl.id) \
+                   SELECT 1 FROM q) ORDER BY 1"),
+            same("SELECT k FROM Cl WHERE EXISTS \
+                  (SELECT 1 FROM Cr JOIN Cr c3 ON c3.id = Cl.id UNION SELECT 2) ORDER BY 1"),
+            // A derived table *inside* the subquery, which reads the outer row
+            // and is not the same question as the sibling one further down.
+            // Measured, because the pair looks contradictory until it is: an
+            // outer-query reference is legal from any depth, and LATERAL is
+            // only about a FROM item naming its own siblings. So this answers
+            // on 8.3 and `FROM Cl, (SELECT ... Cl.id) t` is 1054 — both are
+            // here so a change that collapses the distinction shows up.
+            same("SELECT k FROM Cl WHERE EXISTS \
+                  (SELECT 1 FROM (SELECT c3.id AS z FROM Cr JOIN Cr c3 ON c3.id = Cl.id) d) \
+                  ORDER BY 1"),
+            // Two levels out, because the row a subquery is handed already
+            // carries the level above it.
+            same("SELECT k FROM Cl WHERE EXISTS (SELECT 1 FROM Cr WHERE EXISTS \
+                  (SELECT 1 FROM Cr c4 JOIN Cr c5 ON c5.id = Cl.id)) ORDER BY 1"),
+            // The empty halves, which is what #0100 settled and this must not
+            // unsettle: no pair on the inside, and no row on the outside.
+            same("SELECT k FROM Cl WHERE EXISTS \
+                  (SELECT 1 FROM Cempty JOIN Cempty c3 ON c3.id = Cl.id) ORDER BY 1"),
+            same("SELECT k FROM Lempty WHERE EXISTS \
+                  (SELECT 1 FROM Cr JOIN Cr c3 ON c3.id = Lempty.id) ORDER BY 1"),
+            // A name in neither scope is still 1054 in the ON, with rows to
+            // reach the condition and without.
+            same("SELECT k FROM Cl WHERE EXISTS \
+                  (SELECT 1 FROM Cr JOIN Cr c3 ON c3.id = zz.q)"),
+            same("SELECT k FROM Cl WHERE EXISTS \
+                  (SELECT 1 FROM Cempty JOIN Cempty c3 ON c3.id = zz.q)"),
+            // A derived table beside `Cl` in the *same* FROM is not correlated
+            // to it — that needs LATERAL — so the outer row must not leak
+            // sideways into one.
+            same("SELECT k FROM Cl, (SELECT c3.id AS d FROM Cr JOIN Cr c3 ON c3.id = Cl.id) t"),
+            // And a join that is not inside a subquery at all still answers
+            // over its own two sides.
+            same("SELECT Cl.k FROM Cl JOIN Cr ON Cr.id = Cl.id ORDER BY 1"),
+            same("SELECT k FROM Cl WHERE EXISTS \
+                  (SELECT 1 FROM Cr JOIN Cr c3 USING (id)) ORDER BY 1"),
+        ],
+    },
 ];
