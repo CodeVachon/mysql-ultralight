@@ -8284,6 +8284,140 @@ fn round_breaks_a_tie_by_the_operands_type_and_not_by_the_function() {
     assert_eq!(error.code, 1690, "{}", error.message);
 }
 
+/// #0249. `ROUND`'s shape for the other function: which operands MySQL
+/// computes *exactly* is the argument's business and not the function's, so
+/// `TRUNCATE` takes the same exact path over an integer and a decimal and the
+/// same double over everything else. Left on the double reading by #0223,
+/// because toward zero is toward zero for every operand kind — which is true
+/// of the *rounding* and says nothing about the two things the double loses:
+/// a decimal's declared scale, and a BIGINT's digits past 2^53.
+///
+/// Every expectation below is measured on 8.3.
+#[test]
+fn truncate_keeps_a_decimals_scale_and_a_bigints_digits() {
+    let (engine, mut session) = engine();
+    // The case the issue was opened over, and the scale rule around it:
+    // `min(argument's scale, places)`, the same cap `ROUND` takes. 2.500 cut
+    // to two places is 2.50 under a column described with two decimals, and
+    // asking for five gets the three the argument is shown at rather than
+    // five. The double answered 2.5 to all of them.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TRUNCATE(2.500, 2), TRUNCATE(2.500, 5), TRUNCATE(-2.500, 2), \
+             TRUNCATE(1.567, 1), TRUNCATE(-1.567, 1)"
+        ),
+        vec![vec!["2.50", "2.500", "-2.50", "1.5", "-1.5"]]
+    );
+    // Cutting, not rounding, on the digits: 1.005 keeps 1.00 where `ROUND`
+    // carries to 1.01. A value that cuts away to nothing keeps the places it
+    // was asked for — 0.00, not 0 — and loses its sign with them.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TRUNCATE(1.005, 2), ROUND(1.005, 2), TRUNCATE(0.000, 2), \
+             TRUNCATE(-0.001, 2)"
+        ),
+        vec![vec!["1.00", "1.01", "0.00", "0.00"]]
+    );
+    // A place to the left of the point, which cuts rather than rounds and so
+    // parts company with `ROUND` at 15.6 and again at 24.6. A scale deeper
+    // than the number spells a bare zero.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TRUNCATE(15.6, -1), ROUND(15.6, -1), TRUNCATE(24.6, -1), \
+             TRUNCATE(0.6, -1), TRUNCATE(2.5, -100)"
+        ),
+        vec![vec!["10", "20", "20", "0", "0"]]
+    );
+    // The same over columns, where the scale is declared rather than written:
+    // a `DECIMAL(10,3)` and a `DECIMAL(20,6)`. A BIGINT past 2^53 has digits
+    // no `f64` holds, and at a positive place the double path answered one
+    // under a LONGLONG code — a number the binary protocol would have sent as
+    // eight bytes of something else entirely.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Tr (id INT NOT NULL, d3 DECIMAL(10,3) NOT NULL, \
+         d6 DECIMAL(20,6) NOT NULL, big BIGINT NOT NULL, dt DATETIME(3) NOT NULL, \
+         PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Tr VALUES (1, 2.500, 1234.567890, 9007199254740993, \
+         '2024-01-05 06:07:08.505')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TRUNCATE(d3, 2), TRUNCATE(d3, 0), TRUNCATE(d3, -1), TRUNCATE(d3, 5) FROM Tr"
+        ),
+        vec![vec!["2.50", "2", "0", "2.500"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TRUNCATE(d6, 4), TRUNCATE(d6, -3), TRUNCATE(d6, 8) FROM Tr"
+        ),
+        vec![vec!["1234.5678", "1000", "1234.567890"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TRUNCATE(big, 0), TRUNCATE(big, 2), TRUNCATE(big, -1) FROM Tr"
+        ),
+        vec![vec![
+            "9007199254740993",
+            "9007199254740993",
+            "9007199254740990"
+        ]]
+    );
+    // The operands MySQL does *not* compute exactly still go through the
+    // double, which is the half of the split a change here could break: a
+    // string, a document and a temporal all read as numbers rather than as
+    // exact values, and a temporal's packed digits keep their fraction.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TRUNCATE(2.5e0, 0), TRUNCATE('2.5', 0), TRUNCATE(CAST('2.5' AS JSON), 0), \
+             TRUNCATE(dt, 1) FROM Tr"
+        ),
+        vec![vec!["2", "2", "2", "20240105060708.5"]]
+    );
+    // A quotient is capped at the scale it is *shown* at and not at the one it
+    // carries, the same rule `ROUND` takes: 1/3 holds 0.333333333 and shows
+    // four places, so twelve of them is still four.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TRUNCATE(1/3, 9), TRUNCATE(1.00000/3, 12), TRUNCATE(1/3, 2)"
+        ),
+        vec![vec!["0.3333", "0.333333333", "0.33"]]
+    );
+    // The scale is the value's and not a rendering, which is what says the
+    // exact path handed back a decimal rather than a string of one: a
+    // document reads the number, and `+ 0` computes with it.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TRUNCATE(2.500, 2) + 0, JSON_ARRAY(TRUNCATE(2.500, 2)), \
+             CONCAT(TRUNCATE(2.500, 2))"
+        ),
+        vec![vec!["2.50", "[2.50]", "2.50"]]
+    );
+}
+
 #[test]
 fn a_conditional_keeps_the_unsigned_reading_only_where_every_candidate_has_one() {
     // The same all-candidates rule the UNSIGNED flag on the wire follows, and
@@ -10314,6 +10448,126 @@ fn a_float_with_a_scale_is_stored_and_shown_at_that_scale() {
     assert_eq!(
         rows(&engine, &mut session, "SELECT f, d FROM S"),
         vec![vec!["2.0000", "2.0000"]]
+    );
+}
+
+/// #0131. An `ALTER` that only changes a float column's `(M,D)` is
+/// metadata-only in MySQL: the storage width has not moved, so an existing row
+/// keeps its old bytes and is merely re-rendered. Measured on 8.3 through the
+/// `mysql` client crate with the statement cache off, over a row holding
+/// 1.234567890123 when `f` became a `FLOAT(10,4)` — the text protocol prints
+/// `1.2346` and a prepared statement still reads back `f32:1.2345679`, and
+/// widening the scale again brings the original digits back, which is what
+/// says nothing was rewritten.
+///
+/// The engine already stored it that way. What it did was re-read the number
+/// out of the *rounded* digits on the way out, so the binary protocol sent
+/// four bytes of 1.2346 — a value that had never been in the column.
+#[test]
+fn an_alter_that_narrows_a_float_scale_re_renders_a_row_without_rewriting_it() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE St (id INT NOT NULL, f FLOAT, d DOUBLE, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO St VALUES (1, 1.234567890123, 1.234567890123)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE St MODIFY f FLOAT(10,4), MODIFY d DOUBLE(10,4)",
+    );
+
+    // The rendering, which already agreed: both protocols show the stale row
+    // at the column's four places.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT f, d FROM St"),
+        vec![vec!["1.2346", "1.2346"]]
+    );
+
+    let described = engine
+        .describe(&session, "SELECT f, d FROM St", 0)
+        .unwrap()
+        .unwrap();
+    let Outcome::Rows(result) = run(&engine, &mut session, "SELECT f, d FROM St") else {
+        panic!("expected rows")
+    };
+    let mut text = mysql_ultralight_protocol::BufWriter::new();
+    result.rows[0][0].to_wire().encode_text(&mut text);
+    assert_eq!(
+        String::from_utf8_lossy(&text.into_inner()[1..]),
+        "1.2346",
+        "the text protocol renders the stale row at the new scale"
+    );
+
+    // The number, which did not. Four bytes of the value the row holds, not of
+    // the digits it is shown as: 1.2346 as an `f32` is 1.2346 and the stored
+    // one is 1.2345679, so the two are different bytes on the wire.
+    let mut binary = mysql_ultralight_protocol::BufWriter::new();
+    result.rows[0][0]
+        .to_wire()
+        .encode_binary(&mut binary, described[0].ty);
+    let sent = binary.into_inner();
+    assert_eq!(sent.len(), 4, "a FLOAT is four bytes whatever it holds");
+    // Written as the literal narrowed rather than as an `f32` literal, which
+    // is the claim: the four bytes are what `INSERT` made of 1.234567890123,
+    // and spelling them out as `1.2345679` would be asserting against a number
+    // this test had rounded itself.
+    assert_eq!(
+        f32::from_le_bytes([sent[0], sent[1], sent[2], sent[3]]),
+        1.234_567_890_123_f64 as f32,
+        "the binary protocol sends the stored f32, not the rendered digits"
+    );
+
+    let mut binary = mysql_ultralight_protocol::BufWriter::new();
+    result.rows[0][1]
+        .to_wire()
+        .encode_binary(&mut binary, described[1].ty);
+    let sent = binary.into_inner();
+    assert_eq!(sent.len(), 8, "a DOUBLE is eight bytes");
+    assert_eq!(
+        f64::from_le_bytes([
+            sent[0], sent[1], sent[2], sent[3], sent[4], sent[5], sent[6], sent[7]
+        ]),
+        1.234_567_890_123_f64,
+        "the same for a DOUBLE, whose stale value is the whole literal"
+    );
+
+    // A row written *after* the scale exists is a different matter: the write
+    // path rounds, so its stored number really is 1.2346 and the binary
+    // protocol says so. This is the assertion that keeps the fix from being
+    // "never round" — measured on 8.3, where the two rows read back
+    // `f32:1.2345679` and `f32:1.2346` under one column.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO St VALUES (2, 1.234567890123, 1.234567890123)",
+    );
+    let Outcome::Rows(result) = run(&engine, &mut session, "SELECT f FROM St WHERE id = 2") else {
+        panic!("expected rows")
+    };
+    let mut binary = mysql_ultralight_protocol::BufWriter::new();
+    result.rows[0][0]
+        .to_wire()
+        .encode_binary(&mut binary, described[0].ty);
+    let sent = binary.into_inner();
+    assert_eq!(
+        f32::from_le_bytes([sent[0], sent[1], sent[2], sent[3]]),
+        1.2346_f32,
+        "a row written under the scale was rounded on the way in"
+    );
+
+    // And the original bytes are still there to be found, which is the whole
+    // claim: widening the scale shows digits a rewrite would have destroyed.
+    // Row 2 does not get them back, because its rounding really happened.
+    run(&engine, &mut session, "ALTER TABLE St MODIFY f FLOAT(10,8)");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT id, f FROM St ORDER BY id"),
+        vec![vec!["1", "1.23456788"], vec!["2", "1.23459995"]]
     );
 }
 

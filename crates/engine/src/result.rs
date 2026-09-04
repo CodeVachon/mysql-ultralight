@@ -560,13 +560,25 @@ impl ResultSet {
                     // give a column a scale its existing rows never passed
                     // `coerce` for, and 8.3 renders those stale rows rounded.
                     //
-                    // The binary protocol is unaffected: `encode_binary` takes
-                    // its width from the *type code*, which is still FLOAT or
-                    // DOUBLE, and reads the number back out of these digits.
+                    // The rounding is a *rendering* and stops here, which is
+                    // why the digits go on as the value and the scale as the
+                    // display rather than the other way round. MySQL's own
+                    // (M,D) change is metadata-only — measured on 8.3, a row
+                    // written before `ALTER TABLE t MODIFY f FLOAT(10,4)`
+                    // still reads back `f32:1.2345679` through a prepared
+                    // statement while the text protocol prints `1.2346`, and
+                    // widening the scale again brings the original digits back
+                    // — so the binary protocol has to be able to reach the
+                    // number the row holds. `encode_binary` takes its width
+                    // from the *type code*, which is still FLOAT or DOUBLE,
+                    // and used to read the number back out of the *rounded*
+                    // digits: a stale row was sent as four bytes of a value
+                    // that was never in the column. #0131.
+                    //
                     // Tagged a decimal rather than left as text because it is
                     // a number.
                     let shortest = crate::decimal::plain(value.as_number());
-                    *value = Value::decimal(crate::types::decimal_digits(&shortest, scale));
+                    *value = Value::decimal_at(shortest, scale);
                     continue;
                 }
                 match (column.ty, &value) {

@@ -22,6 +22,32 @@ pub enum Value {
     /// protocol.
     Str(String),
     Bytes(Vec<u8>),
+    /// A number a column shows at fewer places than it carries: the digits a
+    /// client is shown, and the exact value behind them.
+    ///
+    /// Two spellings of one number, because the two protocols ask for
+    /// different ones and only this layer knows which is being written. A
+    /// `Str` carrying the shown digits alone is right for every column MySQL
+    /// sends as characters — a NEWDECIMAL is one, so `SELECT 1/3` puts
+    /// `0.3333` on both wires — and wrong for the one it does not.
+    ///
+    /// That one is `FLOAT(M,D)` and `DOUBLE(M,D)`. MySQL renders those at
+    /// exactly D places and sends the *stored* number in the binary protocol,
+    /// and the two are not the same number when the row predates the scale:
+    /// changing (M,D) is metadata-only there, so a row written before
+    /// `ALTER TABLE t MODIFY f FLOAT(10,4)` keeps its old four bytes and is
+    /// merely re-rendered. Measured on 8.3 over a stale 1.234567890123 — text
+    /// `1.2346`, binary `f32:1.2345679`. Reading the number back out of the
+    /// shown digits sent `f32:1.2346`, a value that was never in the column.
+    /// #0131.
+    Decimal {
+        /// What the text protocol writes, and what the binary protocol writes
+        /// for every column code that is not FLOAT or DOUBLE.
+        shown: String,
+        /// The digits the value actually carries, which is what a binary
+        /// FLOAT or DOUBLE column is encoded from.
+        value: String,
+    },
 }
 
 impl Value {
@@ -36,7 +62,10 @@ impl Value {
             Value::I64(_) | Value::U64(_) => ColumnType::LongLong,
             Value::F32(_) => ColumnType::Float,
             Value::F64(_) => ColumnType::Double,
-            Value::Str(_) => ColumnType::VarString,
+            // Characters, like the `Str` it would otherwise be: MySQL sends a
+            // decimal as its digits, and this is only ever built for a column
+            // whose type the handler has already declared.
+            Value::Str(_) | Value::Decimal { .. } => ColumnType::VarString,
             Value::Bytes(_) => ColumnType::Blob,
         }
     }
@@ -69,6 +98,12 @@ impl Value {
             }
             Value::Bytes(v) => {
                 w.lenenc_bytes(v);
+            }
+            // The digits the column shows, never the ones it carries: this
+            // protocol has no type code to read a number back with, so what
+            // is written here is the whole of what the client gets.
+            Value::Decimal { shown, .. } => {
+                w.lenenc_str(shown);
             }
         }
     }
@@ -123,6 +158,13 @@ impl Value {
                 Value::Str(v) => {
                     w.lenenc_str(v);
                 }
+                // The shown digits, which is what MySQL sends for every code
+                // that reaches here — a NEWDECIMAL among them. Named rather
+                // than left to the fallback so that a column of these does not
+                // pay a `String` per row for a value that is already one.
+                Value::Decimal { shown, .. } => {
+                    w.lenenc_str(shown);
+                }
                 other => {
                     let mut text = BufWriter::new();
                     other.encode_text(&mut text);
@@ -136,6 +178,11 @@ impl Value {
     fn rendered(&self) -> String {
         match self {
             Value::Str(v) => v.clone(),
+            // Named rather than left to the fallback below, which reads the
+            // digits back past a *single* length byte: a float at a fixed
+            // scale can be spelled to hundreds of characters, and a
+            // length-encoded string that long carries three bytes of length.
+            Value::Decimal { shown, .. } => shown.clone(),
             Value::Bytes(v) => String::from_utf8_lossy(v).into_owned(),
             other => {
                 let mut w = BufWriter::new();
@@ -154,7 +201,15 @@ impl Value {
             Value::U64(v) => Some(*v as i64),
             Value::F32(v) => Some(*v as i64),
             Value::F64(v) => Some(*v as i64),
-            Value::Str(v) => v.trim().parse().ok(),
+            // The shown half, where `as_f64` below takes the other one. Each
+            // reader serves the column codes that call it, and those want
+            // different halves: an integer code is sent the number the column
+            // shows, an approximate one the number the row holds. Nothing
+            // reaches here in practice — `ResultSet::reconcile` turns a
+            // decimal under an integer code into an `I64` first — and if
+            // something ever did, the shown digits are the ones MySQL would
+            // have written.
+            Value::Str(v) | Value::Decimal { shown: v, .. } => v.trim().parse().ok(),
             _ => None,
         }
     }
@@ -166,7 +221,11 @@ impl Value {
             Value::U64(v) => Some(*v as f64),
             Value::F32(v) => Some(*v as f64),
             Value::F64(v) => Some(*v),
-            Value::Str(v) => v.trim().parse().ok(),
+            // The carried half, which is the whole point of the pair: a binary
+            // FLOAT or DOUBLE column is encoded from here, and the shown
+            // digits are a rendering the column's scale produced rather than
+            // the number the row holds. See `as_i64` above for the other side.
+            Value::Str(v) | Value::Decimal { value: v, .. } => v.trim().parse().ok(),
             _ => None,
         }
     }

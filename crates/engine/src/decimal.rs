@@ -105,6 +105,28 @@ pub fn whole(text: &str) -> Option<i128> {
 /// answer of its own — the number MySQL reads out of it — and is not this
 /// function's to give.
 pub fn rescale_wide(text: &str, scale: usize) -> Option<String> {
+    at_scale(text, scale, true)
+}
+
+/// [`rescale_wide`]'s sibling, cutting toward zero instead of rounding.
+///
+/// The pair [`rounded`] and [`truncated`] are for digits already counted out;
+/// this is the same split over the characters. Measured on 8.3,
+/// `TRUNCATE(1.005, 2)` is 1.00 where `ROUND(1.005, 2)` is 1.01, and both keep
+/// the two places the function was asked for.
+///
+/// Cutting is not rounding down: `TRUNCATE(-1.567, 1)` is -1.5 on 8.3 and not
+/// -1.6. That falls out of dropping digits from a magnitude and putting the
+/// sign back, which is what [`spell`] does — and it is also why a value that
+/// cuts away to nothing loses its sign, `TRUNCATE(-0.001, 2)` being 0.00 there
+/// rather than -0.00.
+pub fn truncate_wide(text: &str, scale: usize) -> Option<String> {
+    at_scale(text, scale, false)
+}
+
+/// The body of [`rescale_wide`] and [`truncate_wide`], which differ only in
+/// whether the first dropped digit carries.
+fn at_scale(text: &str, scale: usize, round: bool) -> Option<String> {
     let trimmed = text.trim();
     let (negative, rest) = match trimmed.strip_prefix(['-', '+']) {
         Some(rest) => (trimmed.starts_with('-'), rest),
@@ -122,7 +144,7 @@ pub fn rescale_wide(text: &str, scale: usize) -> Option<String> {
     for i in 0..scale {
         digits.push(*fraction.as_bytes().get(i).unwrap_or(&b'0'));
     }
-    if fraction.as_bytes().get(scale).is_some_and(|d| *d >= b'5') {
+    if round && fraction.as_bytes().get(scale).is_some_and(|d| *d >= b'5') {
         // Carried through the string rather than added, because 9.99 at one
         // place is 10.0 and the carry can run off the front into a new digit.
         let mut at = digits.len();
@@ -150,7 +172,7 @@ pub fn rescale_wide(text: &str, scale: usize) -> Option<String> {
 /// A run of digits and a point position, written out as a decimal.
 ///
 /// The digits are values, not characters, because that is what the arithmetic
-/// below carries them as; `rescale_wide` subtracts `b'0'` to reach here rather
+/// below carries them as; [`at_scale`] subtracts `b'0'` to reach here rather
 /// than keeping a second spelling of this.
 fn spell(negative: bool, digits: &[u8], scale: usize) -> String {
     let all = padded(digits, scale);
@@ -1351,6 +1373,53 @@ mod tests {
         assert_eq!(rescale_wide("1e3", 2), None);
         assert_eq!(rescale_wide("-", 2), None);
         assert_eq!(rescale_wide(".", 2), None);
+    }
+
+    /// #0249. The truncating half, against the rounding one on the same text.
+    ///
+    /// Every pair below is `TRUNCATE(<literal>, <scale>)` beside
+    /// `ROUND(<literal>, <scale>)` on 8.3, which is the only way to ask a
+    /// server for these. The rows where the two agree are load-bearing: a
+    /// truncator that simply cut the string would get 1.00 right and 2.50
+    /// wrong, since padding out to the scale is the same job either way.
+    #[test]
+    fn the_wide_truncator_cuts_where_the_rescaler_rounds() {
+        let pairs = [
+            ("1.005", 2, "1.00", "1.01"),
+            ("-1.005", 2, "-1.00", "-1.01"),
+            ("1.567", 1, "1.5", "1.6"),
+            ("-1.567", 1, "-1.5", "-1.6"),
+            ("9.99", 1, "9.9", "10.0"),
+            // Padded, not cut: both keep the places they were asked for.
+            ("2.500", 2, "2.50", "2.50"),
+            // A value that comes out zero has no sign under either rule.
+            ("-0.001", 2, "0.00", "0.00"),
+            ("0.000", 2, "0.00", "0.00"),
+        ];
+        for (text, scale, cut, rounded) in pairs {
+            assert_eq!(
+                truncate_wide(text, scale).as_deref(),
+                Some(cut),
+                "{text} cut at {scale}"
+            );
+            assert_eq!(
+                rescale_wide(text, scale).as_deref(),
+                Some(rounded),
+                "{text} rounded at {scale}"
+            );
+        }
+        // Past an `i128`, where the counted path cannot go at all: 22 digits
+        // before the point. Measured — 8.3 answers 12345678901234567890.2.
+        assert_eq!(
+            truncate_wide("12345678901234567890.25", 1).as_deref(),
+            Some("12345678901234567890.2")
+        );
+        // Widening is not cutting, so a scale past the text pads.
+        assert_eq!(truncate_wide("2.5", 4).as_deref(), Some("2.5000"));
+        // And text that is not a decimal is not this function's to answer
+        // either.
+        assert_eq!(truncate_wide("abc", 2), None);
+        assert_eq!(truncate_wide("1e3", 2), None);
     }
 
     /// #0116. The sign comes off the digits, and zero has none however it was

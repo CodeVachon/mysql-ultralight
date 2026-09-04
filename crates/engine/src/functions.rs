@@ -1358,7 +1358,7 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
             // `...30`. The same split #0195 gave the write path and #0212 gave
             // [`format_digits`] — this arm was the remaining reader that took
             // `f64::round`, which is half away from zero, for every operand.
-            if let Some(exact) = round_exactly(&operand, places) {
+            if let Some(exact) = scaled_exactly(&operand, places, true) {
                 return exact;
             }
             let rounded = double_scaled(operand.as_number(), places, true);
@@ -1407,12 +1407,31 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
         // Toward zero at the given number of places, which may be negative:
         // `TRUNCATE(15.6, -1)` is 10. Not rounding — `TRUNCATE(1.567, 1)` is
         // 1.5 where `ROUND` would say 1.6.
+        //
+        // `ROUND`'s shape otherwise, down to sharing every helper. Which
+        // operands are computed *exactly* is the same list for both — MySQL
+        // picks it by the argument's declared result type, and only an integer
+        // or a decimal is exact — and the two functions differ solely in what
+        // happens to the digits past the cut. Taking the double reading here
+        // dropped both halves of that: a decimal lost the scale the engine had
+        // just declared the column at, so `TRUNCATE(<DECIMAL(10,3)> 2.500, 2)`
+        // answered 2.5 under a NEWDECIMAL promising two places where 8.3
+        // answers 2.50, and a BIGINT past 2^53 came back rounded —
+        // `TRUNCATE(9007199254740993, 0)` was 9007199254740992, and
+        // `TRUNCATE(9007199254740993, 2)` was a double under a LONGLONG code.
+        // #0249.
         "truncate" => {
-            let places = shown_places(&arg(0), args.get(1).and_then(Value::as_int).unwrap_or(0));
-            if let Value::Unsigned(v) = arg(0) {
-                return unsigned_scaled(v, places, false);
+            // Bound once rather than asked for three times: `arg` clones, and
+            // this is per row over a value that carries a `String`.
+            let operand = arg(0);
+            let places = shown_places(&operand, args.get(1).and_then(Value::as_int).unwrap_or(0));
+            if let Value::Unsigned(v) = &operand {
+                return unsigned_scaled(*v, places, false);
             }
-            let cut = double_scaled(arg(0).as_number(), places, false);
+            if let Some(exact) = scaled_exactly(&operand, places, false) {
+                return exact;
+            }
+            let cut = double_scaled(operand.as_number(), places, false);
             if places <= 0 {
                 whole(cut)
             } else {
@@ -1612,28 +1631,37 @@ fn unsigned_scaled(v: u64, places: i64, round: bool) -> EngineResult<Value> {
         .map_err(|_| EngineError::new(1690, "22003", "BIGINT UNSIGNED value is out of range"))
 }
 
-/// `ROUND` of a signed integer, computed exactly.
+/// `ROUND` or `TRUNCATE` of a signed integer, computed exactly.
 ///
 /// [`unsigned_scaled`]'s sibling, and for the same reason: an `f64` drops every
 /// digit past 2^53, which `ROUND(9007199254740993)` shows — that BIGINT comes
 /// back itself on 8.3 and came back 9007199254740992 through the double here.
+/// `TRUNCATE` of the same number was wrong the same way, at every scale, and at
+/// a positive one it came back a *double* under a LONGLONG code.
 ///
 /// The magnitude is scaled and the sign put back afterwards, so that -15 and 15
 /// round the same distance from zero: `ROUND(15, -1)` is 20 and
 /// `ROUND(-15, -1)` is -20 on 8.3, where rounding the negative number itself
-/// half up would answer -10.
+/// half up would answer -10. Cutting wants that same symmetry for the same
+/// reason: `TRUNCATE(-15, -1)` is -10 there.
 ///
 /// Carrying past the top of the range refuses rather than answering, which is
-/// measured: `ROUND(9223372036854775807, -1)` raises 1690 on 8.3.
-fn signed_scaled(v: i64, places: i64) -> EngineResult<Value> {
+/// measured: `ROUND(9223372036854775807, -1)` raises 1690 on 8.3. `TRUNCATE`
+/// cannot reach it — cutting only ever goes toward zero — so the check costs
+/// that path nothing.
+fn signed_scaled(v: i64, places: i64, round: bool) -> EngineResult<Value> {
     if places >= 0 {
         return Ok(Value::Int(v));
     }
-    i128::try_from(magnitude_scaled(u128::from(v.unsigned_abs()), places, true))
-        .ok()
-        .and_then(|magnitude| if v < 0 { -magnitude } else { magnitude }.try_into().ok())
-        .map(Value::Int)
-        .ok_or_else(|| EngineError::new(1690, "22003", "BIGINT value is out of range"))
+    i128::try_from(magnitude_scaled(
+        u128::from(v.unsigned_abs()),
+        places,
+        round,
+    ))
+    .ok()
+    .and_then(|magnitude| if v < 0 { -magnitude } else { magnitude }.try_into().ok())
+    .map(Value::Int)
+    .ok_or_else(|| EngineError::new(1690, "22003", "BIGINT value is out of range"))
 }
 
 /// `magnitude` rounded or cut at the power of ten a *negative* `places` names.
@@ -1731,45 +1759,63 @@ fn power_of_ten(exponent: u64) -> f64 {
     }
 }
 
-/// `ROUND` of an operand MySQL rounds *exactly*, or `None` for one it reads
-/// through a double.
+/// `ROUND` or `TRUNCATE` of an operand MySQL computes *exactly*, or `None` for
+/// one it reads through a double.
 ///
 /// The list is short on purpose: MySQL chooses by the argument's declared
 /// result type and only an integer or a decimal is exact, so a string, a
 /// document, a temporal and a float all fall through to the caller's `f64`.
 /// See the `"round"` arm for the measurements.
-fn round_exactly(value: &Value, places: i64) -> Option<EngineResult<Value>> {
+///
+/// One list for both functions, because the *operand* decides whether the
+/// answer is exact and the function decides only which way the dropped digits
+/// go. `round` says which: half away from zero, or toward zero.
+fn scaled_exactly(value: &Value, places: i64, round: bool) -> Option<EngineResult<Value>> {
     match value {
-        Value::Int(v) => Some(signed_scaled(*v, places)),
+        Value::Int(v) => Some(signed_scaled(*v, places, round)),
         // An integer to MySQL, and typed as one: `ROUND(TRUE)` is 1 under a
         // LONGLONG on 8.3, not under the TINYINT the literal has.
-        Value::Bool(v) => Some(signed_scaled(i64::from(*v), places)),
+        Value::Bool(v) => Some(signed_scaled(i64::from(*v), places, round)),
         // `None` where the text is not digits, which nothing builds a
         // `Decimal` out of — the double below is the honest answer if one ever
         // gets here another way.
-        Value::Decimal(text, _) => decimal_scaled(text, places).map(|d| Ok(Value::decimal(d))),
+        Value::Decimal(text, _) => {
+            decimal_scaled(text, places, round).map(|d| Ok(Value::decimal(d)))
+        }
         _ => None,
     }
 }
 
-/// A decimal's digits rounded at `places`, half away from zero.
+/// A decimal's digits taken to `places`, half away from zero or toward it.
 ///
 /// The digits it *carries*, capped by the caller at the scale it is shown at:
 /// `ROUND(1/3, 9)` is 0.3333 on 8.3 because that quotient is shown at four
-/// places, and the value behind it is 0.333333333.
+/// places, and the value behind it is 0.333333333. `TRUNCATE(1/3, 9)` is the
+/// same 0.3333 for the same reason.
 ///
 /// Answered on the digits rather than through an `f64`, which is not a
 /// refinement but the difference between two answers: `ROUND(1.005, 2)` is
 /// 1.01 on 8.3 and was 1 here, because 1.005 is 1.00499999999999989 as a
-/// double and the tie the decimal has is not a tie there.
-fn decimal_scaled(text: &str, places: i64) -> Option<String> {
+/// double and the tie the decimal has is not a tie there. The double loses
+/// something for `TRUNCATE` too, and something a client sees more often — the
+/// declared scale. 2.500 cut to two places is 2.50 on 8.3 under a column
+/// described with two decimals, and a double has no way to spell the trailing
+/// zero.
+fn decimal_scaled(text: &str, places: i64, round: bool) -> Option<String> {
+    let to_scale = |digits: &str, scale: usize| {
+        if round {
+            crate::decimal::rescale_wide(digits, scale)
+        } else {
+            crate::decimal::truncate_wide(digits, scale)
+        }
+    };
     if places >= 0 {
         // A non-negative count is the scale itself, and it is bounded: the
         // caller capped it at the scale the argument is shown at.
-        return crate::decimal::rescale_wide(text, usize::try_from(places).ok()?);
+        return to_scale(text, usize::try_from(places).ok()?);
     }
     // A negative count names a place to the left of the point. The point is
-    // moved that far left, rounded to a whole number, and moved back — one
+    // moved that far left, settled to a whole number, and moved back — one
     // rounding, because two is a different answer: 24.6 taken to zero places
     // is 25 and then to tens is 30, where 8.3 answers 20.
     //
@@ -1785,7 +1831,7 @@ fn decimal_scaled(text: &str, places: i64) -> Option<String> {
     else {
         return Some("0".to_owned());
     };
-    let mut written = crate::decimal::rescale_wide(&point_moved_left(text, step)?, 0)?;
+    let mut written = to_scale(&point_moved_left(text, step)?, 0)?;
     written.extend(std::iter::repeat_n('0', step));
     // `0` and not `00`: putting the zeros back after rounding to nothing spells
     // a zero at a width, and MySQL spells an exact zero bare.

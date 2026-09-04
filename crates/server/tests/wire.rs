@@ -387,6 +387,9 @@ fn render(value: &Value) -> String {
         Value::F64(v) => v.to_string(),
         Value::Str(v) => v.clone(),
         Value::Bytes(v) => String::from_utf8_lossy(v).into_owned(),
+        // The shown half, since this renders "the way the text protocol would
+        // present it" and that protocol writes nothing else.
+        Value::Decimal { shown, .. } => shown.clone(),
     }
 }
 

@@ -1222,6 +1222,20 @@ pub const GROUPS: &[Group] = &[
             "CREATE TABLE Fu (f FLOAT(10,4) NULL, d DOUBLE(10,4) NULL, a FLOAT(12,2) NULL, \
              h DOUBLE(12,6) NULL, pd DOUBLE NULL)",
             "INSERT INTO Fu VALUES (0.1, 0.1, 0.1, 0.1, 0.1)",
+            // #0131. A row that predates the scale. Changing only `(M,D)`
+            // leaves the storage width alone, so MySQL rewrites nothing: rows
+            // 1 and 2 keep the bytes they were written with and are merely
+            // re-rendered, while row 3 was rounded on the way in because the
+            // scale already existed. Measured on 8.3 with a prepared
+            // statement — rows 1 and 3 read back `f32:1.2345679` and
+            // `f32:1.2346` under one column, and print the same `1.2346`.
+            // Only the binary protocol can tell them apart, which is why
+            // nothing already in this group was ever going to catch it.
+            "CREATE TABLE Fs (id INT NOT NULL, f FLOAT NULL, d DOUBLE NULL, PRIMARY KEY (id))",
+            "INSERT INTO Fs VALUES (1, 1.234567890123, 1.234567890123), (2, 2.5, 2.5)",
+            "ALTER TABLE Fs MODIFY f FLOAT(10,4)",
+            "ALTER TABLE Fs MODIFY d DOUBLE(10,4)",
+            "INSERT INTO Fs VALUES (3, 1.234567890123, 1.234567890123)",
         ],
         cases: &[
             same("SELECT f, d, n FROM Fx ORDER BY id"),
@@ -1310,6 +1324,17 @@ pub const GROUPS: &[Group] = &[
             same("ALTER TABLE Fx MODIFY COLUMN n FLOAT(300,2)"),
             // And the widest each type really allows still goes through.
             same("CREATE TABLE Ba (x FLOAT(255,30), y DOUBLE(255,30), z DECIMAL(65,30))"),
+            // #0131, over the rows the setup left stale. The text protocol
+            // already agreed — every row prints at four places — and the
+            // binary one sent four bytes of the *rendered* digits, so rows 1
+            // and 3 arrived as one number where 8.3 sends two.
+            same("SELECT id, f, d FROM Fs ORDER BY id"),
+            // Widening the scale again is the proof that nothing was
+            // rewritten: the digits a rewrite would have destroyed come back.
+            // Last in the group, because it changes `Fs` for anything after
+            // it.
+            same("ALTER TABLE Fs MODIFY f FLOAT(10,8)"),
+            same("SELECT id, f FROM Fs ORDER BY id"),
         ],
     },
     Group {
@@ -8608,6 +8633,51 @@ pub const GROUPS: &[Group] = &[
             // `scripts/ask.sh` beside the rows, which agree.
             same("SELECT ROUND(7632213.593672946, -5), TRUNCATE(7632213.593672946, -5)")
                 .without_widths(),
+            // #0249. The control above says the *rounding* did not move, and
+            // that is all it says: the two things the double reading loses
+            // have nothing to do with which way a tie goes. A decimal loses
+            // the scale the engine has just declared the column at —
+            // `TRUNCATE(n3, 2)` was 2.5 under two decimals where 8.3 answers
+            // 2.50 — and an integer loses its digits past 2^53.
+            same("SELECT id, TRUNCATE(n3, 2), TRUNCATE(n3, 5), TRUNCATE(n3, -1) \
+                  FROM Rnd ORDER BY id"),
+            // A DECIMAL wider than an `f64` carries, cut rather than rounded:
+            // 12345678901234567890.25 keeps its digits at one place and at
+            // none.
+            same("SELECT id, TRUNCATE(n, 0), TRUNCATE(n, 1) FROM Rnd ORDER BY id"),
+            // The widths go for the reason the `ROUND(25, -1)` case above
+            // gives: 8.3 declares 21 for any whole-number function over a
+            // signed integer. At a *positive* place the double path answered
+            // a double under this LONGLONG code, which the binary protocol
+            // would have read back as eight bytes of something else.
+            same("SELECT id, TRUNCATE(big, 0), TRUNCATE(big, 2), TRUNCATE(big, -1) \
+                  FROM Rnd ORDER BY id")
+                .without_widths(),
+            same("SELECT TRUNCATE(-15, -1), TRUNCATE(25, -1), \
+                  TRUNCATE(9223372036854775807, -1)")
+                .without_widths(),
+            // Cutting on the digits rather than through a double, and what a
+            // value cut away to nothing is spelled as: the places it was asked
+            // for, and no sign.
+            same("SELECT TRUNCATE(1.005, 2), TRUNCATE(0.000, 2), TRUNCATE(-0.001, 2), \
+                  TRUNCATE(24.6, -1), TRUNCATE(-24.6, -1), TRUNCATE(0.6, -1), \
+                  TRUNCATE(2.5, -100)"),
+            same("SELECT TRUNCATE(1.567, 1), TRUNCATE(-1.567, 1), TRUNCATE(-2.500, 2), \
+                  TRUNCATE(2.500, 5)"),
+            // A boolean is an integer to MySQL and takes the exact path with
+            // the rest of them.
+            same("SELECT TRUNCATE(TRUE, 0), TRUNCATE(TRUE, -1), TRUNCATE(0.5, 0), \
+                  TRUNCATE(1.5, 0), TRUNCATE(-1.5, 0)"),
+            // The operands MySQL does *not* compute exactly, which is the half
+            // of the split a change here could break: all four still read as
+            // numbers rather than as exact values.
+            same("SELECT id, TRUNCATE(d, 0), TRUNCATE(f, 0), TRUNCATE(s, 0), TRUNCATE(dt, 0) \
+                  FROM Rnd ORDER BY id"),
+            // The scale is the value's and not a rendering, which is what says
+            // the exact path handed back a decimal rather than a string of
+            // one: a document reads the number, and `+ 0` computes with it.
+            same("SELECT TRUNCATE(2.500, 2) + 0, JSON_ARRAY(TRUNCATE(2.500, 2)), \
+                  CONCAT(TRUNCATE(2.500, 2))"),
         ],
     },
     Group {

@@ -1090,7 +1090,19 @@ impl Value {
             // extra places stop: `SELECT 1/3` sends `0.3333` on 8.3 for a
             // value of 0.333333333. This is the edge both protocols leave
             // through, so it is the one place the rounding has to happen.
-            Value::Decimal(..) => WireValue::Str(self.displayed().into_owned()),
+            //
+            // A decimal that shows every place it carries is those characters
+            // and nothing else. One that does not carries *both* numbers over,
+            // because which of them a client gets depends on the column's type
+            // code, which only the encoder has: a NEWDECIMAL is sent as the
+            // shown digits through either protocol, while a `FLOAT(M,D)` shows
+            // D places and sends the stored number in four bytes. See
+            // [`WireValue::Decimal`] and #0131.
+            Value::Decimal(text, None) => WireValue::Str(text.clone()),
+            Value::Decimal(text, Some(_)) => WireValue::Decimal {
+                shown: self.displayed().into_owned(),
+                value: text.clone(),
+            },
             // JSON crosses the wire as text, which is how MySQL transmits it —
             // through `as_text`, so the stored form's decimal mark comes off
             // here exactly as it does in every other rendering of a document.
@@ -1132,6 +1144,12 @@ impl Value {
             WireValue::F64(v) => Value::Float(*v),
             WireValue::Str(v) => Value::text(v.clone()),
             WireValue::Bytes(v) => Value::Bytes(v.clone()),
+            // Not something a client can send: `decode_binary` never builds
+            // one, and the text protocol has no shape for a value with two
+            // spellings. Answered as the number it carries rather than
+            // refused, because a parameter that arrived some other way is
+            // still a number.
+            WireValue::Decimal { value, .. } => Value::decimal(value.clone()),
         }
     }
 }
