@@ -485,3 +485,183 @@ fn a_diagnostics_statement_this_cannot_read_is_an_error() {
         );
     }
 }
+
+/// A cast that cut a value raises 1292, which is not the 1265 a column write
+/// raises for the same loss.
+///
+/// Two different conditions for two different rules, and the level does not
+/// move either: 1265 is a Note when only trailing spaces were dropped and a
+/// Warning otherwise, while this is a Warning even for the spaces. Every
+/// triple measured on 8.3 through `scripts/ask.sh`. #0215.
+#[test]
+fn a_cast_that_cut_a_value_reports_1292_and_not_the_columns_1265() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "SELECT CAST('abcd' AS CHAR(3))");
+    assert_eq!(
+        warnings(&engine, &mut session),
+        vec![row(
+            "Warning",
+            1292,
+            "Truncated incorrect CHAR(3) value: 'abcd'"
+        )]
+    );
+
+    // Trailing spaces get no exemption here, where a `VARCHAR(3)` column given
+    // the same value gets a Note and keeps everything it wrote.
+    run(&engine, &mut session, "SELECT CAST('ab   ' AS CHAR(3))");
+    assert_eq!(
+        warnings(&engine, &mut session),
+        vec![row(
+            "Warning",
+            1292,
+            "Truncated incorrect CHAR(3) value: 'ab   '"
+        )]
+    );
+
+    // The width in the message is the byte length of what was *kept*, not the
+    // character count that was asked for: `CHAR(2)` over `'ééé'` says
+    // `CHAR(4)`. It is the one part of the message that cannot be read off the
+    // statement, so a message built from the declaration would be wrong here
+    // and right everywhere else.
+    run(&engine, &mut session, "SELECT CAST('ééé' AS CHAR(2))");
+    assert_eq!(
+        warnings(&engine, &mut session),
+        vec![row(
+            "Warning",
+            1292,
+            "Truncated incorrect CHAR(4) value: 'ééé'"
+        )]
+    );
+
+    // A binary target names itself, and escapes what it cannot print — the
+    // bytes it holds, not the characters they would decode to.
+    run(
+        &engine,
+        &mut session,
+        "SELECT HEX(CAST(UNHEX('FFEEDDCC') AS BINARY(2)))",
+    );
+    assert_eq!(
+        warnings(&engine, &mut session),
+        vec![row(
+            "Warning",
+            1292,
+            "Truncated incorrect BINARY(2) value: '\\xFF\\xEE\\xDD\\xCC'"
+        )]
+    );
+
+    // A value that fits raises nothing, and neither does the padding a
+    // `BINARY(n)` adds: a value that grew lost nothing.
+    run(
+        &engine,
+        &mut session,
+        "SELECT CAST('abc' AS CHAR(3)), HEX(CAST('a' AS BINARY(3))), CAST('abcd' AS CHAR)",
+    );
+    assert!(warnings(&engine, &mut session).is_empty());
+}
+
+/// The quoted value is cut at 128 bytes, which is the `%-.128s` in MySQL's own
+/// message rather than a limit invented here.
+#[test]
+fn the_value_a_cast_quotes_is_cut_at_a_hundred_and_twenty_eight_bytes() {
+    let (engine, mut session) = engine();
+    let wide = "x".repeat(200);
+    run(
+        &engine,
+        &mut session,
+        &format!("SELECT CAST('{wide}' AS CHAR(3))"),
+    );
+    assert_eq!(
+        warnings(&engine, &mut session),
+        vec![row(
+            "Warning",
+            1292,
+            &format!("Truncated incorrect CHAR(3) value: '{}'", "x".repeat(128))
+        )]
+    );
+
+    // Bytes and not characters, so 64 two-byte characters fill it exactly.
+    let accents = "é".repeat(70);
+    run(
+        &engine,
+        &mut session,
+        &format!("SELECT CAST('{accents}' AS CHAR(2))"),
+    );
+    assert_eq!(
+        warnings(&engine, &mut session),
+        vec![row(
+            "Warning",
+            1292,
+            &format!("Truncated incorrect CHAR(4) value: '{}'", "é".repeat(64))
+        )]
+    );
+}
+
+/// An unknown locale is 1649 and a *warning*, not an error and not NULL.
+///
+/// The row still comes back, written the en_US way. A NULL locale reaches the
+/// same place and is quoted as the four characters `NULL`, which is why
+/// `FORMAT` is NULL-tolerant in that argument alone. #0212.
+#[test]
+fn an_unknown_format_locale_is_a_warning_and_an_en_us_answer() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(12345.6789, 2, 'xx_XX')"
+        ),
+        vec![vec!["12,345.68".to_owned()]]
+    );
+    assert_eq!(
+        warnings(&engine, &mut session),
+        vec![row("Warning", 1649, "Unknown locale: 'xx_XX'")]
+    );
+
+    run(&engine, &mut session, "SELECT FORMAT(12345.6789, 2, NULL)");
+    assert_eq!(
+        warnings(&engine, &mut session),
+        vec![row("Warning", 1649, "Unknown locale: 'NULL'")]
+    );
+
+    // A locale it does know raises nothing at all, so the warning above is a
+    // report of a real gap and not something every FORMAT leaves behind.
+    run(
+        &engine,
+        &mut session,
+        "SELECT FORMAT(12345.6789, 2, 'de_DE'), FORMAT(12345.6789, 2)",
+    );
+    assert!(warnings(&engine, &mut session).is_empty());
+}
+
+/// A `BINARY(n)` cast wider than `max_allowed_packet` is NULL and a warning,
+/// not the allocation the width asks for.
+///
+/// It is the one cast that builds its whole declared width before it has a
+/// value, so `CAST('a' AS BINARY(4294967295))` would be four gigabytes of NULs
+/// out of an ordinary `SELECT`. 8.3 answers NULL and 1301 instead — measured,
+/// message and number both.
+#[test]
+fn a_binary_cast_wider_than_a_packet_is_null_rather_than_an_allocation() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('a' AS BINARY(4294967295)) IS NULL"
+        ),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        warnings(&engine, &mut session),
+        vec![row(
+            "Warning",
+            1301,
+            "Result of cast_as_binary() was larger than max_allowed_packet (67108864) - truncated"
+        )]
+    );
+
+    // A width the server will build raises nothing, so the guard is a limit
+    // and not a refusal of every declared width.
+    run(&engine, &mut session, "SELECT HEX(CAST('a' AS BINARY(4)))");
+    assert!(warnings(&engine, &mut session).is_empty());
+}

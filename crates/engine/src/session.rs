@@ -82,6 +82,15 @@ fn new_instance_id() -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// `max_allowed_packet`: 64MB, matching the server's own message cap.
+///
+/// Named rather than written twice because it is not only what `SELECT
+/// @@max_allowed_packet` answers: MySQL refuses to *build* a value wider than
+/// it, and `functions::cast` follows that for the one cast whose declared
+/// width is allocated up front. Two spellings of the number would let the
+/// variable and the refusal drift apart.
+pub(crate) const MAX_ALLOWED_PACKET: u64 = 67_108_864;
+
 /// State belonging to one connection.
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -530,8 +539,7 @@ impl Session {
             "port" => int(self.config.port as i64),
             "hostname" => text("localhost"),
             "sql_mode" => text(&self.config.sql_mode),
-            // 64MB, matching the server's own message cap.
-            "max_allowed_packet" => int(67_108_864),
+            "max_allowed_packet" => int(MAX_ALLOWED_PACKET as i64),
             "wait_timeout" | "interactive_timeout" => int(28_800),
             "net_write_timeout" | "net_read_timeout" => int(60),
             "max_connections" => int(151),

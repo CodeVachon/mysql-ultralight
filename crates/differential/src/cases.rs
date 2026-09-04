@@ -25,7 +25,7 @@ pub struct Case {
     /// Whether this case's columns are asked to agree on bytes against
     /// characters.
     ///
-    /// True for all but eleven. MySQL decides it from the collation of what
+    /// True for all but thirteen. MySQL decides it from the collation of what
     /// produced the column, and this engine has no collation to propagate: a
     /// string function over a NULL literal or over an explicitly `BINARY`
     /// value is binary there and text here. The other direction is MySQL's own
@@ -8108,6 +8108,262 @@ pub const GROUPS: &[Group] = &[
             // decides and this is 1. The value itself differs between the two
             // servers, which is why it is compared with itself.
             same("SELECT @@version_comment = CONCAT(@@version_comment, ' ')"),
+        ],
+    },
+    Group {
+        // #0212. FORMAT answered 1235, and the reason it gets a group of its
+        // own rather than a line beside ROUND is that it is not ROUND with
+        // commas: it reads a decimal's *value* where ROUND caps at the scale
+        // it is shown at, it takes its rounding rule from the argument rather
+        // than having one, and its answer is written by a locale.
+        name: "format",
+        setup: &[
+            // Every declared type that reaches FORMAT by a different route:
+            // the exact ones, the approximate ones, the two that are strings
+            // to MySQL and numbers to a reader, and a temporal — which
+            // converts through its packed number and not through its
+            // characters.
+            "CREATE TABLE Fmt (id INT NOT NULL, d DECIMAL(20,4) NULL, f DOUBLE NULL, \
+             i INT NULL, s VARCHAR(20) NULL, b BIGINT UNSIGNED NULL, dt DATE NULL, \
+             f4 FLOAT NULL, e ENUM('a','b','c') NULL, j JSON NULL, ts DATETIME(3) NULL, \
+             PRIMARY KEY (id))",
+            "INSERT INTO Fmt VALUES \
+             (1, 1.5000, 1.5, 3, '2.5', 18446744073709551615, '2024-01-05', \
+             1.234567890123, 'b', '2.5', '2024-01-05 06:07:08.500'), \
+             (2, -1234.5678, -0.145, -12345, 'abc', 0, '1999-12-31', \
+             2.5, 'c', '\"3.75\"', '1999-12-31 23:59:59.999')",
+        ],
+        cases: &[
+            // The value against the rendering, with the two functions that
+            // read the rendering beside it so the contrast is in one row.
+            same("SELECT FORMAT(1/3, 9), ROUND(1/3, 9), TRUNCATE(1/3, 9)"),
+            same("SELECT FORMAT(1/3, 0), FORMAT(1/3, 1), FORMAT(1/3, 12), FORMAT(1/3, 30)"),
+            // The place count: clamped at both ends, and read as a rounded
+            // integer rather than by its leading digits.
+            same(
+                "SELECT FORMAT(1/3, -1), FORMAT(1/3, 31), FORMAT(1/3, 40), \
+                 FORMAT(1/3, 9.7), FORMAT(1/3, '9')",
+            ),
+            // Half away from zero for an exact operand.
+            same(
+                "SELECT FORMAT(0.5, 0), FORMAT(1.5, 0), FORMAT(2.5, 0), \
+                 FORMAT(-0.5, 0), FORMAT(-1.5, 0), FORMAT(-2.5, 0)",
+            ),
+            // Half to *even* for an approximate one, and a string is
+            // approximate: `FORMAT('2.5', 0)` is 2 where the decimal beside it
+            // is 3.
+            same(
+                "SELECT FORMAT(0.5e0, 0), FORMAT(1.5e0, 0), FORMAT(2.5e0, 0), \
+                 FORMAT(-2.5e0, 0), FORMAT(-0.5e0, 0)",
+            ),
+            same(
+                "SELECT FORMAT('0.5', 0), FORMAT('1.5', 0), FORMAT('2.5', 0), \
+                 FORMAT('abc', 2), FORMAT('12abc', 2)",
+            ),
+            // A double is scaled *before* it is rounded, so the error the
+            // scaling introduces is part of the answer: 0.145 times 100 is
+            // 14.499999999999998 and the decimal 0.145 beside it is not.
+            same(
+                "SELECT FORMAT(0.145e0, 2), FORMAT(0.145, 2), FORMAT(1.15e0, 1), \
+                 FORMAT(8.835e0, 2), FORMAT(1.015e0, 2)",
+            ),
+            // And the digits it writes are the shortest that read back as the
+            // double, padded out — not the double's full expansion.
+            same("SELECT FORMAT(1/3e0, 20), FORMAT(2/3e0, 3), FORMAT(1e20, 2), FORMAT(1e30, 2)"),
+            // 2^52 and a half, which no double holds: the exact reading is
+            // ...497 and the approximate one ...496.
+            same("SELECT FORMAT(4503599627370496.5, 0), FORMAT(4503599627370496.5e0, 0)"),
+            // A carry that runs off the front, and a value that rounds to zero
+            // — which loses its sign where it is exact and keeps it where it
+            // went through a double.
+            same(
+                "SELECT FORMAT(999.995, 2), FORMAT(9.995, 2), FORMAT(99999.5, 0), \
+                 FORMAT(-0.4, 0), FORMAT(-0.004, 2), FORMAT(0, 2)",
+            ),
+            // The grouping boundary, with and without a sign in front of it.
+            same(
+                "SELECT FORMAT(123, 0), FORMAT(1234, 0), FORMAT(-123, 0), \
+                 FORMAT(-1234, 0), FORMAT(-12345, 0)",
+            ),
+            same(
+                "SELECT FORMAT(1234567891.23, 2), FORMAT(1234567891.23, 2, 'de_DE'), \
+                 FORMAT(1234567891.23, 2, 'fr_FR'), FORMAT(1234567891.23, 2, 'ru_RU')",
+            ),
+            // Two locales that share a separator and disagree about the point,
+            // and two that group not at all.
+            same(
+                "SELECT FORMAT(1234567891.23, 2, 'de_CH'), FORMAT(1234567891.23, 2, 'it_CH'), \
+                 FORMAT(1234567891.23, 2, 'sr_RS'), FORMAT(1234567891.23, 2, 'sv_SE')",
+            ),
+            // Three digits and then twos all the way up, which is the only
+            // reason a locale's grouping is a list.
+            same(
+                "SELECT FORMAT(12345678901234.56, 2, 'en_IN'), FORMAT(123456, 0, 'en_IN'), \
+                 FORMAT(1234.56, 2, 'en_IN')",
+            ),
+            // A separator that does not draw is still a separator: `bg_BG`
+            // writes a NUL between the groups where `fr_FR` writes nothing at
+            // all, and only HEX tells those apart.
+            same(
+                "SELECT HEX(FORMAT(1234567, 0, 'bg_BG')), HEX(FORMAT(1234567, 0, 'fr_FR')), \
+                 HEX(FORMAT(123, 0, 'bg_BG'))",
+            ),
+            // NULL in the first two arguments makes the answer NULL; NULL or a
+            // name MySQL does not know in the third does not.
+            same(
+                "SELECT FORMAT(NULL, 2), FORMAT(1.5, NULL), FORMAT(12345.6789, 2, NULL), \
+                 FORMAT(12345.6789, 2, 'xx_XX')",
+            ),
+            // Over columns rather than literals, which is where the target
+            // application meets this and where the declared type — not the
+            // shape of the token — picks the rounding rule.
+            same("SELECT id, FORMAT(d, 2), FORMAT(d, 6), FORMAT(d/3, 12) FROM Fmt ORDER BY id"),
+            same(
+                "SELECT id, FORMAT(f, 0), FORMAT(f, 2), FORMAT(i, 2), FORMAT(s, 0), \
+                 FORMAT(b, 2), FORMAT(dt, 2) FROM Fmt ORDER BY id",
+            ),
+            same("SELECT id, FORMAT(d, 2, 'de_DE'), FORMAT(d, 2, 'en_IN') FROM Fmt ORDER BY id"),
+            // A FLOAT widens to the double it *is* rather than to the six
+            // digits it shows, an ENUM converts through its ordinal, and a
+            // DATETIME(3) through a packed number with a fraction on it —
+            // which is the temporal that is not an integer.
+            //
+            // `FORMAT(j, 2)` over the JSON column is deliberately not here.
+            // Its rows agree, measured through `scripts/ask.sh`, but 8.3
+            // describes it LONG_BLOB where this engine says VAR_STRING: MySQL
+            // takes a string function's *type* from the argument's
+            // `max_length` and a JSON column's is four gigabytes, which is the
+            // same width arithmetic `Case::widths` records as absent here. The
+            // value is held by `crates/engine/tests/sql.rs` instead.
+            same(
+                "SELECT id, FORMAT(f4, 0), FORMAT(f4, 10), FORMAT(e, 2), FORMAT(ts, 2) \
+                 FROM Fmt ORDER BY id",
+            ),
+        ],
+    },
+    Group {
+        // #0215. The declared width of a string or binary cast was ignored, so
+        // `CAST('abcd' AS CHAR(3))` was `abcd` and `CAST('a' AS BINARY(3))`
+        // was one byte. Its own group and not a line in the `sql_mode` ones
+        // because the point is that the mode does not reach it: a cast
+        // truncates where a column write refuses.
+        //
+        // The readers below sit directly under the statement they read and do
+        // not chain, for the reason the `warnings` group above gives, and each
+        // one is a different `SHOW` form because a group may not ask the same
+        // statement twice.
+        name: "cast widths",
+        setup: &[],
+        cases: &[
+            same(
+                "SELECT CAST('a' AS CHAR(3)), CAST('abc' AS CHAR(3)), \
+                 CAST('abcd' AS CHAR(3)), CAST('abcd' AS CHAR)",
+            ),
+            // The bytes, because a `CHAR(n)` cast neither pads nor strips and
+            // neither of those is visible in the characters. Characters and
+            // not bytes is what makes `CHAR(2)` over three accents four bytes
+            // long.
+            same(
+                "SELECT HEX(CAST('a' AS CHAR(3))), HEX(CAST('ééé' AS CHAR(2))), \
+                 HEX(CAST('abcd' AS CHAR(0)))",
+            ),
+            // Trailing spaces are cut like any other character here, where a
+            // column write exempts them.
+            same(
+                "SELECT HEX(CAST('ab   ' AS CHAR(3))), HEX(CAST('abcd ' AS CHAR(3))), \
+                 HEX(CAST('ab   ' AS BINARY(3)))",
+            ),
+            // `BINARY(n)` is the one width that can make a value longer.
+            same(
+                "SELECT HEX(CAST('a' AS BINARY(3))), HEX(CAST('abc' AS BINARY(3))), \
+                 HEX(CAST('abcd' AS BINARY(3))), HEX(CAST('abcd' AS BINARY))",
+            ),
+            // Bytes and not characters, so a two-byte character is cut in half
+            // rather than dropped.
+            same(
+                "SELECT HEX(CAST('' AS BINARY(3))), HEX(CAST('ééé' AS BINARY(3))), \
+                 HEX(CAST('abcd' AS BINARY(0)))",
+            ),
+            same(
+                "SELECT HEX(CAST(UNHEX('FFEEDDCC') AS BINARY(2))), \
+                 HEX(CAST(UNHEX('FF') AS BINARY(3)))",
+            ),
+            // The width applies to the rendering, sign and point included.
+            same(
+                "SELECT CAST(12345 AS CHAR(3)), CAST(1.5 AS CHAR(2)), CAST(-123 AS CHAR(3)), \
+                 HEX(CAST(12345 AS BINARY(3)))",
+            ),
+            // The padding is part of the value rather than a rendering of it,
+            // which is what a comparison sees.
+            same("SELECT CAST('a' AS BINARY(3)) = 'a', CAST('a' AS BINARY(3)) = UNHEX('610000')"),
+            // Bytes against characters not asked: MySQL takes a cast's
+            // collation from its operand and a bare NULL is binary there, so
+            // even `CAST(NULL AS CHAR(3))` comes back as bytes. This engine
+            // has no collation to propagate and answers characters — the same
+            // limit the NULL group above records against `UPPER(NULL)`. That a
+            // width leaves NULL alone is compared either way.
+            same("SELECT CAST(NULL AS CHAR(3)), CAST(NULL AS BINARY(3))").without_value_kind(),
+            // 1292 and not the 1265 a column write raises, and the width in
+            // the message is the byte length of what was kept.
+            same("SELECT CAST('abcd' AS CHAR(3)) AS cut"),
+            same("SHOW WARNINGS"),
+            same("SELECT CAST('ééé' AS CHAR(2)) AS wide"),
+            same("SHOW WARNINGS LIMIT 1"),
+            // A binary target names itself and escapes the bytes it cannot
+            // print.
+            same("SELECT HEX(CAST(UNHEX('FFEEDDCC') AS BINARY(2))) AS cutb"),
+            same("SHOW WARNINGS LIMIT 2"),
+            // Spaces are truncation here, so this warns where the column form
+            // of it leaves a Note.
+            same("SELECT CAST('ab   ' AS CHAR(3)) AS spaces"),
+            same("SHOW WARNINGS LIMIT 0, 1"),
+            // And nothing is raised for a value that fits or for one the
+            // padding grew, so the conditions above report a real loss.
+            same("SELECT CAST('abc' AS CHAR(3)), HEX(CAST('a' AS BINARY(3))) AS padded"),
+            same("SHOW COUNT(*) WARNINGS"),
+            // `BINARY(n)` builds its whole declared width before it has a
+            // value, so a width past `max_allowed_packet` is NULL and 1301
+            // rather than the allocation the number asks for.
+            //
+            // No reader after this one, for the reason the `warnings` group
+            // gives about 1466: 8.3 raises 1301 where it *names the item*,
+            // which for a prepared statement is at PREPARE — so the binary run
+            // of this case leaves 8.3's area empty and this engine's holding
+            // the condition. Measured with a reader here, which reported 0
+            // rows to this engine's 1. The condition itself is held by
+            // `crates/engine/tests/warnings.rs` and was measured through
+            // `scripts/ask.sh`.
+            same("SELECT CAST('a' AS BINARY(4294967295)) IS NULL AS refused"),
+        ],
+    },
+    Group {
+        // The same widths under a strict mode, which is the half #0201
+        // deliberately left unmeasured: a column write refuses at 1406 there
+        // and a cast still truncates. Replacing the mode rather than adding to
+        // it; the harness puts the stock one back before the next group.
+        name: "cast widths: TRADITIONAL",
+        setup: &[
+            "SET SESSION sql_mode = 'TRADITIONAL'",
+            "CREATE TABLE Narrow (a VARCHAR(3) NULL, b VARBINARY(3) NULL)",
+        ],
+        cases: &[
+            same(
+                "SELECT CAST('abcd' AS CHAR(3)), HEX(CAST('abcd' AS BINARY(3))), \
+                 HEX(CAST('a' AS BINARY(3)))",
+            ),
+            same("SELECT CAST('ab   ' AS CHAR(3)) = 'ab '"),
+            // The writes beside them, which are 1406 under this mode — so the
+            // two rules are asked in one group rather than being remembered
+            // apart, on both sides of the characters/bytes split.
+            same("INSERT INTO Narrow (a) VALUES ('abcd')"),
+            same("INSERT INTO Narrow (b) VALUES ('abcd')"),
+            same("SELECT COUNT(*) FROM Narrow"),
+            // And the DECIMAL cast #0201 did fix clamps here as it does
+            // everywhere, which is the third rule of the three.
+            same(
+                "SELECT CAST('99999999999' AS DECIMAL(10,2)), \
+                 CAST(999999999.99 AS DECIMAL(10,2)), CAST('3.75' AS DECIMAL(10,1))",
+            ),
         ],
     },
 ];

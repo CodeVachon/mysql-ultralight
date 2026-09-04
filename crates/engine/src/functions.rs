@@ -20,13 +20,17 @@ use crate::value::Value;
 /// function is what makes the rule hold for the next function added — the safe
 /// answer is the one you get by not thinking about it.
 ///
-/// Three kinds are here. Those whose whole purpose is a NULL test
+/// Four kinds are here. Those whose whole purpose is a NULL test
 /// (`COALESCE`, `IFNULL`, `NVL`, `IF`, `ISNULL`, `NULLIF`); `CONCAT_WS`, which
-/// documents that it skips NULL arguments where `CONCAT` propagates them; and
-/// the JSON constructors, which store a JSON null rather than becoming one —
-/// `JSON_ARRAY(NULL)` is `[null]`, not NULL.
+/// documents that it skips NULL arguments where `CONCAT` propagates them; the
+/// JSON constructors, which store a JSON null rather than becoming one —
+/// `JSON_ARRAY(NULL)` is `[null]`, not NULL; and `FORMAT`, which is tolerant
+/// in its *third* argument only. `FORMAT(1.5, 2, NULL)` is 1.50 with a warning
+/// on 8.3, where a NULL in either of the first two makes the answer NULL, so
+/// it answers those two itself.
 const NULL_TOLERANT: &[&str] = &[
     "coalesce",
+    "format",
     "ifnull",
     "nvl",
     "if",
@@ -77,6 +81,7 @@ const KNOWN: &[&str] = &[
     "dayofweek",
     "dayofyear",
     "floor",
+    "format",
     "from_base64",
     "greatest",
     "hex",
@@ -1399,6 +1404,65 @@ pub fn call(name: &str, args: Vec<Value>, session: &Session) -> EngineResult<Val
                 Value::Float(cut)
             }
         }
+        // Not `ROUND` with commas, which is the shape it looks like. Three
+        // things separate them, every one of them measured on 8.3:
+        //
+        // * FORMAT reads a decimal's *value* where `ROUND` and `TRUNCATE` cap
+        //   at the scale it is shown at, so `FORMAT(1/3, 9)` is 0.333333333
+        //   where `ROUND(1/3, 9)` is 0.3333 over the same number. That is why
+        //   [`shown_places`] is deliberately not called here.
+        // * the rounding rule belongs to the argument and not to the function.
+        //   An exact operand rounds half away from zero and an approximate one
+        //   half to even: `FORMAT(2.5, 0)` is 3 and `FORMAT(2.5e0, 0)` is 2,
+        //   the same split [`numeric_operand`] documents for an integer cast.
+        //   A *string* takes the approximate path — `FORMAT('2.5', 0)` is 2 —
+        //   because MySQL chooses by the argument's declared result type and
+        //   only an integer or a decimal is exact.
+        // * the answer is characters, grouped and pointed by a locale rather
+        //   than by the number.
+        //
+        // NULL-tolerant because the third argument is: `FORMAT(1.5, 2, NULL)`
+        // is 1.50 with a warning on 8.3, not NULL. The first two are answered
+        // here instead.
+        "format" => {
+            // Held to two or three arguments here rather than through
+            // `exec::FIXED_ARITY`, which carries one number per name and this
+            // needs two. Without it `FORMAT(1)` answers NULL — the missing
+            // place count reading as one — and a fourth argument is silently
+            // dropped. 8.3 refuses both, in its *parser*: `FORMAT` has a
+            // grammar rule of its own there, so the code is 1064 rather than
+            // the 1582 a native function with an ordinary call gets. 1582 is
+            // the closer of the two answers this engine can give, and either
+            // is better than a number nobody asked for.
+            if !(2..=3).contains(&args.len()) {
+                return Err(EngineError::new(
+                    1582,
+                    "42000",
+                    "Incorrect parameter count in the call to native function 'format'",
+                ));
+            }
+            if arg(0).is_null() || arg(1).is_null() {
+                return Ok(Value::Null);
+            }
+            // Through the integer cast rather than `as_int`, because that is
+            // what MySQL asks the argument for: `FORMAT(1/3, 9.7)` shows ten
+            // places, the decimal 9.7 having rounded rather than truncated.
+            // Clamped the way MySQL clamps it — a negative count is zero and
+            // thirty is the most it will show, so `FORMAT(1/3, -1)` is 0 and
+            // `FORMAT(1/3, 40)` and `FORMAT(1/3, 30)` are the same string.
+            let places = cast_signed(&arg(1)).clamp(0, MAX_FORMAT_PLACES) as usize;
+            let locale = match args.get(2) {
+                // A NULL locale is quoted in the warning as the four
+                // characters `NULL` rather than as the empty string its text
+                // would be: measured on 8.3, `FORMAT(12345.6789, 2, NULL)`
+                // leaves `Unknown locale: 'NULL'` behind. No real locale is
+                // spelled that way, so the lookup below still misses.
+                Some(Value::Null) => locale_named("NULL"),
+                Some(name) => locale_named(&name.as_text()),
+                None => EN_US,
+            };
+            Value::text(grouped(&format_digits(&arg(0), places), places, locale))
+        }
         // The winner comes back untagged: `GREATEST(e, e) + 0` is 0 on 8.3
         // where the bare `e + 0` is the ordinal. `IF` and `CASE` were measured
         // beside it and do keep the tag, which is why this is written here.
@@ -1792,9 +1856,16 @@ pub fn cast(
                 .unwrap_or(digits);
             Value::decimal(clamped)
         }
-        D::Char(_) | D::Varchar(_) | D::Text | D::CharacterVarying(_) | D::Character(_) => {
-            Value::text(value.as_text())
+        // Cut to the declared width, in *characters*, and not padded out to
+        // it: measured on 8.3, `CAST('abcd' AS CHAR(3))` is `abc`,
+        // `CAST('ééé' AS CHAR(2))` is `éé` at four bytes, and `CAST('a' AS
+        // CHAR(3))` is one byte long. A bare `CHAR` declares no width and
+        // keeps every character. See [`cut_text`] for why this is not the
+        // width a column applies. #0215.
+        D::Char(len) | D::Varchar(len) | D::CharacterVarying(len) | D::Character(len) => {
+            Value::text(cut_text(value.as_text(), character_width(*len)))
         }
+        D::Text => Value::text(value.as_text()),
         // Tagged, exactly as the DECIMAL cast above is and for the same
         // reason: the cast declares the type, and without the tag the result
         // is an ordinary string that every later reader has to guess at —
@@ -1862,7 +1933,25 @@ pub fn cast(
         // 8.3 answers FF, so a value did not survive a cast to the type it
         // already had — and since #0139 made the comparison byte-exact,
         // `CAST(UNHEX('FF') AS BINARY) = UNHEX('FF')` answered 0.
-        D::Binary(_) | D::Varbinary(_) | D::Blob(_) => Value::Bytes(value.as_bytes().into_owned()),
+        //
+        // Cut to the declared width in *bytes* and padded out to it with NULs,
+        // which is what makes `BINARY(n)` the one width here that can make a
+        // value longer: `HEX(CAST('a' AS BINARY(3)))` is `610000` on 8.3 and
+        // `HEX(CAST('' AS BINARY(3)))` is `000000`. Bytes and not characters,
+        // so `HEX(CAST('ééé' AS BINARY(3)))` is `C3A9C3` — half of a character
+        // is a whole answer here. #0215.
+        //
+        // `BINARY(n)` alone, because it is the only binary cast target MySQL
+        // has: `CAST(x AS VARBINARY(3))` and `CAST(x AS BLOB)` are both 1064
+        // on 8.3. This engine has always taken those two as a bare binary cast
+        // and they are left exactly as they were — a width applied to them
+        // would have to answer the padding question as well, and there is no
+        // measurement to answer it with.
+        D::Binary(len) => match binary_cast(value.as_bytes().into_owned(), *len) {
+            Some(bytes) => Value::Bytes(bytes),
+            None => return Ok(Value::Null),
+        },
+        D::Varbinary(_) | D::Blob(_) => Value::Bytes(value.as_bytes().into_owned()),
         other => return Err(unsupported(format!("CAST to `{other}`"))),
     };
     // A cast builds a fresh string, so the connection's collation goes onto it
@@ -1872,6 +1961,169 @@ pub fn cast(
     // it shows.
     out.on_connection(collation);
     Ok(out)
+}
+
+/// The character count a `CHAR(n)` cast target declares, if it declares one.
+///
+/// `CHAR(n OCTETS)` is not a MySQL spelling — 8.3 answers 1064 for it — and
+/// `CHAR(MAX)` is T-SQL's. Neither has a width this can apply, so neither gets
+/// one rather than being read as a count of something else.
+fn character_width(length: Option<sqlparser::ast::CharacterLength>) -> Option<u64> {
+    match length {
+        Some(sqlparser::ast::CharacterLength::IntegerLength { length, unit }) => matches!(
+            unit,
+            None | Some(sqlparser::ast::CharLengthUnits::Characters)
+        )
+        .then_some(length),
+        Some(sqlparser::ast::CharacterLength::Max) | None => None,
+    }
+}
+
+/// `text` cut to `width` characters, with the condition MySQL raises for it.
+///
+/// **A cast truncates where a column write refuses**, which is why this is not
+/// [`crate::types::SqlType::store`] with a different caller. Three differences,
+/// all measured on 8.3 and all in the same direction — a cast is the lenient
+/// one:
+///
+/// * a value too wide for a *column* is error 1406 under a strict mode and a
+///   truncation with warning 1265 otherwise. A cast truncates under every
+///   mode, `STRICT_ALL_TABLES` and `TRADITIONAL` included, and the code is
+///   1292 rather than 1265.
+/// * a column exempts trailing spaces — `'ab   '` into a `VARCHAR(3)` keeps
+///   everything that is not a space and gets a *Note*. A cast makes no such
+///   exemption: `CAST('ab   ' AS CHAR(3))` is `'ab '` with a Warning, the
+///   two dropped spaces counting as truncation like any other character.
+/// * a `CHAR(n)` *column* is padded on the way in and stripped on the way out,
+///   so it cannot hold a trailing space at all. A cast neither pads nor
+///   strips: `CAST('a' AS CHAR(3))` is one byte long.
+///
+/// The width in the condition is the byte length of what is *kept*, not the
+/// character count that was asked for. `CAST('ééé' AS CHAR(2))` says
+/// `CHAR(4)` on 8.3 — measured, and the one part of the message that cannot be
+/// read off the statement.
+fn cut_text(mut text: String, width: Option<u64>) -> String {
+    let Some(width) = width else {
+        return text;
+    };
+    let Some((limit, _)) = text.char_indices().nth(width as usize) else {
+        return text;
+    };
+    truncated_cast("CHAR", limit, capped(&text, 128));
+    text.truncate(limit);
+    text
+}
+
+/// `bytes` cut to `width` of them, with the condition MySQL raises for it.
+///
+/// No character boundary to respect and no space exemption, for the reason
+/// [`crate::types::SqlType::store`] gives about a binary column: a binary
+/// string is bytes, and half a character is a whole answer.
+fn cut_bytes(mut bytes: Vec<u8>, width: Option<u64>) -> Vec<u8> {
+    let Some(width) = width.map(|w| w as usize) else {
+        return bytes;
+    };
+    if bytes.len() > width {
+        // Escaped from the *bytes* and not from their lossy text: the whole
+        // reason a binary target quotes `'\xFF\xEE\xDD\xCC'` is that those
+        // four bytes are not characters, and decoding them first would put
+        // three replacement characters in the message.
+        //
+        // Only the first 128 bytes are looked at, because no byte past them
+        // can survive the cap below — every one escapes to at least one
+        // character. Without it a truncating cast over a 64MB blob would build
+        // a quarter of a gigabyte of message and then throw all but 128 bytes
+        // of it away.
+        let escaped: String = bytes
+            .iter()
+            .take(128)
+            .map(|b| {
+                if b.is_ascii_graphic() || *b == b' ' {
+                    char::from(*b).to_string()
+                } else {
+                    format!("\\x{b:02X}")
+                }
+            })
+            .collect();
+        truncated_cast("BINARY", width, capped(&escaped, 128));
+        bytes.truncate(width);
+    }
+    bytes
+}
+
+/// A cast to `BINARY(n)`: the value cut to `n` bytes and padded out to them.
+///
+/// `None` where MySQL will not build the value at all, which is a width past
+/// `max_allowed_packet`: `CAST('a' AS BINARY(4294967295))` is NULL on 8.3 with
+/// `Warning 1301 Result of cast_as_binary() was larger than max_allowed_packet
+/// (67108864) - truncated`, not four gigabytes of NULs. Measured, and the
+/// boundary with it — `BINARY(67108864)` really does answer 64MB of them.
+///
+/// Not cosmetic. This is the only cast that allocates its whole declared width
+/// before it has a value, so without the guard any client could ask a `SELECT`
+/// for that allocation — the same one-statement blow-up
+/// [`check_cast_precision`] closes for a DECIMAL.
+fn binary_cast(bytes: Vec<u8>, width: Option<u64>) -> Option<Vec<u8>> {
+    if width.is_some_and(|width| width > crate::session::MAX_ALLOWED_PACKET) {
+        crate::diagnostics::raise(
+            crate::diagnostics::Level::Warning,
+            1301,
+            format!(
+                "Result of cast_as_binary() was larger than max_allowed_packet ({}) - truncated",
+                crate::session::MAX_ALLOWED_PACKET
+            ),
+        );
+        return None;
+    }
+    Some(fill_bytes(cut_bytes(bytes, width), width))
+}
+
+/// `bytes` padded out to `width` of them with NULs.
+///
+/// Only `BINARY(n)` does this, and it is not cosmetic: the padding is part of
+/// the value, so `CAST('a' AS BINARY(3))` is three bytes and compares equal to
+/// nothing shorter. The same rule a `BINARY(n)` column follows — see
+/// `fitted_bytes` — reached here without sharing its code, because everything
+/// *around* it differs.
+///
+/// No condition is raised for a pad: a value that grew lost nothing.
+fn fill_bytes(mut bytes: Vec<u8>, width: Option<u64>) -> Vec<u8> {
+    // A bare `BINARY` is `BINARY(1)` as a column and no width at all as a cast
+    // target: `CAST('abcd' AS BINARY)` is `abcd` on 8.3, where the column
+    // would hold one byte of it.
+    if let Some(width) = width {
+        bytes.resize(width as usize, 0);
+    }
+    bytes
+}
+
+/// 1292, which MySQL raises for a value a cast cut down to its declared width.
+///
+/// Not the 1265 a column write raises, and a Warning under every mode where
+/// 1265's level and severity both move — see [`cut_text`].
+fn truncated_cast(kind: &str, width: usize, value: &str) {
+    crate::diagnostics::raise(
+        crate::diagnostics::Level::Warning,
+        1292,
+        format!("Truncated incorrect {kind}({width}) value: '{value}'"),
+    );
+}
+
+/// `text` cut to `limit` bytes, which is what the `%-.128s` in MySQL's message
+/// for 1292 does to the value it quotes.
+///
+/// Measured: `CAST(REPEAT('x', 200) AS CHAR(3))` quotes 128 of them on 8.3.
+/// Cut back to a character boundary, which C's `printf` has no reason to do
+/// and this does because the result has to be a `String` either way.
+fn capped(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut at = limit;
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    &text[..at]
 }
 
 /// The limits MySQL puts on the `(M,D)` of a cast target.
@@ -2030,6 +2282,368 @@ fn shown_places(value: &Value, places: i64) -> i64 {
         }
         _ => places,
     }
+}
+
+/// The most places `FORMAT` will show.
+///
+/// MySQL's own cap rather than a limit invented here: measured on 8.3,
+/// `FORMAT(1/3, 31)` and `FORMAT(1/3, 40)` are the same thirty-place string
+/// that `FORMAT(1/3, 30)` gives.
+const MAX_FORMAT_PLACES: i64 = 30;
+
+/// How one locale writes a number.
+///
+/// Read off 8.3 rather than off a published list of locales. The server binary
+/// holds 634 strings shaped `xx_YY`; asking `SET lc_time_names` for each one
+/// says which 112 of them name a real locale, and
+/// `HEX(FORMAT(1234567891.23, 2, <name>))` for those says how each writes a
+/// number. They fall into the nine shapes below, and the `HEX` is not
+/// decoration — two of the shapes differ only in a byte the terminal does not
+/// draw.
+#[derive(Clone, Copy)]
+struct Locale {
+    /// What goes where the point goes.
+    point: char,
+    /// What goes between the groups, or `None` where the locale does not group
+    /// at all.
+    ///
+    /// Not the same as a separator that happens to be invisible, which is why
+    /// this is an `Option` and not a space: `fr_FR` writes `1234567891,23`
+    /// with nothing at all between the digits, while `bg_BG` writes a NUL byte
+    /// between each group and is six bytes longer for it. Both measured
+    /// through `HEX`.
+    separator: Option<char>,
+    /// The group widths, counted from the point outwards, the last repeating.
+    ///
+    /// `en_IN` is `[3, 2]` — 1,23,45,67,891 and not 1,234,567,891 — which is
+    /// the only reason this is a list and not a number.
+    grouping: &'static [usize],
+}
+
+/// The shape `en_US` writes, and the one an unknown locale falls back to.
+const EN_US: Locale = Locale {
+    point: '.',
+    separator: Some(','),
+    grouping: &[3],
+};
+const EUROPEAN: Locale = Locale {
+    point: ',',
+    separator: Some('.'),
+    grouping: &[3],
+};
+const SPACED: Locale = Locale {
+    point: ',',
+    separator: Some(' '),
+    grouping: &[3],
+};
+const SWISS_POINT: Locale = Locale {
+    point: '.',
+    separator: Some('\''),
+    grouping: &[3],
+};
+const SWISS_COMMA: Locale = Locale {
+    point: ',',
+    separator: Some('\''),
+    grouping: &[3],
+};
+/// `bg_BG`, whose separator is a NUL byte. It is written, not skipped:
+/// `HEX(FORMAT(1234567, 0, 'bg_BG'))` is `310032333400353637` on 8.3.
+const NUL_SEPARATED: Locale = Locale {
+    point: ',',
+    separator: Some('\0'),
+    grouping: &[3],
+};
+const UNGROUPED_COMMA: Locale = Locale {
+    point: ',',
+    separator: None,
+    grouping: &[3],
+};
+const UNGROUPED_POINT: Locale = Locale {
+    point: '.',
+    separator: None,
+    grouping: &[3],
+};
+/// The lakh-crore grouping: three digits and then twos all the way up.
+const SOUTH_ASIAN: Locale = Locale {
+    point: '.',
+    separator: Some(','),
+    grouping: &[3, 2],
+};
+
+/// Every locale MySQL 8.3 knows, sorted so the lookup can bisect.
+///
+/// Held in full rather than as the handful the target application happens to
+/// name, because the alternative is worse than a gap: a locale missing here
+/// answers in the en_US shape *and* raises a warning saying the name is
+/// unknown, which is a wrong answer wearing a diagnostic that says it is
+/// right. `every_locale_name_is_sorted` keeps the order this bisects on.
+const LOCALES: &[(&str, Locale)] = &[
+    ("ar_AE", EN_US),
+    ("ar_BH", EN_US),
+    ("ar_DZ", EN_US),
+    ("ar_EG", EN_US),
+    ("ar_IN", EN_US),
+    ("ar_IQ", EN_US),
+    ("ar_JO", EN_US),
+    ("ar_KW", EN_US),
+    ("ar_LB", EN_US),
+    ("ar_LY", EN_US),
+    ("ar_MA", EN_US),
+    ("ar_OM", EN_US),
+    ("ar_QA", EN_US),
+    ("ar_SA", UNGROUPED_POINT),
+    ("ar_SD", EN_US),
+    ("ar_SY", EN_US),
+    ("ar_TN", EN_US),
+    ("ar_YE", EN_US),
+    ("be_BY", EUROPEAN),
+    ("bg_BG", NUL_SEPARATED),
+    ("ca_ES", UNGROUPED_COMMA),
+    ("cs_CZ", SPACED),
+    ("da_DK", EUROPEAN),
+    ("de_AT", UNGROUPED_COMMA),
+    ("de_BE", EUROPEAN),
+    ("de_CH", SWISS_POINT),
+    ("de_DE", EUROPEAN),
+    ("de_LU", EUROPEAN),
+    ("el_GR", UNGROUPED_COMMA),
+    ("en_AU", EN_US),
+    ("en_CA", EN_US),
+    ("en_GB", EN_US),
+    ("en_IN", SOUTH_ASIAN),
+    ("en_NZ", EN_US),
+    ("en_PH", EN_US),
+    ("en_US", EN_US),
+    ("en_ZA", EN_US),
+    ("en_ZW", EN_US),
+    ("es_AR", EUROPEAN),
+    ("es_BO", EUROPEAN),
+    ("es_CL", EUROPEAN),
+    ("es_CO", EUROPEAN),
+    ("es_CR", SPACED),
+    ("es_DO", EN_US),
+    ("es_EC", EUROPEAN),
+    ("es_ES", EUROPEAN),
+    ("es_GT", EN_US),
+    ("es_HN", EN_US),
+    ("es_MX", EN_US),
+    ("es_NI", EN_US),
+    ("es_PA", EN_US),
+    ("es_PE", EN_US),
+    ("es_PR", EN_US),
+    ("es_PY", EUROPEAN),
+    ("es_SV", EN_US),
+    ("es_US", EN_US),
+    ("es_UY", EUROPEAN),
+    ("es_VE", EUROPEAN),
+    ("et_EE", SPACED),
+    ("eu_ES", UNGROUPED_COMMA),
+    ("fi_FI", SPACED),
+    ("fo_FO", EUROPEAN),
+    ("fr_BE", UNGROUPED_COMMA),
+    ("fr_CA", UNGROUPED_COMMA),
+    ("fr_CH", UNGROUPED_COMMA),
+    ("fr_FR", UNGROUPED_COMMA),
+    ("fr_LU", UNGROUPED_COMMA),
+    ("gl_ES", UNGROUPED_COMMA),
+    ("gu_IN", EN_US),
+    ("he_IL", EN_US),
+    ("hi_IN", EN_US),
+    ("hr_HR", UNGROUPED_COMMA),
+    ("hu_HU", EUROPEAN),
+    ("id_ID", EUROPEAN),
+    ("is_IS", EUROPEAN),
+    ("it_CH", SWISS_COMMA),
+    ("it_IT", UNGROUPED_COMMA),
+    ("ja_JP", EN_US),
+    ("ko_KR", EN_US),
+    ("lt_LT", EUROPEAN),
+    ("lv_LV", SPACED),
+    ("mk_MK", SPACED),
+    ("mn_MN", EUROPEAN),
+    ("ms_MY", EN_US),
+    ("nb_NO", EUROPEAN),
+    ("nl_BE", UNGROUPED_COMMA),
+    ("nl_NL", UNGROUPED_COMMA),
+    ("no_NO", EUROPEAN),
+    ("pl_PL", UNGROUPED_COMMA),
+    ("pt_BR", UNGROUPED_COMMA),
+    ("pt_PT", UNGROUPED_COMMA),
+    ("rm_CH", SWISS_COMMA),
+    ("ro_RO", EUROPEAN),
+    ("ru_RU", SPACED),
+    ("ru_UA", EUROPEAN),
+    ("sk_SK", SPACED),
+    ("sl_SI", UNGROUPED_COMMA),
+    ("sq_AL", EUROPEAN),
+    ("sr_RS", UNGROUPED_POINT),
+    ("sr_YU", UNGROUPED_POINT),
+    ("sv_FI", SPACED),
+    ("sv_SE", SPACED),
+    ("ta_IN", SOUTH_ASIAN),
+    ("te_IN", SOUTH_ASIAN),
+    ("th_TH", EN_US),
+    ("tr_TR", EUROPEAN),
+    ("uk_UA", EUROPEAN),
+    ("ur_PK", EN_US),
+    ("vi_VN", EUROPEAN),
+    ("zh_CN", EN_US),
+    ("zh_HK", EN_US),
+    ("zh_TW", EN_US),
+];
+
+/// The locale of that name, or en_US and a warning.
+///
+/// A name MySQL does not know is **not** an error and does not make the answer
+/// NULL: measured on 8.3, `FORMAT(12345.6789, 2, 'xx_XX')` is `12,345.68` and
+/// `SHOW WARNINGS` beside it holds one row, `Warning 1649 Unknown locale:
+/// 'xx_XX'`. So does `FORMAT(12345.6789, 2, NULL)`, which is why `FORMAT` is
+/// in `NULL_TOLERANT`.
+fn locale_named(name: &str) -> Locale {
+    match LOCALES.binary_search_by(|(known, _)| (*known).cmp(name)) {
+        Ok(at) => LOCALES[at].1,
+        Err(_) => {
+            crate::diagnostics::raise(
+                crate::diagnostics::Level::Warning,
+                1649,
+                format!("Unknown locale: '{name}'"),
+            );
+            EN_US
+        }
+    }
+}
+
+/// The digits `FORMAT` rounds its argument to, before a locale writes them.
+///
+/// Which rule applies is the argument's to decide, and MySQL decides it by the
+/// argument's declared result type: an integer or a decimal is *exact* and
+/// rounds half away from zero, and everything else — a double, a string, a
+/// document, a binary string — goes through a double and rounds half to even.
+/// `FORMAT(2.5, 0)` is 3 and `FORMAT(2.5e0, 0)` and `FORMAT('2.5', 0)` are
+/// both 2, all measured on 8.3.
+fn format_digits(value: &Value, places: usize) -> String {
+    exact_digits(value)
+        .and_then(|digits| crate::decimal::rescale_wide(&digits, places))
+        .unwrap_or_else(|| approximate_digits(value.as_number(), places))
+}
+
+/// The digits of a value MySQL formats *exactly*, or `None` for one it reads
+/// through a double.
+fn exact_digits(value: &Value) -> Option<String> {
+    match value {
+        Value::Int(_) | Value::Unsigned(_) | Value::Bool(_) => Some(value.as_text()),
+        // The digits it *carries* and not the ones it shows, which is the
+        // whole of #0212: `FORMAT(1/3, 9)` is 0.333333333 where the same
+        // quotient prints 0.3333 and `ROUND(1/3, 9)` answers those four
+        // places.
+        Value::Decimal(digits, _) => Some(digits.clone()),
+        // Through its packed number, the way a DECIMAL cast converts one:
+        // `FORMAT(DATE '2024-01-05', 2)` is 20,240,105.00 on 8.3, not the
+        // 2,024.00 its characters spell.
+        Value::Temporal(_) => value
+            .temporal_number()
+            .map(|number| number.numeric_text().into_owned()),
+        _ => None,
+    }
+}
+
+/// A double at `places` places, written the two-step way MySQL writes one.
+///
+/// Not `format!("{value:.places$}")`, which rounds the number the double
+/// actually holds. MySQL multiplies by a power of ten *first* and rounds the
+/// product, and the error that introduces is visible: `FORMAT(0.145e0, 2)` is
+/// 0.14 on 8.3 because 0.145 times 100 is 14.499999999999998 as a double,
+/// where the decimal 0.145 beside it gives 0.15.
+///
+/// The second step is the shortest string that reads back as the rounded
+/// double, padded out with zeros — not the double's full expansion.
+/// `FORMAT(1/3e0, 20)` is 0.33333333333333330000 on 8.3 and not
+/// 0.33333333333333331483. Only when that shortest string carries more places
+/// than were asked for does the expansion decide, which is what makes
+/// `FORMAT(1.015e0, 2)` 1.01.
+fn approximate_digits(value: f64, places: usize) -> String {
+    let factor = 10f64.powi(places as i32);
+    let scaled = value * factor;
+    // A value the scaling overflowed is left alone rather than becoming an
+    // infinity, which is MySQL's own guard: `FORMAT(1.7976931348623157e308,
+    // 2)` writes all 309 digits on 8.3.
+    let rounded = if scaled.is_finite() {
+        scaled.round_ties_even() / factor
+    } else {
+        value
+    };
+    let shortest = crate::decimal::plain(rounded);
+    let scale = shortest
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    // A guard rather than a case. The scaling above already put the value at
+    // `places`, and the shortest string that reads back as the *nearest double
+    // to* `n / 10^places` cannot carry more than `places` of them — that
+    // quotient is itself inside the double's rounding interval, so nothing
+    // longer is ever the shortest. But "cannot" there is an argument about
+    // rounding intervals rather than something the types hold, and the full
+    // expansion is the right answer if the argument is ever wrong. Without
+    // this the fall-through would pad, and pad a number to fewer places than
+    // it already shows.
+    if scale > places {
+        return format!("{rounded:.places$}");
+    }
+    let mut written = shortest;
+    if places > 0 {
+        if scale == 0 {
+            written.push('.');
+        }
+        written.extend(std::iter::repeat_n('0', places - scale));
+    }
+    written
+}
+
+/// `digits` written the way `locale` writes a number.
+///
+/// The groups are counted from the point outwards and the last width repeats,
+/// which is what makes `en_IN` write 1,23,45,67,89,01,234 where `en_US` writes
+/// 12,345,678,901,234 — measured on 8.3 at that width.
+///
+/// A number with no more digits than its first group gets no separator at all,
+/// and the sign does not count toward that: 1234 is 1,234 while both 123 and
+/// -123 are left alone.
+fn grouped(digits: &str, places: usize, locale: Locale) -> String {
+    let (sign, rest) = match digits.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", digits),
+    };
+    let (whole, fraction) = rest.split_once('.').unwrap_or((rest, ""));
+    let mut written = String::with_capacity(digits.len() * 2);
+    written.push_str(sign);
+    match locale.separator {
+        Some(separator) => {
+            // Cut from the right, because that is the end the widths are
+            // counted from; the leftmost group is whatever is left over and
+            // may be shorter than any of them.
+            let mut groups: Vec<&str> = Vec::new();
+            let mut end = whole.len();
+            let mut widths = locale.grouping.iter().copied();
+            let mut width = widths.next().unwrap_or(3);
+            while end > width {
+                groups.push(&whole[end - width..end]);
+                end -= width;
+                width = widths.next().unwrap_or(width);
+            }
+            groups.push(&whole[..end]);
+            for (at, group) in groups.iter().rev().enumerate() {
+                if at > 0 {
+                    written.push(separator);
+                }
+                written.push_str(group);
+            }
+        }
+        None => written.push_str(whole),
+    }
+    if places > 0 {
+        written.push(locale.point);
+        written.push_str(fraction);
+    }
+    written
 }
 
 /// The whole number a *numeric* operand of an integer cast carries.
@@ -2408,6 +3022,33 @@ mod known_names {
     fn every_tolerant_name_is_known() {
         for name in NULL_TOLERANT {
             assert!(KNOWN.binary_search(name).is_ok(), "{name} is not in KNOWN");
+        }
+    }
+
+    /// `LOCALES` is bisected, so its order is part of it.
+    ///
+    /// Out of order, the miss is silent: the name is not found, `FORMAT`
+    /// writes the en_US shape, and the warning beside it says the locale is
+    /// unknown — an answer that is wrong and says so in a way nobody reads.
+    #[test]
+    fn every_locale_name_is_sorted_and_unique() {
+        let names: Vec<&str> = LOCALES.iter().map(|(name, _)| *name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(names, sorted);
+    }
+
+    /// A group width of zero would make `grouped` loop forever, and a locale
+    /// that groups not at all says so with `separator: None` instead.
+    #[test]
+    fn every_grouping_width_is_at_least_one() {
+        for (name, locale) in LOCALES {
+            assert!(!locale.grouping.is_empty(), "{name} groups by nothing");
+            assert!(
+                locale.grouping.iter().all(|width| *width > 0),
+                "{name} has a zero-wide group"
+            );
         }
     }
 }

@@ -32195,3 +32195,477 @@ fn a_string_that_is_not_a_literal_carries_its_own_collation() {
         vec![vec!["1", "1"]]
     );
 }
+
+/// FORMAT reads a decimal's *value* where ROUND and TRUNCATE read the scale it
+/// is shown at.
+///
+/// That contrast is #0212 in one line, and it is why FORMAT is not ROUND with
+/// commas: the same quotient answers 0.333333333 to one and 0.3333 to the
+/// other. Every number here measured on mysql:8.3.
+#[test]
+fn format_reads_a_decimals_value_where_round_reads_its_rendering() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(1/3, 9), ROUND(1/3, 9), TRUNCATE(1/3, 9)"
+        ),
+        vec![vec!["0.333333333", "0.3333", "0.3333"]]
+    );
+
+    // Past the value's own digits it pads rather than inventing more, which is
+    // the half that says the digits came from the value and not from a
+    // division done here: 1/3 carries nine places and nothing beyond them.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT FORMAT(1/3, 12)"),
+        vec![vec!["0.333333333000"]]
+    );
+
+    // A DECIMAL column's quotient reaches the same nine places, so the value
+    // being read is the engine's own and not a property of two integer
+    // literals.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Fmt (n DECIMAL(20,4) NULL)",
+    );
+    run(&engine, &mut session, "INSERT INTO Fmt VALUES (1.5000)");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(n/3, 12), FORMAT(n/3, 4), FORMAT(n, 6) FROM Fmt"
+        ),
+        vec![vec!["0.500000000000", "0.5000", "1.500000"]]
+    );
+
+    // A document converts through the scalar it holds rather than through its
+    // rendering, so a quoted number is unquoted on the way — the same reading
+    // `CAST(x AS DECIMAL)` takes, and the reason this is here rather than in
+    // the differential corpus is that 8.3 describes `FORMAT` over a JSON
+    // column LONG_BLOB where this engine says VAR_STRING. The rows were
+    // measured through `scripts/ask.sh`; only the type differs.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(CAST('2.5' AS JSON), 2), FORMAT(CAST('\"3.75\"' AS JSON), 1)"
+        ),
+        vec![vec!["2.50", "3.8"]]
+    );
+}
+
+/// The rounding rule belongs to the argument, not to the function.
+///
+/// An exact operand rounds half away from zero and an approximate one half to
+/// even — the same split `CAST(x AS SIGNED)` follows. A *string* is
+/// approximate here, which is the part that cannot be guessed from the
+/// outside: `FORMAT('2.5', 0)` is 2 on 8.3 where the decimal 2.5 beside it is
+/// 3, because MySQL picks the path from the argument's declared result type.
+#[test]
+fn format_rounds_an_exact_operand_half_away_and_an_approximate_one_half_to_even() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(0.5, 0), FORMAT(1.5, 0), FORMAT(2.5, 0), \
+                    FORMAT(-0.5, 0), FORMAT(-1.5, 0), FORMAT(-2.5, 0)"
+        ),
+        vec![vec!["1", "2", "3", "-1", "-2", "-3"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(0.5e0, 0), FORMAT(1.5e0, 0), FORMAT(2.5e0, 0), FORMAT(-2.5e0, 0)"
+        ),
+        vec![vec!["0", "2", "2", "-2"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT('0.5', 0), FORMAT('1.5', 0), FORMAT('2.5', 0), FORMAT('-2.5', 0)"
+        ),
+        vec![vec!["0", "2", "2", "-2"]]
+    );
+
+    // Wide enough that a double cannot hold the tie: 4503599627370496.5 is
+    // 2^52 and a half, so an exact operand read through an `f64` would answer
+    // ...496 where 8.3 answers ...497. The double beside it really is ...496.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(4503599627370496.5, 0), FORMAT(4503599627370496.5e0, 0)"
+        ),
+        vec![vec!["4,503,599,627,370,497", "4,503,599,627,370,496"]]
+    );
+
+    // A value that rounds to zero loses its sign where it is exact and keeps
+    // it where it went through a double, which is the one place the two paths
+    // disagree about something other than a digit.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(-0.4, 0), FORMAT(-0.004, 2), FORMAT(-0.5e0, 0)"
+        ),
+        vec![vec!["0", "0.00", "-0"]]
+    );
+}
+
+/// A double is rounded by scaling it *first*, which is not the same as
+/// rounding the number it holds.
+///
+/// 0.145 as a double is a shade above 0.145, so rounding the value gives 0.15
+/// — and 0.145 times 100 is 14.499999999999998, so MySQL's answer is 0.14. The
+/// decimal 0.145 beside it really is 0.15. Both measured; a `format!` with a
+/// precision agrees with the decimal and so answers the double wrongly.
+#[test]
+fn format_over_a_double_rounds_the_scaled_product_rather_than_the_value() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(0.145e0, 2), FORMAT(0.145, 2)"
+        ),
+        vec![vec!["0.14", "0.15"]]
+    );
+
+    // The other direction, where scaling pushes a value *up* onto a tie: 1.15
+    // as a double is below 1.15, and 1.15 times 10 is exactly 11.5.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(1.15e0, 1), FORMAT(8.835e0, 2), FORMAT(1.015e0, 2)"
+        ),
+        vec![vec!["1.2", "8.84", "1.01"]]
+    );
+
+    // And the digits it writes are the shortest that read back as the double,
+    // padded — not the double's full expansion, which would make this
+    // 0.33333333333333331483.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT FORMAT(1/3e0, 20)"),
+        vec![vec!["0.33333333333333330000"]]
+    );
+
+    // A double too big to scale is left alone rather than becoming an
+    // infinity, which is the guard that keeps every one of its digits.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT FORMAT(1e30, 2)"),
+        vec![vec!["1,000,000,000,000,000,000,000,000,000,000.00"]]
+    );
+}
+
+/// The grouping and the point are the locale's, and both are measured.
+#[test]
+fn format_writes_the_groups_and_the_point_the_locale_asks_for() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(1234567891.23, 2), FORMAT(1234567891.23, 2, 'de_DE'), \
+                    FORMAT(1234567891.23, 2, 'fr_FR'), FORMAT(1234567891.23, 2, 'ru_RU')"
+        ),
+        vec![vec![
+            "1,234,567,891.23",
+            "1.234.567.891,23",
+            "1234567891,23",
+            "1 234 567 891,23"
+        ]]
+    );
+
+    // The two Swiss shapes, which share a separator and disagree about the
+    // point — so a table keyed on the separator alone would answer one of
+    // them wrongly.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(1234567891.23, 2, 'de_CH'), FORMAT(1234567891.23, 2, 'it_CH'), \
+                    FORMAT(1234567891.23, 2, 'sr_RS')"
+        ),
+        vec![vec![
+            "1'234'567'891.23",
+            "1'234'567'891,23",
+            "1234567891.23"
+        ]]
+    );
+
+    // The lakh-crore grouping, which is the only reason the widths are a list:
+    // three digits and then twos all the way up.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(12345678901234.56, 2, 'en_IN'), FORMAT(123456, 0, 'en_IN')"
+        ),
+        vec![vec!["1,23,45,67,89,01,234.56", "1,23,456"]]
+    );
+
+    // A separator that does not draw is still a separator: bg_BG writes a NUL
+    // byte between the groups and is six bytes longer for it, where fr_FR
+    // above writes nothing at all. Only `HEX` can tell those apart.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT HEX(FORMAT(1234567, 0, 'bg_BG')), HEX(FORMAT(1234567, 0, 'fr_FR'))"
+        ),
+        vec![vec!["310032333400353637", "31323334353637"]]
+    );
+
+    // A number no wider than its first group gets no separator, and the sign
+    // does not count toward the width.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(123, 0), FORMAT(1234, 0), FORMAT(-123, 0), FORMAT(-1234, 0)"
+        ),
+        vec![vec!["123", "1,234", "-123", "-1,234"]]
+    );
+}
+
+/// A locale MySQL does not know is a warning and an en_US answer, not an
+/// error and not NULL.
+///
+/// Measured on 8.3, which is the whole reason FORMAT sits in `NULL_TOLERANT`:
+/// a NULL third argument reaches this too, and answers a number. The condition
+/// it leaves behind is asserted in `warnings.rs`.
+#[test]
+fn format_falls_back_to_en_us_for_a_locale_mysql_does_not_know() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(12345.6789, 2, 'xx_XX'), FORMAT(12345.6789, 2, ''), \
+                    FORMAT(12345.6789, 2, NULL)"
+        ),
+        vec![vec!["12,345.68", "12,345.68", "12,345.68"]]
+    );
+
+    // A NULL in either of the first two arguments still answers NULL, so the
+    // tolerance above is the third argument's and not the function's.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(NULL, 2), FORMAT(1.5, NULL), FORMAT(NULL, 2, 'de_DE')"
+        ),
+        vec![vec!["NULL", "NULL", "NULL"]]
+    );
+}
+
+/// The place count is clamped, and it is read as a rounded integer.
+#[test]
+fn format_clamps_its_place_count_and_rounds_the_argument_that_carries_it() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(1/3, -1), FORMAT(1/3, 30) = FORMAT(1/3, 31), \
+                    FORMAT(1/3, 30) = FORMAT(1/3, 40)"
+        ),
+        vec![vec!["0", "1", "1"]]
+    );
+
+    // Rounded rather than truncated: 9.7 places is ten of them, which is the
+    // integer cast's rule rather than a read of the leading digits.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT FORMAT(1/3, 9.7), FORMAT(1/3, '9')"
+        ),
+        vec![vec!["0.3333333330", "0.333333333"]]
+    );
+}
+
+/// FORMAT takes two arguments or three, and refuses anything else.
+///
+/// 8.3 has a grammar rule of its own for FORMAT, so it answers 1064 where this
+/// engine — whose parser takes it as an ordinary call — answers the 1582 a
+/// native function with the wrong parameter count gets. What matters is that
+/// neither invents a number: without this `FORMAT(1)` answered NULL and a
+/// fourth argument was silently dropped.
+#[test]
+fn format_refuses_a_call_with_the_wrong_number_of_arguments() {
+    let (engine, mut session) = engine();
+    for sql in [
+        "SELECT FORMAT(1)",
+        "SELECT FORMAT(1, 2, 'en_US', 'extra')",
+        "SELECT FORMAT()",
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(
+            err.code, 1582,
+            "expected a parameter count refusal for: {sql}"
+        );
+    }
+}
+
+/// A cast to `CHAR(n)` cuts to n *characters*, and does not pad.
+///
+/// #0215. The width was ignored entirely, so `CAST('abcd' AS CHAR(3))` was
+/// `abcd`. Characters and not bytes — `CAST('ééé' AS CHAR(2))` is four bytes
+/// long on 8.3 — and no padding, which is where it parts company with the
+/// `CHAR(n)` *column* it is spelled after.
+#[test]
+fn a_cast_to_char_cuts_characters_and_does_not_pad() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('a' AS CHAR(3)), CAST('abc' AS CHAR(3)), CAST('abcd' AS CHAR(3)), \
+                    CAST('abcd' AS CHAR)"
+        ),
+        vec![vec!["a", "abc", "abc", "abcd"]]
+    );
+
+    // The bytes, because the padding a column would add is invisible in the
+    // characters: `CAST('a' AS CHAR(3))` is one byte on 8.3 and a `CHAR(3)`
+    // column holding `a` is three.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT HEX(CAST('a' AS CHAR(3))), HEX(CAST('ééé' AS CHAR(2))), \
+                    HEX(CAST('abcd' AS CHAR(0)))"
+        ),
+        vec![vec!["61", "C3A9C3A9", ""]]
+    );
+
+    // Trailing spaces are cut like any other character, where a column write
+    // exempts them: `CAST('ab   ' AS CHAR(3))` keeps one of them.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT HEX(CAST('ab   ' AS CHAR(3))), HEX(CAST('abcd ' AS CHAR(3)))"
+        ),
+        vec![vec!["616220", "616263"]]
+    );
+
+    // Whatever it was before it was characters: the width applies to the
+    // rendering, sign and point included.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(12345 AS CHAR(3)), CAST(1.5 AS CHAR(2)), CAST(-123 AS CHAR(3))"
+        ),
+        vec![vec!["123", "1.", "-12"]]
+    );
+}
+
+/// A cast to `BINARY(n)` cuts to n *bytes*, and pads out to them with NULs.
+///
+/// The one width here that can make a value longer, and it is not cosmetic:
+/// the padding is part of the value. Bytes and not characters, so a multi-byte
+/// character is cut in half rather than dropped — `HEX(CAST('ééé' AS
+/// BINARY(3)))` is `C3A9C3` on 8.3.
+#[test]
+fn a_cast_to_binary_cuts_bytes_and_pads_with_nuls() {
+    let (engine, mut session) = engine();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT HEX(CAST('a' AS BINARY(3))), HEX(CAST('abc' AS BINARY(3))), \
+                    HEX(CAST('abcd' AS BINARY(3))), HEX(CAST('abcd' AS BINARY))"
+        ),
+        vec![vec!["610000", "616263", "616263", "61626364"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT HEX(CAST('' AS BINARY(3))), HEX(CAST('ééé' AS BINARY(3))), \
+                    HEX(CAST('abcd' AS BINARY(0)))"
+        ),
+        vec![vec!["000000", "C3A9C3", ""]]
+    );
+
+    // The bytes that are there, not the ones their text decodes to: a binary
+    // string reaching a binary cast survives it.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT HEX(CAST(UNHEX('FFEEDDCC') AS BINARY(2))), HEX(CAST(UNHEX('FF') AS BINARY(3)))"
+        ),
+        vec![vec!["FFEE", "FF0000"]]
+    );
+
+    // The padding is part of the value and not a rendering of it, which shows
+    // in a comparison: three bytes are not one.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('a' AS BINARY(3)) = 'a', CAST('a' AS BINARY(3)) = UNHEX('610000')"
+        ),
+        vec![vec!["0", "1"]]
+    );
+}
+
+/// A cast truncates under every mode, where a column write refuses under a
+/// strict one.
+///
+/// This is why #0201 did not reuse the write path's rule here. Measured on 8.3
+/// under `STRICT_ALL_TABLES` and under `TRADITIONAL`: the cast still answers,
+/// while the same value into the same-width column is error 1406.
+#[test]
+fn a_cast_to_a_width_truncates_under_a_strict_mode_where_a_column_refuses() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Narrow (a VARCHAR(3) NULL)",
+    );
+    for mode in ["STRICT_ALL_TABLES", "TRADITIONAL", "STRICT_TRANS_TABLES"] {
+        run(
+            &engine,
+            &mut session,
+            &format!("SET SESSION sql_mode = '{mode}'"),
+        );
+        assert_eq!(
+            rows(
+                &engine,
+                &mut session,
+                "SELECT CAST('abcd' AS CHAR(3)), HEX(CAST('abcd' AS BINARY(3)))"
+            ),
+            vec![vec!["abc", "616263"]],
+            "a cast truncates under {mode}"
+        );
+        let err = refusal_of(
+            &engine,
+            &mut session,
+            "INSERT INTO Narrow (a) VALUES ('abcd')",
+        );
+        assert_eq!(err.code, 1406, "a column write refuses under {mode}");
+    }
+
+    // And the DECIMAL width #0201 did fix is unchanged by any of this: it
+    // clamps rather than truncating, under every mode including these.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST('99999999999' AS DECIMAL(10,2)), CAST(999999999.99 AS DECIMAL(10,2)), \
+                    CAST('3.75' AS DECIMAL(10,1))"
+        ),
+        vec![vec!["99999999.99", "99999999.99", "3.8"]]
+    );
+}
