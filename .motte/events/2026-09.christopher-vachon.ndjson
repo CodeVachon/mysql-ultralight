@@ -138,3 +138,20 @@
 {"at":"2026-09-03T19:15:27Z","id":179,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-09-03T19:15:27Z","id":180,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-09-03T19:15:27Z","id":184,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T19:16:10Z","id":84,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T19:16:10Z","id":121,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T19:16:10Z","id":111,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T19:16:10Z","id":142,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-03T22:31:37Z","id":84,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T22:31:37Z","id":121,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T22:31:37Z","id":209,"by":"Christopher Vachon","as":"user","type":"created","title":"A document is true in a boolean context unless it is the number 0","state":"Todo"}
+{"at":"2026-09-03T22:31:37Z","id":210,"by":"Christopher Vachon","as":"user","type":"created","title":"CAST of a JSON number to SIGNED truncates where MySQL rounds","state":"Todo"}
+{"at":"2026-09-03T22:31:37Z","id":211,"by":"Christopher Vachon","as":"user","type":"created","title":"A non-JSON value assigned to a JSON column is accepted","state":"Todo"}
+{"at":"2026-09-03T23:20:39Z","id":118,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T23:20:39Z","id":122,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T23:20:40Z","id":123,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-03T23:20:40Z","id":212,"by":"Christopher Vachon","as":"user","type":"created","title":"FORMAT() is unsupported, and the app calls it","state":"Todo"}
+{"at":"2026-09-03T23:20:40Z","id":213,"by":"Christopher Vachon","as":"user","type":"created","title":"A GROUP BY that needs a temp table settles a decimal's value","state":"Todo"}
+{"at":"2026-09-03T23:20:40Z","id":214,"by":"Christopher Vachon","as":"user","type":"created","title":"The parser accepts reserved words as identifiers","state":"Todo"}
+{"at":"2026-09-04T00:19:02Z","id":111,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T00:19:03Z","id":142,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}

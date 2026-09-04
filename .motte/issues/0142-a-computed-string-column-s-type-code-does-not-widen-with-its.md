@@ -1,11 +1,11 @@
 ---
 id: 142
 title: A computed string column's type code does not widen with its argument
-state: Todo
+state: Done
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-08-31T20:28:22Z
-updated: 2026-09-03T14:20:29Z
+updated: 2026-09-04T00:19:03Z
 ---
 
 ## Description
@@ -28,3 +28,11 @@ Same underlying mechanism as the computed-width gap #0111 records and crates/dif
 ### 2026-09-03T14:02:14Z — Christopher Vachon (user)
 
 VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed exactly, all four: HEX(bl) mysql MEDIUM_BLOB, HEX(js) mysql LONG_BLOB, CONCAT(tx,tx) and UPPER(tx) mysql MEDIUM_BLOB -- every one VAR_STRING here.
+
+### 2026-09-04T00:19:02Z — Christopher Vachon (user)
+
+Landed in 088b2b7. Type code comes from the item's BYTE width: VAR_STRING to 65535, MEDIUM_BLOB to 16777215, LONG_BLOB above. Widths are counted in characters and multiplied by 4, then multiplied AGAIN for a blob-coded answer but not for one already in bytes -- which is why UPPER over a TEXT is 1048560 and not 262140.
+
+Per-function rules measured over 13 shapes: HEX doubles bytes not characters, UNHEX rounds up, TO_BASE64 wraps every 76 characters, REPLACE grows by the replacement's length independently of the pattern.
+
+Re-measuring for the review fixes caught three bugs the review had not, one of them a wrong type code this change had introduced (UNHEX/FROM_BASE64 widths multiplied by a character set they do not use).

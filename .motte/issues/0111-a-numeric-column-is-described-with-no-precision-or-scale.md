@@ -1,11 +1,11 @@
 ---
 id: 111
 title: A numeric column is described with no precision or scale
-state: Todo
+state: Done
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-08-25T23:12:44Z
-updated: 2026-09-03T14:20:27Z
+updated: 2026-09-04T00:22:02Z
 ---
 
 ## Description
@@ -43,3 +43,17 @@ Both are named with those counts in compare.rs and in crates/differential/README
 ### 2026-09-03T14:03:11Z — Christopher Vachon (user)
 
 VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed. Over DECIMAL(10,2) and DECIMAL(7,3): 8.3 reports len 12 dec 2, len 10 dec 3, and len 14 dec 3 BINARY NUM for a+b; the engine reports len 20 dec 0 NUM for all three.
+
+### 2026-09-04T00:19:02Z — Christopher Vachon (user)
+
+Landed in 088b2b7, check.sh green. DIFFERENTIAL NOT RE-RUN -- Docker is failing every write to containerd's metadata DB on this machine. Last clean run 4334/0 on the tree before the decimal merge. Must be re-run before this is relied on, because it widens compare.rs.
+
+Precision is recoverable from width and places, so only those two are carried: length = precision + (scale>0) + signed. Two asymmetries measured rather than assumed: + does NOT clamp precision (DECIMAL(65,30)+DECIMAL(3,3) is 68 wide), and MOD works from the wider WIDTH not the wider precision (12 where precisions give 13).
+
+The split that shapes the fix: a FIELD with no scale reports 0, an ITEM reports 31 (NOT_FIXED_DEC), so a bare FLOAT column and a computed one describe themselves differently.
+
+Confirmed no finding where one was possible: the decimal scale helpers from #0118 agree exactly with what was measured here independently. A decimal's displayed scale and a column's described scale are one rule with two readers.
+
+### 2026-09-04T00:22:02Z — Christopher Vachon (user)
+
+DIFFERENTIAL NOW VERIFIED: 4420 statements, 0 divergences, baseline empty. Docker was repaired (its containerd metadata DB had corrupted; a restart fixed it) and the run completed on the merged tree. Widening compare.rs to compare 'decimals' surfaced no new divergences, which is the result that matters -- that field was collected nowhere and compared nowhere before. Supersedes the 'NOT RE-RUN' caveat in the earlier note.

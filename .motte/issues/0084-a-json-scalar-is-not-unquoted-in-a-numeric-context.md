@@ -1,11 +1,11 @@
 ---
 id: 84
 title: A JSON scalar is not unquoted in a numeric context
-state: Todo
+state: Done
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-08-24T20:58:12Z
-updated: 2026-09-03T14:20:26Z
+updated: 2026-09-03T22:31:37Z
 ---
 
 ## Description
@@ -35,3 +35,11 @@ Still broken, and it is the half the title is actually about -- a quoted numeric
                            CAST(s AS SIGNED)  mysql 2026   engine 0
 
 So the remaining work is the quoted-string case only. Anyone taking this should not re-fix the number path; a probe that only tries j+0 over a JSON number will look green and prove nothing.
+
+### 2026-09-03T22:31:36Z — Christopher Vachon (user)
+
+Landed in f9904f1, gate green. Differential 4280 statements, 0 divergences.
+
+Scope was correctly the smaller one recorded in the earlier validation note: the JSON *number* path was already fixed, so only the quoted case was done. The test covers the number path too, so it cannot regress.
+
+The conversion rule, measured: a numeric context reads the scalar itself -- a string reads as that SQL string (' 2026 '->2026, '+2026'->2026, '2.5e3'->2500, '12abc'->12, '0x10'->0, 'abc'->0), a boolean is 1/0, anything else reads as its rendering. CAST to SIGNED/UNSIGNED takes the LEADING-INTEGER reading instead, so '1e30' is 1 there where arithmetic gives the whole number -- two different rules on the same value.

@@ -1,11 +1,11 @@
 ---
 id: 118
 title: A quotient's value carries more places than its column declares
-state: In Progress
+state: Done
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-08-25T23:29:12Z
-updated: 2026-09-03T16:32:40Z
+updated: 2026-09-03T23:20:39Z
 ---
 
 ## Description
@@ -42,3 +42,16 @@ Found while cross-checking a 32768-row aggregate against 8.3 after #0070.
 ### 2026-09-03T14:01:18Z — Christopher Vachon (user)
 
 VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed exactly, including the width pattern. JSON_ARRAY(1/3) mysql [0.333333333] engine [0.3333]; 1/3=0.3333 mysql 0 engine 1; (1/3)*3 mysql 1.0000 engine 0.9999. JSON_ARRAY(1.5/1, 1/1.5, 1.5/1.5, 1.000000/1) confirms 9/9/18/18 places on 8.3 against 5/4/5/10 here.
+
+### 2026-09-03T23:20:39Z — Christopher Vachon (user)
+
+Landed in f7be76b, gate green. Differential 4366 statements, 0 divergences.
+
+THE WIDTH RULE IN THIS DESCRIPTION WAS WRONG. It says the quotient's places are the operand scales plus div_precision_increment rounded up to a nine-digit word. Measured over a 13x13 grid of operand scales plus 440 further points across seven increment values (609 in all), the rule is:
+
+    value places = 9 * max( ceil(s1/9) + ceil(s2/9), ceil((s1+s2+increment)/9) ), capped at 81
+    shown places = min(s1_shown + increment, 30)
+
+Both halves of the max bite: the description's formula alone predicts 9 places for 1.5/1.5 where 8.3 gives 18, and the operands'-words half alone misses 1/7.000000. Implementing the description literally would have been wrong on a whole class of divisions.
+
+Also measured: products clamp the VALUE at 31 places (not 30, which is where the display clamps), while + - and % clamp at nothing.
