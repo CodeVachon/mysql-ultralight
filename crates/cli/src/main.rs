@@ -118,8 +118,37 @@ fn parse_args() -> Options {
     options
 }
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
+/// The stack a connection's thread gets.
+///
+/// tokio's default is 2 MB, and the server used to take it. That is not enough
+/// to *parse* a very long statement: sqlparser's descent over a left-deep
+/// chain like `1 AND 1 AND ...` runs out somewhere between 60000 and 70000
+/// terms, and it runs out inside the parser -- before the engine has an AST,
+/// and so before `expr::within_walking_depth` can refuse it. The connection
+/// did not get an error; the process aborted and took every other connection
+/// with it.
+///
+/// Measured: at 32 MB both a 70000-term and a 100000-term chain come back as a
+/// clean 1436, because the parser survives and the depth cap then does its
+/// job. So this is not a second limit bolted on -- it is the room the existing
+/// one needs in order to be reached.
+///
+/// A bound on the statement's *size* was measured and rejected: a 731 KB flat
+/// INSERT of 20000 rows parses fine and agrees with 8.3, while a 410 KB chain
+/// dies, and the flat one has more tokens than the chain. Neither bytes nor
+/// tokens separate the two -- only the shape of the tree does, which is not
+/// knowable without parsing. See #0247.
+const CONNECTION_STACK: usize = 32 * 1024 * 1024;
+
+fn main() -> std::io::Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(CONNECTION_STACK)
+        .build()?
+        .block_on(serve())
+}
+
+async fn serve() -> std::io::Result<()> {
     // Measured from as early as possible so the reported figure is the number
     // a test harness actually pays.
     let started = Instant::now();
@@ -266,4 +295,54 @@ async fn main() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CONNECTION_STACK;
+
+    /// A statement too long to parse is refused, not fatal.
+    ///
+    /// Run on a thread of the size a connection actually gets, because that is
+    /// the whole subject: on the 2 MB `cargo test` gives a thread, sqlparser's
+    /// descent over this chain overflows *inside the parser* and aborts the
+    /// process — which would take this test binary with it rather than fail an
+    /// assertion. With the stack a connection has, the parser survives and
+    /// `expr::within_walking_depth` refuses it with 1436.
+    ///
+    /// Measured against the real server before and after: at 70000 terms the
+    /// client used to see `Lost connection to MySQL server during query`, and
+    /// now sees the 1436. See #0247.
+    #[test]
+    fn a_statement_too_long_to_parse_is_refused_rather_than_fatal() {
+        let handle = std::thread::Builder::new()
+            .stack_size(CONNECTION_STACK)
+            .spawn(|| {
+                let engine = mysql_ultralight_engine::Engine::new(
+                    mysql_ultralight_engine::ServerConfig::default(),
+                );
+                engine.bootstrap_database("t").unwrap();
+                let mut session = mysql_ultralight_engine::Session::new(
+                    mysql_ultralight_engine::ServerConfig::default(),
+                    1,
+                );
+                session.current_database = Some("t".to_owned());
+
+                let chain = std::iter::repeat_n("1", 70_000)
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                let refused = engine
+                    .execute(&mut session, &format!("SELECT {chain}"), &[])
+                    .unwrap_err();
+                assert_eq!(refused.code, 1436, "{refused}");
+
+                // And the connection is still usable afterwards, which is the
+                // difference between a refusal and an abort.
+                engine
+                    .execute(&mut session, "SELECT 1", &[])
+                    .expect("the session survives the refusal");
+            })
+            .expect("spawn");
+        handle.join().expect("the thread must refuse, not abort");
+    }
 }
