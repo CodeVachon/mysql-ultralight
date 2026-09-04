@@ -1,11 +1,11 @@
 ---
 id: 250
 title: Threading the outer scope deeper overflows the stack at 20 levels
-state: Todo
+state: Done
 parent: 9
 labels: [executor, app-priority-2]
 created: 2026-09-04T21:13:26Z
-updated: 2026-09-04T21:15:44Z
+updated: 2026-09-04T22:08:26Z
 ---
 
 ## Description
@@ -45,3 +45,15 @@ A cheap fix I considered and rejected: Session::lateral is Option<OuterRow> inli
 Where to look instead: OuterRow::behind ACCUMULATES the enclosing scope, so at level N the schema/values/columns hold all N levels' columns. That makes the structure grow with depth rather than staying constant, which fits a ~50% increase far better than a fixed per-level cost. Sharing the enclosing scope by reference or Rc instead of rebuilding a combined OuterRow per level is the first thing to measure.
 
 Do NOT lower the deep-nest test's depth or raise its stack to make this pass -- both hide a regression a real client would hit.
+
+### 2026-09-04T22:08:25Z — Christopher Vachon (user)
+
+RESOLVED by circumstance rather than by the fix I was looking for, and the distinction matters.
+
+The diagnosis stands: carrying the enclosing scope per nesting level costs stack, and the deep-nest test needed between 2 and 3 MB where it previously fit in 2. I did not find a way to shrink that.
+
+What changed is the ground under it. #0247 measured that tokio's default 2 MB was never enough to PARSE a long statement -- a client could abort the process -- and gave a connection 32 MB. So the 2 MB a cargo test thread hands out is now STRICTER than anything a client runs against, and holding the engine to it would refuse work that is fine everywhere it actually executes.
+
+The deep-nest test now runs on a connection-sized thread and records why, which is the same shape #0247's own test uses.
+
+This is a narrower claim than 'the regression is gone'. The per-level cost is real, the bound is real, and shrinking that number is how the next person discovers something grew it. Anyone embedding mysql-ultralight-engine as a LIBRARY on a default thread still has the smaller budget -- that case is uncovered and the comment says so.

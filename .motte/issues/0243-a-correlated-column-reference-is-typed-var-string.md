@@ -1,11 +1,11 @@
 ---
 id: 243
 title: A correlated column reference is typed VAR_STRING
-state: Todo
+state: Done
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-09-04T08:53:05Z
-updated: 2026-09-04T21:13:46Z
+updated: 2026-09-04T22:08:26Z
 ---
 
 ## Description

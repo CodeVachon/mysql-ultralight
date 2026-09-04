@@ -1,11 +1,11 @@
 ---
 id: 245
 title: An unreferenced CTE and a comma-joined LATERAL are refused where MySQL answers
-state: Todo
+state: Done
 parent: 9
 labels: [executor, app-priority-2]
 created: 2026-09-04T08:53:05Z
-updated: 2026-09-04T21:13:46Z
+updated: 2026-09-04T22:08:26Z
 ---
 
 ## Description
@@ -30,3 +30,7 @@ The LATERAL case is distinct from #0238 (LATERAL parsed and ignored) in that the
 ### 2026-09-04T21:13:46Z — Christopher Vachon (user)
 
 Implementation COMPLETE and preserved on branch worktree-agent-a047704b24d72035d (ac5e241, rebased onto c8d250e), but NOT merged: it overflows the stack at 20 levels of scalar-subquery nesting and aborts the test suite. Blocker filed as #0250 with the diagnosis needed. Returned to Todo rather than left In Progress, since no agent holds it.
+
+### 2026-09-04T22:08:26Z — Christopher Vachon (user)
+
+Landed in c5b89e2. Both halves were the engine REFUSING SQL MySQL accepts -- an unreferenced CTE (which 8.3 does not resolve at all, matching #0192's finding for the recursive case) and a comma-joined LATERAL. That is the direction that costs a test which would have passed in production.

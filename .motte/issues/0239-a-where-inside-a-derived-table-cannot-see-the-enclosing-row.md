@@ -1,11 +1,11 @@
 ---
 id: 239
 title: A WHERE inside a derived table cannot see the enclosing row
-state: Todo
+state: Done
 parent: 9
 labels: [executor, app-priority-2]
 created: 2026-09-04T08:10:22Z
-updated: 2026-09-04T21:13:46Z
+updated: 2026-09-04T22:08:26Z
 ---
 
 ## Description
@@ -25,3 +25,7 @@ Priority 2: 29 subqueries in FROM and 72 EXISTS subqueries in the target applica
 ### 2026-09-04T21:13:46Z — Christopher Vachon (user)
 
 Implementation COMPLETE and preserved on branch worktree-agent-a047704b24d72035d (ac5e241, rebased onto c8d250e), but NOT merged: it overflows the stack at 20 levels of scalar-subquery nesting and aborts the test suite. Blocker filed as #0250 with the diagnosis needed. Returned to Todo rather than left In Progress, since no agent holds it.
+
+### 2026-09-04T22:08:26Z — Christopher Vachon (user)
+
+Landed in c5b89e2 with #0243 and #0245 -- one mechanism, three symptoms. #0230 carried the enclosing row's VALUES into evaluation, #0227 carried its NAMES into resolution, and neither carried its TYPES; a derived table's own WHERE got none of them. All three now reach the same depth.
