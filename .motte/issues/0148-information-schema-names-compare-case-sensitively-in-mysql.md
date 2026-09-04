@@ -1,11 +1,11 @@
 ---
 id: 148
 title: information_schema names compare case-sensitively in MySQL
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-09-01T06:09:08Z
-updated: 2026-09-03T14:20:30Z
+updated: 2026-09-04T00:23:07Z
 ---
 
 ## Description

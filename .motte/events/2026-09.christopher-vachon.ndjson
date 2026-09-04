@@ -155,3 +155,21 @@
 {"at":"2026-09-03T23:20:40Z","id":214,"by":"Christopher Vachon","as":"user","type":"created","title":"The parser accepts reserved words as identifiers","state":"Todo"}
 {"at":"2026-09-04T00:19:02Z","id":111,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-09-04T00:19:03Z","id":142,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T00:23:07Z","id":148,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T00:23:08Z","id":154,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T00:23:08Z","id":204,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T00:23:08Z","id":168,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T00:23:08Z","id":201,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T00:23:08Z","id":211,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T00:23:08Z","id":193,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T01:36:11Z","id":215,"by":"Christopher Vachon","as":"user","type":"created","title":"CAST ignores a declared string or binary width","state":"Todo"}
+{"at":"2026-09-04T01:36:12Z","id":216,"by":"Christopher Vachon","as":"user","type":"created","title":"A JSON, TEXT or BLOB column may not have a literal DEFAULT","state":"Todo"}
+{"at":"2026-09-04T01:36:12Z","id":217,"by":"Christopher Vachon","as":"user","type":"created","title":"The duplicate-key message does not qualify or escape its value","state":"Todo"}
+{"at":"2026-09-04T01:56:12Z","id":193,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T01:56:12Z","id":201,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T01:56:12Z","id":211,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T02:00:21Z","id":218,"by":"Christopher Vachon","as":"user","type":"created","title":"A deeply nested statement can overflow the worker stack","state":"Todo"}
+{"at":"2026-09-04T02:00:21Z","id":219,"by":"Christopher Vachon","as":"user","type":"created","title":"SHOW VARIABLES ignores its LIKE filter (confirmed again)","state":"Todo"}
+{"at":"2026-09-04T02:00:32Z","id":219,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Cancelled"}
+{"at":"2026-09-04T02:18:15Z","id":168,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T02:18:15Z","id":204,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}

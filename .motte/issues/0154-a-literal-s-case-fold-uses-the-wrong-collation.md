@@ -1,11 +1,11 @@
 ---
 id: 154
 title: A literal's case fold uses the wrong collation
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-09-02T17:25:27Z
-updated: 2026-09-03T14:20:30Z
+updated: 2026-09-04T00:23:08Z
 ---
 
 ## Description

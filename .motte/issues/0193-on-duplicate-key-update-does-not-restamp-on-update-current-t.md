@@ -1,11 +1,11 @@
 ---
 id: 193
 title: ON DUPLICATE KEY UPDATE does not restamp ON UPDATE CURRENT_TIMESTAMP
-state: Todo
+state: Done
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-09-03T15:12:57Z
-updated: 2026-09-03T15:12:57Z
+updated: 2026-09-04T01:56:12Z
 ---
 
 ## Description
@@ -27,3 +27,13 @@ restamp_on_update is called from the two UPDATE paths and not from the upsert br
 Note this cannot be covered in the differential corpus until it is fixed: a case would fail against the empty baseline. It is uncovered until then, which is the argument for doing it soon rather than later.
 
 Relevant to the target application: ON DUPLICATE KEY UPDATE appears 14 times in application-mono-repo, and Prisma upserts compile to it.
+
+## Notes
+
+### 2026-09-04T01:56:12Z — Christopher Vachon (user)
+
+Landed in e7ee480. The trap the review named in advance held: #0089 established MySQL decides 'changed' AFTER the restamp, so restamping naively would have fixed the timestamp and broken the affected-rows count. The restamp is ordered before finalise_row and the comparison, as both UPDATE paths already do it, and the test loops over both CLIENT_FOUND_ROWS settings to pin 2/0/1 alongside the moved timestamp.
+
+restamp_on_update self-guards on before == candidate, which is what keeps a no-op upsert from counting one; a mutation disabling that guard proves it is load-bearing.
+
+The corpus case this issue could not have before -- it would have failed the empty baseline -- now exists.
