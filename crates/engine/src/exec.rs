@@ -842,6 +842,7 @@ impl Engine {
                 database.views.insert(name, view);
                 Ok(Outcome::ok())
             }
+            Statement::RenameTable(pairs) => ddl::rename_tables(self, session, pairs),
             Statement::AlterTable(alter) => {
                 let outcome = ddl::alter_table(
                     self,

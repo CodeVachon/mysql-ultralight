@@ -34862,3 +34862,111 @@ fn a_grouped_key_determines_the_rest_of_its_row() {
         "SET SESSION sql_mode='ONLY_FULL_GROUP_BY'",
     );
 }
+
+/// `RENAME TABLE` renames, carries the foreign keys, and is all or nothing.
+///
+/// Measured on 8.3. The two refusals are the interesting half: a target that
+/// exists is 1050, and a source that does not is 1146 **qualified** with its
+/// database, which the same error from a SELECT is not.
+#[test]
+fn rename_table_moves_every_pair_or_none() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE P (id INT NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C (id INT NOT NULL, pid INT, PRIMARY KEY (id), \
+         CONSTRAINT fk1 FOREIGN KEY (pid) REFERENCES P(id))",
+    );
+    run(&engine, &mut session, "CREATE TABLE Keep (i INT)");
+
+    // The parent moves and the child follows it, which is the whole point of
+    // renaming a table that something references.
+    run(&engine, &mut session, "RENAME TABLE P TO P2");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT REFERENCED_TABLE_NAME FROM information_schema.referential_constraints \
+             WHERE CONSTRAINT_SCHEMA = 'testdb'"
+        ),
+        vec![vec!["P2"]]
+    );
+
+    // Several pairs in one statement, applied in the order written: `Tmp`
+    // exists by the time the second pair reads it.
+    run(&engine, &mut session, "RENAME TABLE P2 TO Tmp, Tmp TO P3");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME FROM information_schema.tables \
+             WHERE TABLE_SCHEMA = 'testdb' ORDER BY TABLE_NAME"
+        ),
+        vec![vec!["C"], vec!["Keep"], vec!["P3"]]
+    );
+
+    let taken = engine
+        .execute(&mut session, "RENAME TABLE P3 TO Keep", &[])
+        .unwrap_err();
+    assert_eq!(taken.code, 1050, "{taken}");
+
+    let missing = engine
+        .execute(&mut session, "RENAME TABLE nosuch TO x", &[])
+        .unwrap_err();
+    assert_eq!(missing.code, 1146, "{missing}");
+    assert_eq!(
+        missing.message, "Table 'testdb.nosuch' doesn't exist",
+        "1146 names the table qualified here, which a SELECT's 1146 does not"
+    );
+
+    // All or nothing: the first pair is legal and the second is not, so
+    // neither happens.
+    let both = engine
+        .execute(&mut session, "RENAME TABLE P3 TO P4, C TO Keep", &[])
+        .unwrap_err();
+    assert_eq!(both.code, 1050, "{both}");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME FROM information_schema.tables \
+             WHERE TABLE_SCHEMA = 'testdb' ORDER BY TABLE_NAME"
+        ),
+        vec![vec!["C"], vec!["Keep"], vec!["P3"]],
+        "a refused pair must not leave an earlier one applied"
+    );
+}
+
+/// A rename into another database is refused, and leaves the table reachable.
+///
+/// 8.3 *moves* it. This engine does not, and the reason it refuses rather than
+/// doing half of it is what the test is really about: joining the qualified
+/// target into one name built a table literally called `other.Alt` in the
+/// current database, and `SELECT ... FROM other.Alt` could not then find it —
+/// the rows sat in the catalog under a name nothing could address.
+#[test]
+fn a_rename_into_another_database_is_refused_rather_than_stranding_the_table() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE DATABASE other");
+    run(&engine, &mut session, "CREATE TABLE B2 (i INT)");
+    run(&engine, &mut session, "INSERT INTO B2 VALUES (7)");
+
+    for sql in [
+        "ALTER TABLE B2 RENAME TO other.Alt",
+        "RENAME TABLE B2 TO other.Alt",
+    ] {
+        let refused = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(refused.code, 1235, "{sql} -> {refused}");
+        // The table is still where it was, and still holds its row.
+        assert_eq!(
+            rows(&engine, &mut session, "SELECT i FROM B2"),
+            vec![vec!["7"]],
+            "{sql} left the table unreachable"
+        );
+    }
+}

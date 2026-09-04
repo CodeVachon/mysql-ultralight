@@ -1474,6 +1474,131 @@ fn index_column_names(columns: &[sqlparser::ast::IndexColumn]) -> Vec<String> {
         .collect()
 }
 
+/// `RENAME TABLE a TO b, c TO d`.
+///
+/// A statement of its own rather than a spelling of `ALTER TABLE ... RENAME
+/// TO`, because it renames *several* tables and either all of them happen or
+/// none do. Measured on 8.3: `RENAME TABLE A TO A2, B TO B2` moves both, and a
+/// pair that fails leaves every earlier pair alone -- so the whole list is
+/// checked before any of it is written, the way `alter_table` checks its
+/// operations.
+///
+/// The two refusals are measured too, and neither is the one the engine gave
+/// before (which was 1235 for the statement itself):
+///
+/// ```text
+/// RENAME TABLE A2 TO Keep   -- Keep exists      1050 Table 'Keep' already exists
+/// RENAME TABLE nosuch TO x                      1146 Table 'probe.nosuch' doesn't exist
+/// ```
+///
+/// Note 1146 names the table **qualified** here, where the same error from a
+/// SELECT does not. That is 8.3's spelling, not a slip.
+///
+/// A target in another database *moves* the table there on 8.3. That is
+/// refused rather than implemented, because a move has to carry the rows, the
+/// keys and every foreign key pointing at the table across two databases at
+/// once, and doing half of it is how a table ends up somewhere nothing can
+/// address. See #0251.
+pub fn rename_tables(
+    engine: &Engine,
+    session: &mut Session,
+    pairs: &[sqlparser::ast::RenameTable],
+) -> EngineResult<Outcome> {
+    // Resolved before anything is written, so a bad pair late in the list
+    // cannot leave an earlier one applied.
+    let mut planned: Vec<(String, String, String)> = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        let (db, from) = engine.split_name_public(session, &pair.old_name)?;
+        let (target_db, to) = engine.split_name_public(session, &pair.new_name)?;
+        if !target_db.eq_ignore_ascii_case(&db) {
+            return Err(crate::error::unsupported(format!(
+                "moving `{from}` to another database with RENAME TABLE"
+            )));
+        }
+        planned.push((db, from, to));
+    }
+
+    {
+        let catalog = engine.catalog_public()?;
+        // Every pair against the catalog as it stands, plus the targets this
+        // statement is itself about to create: `RENAME TABLE A TO B, B TO C`
+        // is legal on 8.3 because B is gone by the time the second pair runs,
+        // while `A TO X, B TO X` is not.
+        // A running picture of what exists, not a set of exceptions to the
+        // catalog: 8.3 applies the pairs *in order*, so `A TO Tmp, Tmp TO A3`
+        // is legal -- Tmp exists by the time the second pair reads it -- and
+        // `A TO X, B TO X` is not. Only a simulation gets both.
+        let mut names: Vec<(String, String)> = Vec::new();
+        let mut seeded: Vec<String> = Vec::new();
+        for (db, from, to) in &planned {
+            let database = catalog
+                .database(db)
+                .ok_or_else(|| EngineError::unknown_database(db))?;
+            if !seeded.iter().any(|d| d == db) {
+                names.extend(database.tables.keys().map(|k| (db.clone(), k.clone())));
+                seeded.push(db.clone());
+            }
+            // The target before the source, which is measurable only when
+            // both are wrong at once: `RENAME TABLE gone TO Have` with `gone`
+            // missing and `Have` present is 1050 on 8.3, not 1146.
+            //
+            // And with no exemption for a rename onto the same name --
+            // `RENAME TABLE Have2 TO Have2` is 1050 there too, where the
+            // `ALTER TABLE ... RENAME TO` spelling treats it as the no-op it
+            // looks like. Two statements, two answers; this is the one that
+            // refuses.
+            if names
+                .iter()
+                .any(|(d, t)| d == db && t.eq_ignore_ascii_case(to))
+            {
+                return Err(EngineError::table_exists(to));
+            }
+            let at = names
+                .iter()
+                .position(|(d, t)| d == db && t.eq_ignore_ascii_case(from));
+            let Some(at) = at else {
+                return Err(EngineError::no_such_table(&format!("{db}.{from}")));
+            };
+            names.remove(at);
+            names.push((db.clone(), to.clone()));
+        }
+    }
+
+    for (db, from, to) in &planned {
+        engine.mark_modified_public(session, db, from);
+        engine.mark_modified_public(session, db, to);
+        let mut catalog = engine.catalog_mut_public()?;
+        // The foreign keys that point at the old name, before the table moves
+        // out from under them -- the same propagation `ALTER TABLE ... RENAME
+        // TO` does, and the reason a renamed parent does not leave its
+        // children pointing at a table that is gone.
+        let touched = rename_referencing_tables(&mut catalog, db, from, to);
+        let database = catalog
+            .database_mut(db)
+            .ok_or_else(|| EngineError::unknown_database(db))?;
+        let key = database
+            .tables
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(from))
+            .cloned();
+        if let Some(key) = key {
+            let Some(mut table) = database.tables.remove(&key) else {
+                continue;
+            };
+            let was = table.name.clone();
+            rename_own_auto_keys(&mut table, &was, to);
+            table.name = to.clone();
+            database.tables.insert(to.clone(), table);
+        }
+        drop(catalog);
+        for (other_db, other_table) in touched {
+            engine.mark_modified_public(session, &other_db, &other_table);
+        }
+    }
+
+    Ok(Outcome::ok())
+}
+
 pub fn alter_table(
     engine: &Engine,
     session: &mut Session,
@@ -1728,7 +1853,26 @@ pub fn alter_table(
                 let target = match new_name {
                     RenameTableNameKind::To(name) | RenameTableNameKind::As(name) => name,
                 };
-                renamed_to = Some(name::dotted(target));
+                // A qualified target names another database, and 8.3 *moves*
+                // the table there. Joining the parts back into one name --
+                // which is what this did -- produced a table literally called
+                // `other.Alt` in the current database, which no qualified name
+                // then reaches: `SELECT i FROM other.Alt` is 1146 while the
+                // rows sit in the catalog under a name nothing can address.
+                //
+                // Refused rather than half-implemented. A move has to carry
+                // the rows, the keys and every foreign key pointing at the
+                // table across two databases at once, and stranding a table is
+                // a worse answer than declining to move it. See #0251.
+                let mut parts = name::parts(target);
+                if parts.len() > 1 && !parts[0].eq_ignore_ascii_case(&db) {
+                    return Err(crate::error::unsupported(format!(
+                        "moving `{table_name}` to database `{}`",
+                        parts[0]
+                    )));
+                }
+                let bare = parts.pop().unwrap_or_default();
+                renamed_to = Some(bare);
             }
             AlterTableOperation::AddConstraint { constraint, .. } => {
                 apply_constraint(table, constraint)?

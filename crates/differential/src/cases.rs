@@ -9443,4 +9443,68 @@ pub const GROUPS: &[Group] = &[
                   (SELECT 1 FROM Cr JOIN Cr c3 USING (id)) ORDER BY 1"),
         ],
     },
+    Group {
+        // What RENAME TABLE does, which the engine answered 1235 for until
+        // #0232. The refusals are the half worth pinning: a target that exists
+        // is 1050, a source that does not is 1146 *qualified* with its
+        // database — which the same code from a SELECT is not — and a pair
+        // that fails leaves every earlier pair in the statement alone.
+        //
+        // A cross-database target is deliberately absent: 8.3 moves the table
+        // and this engine refuses, so a case would fail against an empty
+        // baseline. It is #0251, and the engine test carries the refusal.
+        name: "what a rename does to a table",
+        setup: &[
+            "CREATE TABLE RnP (id INT NOT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE RnC (id INT NOT NULL, pid INT, PRIMARY KEY (id), \
+             CONSTRAINT rnfk FOREIGN KEY (pid) REFERENCES RnP(id))",
+            "CREATE TABLE RnKeep (i INT)",
+            "INSERT INTO RnP VALUES (1)",
+            "INSERT INTO RnC VALUES (1, 1)",
+        ],
+        cases: &[
+            // The parent moves and the key that points at it follows.
+            same("RENAME TABLE RnP TO RnP2"),
+            same("SELECT CONSTRAINT_NAME, TABLE_NAME, REFERENCED_TABLE_NAME \
+                  FROM information_schema.referential_constraints \
+                  WHERE CONSTRAINT_SCHEMA = DATABASE() ORDER BY CONSTRAINT_NAME"),
+            same("SELECT TABLE_NAME, 'after_one' AS at FROM information_schema.tables \
+                  WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME"),
+            // The rows are still reachable under the new name.
+            same("SELECT id FROM RnP2 ORDER BY id"),
+            // Several pairs at once, applied in the order written — `RnTmp`
+            // exists by the time the second pair reads it.
+            same("RENAME TABLE RnP2 TO RnTmp, RnTmp TO RnP3"),
+            same("SELECT TABLE_NAME, 'after_chain' AS at FROM information_schema.tables \
+                  WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME"),
+            // A target that already exists.
+            same("RENAME TABLE RnP3 TO RnKeep"),
+            // A source that does not, named with its database.
+            same("RENAME TABLE rn_nosuch TO RnX"),
+            // Two pairs onto one name is not the chained case above: nothing
+            // frees the second target.
+            same("RENAME TABLE RnP3 TO RnX, RnC TO RnX"),
+            // The target is checked before the source, which only shows when
+            // both are wrong at once.
+            same("RENAME TABLE rn_gone TO RnKeep"),
+            // And a rename onto the same name is refused, where the
+            // `ALTER TABLE ... RENAME TO` spelling of it is a no-op.
+            same("RENAME TABLE RnKeep TO RnKeep"),
+            same("ALTER TABLE RnKeep RENAME TO RnKeep"),
+            same("SELECT i FROM RnKeep ORDER BY i"),
+            // All or nothing — the first pair here is legal and the second is
+            // not, so the table list must be unchanged after it.
+            same("RENAME TABLE RnP3 TO RnP4, RnC TO RnKeep"),
+            same("SELECT TABLE_NAME, 'after_refusal' AS at FROM information_schema.tables \
+                  WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME"),
+            // A rename that differs only in case is deliberately NOT asked
+            // here. On the reference server table names are case-sensitive
+            // (`lower_case_table_names` is 0), so `RENAME TABLE RnP3 TO rnp3`
+            // leaves nothing called `RnP3` and reading it back is 1146, while
+            // this engine looks a table up case-insensitively and finds it.
+            // That is #0151 -- the identifier case rule -- and asking it here
+            // would cost the empty baseline for a question this group is not
+            // about. The engine test carries the rename itself.
+        ],
+    },
 ];
