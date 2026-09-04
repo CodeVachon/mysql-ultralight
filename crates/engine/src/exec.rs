@@ -2039,12 +2039,29 @@ impl Engine {
         let aggregating = !group_exprs.is_empty() || aggregates_of_itself(select);
 
         if aggregating {
+            // Read here rather than inside `grouped`, which is handed the
+            // relation's columns and not the FROM items they came from — and
+            // a key is a fact about a *table*, which only those still name.
+            // The guard is dropped before the grouping runs, so nothing this
+            // engine does while answering holds the catalog open.
+            //
+            // Only where there is a rule for it to satisfy: with
+            // ONLY_FULL_GROUP_BY off nothing asks what the grouping
+            // determines, and this would be a catalog read per grouped query
+            // for an answer nobody reads.
+            let keys = if session.sql_mode().only_full_group_by {
+                let rejected = null_rejected_columns(select.selection.as_ref(), &refs);
+                relation_keys(&*self.catalog()?, &relation, &rejected)
+            } else {
+                Vec::new()
+            };
             let mut grouped = self.grouped(
                 session,
                 select,
                 Input {
                     refs: &refs,
                     columns: &relation.columns,
+                    keys: &keys,
                     matching: &matching,
                 },
                 &group_exprs,
@@ -3179,9 +3196,12 @@ impl Engine {
                 &implicit_schema,
                 [having],
             )?;
+            // Resolved before the row is looked at, so a clause the resolution
+            // refuses is refused whether the WHERE left a row or not. No
+            // grouped columns are passed for the reason the scope check above
+            // gives: this path has no relation for one to come from.
+            let resolved = substitute_aliases(having, &items, &implicit_schema, &[])?;
             if let Some(projected) = rows.first() {
-                let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
-                let resolved = substitute_aliases(having, &names);
                 // Over `group` rather than the implicit row, so an aggregate
                 // in the clause folds over what the WHERE left exactly as one
                 // in the select list does.
@@ -3700,6 +3720,7 @@ impl Engine {
         let Input {
             refs,
             columns: input_columns,
+            keys,
             matching,
         } = input;
         let sub = Some(Sub {
@@ -3715,7 +3736,6 @@ impl Engine {
         let written_groups = group_exprs;
 
         let items = projected_items(&select.projection)?;
-        let names: Vec<String> = items.iter().map(|(alias, _)| alias.clone()).collect();
 
         // Before the grouping rules, because MySQL resolves names first:
         // `SELECT a.b, COUNT(*) FROM J2 GROUP BY b` is 1054 there and would
@@ -3784,6 +3804,17 @@ impl Engine {
             select.having.as_ref(),
         )?;
 
+        // What each name in the HAVING means, settled once and before any row
+        // is grouped rather than once per group. Which column or which
+        // projected value a name stands for does not change from group to
+        // group, and 8.3 settles it at prepare — so the 1052 two aliases of
+        // one name draw is drawn over an empty table too, where a per-group
+        // substitution would never have run at all.
+        let having = match &select.having {
+            Some(having) => Some(substitute_aliases(having, &items, refs, &group_exprs)?),
+            None => None,
+        };
+
         // The same resolution the ungrouped path uses, and ahead of the
         // grouping rules because that is the order 8.3 answers in: `SELECT id
         // AS b FROM t GROUP BY b ORDER BY 9` is 1054 for the position there,
@@ -3819,7 +3850,7 @@ impl Engine {
         // aggregated. Silently evaluating it against the group's first row
         // returns an arbitrary value where MySQL raises an error.
         if session.sql_mode().only_full_group_by {
-            let determined = determined_columns(select, refs, &group_exprs);
+            let determined = determined_columns(select, refs, &group_exprs, keys);
             for (_, e) in &items {
                 check_full_group_by(e, e, &group_exprs, refs, &determined)?;
             }
@@ -3945,10 +3976,9 @@ impl Engine {
 
             // HAVING is evaluated after the projection so it can reference an
             // output alias, which MySQL allows and reporting queries rely on.
-            if let Some(having) = &select.having {
-                let resolved = substitute_aliases(having, &names);
+            if let Some(having) = &having {
                 if self
-                    .eval_over_group(&resolved, group, refs, session, &out)?
+                    .eval_over_group(having, group, refs, session, &out)?
                     .truthy()
                     != Some(true)
                 {
@@ -6802,6 +6832,12 @@ impl Executed {
 struct Input<'a> {
     refs: &'a [ColumnRef],
     columns: &'a [crate::relation::RelColumn],
+    /// The unique keys the FROM items brought, for the functional dependency
+    /// ONLY_FULL_GROUP_BY admits. Built by the caller because it is the one
+    /// that still has the FROM items: a column knows the name it is reached
+    /// through and not which stored table declared it, and a key is a fact
+    /// about the table.
+    keys: &'a [RelationKey],
     matching: &'a [&'a Vec<Value>],
 }
 
@@ -7865,8 +7901,6 @@ fn output_items(
     refs: &[ColumnRef],
     coalesced: &[String],
 ) -> EngineResult<Vec<OutItem>> {
-    use sqlparser::ast::Ident;
-
     let mut out: Vec<OutItem> = Vec::new();
     for item in projection {
         let qualifier = match item {
@@ -7909,14 +7943,7 @@ fn output_items(
             }) {
                 continue;
             }
-            let written = if column.table.is_empty() {
-                Expr::Identifier(Ident::new(column.name.clone()))
-            } else {
-                Expr::CompoundIdentifier(vec![
-                    Ident::new(column.table.clone()),
-                    Ident::new(column.name.clone()),
-                ])
-            };
+            let written = qualified_column(&column.reference());
             // A column `USING` joined on is one column in MySQL, which
             // returns it once; this engine's relation keeps both sides, so
             // `SELECT * FROM a JOIN b USING (id)` puts two columns called
@@ -8324,20 +8351,62 @@ fn check_projected_order(
     Ok(())
 }
 
-/// Rewrites references to a select-list alias into the hidden column carrying
-/// the value already computed for it, so HAVING and ORDER BY can name one.
+/// Rewrites the names a HAVING writes into what each one means: the hidden
+/// column carrying an alias's already-computed value, or the grouped column
+/// that takes the name back off it.
 ///
 /// A hidden column and not a rendered literal, for the reason `alias_name`
 /// gives: the value goes through unchanged, tag and all.
-fn substitute_aliases(e: &Expr, names: &[String]) -> Expr {
+///
+/// The grouped column wins, which is #0236 and is the third precedence in this
+/// family: GROUP BY prefers the relation outright, ORDER BY prefers the select
+/// list outright, and HAVING is the only one of the three that depends on what
+/// else is in the GROUP BY. `grouped_column` carries the measurements.
+fn substitute_aliases<E: std::borrow::Borrow<Expr>>(
+    e: &Expr,
+    items: &[(String, E)],
+    refs: &[ColumnRef],
+    group_exprs: &[Expr],
+) -> EngineResult<Expr> {
     use sqlparser::ast::Ident;
 
-    substitute_names(e, &|written| {
-        names
-            .iter()
-            .position(|name| name.eq_ignore_ascii_case(written))
-            .map(|position| Expr::Identifier(Ident::new(alias_name(position))))
-    })
+    // The walk cannot fail, so the ambiguity is carried out of it rather than
+    // returned from it, exactly as `substitute_group_aliases` does. First one
+    // wins, which is the same left-to-right reading.
+    let failure: std::cell::RefCell<Option<EngineError>> = std::cell::RefCell::new(None);
+    let record = |error| {
+        let mut slot = failure.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(error);
+        }
+    };
+    let substituted = substitute_names(e, &|written| {
+        // The select list is searched first even though the grouped column
+        // wins, because two aliases of one name are ambiguous whether the
+        // clause groups a column of that name or not: measured, `SELECT k AS
+        // b, s AS b, COUNT(*) FROM Cl GROUP BY id, Cl.b HAVING b > 50` is 1052
+        // on 8.3 and not the three rows the grouped `Cl.b` would have given.
+        let alias = match select_alias(written, items, refs, "having clause") {
+            Ok(alias) => alias,
+            Err(error) => {
+                record(error);
+                return None;
+            }
+        };
+        let name = Expr::Identifier(Ident::new(written));
+        match grouped_column(&name, group_exprs, refs, "having clause") {
+            Ok(Some(slot)) => Some(qualified_column(&refs[slot])),
+            Ok(None) => alias.map(|position| Expr::Identifier(Ident::new(alias_name(position)))),
+            Err(error) => {
+                record(error);
+                None
+            }
+        }
+    });
+    match failure.into_inner() {
+        Some(error) => Err(error),
+        None => Ok(substituted),
+    }
 }
 
 /// Rewrites a reference to a select-list item into the expression written for
@@ -11618,6 +11687,176 @@ fn is_set_operation(body: &SetExpr) -> bool {
     }
 }
 
+/// A unique key one FROM item brings, as positions in the relation's columns.
+///
+/// Both halves are needed together: `columns` is what has to be grouped, and
+/// `table` is every column of the item that is then determined. A key on its
+/// own says nothing about what it fixes.
+struct RelationKey {
+    columns: Vec<usize>,
+    table: Vec<usize>,
+}
+
+/// The unique keys the stored tables in a FROM clause bring with them.
+///
+/// The second way a GROUP BY determines a column, and the one #0237 is about:
+/// grouping by a primary key fixes every other column of that row, so `SELECT
+/// k FROM Fd GROUP BY id` answers on 8.3 where this engine raised 1055 — a
+/// working statement refused, which is the failure direction this engine
+/// exists to avoid.
+///
+/// A primary key always qualifies. A unique key qualifies only when none of
+/// its columns can be NULL, and that is not pedantry: a unique index treats
+/// two NULLs as distinct and a GROUP BY treats them as equal, so a nullable
+/// unique column collects every NULL row into one group and fixes nothing.
+/// Measured on 8.3 over `Fd(id PK, k, u INT NOT NULL UNIQUE, un INT NULL
+/// UNIQUE)`:
+///
+/// ```sql
+/// SELECT k FROM Fd GROUP BY id   -- answers, primary key
+/// SELECT k FROM Fd GROUP BY u    -- answers, unique over a NOT NULL column
+/// SELECT k FROM Fd GROUP BY un   -- 1055, the unique column admits NULL
+/// ```
+///
+/// `null_rejected` is why the third one is not the end of it: a WHERE that
+/// cannot pass a NULL makes the column non-nullable *for this query*, and 8.3
+/// follows that — `WHERE un IS NOT NULL GROUP BY un` answers, and so do `WHERE
+/// un = 1000` and `WHERE un > 0`.
+///
+/// Read from the catalog rather than from the relation, so an alias reaches
+/// the table it renames: `SELECT f.k FROM Fd f GROUP BY f.id` answers on 8.3.
+/// A derived table has no catalog entry and so brings no key, which leaves
+/// `SELECT k FROM (SELECT * FROM Fd) x GROUP BY id` refused where 8.3 answers
+/// it — a gap rather than a wrong answer.
+fn relation_keys(
+    catalog: &Catalog,
+    relation: &Relation,
+    null_rejected: &[usize],
+) -> Vec<RelationKey> {
+    let mut keys = Vec::new();
+    // Zipped rather than indexed, so the three vectors being parallel is what
+    // the code does rather than something it assumes.
+    let sources = relation
+        .sources
+        .iter()
+        .zip(&relation.base_tables)
+        .zip(&relation.source_databases);
+    for ((shown, base), database) in sources {
+        // A name two FROM items answer to cannot tell their columns apart, so
+        // a key read through it would claim to fix the *other* item's row as
+        // well. 8.3 never gets here — `FROM Cl, Cl` is 1066 there — but this
+        // engine does not yet raise that, and the failure this guard prevents
+        // is a wrong answer rather than a missing one.
+        if relation
+            .sources
+            .iter()
+            .filter(|other| other.eq_ignore_ascii_case(shown))
+            .count()
+            > 1
+        {
+            continue;
+        }
+        let Some(table) = catalog
+            .database(&database.holds)
+            .and_then(|d| d.table(base))
+        else {
+            continue;
+        };
+        // Every column this FROM item contributes, by the name a qualified
+        // reference reaches it through — which is the alias where there is
+        // one, and is why a self-join's two halves do not run together.
+        let slots: Vec<usize> = relation
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.table.eq_ignore_ascii_case(shown))
+            .map(|(slot, _)| slot)
+            .collect();
+        for index in &table.indexes {
+            if !index.primary && !index.unique {
+                continue;
+            }
+            // A key whose columns are not all in the relation determines
+            // nothing here. `collect` over `Option` stops at the first one
+            // that is missing.
+            let Some(columns) = index
+                .columns
+                .iter()
+                .map(|name| {
+                    slots
+                        .iter()
+                        .copied()
+                        .find(|slot| relation.columns[*slot].name.eq_ignore_ascii_case(name))
+                })
+                .collect::<Option<Vec<usize>>>()
+            else {
+                continue;
+            };
+            // The catalog's nullability and not the relation's: an outer join
+            // relaxes a column to nullable, and a key on the null-supplying
+            // side still determines. An unmatched row is NULL in every column
+            // of that side at once, so the group a NULL key collects is a
+            // group whose other columns are NULL too. Measured: `SELECT Fj.w
+            // FROM Fd LEFT JOIN Fj ON Fj.id = Fd.id GROUP BY Fj.id` answers on
+            // 8.3.
+            let determines = index.primary
+                || columns.iter().all(|slot| {
+                    table
+                        .column(&relation.columns[*slot].name)
+                        .is_some_and(|c| !c.nullable)
+                        || null_rejected.contains(slot)
+                });
+            if determines {
+                keys.push(RelationKey {
+                    columns,
+                    table: slots.clone(),
+                });
+            }
+        }
+    }
+    keys
+}
+
+/// The columns a WHERE cannot let a NULL through.
+///
+/// Only the top-level `AND` chain, because that is the only place a condition
+/// holds for every row the grouping sees: one arm of an `OR` says nothing
+/// about the rows the other arm let in.
+///
+/// A comparison rejects a NULL whichever way it points — `un > 0`, `un = 1000`
+/// and `1000 = un` all evaluate to NULL for a NULL `un`, and a NULL is not
+/// true. `<=>` is left out for exactly that reason: it is the one comparison
+/// that answers *true* for two NULLs, so `WHERE un <=> NULL` keeps them.
+fn null_rejected_columns(selection: Option<&Expr>, refs: &[ColumnRef]) -> Vec<usize> {
+    use sqlparser::ast::BinaryOperator as Op;
+
+    let Some(e) = selection else {
+        return Vec::new();
+    };
+    match e {
+        Expr::BinaryOp {
+            left,
+            op: Op::And,
+            right,
+        } => {
+            let mut out = null_rejected_columns(Some(left), refs);
+            out.extend(null_rejected_columns(Some(right), refs));
+            out
+        }
+        Expr::Nested(inner) => null_rejected_columns(Some(inner), refs),
+        Expr::IsNotNull(inner) => column_slot(refs, inner).into_iter().collect(),
+        Expr::BinaryOp {
+            left,
+            op: Op::Eq | Op::NotEq | Op::Lt | Op::LtEq | Op::Gt | Op::GtEq,
+            right,
+        } => column_slot(refs, left)
+            .into_iter()
+            .chain(column_slot(refs, right))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The column positions a GROUP BY determines, which is more than the columns
 /// it names.
 ///
@@ -11627,7 +11866,18 @@ fn is_set_operation(body: &SetExpr) -> bool {
 /// selecting it is not ambiguous and MySQL accepts it — the migrations rely on
 /// exactly that. Equality conditions in ON and WHERE are followed to build the
 /// set; anything they do not reach is still an error.
-fn determined_columns(select: &Select, refs: &[ColumnRef], group_exprs: &[Expr]) -> Vec<usize> {
+///
+/// `keys` is the other half of the same rule, and the two feed each other:
+/// grouping by a joined table's primary key fixes its foreign key column,
+/// which an equality then carries across to the other table's primary key,
+/// which fixes that table in turn. Measured: `SELECT Fd.k FROM Fd JOIN Fj ON
+/// Fj.fid = Fd.id GROUP BY Fj.id` answers on 8.3, and it takes both steps.
+fn determined_columns(
+    select: &Select,
+    refs: &[ColumnRef],
+    group_exprs: &[Expr],
+    keys: &[RelationKey],
+) -> Vec<usize> {
     let mut determined: Vec<usize> = group_exprs
         .iter()
         .filter_map(|e| column_slot(refs, e))
@@ -11688,6 +11938,10 @@ fn determined_columns(select: &Select, refs: &[ColumnRef], group_exprs: &[Expr])
 
     // Determination is transitive, so the set is closed rather than walked
     // once. These pairs are directed, so the closure follows them one way.
+    //
+    // The keys are inside the same loop rather than applied once before or
+    // after it, because each feeds the other: an equality can complete a key,
+    // and a completed key can supply the column another equality needs.
     let mut grew = true;
     while grew {
         grew = false;
@@ -11695,6 +11949,17 @@ fn determined_columns(select: &Select, refs: &[ColumnRef], group_exprs: &[Expr])
             if determined.contains(from) && !determined.contains(to) {
                 determined.push(*to);
                 grew = true;
+            }
+        }
+        for key in keys {
+            if !key.columns.iter().all(|slot| determined.contains(slot)) {
+                continue;
+            }
+            for slot in &key.table {
+                if !determined.contains(slot) {
+                    determined.push(*slot);
+                    grew = true;
+                }
             }
         }
     }
@@ -12549,7 +12814,7 @@ fn substitute_group_aliases<E: std::borrow::Borrow<Expr>>(
         // a `Cl` that has a column `b`: `SELECT k AS b, s AS b FROM Cl GROUP
         // BY b` is 1052 on 8.3, where the single-alias `SELECT k AS b FROM Cl
         // GROUP BY b` groups on the column and is 1055 for the ungrouped `k`.
-        let found = match group_alias(written, items, refs) {
+        let found = match select_alias(written, items, refs, "group statement") {
             Ok(found) => found,
             Err(error) => {
                 record(error);
@@ -12561,7 +12826,7 @@ fn substitute_group_aliases<E: std::borrow::Borrow<Expr>>(
         if taken_by_the_relation {
             return None;
         }
-        let found = found?;
+        let found = items[found?].1.borrow().clone();
         // Asked of whichever expression won, and so not asked at all when the
         // relation took the name: `GROUP BY b` beside `SELECT COUNT(*) AS b`
         // is 1056 only where nothing is called `b` in the FROM.
@@ -12577,12 +12842,40 @@ fn substitute_group_aliases<E: std::borrow::Borrow<Expr>>(
     }
 }
 
-/// The select item a GROUP BY name resolves to, once the relation has declined
-/// it.
+/// One select-list item a name written in a GROUP BY or a HAVING could mean.
+#[derive(Clone, Copy)]
+enum Candidate<'a> {
+    /// A plain column reference: the slot it resolves to where it resolves to
+    /// one, and the expression as written for the case where it does not.
+    Column(Option<usize>, Option<&'a Expr>),
+    /// Anything else — a constant, a call, an expression. It settles the name
+    /// where it stands and stops the walk.
+    Other,
+}
+
+/// Whether two candidates for one name are the same thing.
+///
+/// By resolved column where both resolve to one, which is the rule `OutItem`
+/// states for ORDER BY and which these clauses share: `SELECT Cl.k AS a, k AS
+/// a, COUNT(*) FROM Cl GROUP BY a` answers on 8.3, where two *different*
+/// columns under one alias are 1052. So the comparison is which column each
+/// item resolves to and not how it was written; where neither resolves to one
+/// — a correlated reference, or a query with no FROM — the spelling is all
+/// there is to compare, and a candidate that resolves is never the same thing
+/// as one that does not.
+fn same_candidate(left: &Candidate<'_>, right: &Candidate<'_>) -> bool {
+    match (left, right) {
+        (Candidate::Column(Some(a), _), Candidate::Column(Some(b), _)) => a == b,
+        (Candidate::Column(None, Some(a)), Candidate::Column(None, Some(b))) => a == b,
+        _ => false,
+    }
+}
+
+/// Which candidate a name settles on, or the 1052 two of them raise.
 ///
 /// 8.3 walks the select list and treats a plain column reference differently
 /// from everything else, which is visible from outside and had to be measured
-/// rather than guessed. A second *column* under the same alias is ambiguous;
+/// rather than guessed. A second *column* under the same name is ambiguous;
 /// anything else settles the name where it stands and stops the walk. All four
 /// orders, over `Cl(id, k, b, s)`:
 ///
@@ -12597,50 +12890,138 @@ fn substitute_group_aliases<E: std::borrow::Borrow<Expr>>(
 /// expression is visible at all — the constant won in both, so the walk does
 /// not stop at the first match and does not prefer a column either.
 ///
-/// Two items that are the same column are not ambiguous however they are
-/// spelled, which is the rule `OutItem` states for ORDER BY and which this
-/// clause shares: `SELECT Cl.k AS a, k AS a, COUNT(*) FROM Cl GROUP BY a`
-/// answers on 8.3, where the two *different* columns above are 1052. So the
-/// comparison is which column each item resolves to and not how it was
-/// written; where neither resolves to one — a correlated reference, or a
-/// query with no FROM — the spelling is all there is to compare.
+/// One walk for both clauses, because HAVING reads the select list the same
+/// way — measured over the same table: `SELECT k AS b, 200 AS b, COUNT(*) FROM
+/// Cl GROUP BY id, k, s HAVING b > 50` answers three rows on 8.3, so the
+/// constant settled the name there too rather than colliding with the column.
+/// This engine raised 1052 for it before the two clauses shared a rule.
 ///
-/// The ambiguity is the only thing this raises. Whether the item can be
-/// grouped on at all is the caller's, because it is asked of whatever finally
-/// won the name and the relation may still take it.
-fn group_alias<E: std::borrow::Borrow<Expr>>(
+/// The ambiguity is the only thing this raises. What the winner may then be
+/// used for is the caller's: a GROUP BY refuses an aggregate, and a HAVING has
+/// a grouped column that may still take the name off it.
+fn settle(
+    candidates: &[Candidate<'_>],
+    written: &str,
+    clause: &str,
+) -> EngineResult<Option<usize>> {
+    let mut found: Option<usize> = None;
+    for (index, candidate) in candidates.iter().enumerate() {
+        match candidate {
+            Candidate::Other => return Ok(Some(index)),
+            Candidate::Column(..) => match found {
+                Some(previous) if !same_candidate(&candidates[previous], candidate) => {
+                    return Err(EngineError::ambiguous(written, clause))
+                }
+                Some(_) => {}
+                None => found = Some(index),
+            },
+        }
+    }
+    Ok(found)
+}
+
+/// The position of the select item a name written in a GROUP BY or a HAVING
+/// resolves to.
+///
+/// By output name only, which is what makes it an *alias* search: the same
+/// walk asked about a column's identity rather than its name lives in
+/// `resolve_having_name`, which has the wildcards to expand as well.
+fn select_alias<E: std::borrow::Borrow<Expr>>(
     written: &str,
     items: &[(String, E)],
     refs: &[ColumnRef],
-) -> EngineResult<Option<Expr>> {
-    let mut found: Option<&Expr> = None;
-    for (name, item) in items {
-        let e = item.borrow();
+    clause: &str,
+) -> EngineResult<Option<usize>> {
+    let mut positions: Vec<usize> = Vec::new();
+    let mut candidates: Vec<Candidate<'_>> = Vec::new();
+    for (position, (name, item)) in items.iter().enumerate() {
         if !name.eq_ignore_ascii_case(written) {
             continue;
         }
-        if matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
-            match found {
-                Some(previous) if !same_column(previous, e, refs) => {
-                    return Err(EngineError::ambiguous(written, "group statement"))
-                }
-                Some(_) => {}
-                None => found = Some(e),
-            }
-        } else {
-            found = Some(e);
-            break;
-        }
+        candidates.push(candidate_for(item.borrow(), refs));
+        positions.push(position);
     }
-    Ok(found.cloned())
+    Ok(settle(&candidates, written, clause)?.map(|index| positions[index]))
 }
 
-/// Whether two select items name the same column of the same relation.
-fn same_column(left: &Expr, right: &Expr, refs: &[ColumnRef]) -> bool {
-    match (column_slot(refs, left), column_slot(refs, right)) {
-        (Some(a), Some(b)) => a == b,
-        _ => left == right,
+/// How one select item enters the walk.
+fn candidate_for<'a>(e: &'a Expr, refs: &[ColumnRef]) -> Candidate<'a> {
+    match e {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            Candidate::Column(column_slot(refs, e), Some(e))
+        }
+        _ => Candidate::Other,
     }
+}
+
+/// The relation column a HAVING name reaches through the GROUP BY, if any.
+///
+/// The half of #0236 that decides the clause: a column the query *groups by*
+/// takes the name back off a select alias that shadows it, and a column it
+/// does not group by leaves the alias with it. Measured on 8.3 over `Cl(id PK,
+/// k, b, s)`:
+///
+/// ```sql
+/// SELECT k AS b, COUNT(*) FROM Cl GROUP BY id, k, b HAVING b > 50  -- 3 rows, the COLUMN
+/// SELECT k AS b, COUNT(*) FROM Cl GROUP BY id       HAVING b > 50  -- 0 rows, the ALIAS
+/// ```
+///
+/// Named in the clause and not merely determined by it: `id` is the primary
+/// key, so the second query may *select* `k` — but `b` is still the alias
+/// there. Written as a column, too: `GROUP BY b + 0` leaves the alias with the
+/// name, and `SELECT COUNT(*) FROM Cl GROUP BY b + 0 HAVING b > 50` is 1054.
+///
+/// Not gated on ONLY_FULL_GROUP_BY, measured with the mode off: `GROUP BY id,
+/// k, s, b HAVING b > 50` filters on the column there and `GROUP BY id, k, s
+/// HAVING b > 50` on the alias, exactly as with the mode on.
+///
+/// The slot rather than a yes or no, because a bare name does not always reach
+/// the column that won it: over `Cl JOIN Rt` where both have a `b`, `... GROUP
+/// BY Cl.id, Cl.k, Rt.b HAVING b > 500` filters on `Rt.b` on 8.3 — the one the
+/// clause grouped, not the one the name would have found first. Two grouped
+/// columns of that name are 1052.
+fn grouped_column(
+    e: &Expr,
+    group_exprs: &[Expr],
+    refs: &[ColumnRef],
+    clause: &str,
+) -> EngineResult<Option<usize>> {
+    let Some(written) = column_parts(e) else {
+        return Ok(None);
+    };
+    let mut found: Option<usize> = None;
+    for group in group_exprs {
+        let Some(slot) = column_slot(refs, group) else {
+            continue;
+        };
+        if !refs[slot].matches(&written) {
+            continue;
+        }
+        match found {
+            Some(previous) if previous != slot => {
+                return Err(EngineError::ambiguous(&written_name(e), clause))
+            }
+            _ => found = Some(slot),
+        }
+    }
+    Ok(found)
+}
+
+/// A reference that reaches exactly the column at `slot`.
+///
+/// The grouped-column rule picks a slot, and the name as written does not
+/// always reach it: `b` over `Cl JOIN Rt` finds `Cl.b` and the grouped one may
+/// be `Rt.b`. Qualifying it is what makes the two agree.
+fn qualified_column(column: &ColumnRef) -> Expr {
+    use sqlparser::ast::Ident;
+
+    if column.table.is_empty() {
+        return Expr::Identifier(Ident::new(column.name.clone()));
+    }
+    Expr::CompoundIdentifier(vec![
+        Ident::new(column.table.clone()),
+        Ident::new(column.name.clone()),
+    ])
 }
 
 /// Resolves the ORDER BY of an UPDATE or a DELETE, before any row is chosen.
@@ -12922,9 +13303,12 @@ fn resolve_having_name(
             .collect()
     };
 
-    // What the name could resolve to, one entry per candidate, each carrying
-    // whether the expression behind it is a window.
-    let mut found: Vec<(String, bool)> = Vec::new();
+    // What the name could resolve to, in select-list order, beside whether the
+    // expression behind each is a window. Two vectors rather than one, because
+    // the walk that reads the first is shared with the GROUP BY and a window
+    // is a fact only this clause cares about.
+    let mut candidates: Vec<Candidate<'_>> = Vec::new();
+    let mut windowed: Vec<bool> = Vec::new();
     for item in projection {
         match item {
             // A `*` projects every column of this query's own relation, so a
@@ -12932,7 +13316,8 @@ fn resolve_having_name(
             // item having been written for it.
             SelectItem::Wildcard(_) => {
                 for slot in projected_slots(None) {
-                    found.push((format!("#{slot}"), false));
+                    candidates.push(Candidate::Column(Some(slot), None));
+                    windowed.push(false);
                 }
             }
             SelectItem::QualifiedWildcard(kind, _) => {
@@ -12940,7 +13325,8 @@ fn resolve_having_name(
                 // projects nothing into the select list for a HAVING to find.
                 if let Some((database, table)) = wildcard_qualifier(kind) {
                     for slot in projected_slots(Some((database.as_deref(), &table))) {
-                        found.push((format!("#{slot}"), false));
+                        candidates.push(Candidate::Column(Some(slot), None));
+                        windowed.push(false);
                     }
                 }
             }
@@ -12949,46 +13335,52 @@ fn resolve_having_name(
                     SelectItem::ExprWithAlias { alias, .. } => name::alias(alias),
                     _ => render_expr(inner),
                 };
-                let inner_slot = column_slot(refs, inner);
                 let by_name = bare.is_some_and(|n| name.eq_ignore_ascii_case(n));
-                let by_column = slot.is_some() && inner_slot == slot;
+                let by_column = slot.is_some() && column_slot(refs, inner) == slot;
                 if by_name || by_column {
-                    let identity = inner_slot
-                        .map(|s| format!("#{s}"))
-                        .unwrap_or_else(|| render_expr(inner));
-                    found.push((identity, contains_window(inner)));
+                    candidates.push(candidate_for(inner, refs));
+                    windowed.push(contains_window(inner));
                 }
             }
             _ => {}
         }
     }
 
-    // Two candidates that are the same thing are not ambiguous, which is why
-    // this compares identities rather than counting matches: `SELECT t.b, b
-    // FROM t HAVING b > 1` answers on 8.3 and `SELECT id AS b, t.b FROM t
-    // HAVING b > 1` is 1052.
-    if found.len() > 1 && found.iter().any(|(id, _)| *id != found[0].0) {
-        return Err(EngineError::ambiguous(&written_name(e), "having clause"));
+    // Two candidates that are the same thing are not ambiguous, and one that
+    // is not a column settles the name where it stands. `settle` has both
+    // rules and the measurements behind them: `SELECT t.b, b FROM t HAVING b >
+    // 1` answers on 8.3, `SELECT id AS b, t.b FROM t HAVING b > 1` is 1052,
+    // and `SELECT k AS b, 200 AS b ... HAVING b > 50` answers on the constant.
+    let settled = settle(&candidates, &written_name(e), "having clause")?;
+
+    // A column the GROUP BY names beats the select list, which is the rule
+    // #0236 is about and the one thing this clause does that neither of its
+    // neighbours does. Ahead of the window complaint below, because the column
+    // means the alias is never read at all: measured, `SELECT ROW_NUMBER()
+    // OVER () AS b FROM Cl GROUP BY id, k, s, b HAVING b > 50` answers three
+    // rows on 8.3 where this engine raised 3594. The ambiguity above is still
+    // settled first — two aliases collide whether a grouped column would have
+    // taken the name from them or not.
+    if grouped_column(e, group_exprs, refs, "having clause")?.is_some() {
+        return Ok(());
     }
-    if let Some((_, windowed)) = found.first() {
+    if let Some(index) = settled {
         // A window function is computed over the finished result, so a clause
         // that decides what the result contains cannot read one even at second
         // hand: `SELECT b, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM t HAVING
         // rn > 2` is 3594 on 8.3. The value is right there in the projected
         // row, so without this the alias would have been answered with it.
-        if *windowed {
+        if windowed[index] {
             return Err(EngineError::window_alias_misplaced(&written_name(e)));
         }
         return Ok(());
     }
 
-    // A column the query groups by, whether or not the select list also
-    // returns it: `SELECT COUNT(*) FROM t GROUP BY s HAVING s > 'w'` answers
-    // on 8.3.
+    // A GROUP BY expression written exactly as the clause writes it, which is
+    // the half `grouped_column` cannot answer: it resolves columns, and
+    // `GROUP BY a + b HAVING a + b > 1` groups on no column at all.
     let rendered = e.to_string();
-    if group_exprs.iter().any(|g| g.to_string() == rendered)
-        || slot.is_some_and(|s| group_exprs.iter().any(|g| column_slot(refs, g) == Some(s)))
-    {
+    if group_exprs.iter().any(|g| g.to_string() == rendered) {
         return Ok(());
     }
 

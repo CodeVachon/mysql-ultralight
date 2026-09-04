@@ -9096,6 +9096,259 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // #0236. The same question for the next clause along, and the answer
+        // is the one neither neighbour gives: a HAVING prefers the *grouped*
+        // column to a select alias that shadows it, and prefers the alias when
+        // the column is not grouped. Three clauses, three precedences, and
+        // this is the only one that depends on what else is in the GROUP BY.
+        //
+        // The rows are what tells the two apart throughout: `b` the column is
+        // 100, 200 and 300 and `b` the alias is `k`, which is 10 and 20, so
+        // `> 50` is every group or none depending on which one was read. A
+        // code would not have shown it — both readings answer.
+        //
+        // The empty table is asked beside the full one, as #0229's group does
+        // and for the same reason: what the clause means was settled inside
+        // the group loop, so a query with no groups settled it never.
+        name: "a HAVING that names a select alias",
+        setup: &[
+            "CREATE TABLE Cl (id INT NOT NULL, k INT NULL, b INT NULL, s VARCHAR(20) NULL, \
+             PRIMARY KEY (id))",
+            "CREATE TABLE Emp (id INT NOT NULL, k INT NULL, b INT NULL, s VARCHAR(20) NULL, \
+             PRIMARY KEY (id))",
+            "CREATE TABLE Rt (id INT NOT NULL, b INT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Cl VALUES (1, 10, 100, 'x'), (2, 20, 200, 'y'), (3, 10, 300, 'z')",
+            "INSERT INTO Rt VALUES (1, 1000), (2, 2000), (3, 3000)",
+        ],
+        cases: &[
+            // The issue's own pair, and the same pair over an empty table.
+            same("SELECT k AS b, COUNT(*) FROM Cl GROUP BY id, k, b HAVING b > 50 ORDER BY 1, 2"),
+            same("SELECT k AS b, COUNT(*) FROM Cl GROUP BY id HAVING b > 50 ORDER BY 1, 2"),
+            same("SELECT k AS b, COUNT(*) FROM Emp GROUP BY id, k, b HAVING b > 50 ORDER BY 1, 2"),
+            same("SELECT k AS b, COUNT(*) FROM Emp GROUP BY id HAVING b > 50 ORDER BY 1, 2"),
+            // Grouped by some other column, so the alias half cannot be read
+            // as being about the primary key determining the select list.
+            same("SELECT k AS b, COUNT(*) FROM Cl GROUP BY k HAVING b > 50 ORDER BY 1, 2"),
+            same("SELECT k AS b, COUNT(*) FROM Emp GROUP BY k HAVING b > 50 ORDER BY 1, 2"),
+            // Named in the GROUP BY and not merely covered by it: an
+            // expression over the column leaves the alias with the name, and
+            // leaves the bare column out of the clause's scope entirely.
+            same("SELECT MIN(k) AS b, COUNT(*) FROM Cl GROUP BY b HAVING b > 50 ORDER BY 1, 2"),
+            same("SELECT MIN(k) AS b, COUNT(*) FROM Cl GROUP BY b + 0 HAVING b > 50 ORDER BY 1, 2"),
+            same("SELECT COUNT(*) FROM Cl GROUP BY b HAVING b > 50 ORDER BY 1"),
+            same("SELECT COUNT(*) FROM Cl GROUP BY b + 0 HAVING b > 50"),
+            same("SELECT COUNT(*) FROM Emp GROUP BY b + 0 HAVING b > 50"),
+            // A qualified spelling in either clause reaches the same column;
+            // a qualified name in the HAVING is never an alias.
+            same("SELECT k AS b, COUNT(*) FROM Cl GROUP BY Cl.b, id HAVING b > 50 ORDER BY 1, 2"),
+            same("SELECT k AS b, COUNT(*) FROM Cl GROUP BY id HAVING Cl.b > 50"),
+            // Reached inside an expression, both ways round.
+            same("SELECT k AS b, COUNT(*) FROM Cl GROUP BY id, b HAVING b + 0 > 50 ORDER BY 1, 2"),
+            same("SELECT k AS b, COUNT(*) FROM Cl GROUP BY id HAVING b + 0 > 50 ORDER BY 1, 2"),
+            same(
+                "SELECT k AS b, COUNT(*) FROM Cl GROUP BY id, k, s HAVING b > 50 OR b < 15 \
+                 ORDER BY 1, 2",
+            ),
+            same(
+                "SELECT k AS b, COUNT(*) FROM Cl GROUP BY id, k, s, b HAVING b > 50 OR b < 15 \
+                 ORDER BY 1, 2",
+            ),
+            // The select list is searched before the grouped column takes the
+            // name, so two aliases of one name collide whether a grouped
+            // column would have won it or not — and collide over an empty
+            // table too.
+            same("SELECT k AS b, s AS b, COUNT(*) FROM Cl GROUP BY id, Cl.b HAVING b > 50"),
+            same("SELECT k AS b, s AS b, COUNT(*) FROM Emp GROUP BY id, Emp.b HAVING b > 50"),
+            same("SELECT k AS b, s AS b, COUNT(*) FROM Cl GROUP BY id HAVING b > 50"),
+            same("SELECT k AS q, s AS q, COUNT(*) FROM Cl GROUP BY id HAVING q > 50"),
+            // The same column twice under one name is not a collision, however
+            // the two are spelled.
+            same("SELECT k AS q, k AS q, COUNT(*) FROM Cl GROUP BY id HAVING q > 15 ORDER BY 1, 2"),
+            same(
+                "SELECT Cl.k AS q, k AS q, COUNT(*) FROM Cl GROUP BY id HAVING q > 15 \
+                 ORDER BY 1, 2",
+            ),
+            // An item that is not a column settles the name where it stands,
+            // so it does not collide with a column alias beside it — and loses
+            // to the grouped column all the same. `> 150` is what separates
+            // the constant from the column: it passes every group, the column
+            // passes two.
+            same(
+                "SELECT k AS b, 200 AS b, COUNT(*) FROM Cl GROUP BY id, k, s HAVING b > 50 \
+                 ORDER BY 1, 2",
+            ),
+            same(
+                "SELECT k AS b, 200 AS b, COUNT(*) FROM Cl GROUP BY id, k, s, b HAVING b > 150 \
+                 ORDER BY 1, 2",
+            ),
+            same(
+                "SELECT k AS b, 200 AS b, COUNT(*) FROM Emp GROUP BY id, k, s HAVING b > 50 \
+                 ORDER BY 1, 2",
+            ),
+            same("SELECT 200 AS b, COUNT(*) FROM Cl GROUP BY id, k, s HAVING b > 150 ORDER BY 1"),
+            // An aggregate alias loses to the grouped column too, which is
+            // what shows the preference is not about what kind of thing the
+            // alias is.
+            same("SELECT COUNT(*) AS b FROM Cl GROUP BY id, k, s, b HAVING b > 50 ORDER BY 1"),
+            same("SELECT COUNT(*) AS b FROM Cl GROUP BY id, k, s HAVING b > 50 ORDER BY 1"),
+            same("SELECT COUNT(*) AS b FROM Emp GROUP BY id, k, s, b HAVING b > 50 ORDER BY 1"),
+            // Over a join where both sides have a `b`, the clause reads the
+            // *grouped* one and not the one the bare name finds first. Rt's
+            // values are ten times Cl's, so the rows tell them apart.
+            same(
+                "SELECT Cl.k AS zz, COUNT(*) FROM Cl JOIN Rt ON Rt.id = Cl.id \
+                 GROUP BY Cl.id, Cl.k, Rt.b HAVING b > 500 ORDER BY 1, 2",
+            ),
+            same(
+                "SELECT Cl.k AS zz, COUNT(*) FROM Cl JOIN Rt ON Rt.id = Cl.id \
+                 GROUP BY Cl.id, Cl.k, Cl.b HAVING b > 500 ORDER BY 1, 2",
+            ),
+            // Two grouped columns of one name are ambiguous, with an alias of
+            // that name beside them and without.
+            same(
+                "SELECT Cl.k AS b, COUNT(*) FROM Cl JOIN Rt ON Rt.id = Cl.id \
+                 GROUP BY Cl.id, Cl.k, Rt.b, Cl.b HAVING b > 50",
+            ),
+            same(
+                "SELECT a.id FROM Cl a JOIN Cl c ON a.id = c.id \
+                 GROUP BY a.id, a.k, a.b, a.s, c.id, c.k, c.b, c.s HAVING b > 50",
+            ),
+            // An aggregate's argument reads the relation whatever the alias
+            // says: `SUM(b)` sums the column, so every group passes where the
+            // alias `k` would have passed none.
+            same("SELECT k AS b, COUNT(*) FROM Cl GROUP BY id HAVING SUM(b) > 50 ORDER BY 1, 2"),
+            same("SELECT k AS b, COUNT(*) FROM Cl GROUP BY id, b HAVING SUM(b) > 50 ORDER BY 1, 2"),
+            // A window alias is still 3594 where the clause reads it, which is
+            // where the column it shadows is not grouped.
+            same("SELECT ROW_NUMBER() OVER () AS b FROM Cl GROUP BY id, k, s HAVING b > 50"),
+            // A column that is neither grouped nor projected is 1054 under
+            // this clause's own name, whatever else the grouping determines.
+            same("SELECT COUNT(*) FROM Cl GROUP BY id HAVING b > 50"),
+            same("SELECT COUNT(*) FROM Cl GROUP BY k HAVING b > 50"),
+        ],
+    },
+    Group {
+        // #0237. ONLY_FULL_GROUP_BY admits a column the GROUP BY *determines*,
+        // and a key is the second way to determine one: grouping by a primary
+        // key fixes every other column of that row. `SELECT k FROM Fd GROUP BY
+        // id` answers on 8.3 and this engine raised 1055 — a working statement
+        // refused, which is the failure direction this project exists to
+        // prevent, and the shape Prisma writes.
+        //
+        // A unique key qualifies only when its columns cannot be NULL: a
+        // unique index treats two NULLs as distinct and a GROUP BY treats them
+        // as equal, so a nullable unique column fixes nothing. `un` is here to
+        // hold that line, and the WHERE cases are here because a clause that
+        // cannot pass a NULL makes the column non-nullable for the query.
+        //
+        // The empty table is asked beside the full one: a key determines over
+        // no rows exactly as it does over three, and a column nothing
+        // determines is refused there rather than answering an empty set.
+        name: "a GROUP BY key that determines the row",
+        setup: &[
+            "CREATE TABLE Fd (id INT NOT NULL, k INT NULL, u INT NOT NULL, un INT NULL, \
+             v INT NULL, PRIMARY KEY (id), UNIQUE KEY uu (u), UNIQUE KEY uun (un))",
+            "CREATE TABLE FdE (id INT NOT NULL, k INT NULL, u INT NOT NULL, un INT NULL, \
+             v INT NULL, PRIMARY KEY (id), UNIQUE KEY uu (u), UNIQUE KEY uun (un))",
+            "CREATE TABLE Comp (a INT NOT NULL, b INT NOT NULL, c INT NULL, PRIMARY KEY (a, b))",
+            "CREATE TABLE Cu (a INT NOT NULL, b INT NOT NULL, c INT NULL, UNIQUE KEY ab (a, b))",
+            "CREATE TABLE Fj (id INT NOT NULL, fid INT NULL, w INT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Fd VALUES (1, 10, 100, 1000, 7), (2, 20, 200, NULL, 7), \
+             (3, 10, 300, 3000, 8)",
+            "INSERT INTO Comp VALUES (1, 1, 5), (1, 2, 6), (2, 1, 7)",
+            "INSERT INTO Cu VALUES (1, 1, 5), (1, 2, 6), (2, 1, 7)",
+            "INSERT INTO Fj VALUES (1, 1, 9), (2, 3, 9)",
+        ],
+        cases: &[
+            // The issue's own statement, and the plain shapes behind it.
+            same("SELECT k AS b, COUNT(*) FROM Fd GROUP BY id ORDER BY b, 2"),
+            same("SELECT k FROM Fd GROUP BY id ORDER BY 1"),
+            same("SELECT k FROM Fd GROUP BY Fd.id ORDER BY 1"),
+            same("SELECT f.k FROM Fd f GROUP BY f.id ORDER BY 1"),
+            same("SELECT k, v FROM Fd GROUP BY id ORDER BY 1, 2"),
+            same("SELECT k + v FROM Fd GROUP BY id ORDER BY 1"),
+            same("SELECT MAX(v), k FROM Fd GROUP BY id ORDER BY 1, 2"),
+            same("SELECT COUNT(DISTINCT k) FROM Fd GROUP BY id ORDER BY 1"),
+            same("SELECT k FROM Fd GROUP BY id, u ORDER BY 1"),
+            same("SELECT k FROM Fd GROUP BY un, id ORDER BY 1"),
+            // Reached from an ORDER BY rather than from the select list.
+            same("SELECT k FROM Fd GROUP BY id ORDER BY k, v"),
+            // A unique key over a NOT NULL column determines as a primary key
+            // does; one that admits NULL does not.
+            same("SELECT k FROM Fd GROUP BY u ORDER BY 1"),
+            same("SELECT COUNT(*), k FROM Fd GROUP BY u ORDER BY 2"),
+            same("SELECT k FROM Fd GROUP BY un"),
+            // Unless the WHERE cannot pass a NULL. All three spellings.
+            same("SELECT k FROM Fd WHERE un IS NOT NULL GROUP BY un ORDER BY 1"),
+            same("SELECT k FROM Fd WHERE un > 0 GROUP BY un ORDER BY 1"),
+            same("SELECT k FROM Fd WHERE un = 1000 GROUP BY un ORDER BY 1"),
+            // A composite key determines only when the whole of it is grouped,
+            // in either order, and a unique one over NOT NULL columns is the
+            // same rule again.
+            same("SELECT c FROM Comp GROUP BY a, b ORDER BY 1"),
+            same("SELECT c FROM Comp GROUP BY a"),
+            same("SELECT c FROM Comp GROUP BY b"),
+            same("SELECT c FROM Cu GROUP BY a, b ORDER BY 1"),
+            same("SELECT c FROM Cu GROUP BY b, a ORDER BY 1"),
+            same("SELECT c FROM Cu GROUP BY a"),
+            // Named in the clause and not merely covered by it, and a column
+            // that is no key at all determines nothing.
+            same("SELECT k FROM Fd GROUP BY id + 0"),
+            same("SELECT k FROM Fd GROUP BY v"),
+            // Through a join, which takes both halves of the rule: `Fj.id`
+            // fixes `Fj.fid`, the ON carries that to `Fd.id`, and `Fd.id`
+            // fixes `Fd.k`. The other direction stops at `fid`, which is no
+            // key of `Fj`.
+            same("SELECT Fd.k, Fj.w FROM Fd JOIN Fj ON Fj.fid = Fd.id GROUP BY Fj.id ORDER BY 1, 2"),
+            same("SELECT Fd.k FROM Fd JOIN Fj ON Fj.fid = Fd.id GROUP BY Fj.id ORDER BY 1"),
+            same("SELECT Fd.k, Fj.w FROM Fd JOIN Fj ON Fj.fid = Fd.id GROUP BY Fd.id"),
+            same("SELECT k FROM Fd JOIN Fj ON Fj.fid = Fd.id GROUP BY Fd.id, Fj.id ORDER BY 1"),
+            same("SELECT Fd.k FROM Fd, Fj WHERE Fj.fid = Fd.id GROUP BY Fj.id ORDER BY 1"),
+            // A key on the null-supplying side of an outer join still
+            // determines: an unmatched row is NULL in every column of that
+            // side at once. The preserved side is not determined by it.
+            same("SELECT Fj.w FROM Fd LEFT JOIN Fj ON Fj.id = Fd.id GROUP BY Fj.id ORDER BY 1"),
+            same("SELECT Fj.w FROM Fd LEFT JOIN Fj ON Fj.id = Fd.id GROUP BY Fd.id ORDER BY 1"),
+            same("SELECT Fj.w FROM Fd LEFT JOIN Fj ON Fj.fid = Fd.id GROUP BY Fd.id"),
+            same("SELECT Fd.k FROM Fd LEFT JOIN Fj ON Fj.fid = Fd.id GROUP BY Fj.id"),
+            // The empty table, both ways.
+            same("SELECT k, COUNT(*) FROM FdE GROUP BY id ORDER BY 1"),
+            same("SELECT k, COUNT(*) FROM FdE GROUP BY u ORDER BY 1"),
+            same("SELECT k, COUNT(*) FROM FdE GROUP BY v"),
+            same("SELECT k, COUNT(*) FROM FdE GROUP BY un"),
+            // Determination widens what may be selected and not what a HAVING
+            // may name: the clause reads the select list and the GROUP BY, and
+            // `v` is in neither.
+            same("SELECT k FROM Fd GROUP BY id HAVING v > 0"),
+            same("SELECT k, MAX(v) FROM Fd GROUP BY id HAVING MAX(v) > 0 ORDER BY 1, 2"),
+            // What the rule *opens up*, which is the direction the fix could
+            // go wrong in: every one of these was 1055 here before, so what
+            // they answer has never been compared against 8.3 at all. A row
+            // read off the wrong member of a group is the failure to look for.
+            same("SELECT id, k, u, un, v, COUNT(*) FROM Fd GROUP BY id ORDER BY 1"),
+            same("SELECT id, k * 2, v + 1, COUNT(*) FROM Fd GROUP BY id ORDER BY 1"),
+            same("SELECT id, MAX(v) - k FROM Fd GROUP BY id ORDER BY 1"),
+            same("SELECT id, CASE WHEN k > 15 THEN v ELSE 0 END FROM Fd GROUP BY id ORDER BY 1"),
+            same("SELECT id, k FROM Fd WHERE k > 5 GROUP BY id ORDER BY 1"),
+            same("SELECT id, k FROM Fd GROUP BY id HAVING COUNT(*) > 0 ORDER BY 1"),
+            same("SELECT id, k FROM Fd GROUP BY id ORDER BY v DESC, 1"),
+            same("SELECT DISTINCT k FROM Fd GROUP BY id ORDER BY 1"),
+            same("SELECT COUNT(*) FROM (SELECT id, k FROM Fd GROUP BY id) x"),
+            same(
+                "SELECT id, (SELECT MAX(w) FROM Fj WHERE Fj.fid = Fd.id) FROM Fd \
+                 GROUP BY id ORDER BY 1",
+            ),
+            same(
+                "SELECT Fd.id, Fd.k, COUNT(*), SUM(Fj.w) FROM Fd JOIN Fj ON Fj.fid = Fd.id \
+                 GROUP BY Fd.id ORDER BY 1",
+            ),
+            same(
+                "SELECT Fd.id, Fd.k, COUNT(*) FROM Fd LEFT JOIN Fj ON Fj.fid = Fd.id \
+                 GROUP BY Fd.id ORDER BY 1",
+            ),
+        ],
+    },
+    Group {
         // #0230. A join condition inside a correlated subquery may name the
         // row the subquery is being run for: `SELECT k FROM Cl WHERE EXISTS
         // (SELECT 1 FROM Cr JOIN Cr c3 ON c3.id = Cl.id)` answers on 8.3 and

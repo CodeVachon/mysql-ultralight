@@ -34337,3 +34337,528 @@ fn a_correlated_on_is_read_against_the_enclosing_row() {
     assert_eq!(err.code, 1054, "{sql} -> {err}");
     assert_eq!(err.message, "Unknown column 'zz.q' in 'on clause'");
 }
+
+/// A HAVING prefers a grouped column to a select alias, and only then.
+///
+/// #0236. `SELECT k AS b, COUNT(*) FROM Cl GROUP BY id, k, b HAVING b > 50`
+/// answers three rows on 8.3 — the clause filters on the *column* `b` — and
+/// this engine answered none, because `substitute_aliases` took the alias
+/// whatever else was in the GROUP BY. The same query grouped only by `id`
+/// flips: 8.3 answers none there, so the alias wins when the column is not
+/// grouped. Every expectation below was measured on 8.3 with `scripts/ask.sh`.
+///
+/// The third precedence in this family and the only one that depends on
+/// another clause: GROUP BY prefers the relation outright (#0229), ORDER BY
+/// prefers the select list outright, and HAVING asks what is grouped.
+///
+/// The empty table is asserted beside the full one throughout, which is where
+/// this family's bugs have been: a rule settled inside the group loop is a
+/// rule a query with no groups never settles.
+#[test]
+fn a_having_prefers_a_grouped_column_to_a_select_alias() {
+    let (engine, mut session) = engine();
+    for ddl in [
+        "CREATE TABLE Cl (id INT NOT NULL, k INT NULL, b INT NULL, s VARCHAR(20) NULL, \
+         PRIMARY KEY (id))",
+        "CREATE TABLE Emp (id INT NOT NULL, k INT NULL, b INT NULL, s VARCHAR(20) NULL, \
+         PRIMARY KEY (id))",
+        "CREATE TABLE Rt (id INT NOT NULL, b INT NULL, PRIMARY KEY (id))",
+        "INSERT INTO Cl VALUES (1, 10, 100, 'x'), (2, 20, 200, 'y'), (3, 10, 300, 'z')",
+        "INSERT INTO Rt VALUES (1, 1000), (2, 2000), (3, 3000)",
+    ] {
+        run(&engine, &mut session, ddl);
+    }
+
+    // The issue's own pair. The rows are what tells the two apart: the column
+    // `b` is 100, 200 and 300 and the alias is `k`, which is 10 and 20, so
+    // `> 50` is every group or none depending on which one the clause read.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k AS b, COUNT(*) FROM Cl GROUP BY id, k, b HAVING b > 50 ORDER BY 1, 2"
+        ),
+        vec![vec!["10", "1"], vec!["10", "1"], vec!["20", "1"]]
+    );
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT k AS b, COUNT(*) FROM Cl GROUP BY id HAVING b > 50 ORDER BY 1, 2"
+    )
+    .is_empty());
+
+    // Grouped by *some* other column rather than by the primary key, so the
+    // second half of the pair cannot be read as being about determination.
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT k AS b, COUNT(*) FROM Cl GROUP BY k HAVING b > 50 ORDER BY 1, 2"
+    )
+    .is_empty());
+
+    // Named in the GROUP BY and not merely covered by it: an expression over
+    // the column leaves the alias with the name, and leaves the bare column
+    // out of the clause's scope altogether. Over an empty table as well, where
+    // no group is ever formed to read the clause.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT MIN(k) AS b, COUNT(*) FROM Cl GROUP BY b HAVING b > 50 ORDER BY 1, 2"
+        ),
+        vec![vec!["10", "1"], vec!["10", "1"], vec!["20", "1"]]
+    );
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT MIN(k) AS b, COUNT(*) FROM Cl GROUP BY b + 0 HAVING b > 50 ORDER BY 1, 2"
+    )
+    .is_empty());
+    for table in ["Cl", "Emp"] {
+        let sql = format!("SELECT COUNT(*) FROM {table} GROUP BY b + 0 HAVING b > 50");
+        let err = engine.execute(&mut session, &sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1054, "{sql} -> {err}");
+        assert_eq!(
+            err.message, "Unknown column 'b' in 'having clause'",
+            "{sql}"
+        );
+    }
+
+    // A grouped column the select list does not return at all is still the
+    // clause's, and a qualified spelling in either clause reaches the same
+    // column: what is compared is which column, not how it was written.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) FROM Cl GROUP BY b HAVING b > 50 ORDER BY 1"
+        ),
+        vec![vec!["1"], vec!["1"], vec!["1"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k AS b, COUNT(*) FROM Cl GROUP BY Cl.b, id HAVING b > 50 ORDER BY 1, 2"
+        ),
+        vec![vec!["10", "1"], vec!["10", "1"], vec!["20", "1"]]
+    );
+
+    // A qualified name in the clause is not an alias, so an ungrouped column
+    // spelled that way is 1054 rather than the alias's answer.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT k AS b, COUNT(*) FROM Cl GROUP BY id HAVING Cl.b > 50",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1054, "{err}");
+    assert_eq!(err.message, "Unknown column 'Cl.b' in 'having clause'");
+
+    // Reached inside an expression, both ways round.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k AS b, COUNT(*) FROM Cl GROUP BY id, b HAVING b + 0 > 50 ORDER BY 1, 2"
+        ),
+        vec![vec!["10", "1"], vec!["10", "1"], vec!["20", "1"]]
+    );
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT k AS b, COUNT(*) FROM Cl GROUP BY id HAVING b + 0 > 50 ORDER BY 1, 2"
+    )
+    .is_empty());
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k AS b, COUNT(*) FROM Cl GROUP BY id, k, s HAVING b > 50 OR b < 15 \
+             ORDER BY 1, 2"
+        ),
+        vec![vec!["10", "1"], vec!["10", "1"]]
+    );
+
+    // The select list is searched *before* the grouped column takes the name,
+    // so two aliases of one name collide whether a grouped column would have
+    // won it or not — and collide over an empty table too, which is what
+    // settling the clause before the first group buys.
+    for table in ["Cl", "Emp"] {
+        let sql = format!(
+            "SELECT k AS b, s AS b, COUNT(*) FROM {table} GROUP BY id, {table}.b HAVING b > 50"
+        );
+        let err = engine.execute(&mut session, &sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1052, "{sql} -> {err}");
+        assert_eq!(
+            err.message, "Column 'b' in having clause is ambiguous",
+            "{sql}"
+        );
+    }
+
+    // The same column twice under one alias is not a collision, however the
+    // two are spelled — the rule the GROUP BY has, shared.
+    for sql in [
+        "SELECT k AS q, k AS q, COUNT(*) FROM Cl GROUP BY id HAVING q > 15 ORDER BY 1, 2",
+        "SELECT Cl.k AS q, k AS q, COUNT(*) FROM Cl GROUP BY id HAVING q > 15 ORDER BY 1, 2",
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec!["20", "20", "1"]],
+            "{sql}"
+        );
+    }
+
+    // An item that is not a column settles the name where it stands and stops
+    // the walk, so it does not collide with a column alias written beside it.
+    // This engine raised 1052 here before the two clauses shared one rule.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k AS b, 200 AS b, COUNT(*) FROM Cl GROUP BY id, k, s HAVING b > 50 \
+             ORDER BY 1, 2"
+        ),
+        vec![
+            vec!["10", "200", "1"],
+            vec!["10", "200", "1"],
+            vec!["20", "200", "1"]
+        ]
+    );
+    // And loses to the grouped column all the same. `> 150` is what tells the
+    // two apart: the constant passes every group, the column passes two.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k AS b, 200 AS b, COUNT(*) FROM Cl GROUP BY id, k, s, b HAVING b > 150 \
+             ORDER BY 1, 2"
+        ),
+        vec![vec!["10", "200", "1"], vec!["20", "200", "1"]]
+    );
+    // So does an aggregate alias, which is the case that shows the preference
+    // is not about what kind of thing the alias is: `COUNT(*)` is 1 in every
+    // group and the column is over 50 in all three.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COUNT(*) AS b FROM Cl GROUP BY id, k, s, b HAVING b > 50 ORDER BY 1"
+        ),
+        vec![vec!["1"], vec!["1"], vec!["1"]]
+    );
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT COUNT(*) AS b FROM Cl GROUP BY id, k, s HAVING b > 50 ORDER BY 1"
+    )
+    .is_empty());
+
+    // A bare name does not always reach the column that won it: over a join
+    // where both sides have a `b`, the clause reads the *grouped* one and not
+    // the one the name finds first. Rt's values are ten times Cl's so the two
+    // are told apart by the rows.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT Cl.k AS zz, COUNT(*) FROM Cl JOIN Rt ON Rt.id = Cl.id \
+             GROUP BY Cl.id, Cl.k, Rt.b HAVING b > 500 ORDER BY 1, 2"
+        ),
+        vec![vec!["10", "1"], vec!["10", "1"], vec!["20", "1"]]
+    );
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT Cl.k AS zz, COUNT(*) FROM Cl JOIN Rt ON Rt.id = Cl.id \
+         GROUP BY Cl.id, Cl.k, Cl.b HAVING b > 500 ORDER BY 1, 2"
+    )
+    .is_empty());
+    // Two grouped columns of that name are 1052, with or without an alias of
+    // the same name beside them.
+    for sql in [
+        "SELECT Cl.k AS b, COUNT(*) FROM Cl JOIN Rt ON Rt.id = Cl.id \
+         GROUP BY Cl.id, Cl.k, Rt.b, Cl.b HAVING b > 50",
+        "SELECT a.id FROM Cl a JOIN Cl c ON a.id = c.id \
+         GROUP BY a.id, a.k, a.b, a.s, c.id, c.k, c.b, c.s HAVING b > 50",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1052, "{sql} -> {err}");
+        assert_eq!(
+            err.message, "Column 'b' in having clause is ambiguous",
+            "{sql}"
+        );
+    }
+
+    // An aggregate's argument reads the relation whatever the alias says,
+    // which is the one part of the clause the alias never reaches: `SUM(b)`
+    // sums the column, so every group passes where the alias `k` would have
+    // passed none.
+    for group in ["id", "id, b"] {
+        let sql = format!(
+            "SELECT k AS b, COUNT(*) FROM Cl GROUP BY {group} HAVING SUM(b) > 50 ORDER BY 1, 2"
+        );
+        assert_eq!(
+            rows(&engine, &mut session, &sql),
+            vec![vec!["10", "1"], vec!["10", "1"], vec!["20", "1"]],
+            "{sql}"
+        );
+    }
+
+    // A grouped column beats a *window* alias too, which means the alias is
+    // never read and the 3594 naming one is never raised. 8.3 answers three
+    // rows; this engine has no window function to run over a grouped query, so
+    // what is left is a clear 1235 and not the wrong 3594.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT ROW_NUMBER() OVER () AS b FROM Cl GROUP BY id, k, s, b HAVING b > 50",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1235, "{err}");
+    // Ungrouped, the alias is what the clause reads, and naming a window
+    // through one is 3594 on 8.3.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT ROW_NUMBER() OVER () AS b FROM Cl GROUP BY id, k, s HAVING b > 50",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 3594, "{err}");
+
+    // The preference is not gated on ONLY_FULL_GROUP_BY: with the mode off the
+    // grouped column still wins and the ungrouped one still loses.
+    run(&engine, &mut session, "SET SESSION sql_mode=''");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k AS b, COUNT(*) FROM Cl GROUP BY id, k, s, b HAVING b > 50 ORDER BY 1, 2"
+        ),
+        vec![vec!["10", "1"], vec!["10", "1"], vec!["20", "1"]]
+    );
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT k AS b, COUNT(*) FROM Cl GROUP BY id, k, s HAVING b > 50 ORDER BY 1, 2"
+    )
+    .is_empty());
+    run(
+        &engine,
+        &mut session,
+        "SET SESSION sql_mode='ONLY_FULL_GROUP_BY'",
+    );
+
+    // The same shapes over the empty table, where the answer is an empty set
+    // and not a refusal.
+    for sql in [
+        "SELECT k AS b, COUNT(*) FROM Emp GROUP BY id, k, b HAVING b > 50 ORDER BY 1, 2",
+        "SELECT k AS b, COUNT(*) FROM Emp GROUP BY id HAVING b > 50 ORDER BY 1, 2",
+        "SELECT k AS b, COUNT(*) FROM Emp GROUP BY k HAVING b > 50 ORDER BY 1, 2",
+        "SELECT k AS b, 200 AS b, COUNT(*) FROM Emp GROUP BY id, k, s HAVING b > 50 ORDER BY 1, 2",
+        "SELECT COUNT(*) AS b FROM Emp GROUP BY id, k, s, b HAVING b > 50 ORDER BY 1",
+    ] {
+        assert!(rows(&engine, &mut session, sql).is_empty(), "{sql}");
+    }
+}
+
+/// A key the GROUP BY names determines the rest of its row.
+///
+/// #0237. `SELECT k AS b, COUNT(*) FROM Fd GROUP BY id ORDER BY b` answers on
+/// 8.3 where `id` is the primary key — `k` is functionally dependent on it, so
+/// ONLY_FULL_GROUP_BY allows it — and this engine raised 1055. Refusing a
+/// statement a real server answers is the failure direction this project
+/// exists to prevent, and it is ordinary Prisma-shaped SQL: group by the id,
+/// select the row's other columns. Every expectation was measured on 8.3.
+#[test]
+fn a_grouped_key_determines_the_rest_of_its_row() {
+    let (engine, mut session) = engine();
+    for ddl in [
+        "CREATE TABLE Fd (id INT NOT NULL, k INT NULL, u INT NOT NULL, un INT NULL, v INT NULL, \
+         PRIMARY KEY (id), UNIQUE KEY uu (u), UNIQUE KEY uun (un))",
+        "CREATE TABLE FdE (id INT NOT NULL, k INT NULL, u INT NOT NULL, un INT NULL, \
+         v INT NULL, PRIMARY KEY (id), UNIQUE KEY uu (u), UNIQUE KEY uun (un))",
+        "CREATE TABLE Comp (a INT NOT NULL, b INT NOT NULL, c INT NULL, PRIMARY KEY (a, b))",
+        "CREATE TABLE Fj (id INT NOT NULL, fid INT NULL, w INT NULL, PRIMARY KEY (id))",
+        "INSERT INTO Fd VALUES (1, 10, 100, 1000, 7), (2, 20, 200, NULL, 7), (3, 10, 300, 3000, 8)",
+        "INSERT INTO Comp VALUES (1, 1, 5), (1, 2, 6), (2, 1, 7)",
+        "INSERT INTO Fj VALUES (1, 1, 9), (2, 3, 9)",
+    ] {
+        run(&engine, &mut session, ddl);
+    }
+
+    // The issue's own statement, and the plain shapes behind it.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k AS b, COUNT(*) FROM Fd GROUP BY id ORDER BY b, 2"
+        ),
+        vec![vec!["10", "1"], vec!["10", "1"], vec!["20", "1"]]
+    );
+    for sql in [
+        "SELECT k FROM Fd GROUP BY id ORDER BY 1",
+        "SELECT k FROM Fd GROUP BY Fd.id ORDER BY 1",
+        "SELECT f.k FROM Fd f GROUP BY f.id ORDER BY 1",
+        "SELECT k FROM Fd GROUP BY id, u ORDER BY 1",
+        "SELECT k FROM Fd GROUP BY un, id ORDER BY 1",
+        // A unique key over a NOT NULL column determines just as a primary key
+        // does.
+        "SELECT k FROM Fd GROUP BY u ORDER BY 1",
+        // The dependent column reached from an ORDER BY rather than from the
+        // select list.
+        "SELECT k FROM Fd GROUP BY id ORDER BY k, v",
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec!["10"], vec!["10"], vec!["20"]],
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k + v FROM Fd GROUP BY id ORDER BY 1"
+        ),
+        vec![vec!["17"], vec!["18"], vec!["27"]]
+    );
+
+    // A unique key that admits NULL does not determine: a unique index treats
+    // two NULLs as distinct and a GROUP BY treats them as equal, so the group
+    // a NULL key collects can hold rows that disagree.
+    let err = engine
+        .execute(&mut session, "SELECT k FROM Fd GROUP BY un", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1055, "{err}");
+
+    // Unless the WHERE cannot pass a NULL, which makes the column
+    // non-nullable for this query. All three spellings measured on 8.3.
+    for (sql, expected) in [
+        (
+            "SELECT k FROM Fd WHERE un IS NOT NULL GROUP BY un ORDER BY 1",
+            vec![vec!["10"], vec!["10"]],
+        ),
+        (
+            "SELECT k FROM Fd WHERE un > 0 GROUP BY un ORDER BY 1",
+            vec![vec!["10"], vec!["10"]],
+        ),
+        (
+            "SELECT k FROM Fd WHERE un = 1000 GROUP BY un ORDER BY 1",
+            vec![vec!["10"]],
+        ),
+    ] {
+        assert_eq!(rows(&engine, &mut session, sql), expected, "{sql}");
+    }
+
+    // A composite key determines only when the whole of it is grouped.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT c FROM Comp GROUP BY a, b ORDER BY 1"
+        ),
+        vec![vec!["5"], vec!["6"], vec!["7"]]
+    );
+    for sql in [
+        "SELECT c FROM Comp GROUP BY a",
+        "SELECT c FROM Comp GROUP BY b",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1055, "{sql} -> {err}");
+    }
+
+    // Named in the clause and not merely covered by it: an expression over the
+    // key is not the key, and a column that is no key at all determines
+    // nothing.
+    for sql in [
+        "SELECT k FROM Fd GROUP BY id + 0",
+        "SELECT k FROM Fd GROUP BY v",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1055, "{sql} -> {err}");
+    }
+
+    // Through a join, which takes both halves of the rule: `Fj.id` fixes
+    // `Fj.fid`, the ON carries that to `Fd.id`, and `Fd.id` fixes `Fd.k`.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT Fd.k, Fj.w FROM Fd JOIN Fj ON Fj.fid = Fd.id GROUP BY Fj.id ORDER BY 1, 2"
+        ),
+        vec![vec!["10", "9"], vec!["10", "9"]]
+    );
+    // The other direction does not: `Fd.id` fixes `Fj.fid`, and `fid` is no
+    // key of `Fj`, so `Fj.w` is still arbitrary within the group.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT Fd.k, Fj.w FROM Fd JOIN Fj ON Fj.fid = Fd.id GROUP BY Fd.id",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1055, "{err}");
+    // A key on the null-supplying side of an outer join still determines: an
+    // unmatched row is NULL in every column of that side at once, so the group
+    // a NULL key collects is a group whose other columns are NULL too.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT Fj.w FROM Fd LEFT JOIN Fj ON Fj.id = Fd.id GROUP BY Fj.id ORDER BY 1"
+        ),
+        vec![vec!["NULL"], vec!["9"], vec!["9"]]
+    );
+
+    // The empty table, which is where this family's bugs have been. A key
+    // determines over no rows exactly as it does over three, and a column
+    // nothing determines is refused there too rather than answering an empty
+    // set.
+    for sql in [
+        "SELECT k, COUNT(*) FROM FdE GROUP BY id ORDER BY 1",
+        "SELECT k, COUNT(*) FROM FdE GROUP BY u ORDER BY 1",
+    ] {
+        assert!(rows(&engine, &mut session, sql).is_empty(), "{sql}");
+    }
+    for sql in [
+        "SELECT k, COUNT(*) FROM FdE GROUP BY v",
+        "SELECT k, COUNT(*) FROM FdE GROUP BY un",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1055, "{sql} -> {err}");
+    }
+
+    // Determination widens what may be *selected* and not what a HAVING may
+    // name: the clause reads the select list and the GROUP BY, and `v` is in
+    // neither.
+    let err = engine
+        .execute(
+            &mut session,
+            "SELECT k FROM Fd GROUP BY id HAVING v > 0",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1054, "{err}");
+    assert_eq!(err.message, "Unknown column 'v' in 'having clause'");
+
+    // With ONLY_FULL_GROUP_BY off there is no rule to satisfy, and the
+    // nullable unique key answers rather than refusing.
+    run(&engine, &mut session, "SET SESSION sql_mode=''");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k FROM Fd GROUP BY un ORDER BY 1"
+        ),
+        vec![vec!["10"], vec!["10"], vec!["20"]]
+    );
+    run(
+        &engine,
+        &mut session,
+        "SET SESSION sql_mode='ONLY_FULL_GROUP_BY'",
+    );
+}
