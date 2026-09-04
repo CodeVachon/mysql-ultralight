@@ -1,11 +1,11 @@
 ---
 id: 131
 title: A row predating an ALTER that adds a scale is re-rendered
-state: In Progress
+state: Done
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-08-26T16:18:44Z
-updated: 2026-09-04T10:04:43Z
+updated: 2026-09-04T21:13:45Z
 ---
 
 ## Description
@@ -23,3 +23,9 @@ Text agrees; the binary protocol does not. Before eb9d89a the same case was wron
 The cause is that reconcile substitutes a decimal at the result boundary and the binary encoder re-reads the number from those digits, so a stale row is rounded on the way out. Matching MySQL means the scale being available inside as_text(), which is the tagged-value design #0075 ruled out on measurement -- it would make f*f eight places where MySQL gives four.
 
 No corpus case. Reachable only by an ALTER that adds or changes a scale over existing rows.
+
+## Notes
+
+### 2026-09-04T21:13:45Z — Christopher Vachon (user)
+
+Landed in 0f78c5e, gate green. The premise HELD, and it is a binary-protocol bug: a FLOAT(M,D) keeps the four bytes it was written with, and MySQL renders those at the declared scale but SENDS the bytes. The engine was reading the number back out of the SHOWN digits, so it put f32:1.2346 on the wire -- a value no INSERT ever wrote and no text query would show.

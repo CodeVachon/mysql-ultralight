@@ -1,11 +1,11 @@
 ---
 id: 236
 title: HAVING prefers a select alias where MySQL prefers a grouped column
-state: In Progress
+state: Done
 parent: 9
 labels: [executor, app-priority-2]
 created: 2026-09-04T08:10:22Z
-updated: 2026-09-04T10:04:43Z
+updated: 2026-09-04T21:13:45Z
 ---
 
 ## Description
@@ -26,3 +26,9 @@ So the rule appears to be: a GROUPED column beats the alias; otherwise the alias
 Same family as #0229 (GROUP BY: the column wins outright) and the ORDER BY rule (the select list wins outright) -- three clauses, three different precedences, and this is the only one that depends on what else is in the GROUP BY.
 
 Priority 2: HAVING appears alongside 82 GROUP BY sites in the target application, and a wrong-rows answer is worse than a wrong error.
+
+## Notes
+
+### 2026-09-04T21:13:45Z — Christopher Vachon (user)
+
+Landed in c8d250e, gate green. HAVING is the third member of a family with three DIFFERENT rules, and the only conditional one: GROUP BY prefers the relation outright (#0229), ORDER BY prefers the select list outright, and HAVING prefers a GROUPED column but falls back to the alias when the column is not grouped.

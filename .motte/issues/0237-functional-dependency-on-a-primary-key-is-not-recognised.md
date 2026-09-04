@@ -1,11 +1,11 @@
 ---
 id: 237
 title: Functional dependency on a primary key is not recognised
-state: In Progress
+state: Done
 parent: 9
 labels: [executor, app-priority-2]
 created: 2026-09-04T08:10:22Z
-updated: 2026-09-04T10:04:43Z
+updated: 2026-09-04T21:13:46Z
 ---
 
 ## Description
@@ -21,3 +21,11 @@ MySQL's ONLY_FULL_GROUP_BY permits an ungrouped column when the GROUP BY determi
 Priority 2: this is ordinary Prisma-shaped SQL (group by the id, select the row's other columns), and the engine refuses a statement a real server answers -- the failure direction this project exists to prevent.
 
 Related: the 1055 message text also differs from MySQL's for every 1055 -- 8.3 names the expression's POSITION, the qualified column, and says 'which is not functionally dependent on columns in GROUP BY clause'. Invisible to the differential, which compares code and SQLSTATE for failures.
+
+## Notes
+
+### 2026-09-04T21:13:45Z — Christopher Vachon (user)
+
+Landed in c8d250e. A PRIMARY KEY determines the row; a UNIQUE key does too, but only when it cannot be NULL -- and MySQL accepts a NULLABLE unique key when the WHERE rejects NULLs for it, which is why the implementation reads the top-level AND chain.
+
+The care is in that walk: only the top-level AND counts, because one arm of an OR says nothing about rows the other arm admitted; a comparison rejects NULL whichever way it points (un > 0 and 1000 = un both qualify); and <=> is deliberately EXCLUDED, because it is the one comparison that answers true for two NULLs, so WHERE un <=> NULL keeps them.
