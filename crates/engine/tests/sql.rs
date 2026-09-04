@@ -25374,46 +25374,46 @@ fn a_deep_nest_of_scalar_subqueries_still_answers() {
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
         .spawn(|| {
-        let (engine, mut session) = engine();
-        every_type(&engine, &mut session);
+            let (engine, mut session) = engine();
+            every_type(&engine, &mut session);
 
-        // Each layer reads the table, which is what makes the *describe* recurse:
-        // a probe reads a stored table as empty, so there is no row to evaluate
-        // and the type is the only thing being worked out at every level.
-        let nested = |depth: usize| {
-            let mut sql = "(SELECT sid FROM Ty)".to_owned();
-            for _ in 0..depth {
-                sql = format!("(SELECT {sql} FROM Ty)");
-            }
-            format!("SELECT {sql}")
-        };
+            // Each layer reads the table, which is what makes the *describe* recurse:
+            // a probe reads a stored table as empty, so there is no row to evaluate
+            // and the type is the only thing being worked out at every level.
+            let nested = |depth: usize| {
+                let mut sql = "(SELECT sid FROM Ty)".to_owned();
+                for _ in 0..depth {
+                    sql = format!("(SELECT {sql} FROM Ty)");
+                }
+                format!("SELECT {sql}")
+            };
 
-        // Inside the limit the column is the one the innermost query projects,
-        // however many layers are in the way.
-        let shallow = nested(3);
-        assert_eq!(
-            format!(
-                "{:?}",
-                engine.describe(&session, &shallow, 0).unwrap().unwrap()[0].ty
-            ),
-            "Long"
-        );
+            // Inside the limit the column is the one the innermost query projects,
+            // however many layers are in the way.
+            let shallow = nested(3);
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    engine.describe(&session, &shallow, 0).unwrap().unwrap()[0].ty
+                ),
+                "Long"
+            );
 
-        // Past it — and still inside `sqlparser`'s own recursion limit, which
-        // refuses the text before any of this is reached — the type falls back and
-        // the statement answers anyway. That is the whole of the guard: a worse
-        // answer at the bottom rather than a recursion that follows the text.
-        let deep = nested(20);
-        assert_eq!(rows(&engine, &mut session, &deep), vec![vec!["1"]]);
-        // Described as well as executed: the describe is the path that recurses
-        // furthest, because it has no rows to stop it.
-        assert_eq!(
-            format!(
-                "{:?}",
-                engine.describe(&session, &deep, 0).unwrap().unwrap()[0].ty
-            ),
-            "VarString"
-        );
+            // Past it — and still inside `sqlparser`'s own recursion limit, which
+            // refuses the text before any of this is reached — the type falls back and
+            // the statement answers anyway. That is the whole of the guard: a worse
+            // answer at the bottom rather than a recursion that follows the text.
+            let deep = nested(20);
+            assert_eq!(rows(&engine, &mut session, &deep), vec![vec!["1"]]);
+            // Described as well as executed: the describe is the path that recurses
+            // furthest, because it has no rows to stop it.
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    engine.describe(&session, &deep, 0).unwrap().unwrap()[0].ty
+                ),
+                "VarString"
+            );
         })
         .expect("spawn")
         .join()
