@@ -7294,6 +7294,88 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // #0204 and #0168: the diagnostics area, which had no cases at all
+        // because nothing here could raise a condition and `SHOW WARNINGS`
+        // answered 1235.
+        //
+        // **Every reader below sits directly under the statement it reads**,
+        // and the pairs do not chain. A statement replaces the area with its
+        // own conditions, so a reader reports what the case above it raised --
+        // but each case is asked twice, once per protocol, and 8.3 refuses
+        // these four SHOW forms in the *prepared* protocol with 1295. That
+        // refusal is a condition too, so a second reader after the first would
+        // be reading the 1295 the first one's binary run left, not the write.
+        // Measured; it is why this group is pairs and not a sequence.
+        //
+        // Non-strict, because a strict mode refuses these writes instead of
+        // truncating them and the area would then hold the refusal rather than
+        // the truncation this group is about. Replacing the mode rather than
+        // adding to it; the harness puts the stock one back before the next
+        // group.
+        //
+        // `SELECT @@warning_count` is deliberately absent. It is the third way
+        // to read the count and it works, but every `SELECT @@<integer>` in
+        // this engine is described VAR_STRING where 8.3 says LONGLONG
+        // UNSIGNED, and this group would report that instead.
+        name: "warnings",
+        setup: &[
+            "SET SESSION sql_mode = 'ONLY_FULL_GROUP_BY,NO_ZERO_IN_DATE,NO_ZERO_DATE,\
+             ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'",
+            "CREATE TABLE Warn (a VARCHAR(3) NULL, t TINYINT NULL)",
+        ],
+        cases: &[
+            // Two of three rows truncate, and the row numbers are the part a
+            // per-statement counter gets wrong: row 2 fits, and row 3 is still
+            // called row 3.
+            same("INSERT INTO Warn (a) VALUES ('abcdef'), ('ok'), ('zzzzzz')"),
+            same("SHOW WARNINGS"),
+            // The count is a different number from the length of the list once
+            // `max_error_count` is involved, so both are asked.
+            same("INSERT INTO Warn (a) VALUES ('bbbbbb'), ('cccccc')"),
+            same("SHOW COUNT(*) WARNINGS"),
+            // 1264 rather than 1265, at both ends of the range.
+            same("INSERT INTO Warn (t) VALUES (300), (-300)"),
+            same("SHOW WARNINGS LIMIT 1"),
+            same("INSERT INTO Warn (t) VALUES (999), (-999)"),
+            same("SHOW WARNINGS LIMIT 0, 2"),
+            // Only spaces past the width: the same code at a different level,
+            // which is the half of 1265 no code name predicts.
+            same("INSERT INTO Warn (a) VALUES ('abc  ')"),
+            same("SHOW WARNINGS LIMIT 2"),
+            // Warnings and no errors, so these two are empty against a list
+            // that is not.
+            same("INSERT INTO Warn (a) VALUES ('dddddd')"),
+            same("SHOW ERRORS"),
+            same("INSERT INTO Warn (a) VALUES ('eeeeee')"),
+            same("SHOW COUNT(*) ERRORS"),
+            // #0168: the alias is cut at 256 bytes, and the condition quotes
+            // it uncut.
+            same(
+                "SELECT 1 AS `\
+                 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+                 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+                 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`",
+            ),
+            // No reader after that one, and the reason is worth writing down:
+            // 8.3 raises 1466 when it *names the item*, which for a prepared
+            // statement is at PREPARE. So the binary run of the case above
+            // leaves 8.3's area empty and this engine's holding the condition,
+            // because `describe` raises nothing. Measured against 8.3 with a
+            // reader here, which reported 0 rows to this engine's 1. The cut
+            // name itself is compared above, in both protocols; the condition
+            // is held by `crates/engine/tests/warnings.rs`.
+            //
+            // A statement that raises nothing empties the area, which is the
+            // rule a probe written without it reads as agreement.
+            same("SELECT 'nothing to report' AS quiet"),
+            same("SHOW WARNINGS LIMIT 4"),
+            // What is stored is unchanged by any of this. The report of it is
+            // what is new, and a case that only read the report could not tell
+            // a truncation from a refusal.
+            same("SELECT a, t FROM Warn ORDER BY a, t"),
+        ],
+    },
+    Group {
         // The compound mode that turns strictness *on*, where `ANSI` above
         // leaves it off. It reached the parser as a name no arm matched, so
         // the strictest mode MySQL ships behaved here as the loosest one:

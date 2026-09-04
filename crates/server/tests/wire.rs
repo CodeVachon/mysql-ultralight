@@ -10,7 +10,9 @@ use std::sync::Arc;
 use mysql_ultralight_protocol::auth::native_password_scramble;
 use mysql_ultralight_protocol::buf::BufReader;
 use mysql_ultralight_protocol::packet::{read_packet, write_packet, Sequence};
-use mysql_ultralight_protocol::{BufWriter, Capabilities, ColumnDef, ColumnType, ErrPacket, Value};
+use mysql_ultralight_protocol::{
+    BufWriter, Capabilities, ColumnDef, ColumnType, ErrPacket, OkPacket, Value,
+};
 use mysql_ultralight_server::{
     Answered, Config, Handler, HandlerResult, Prepared, Response, ResultSet, Server,
 };
@@ -75,6 +77,20 @@ impl Handler for TestHandler {
             ))),
             "BOOM" => Err(ErrPacket::parse_error("deliberate failure")),
             "UPDATE" => Ok(Response::affected(7)),
+            // A statement that raised conditions, in both shapes a response
+            // can take. The counts differ so a test cannot pass by reading the
+            // wrong one.
+            "WARNROWS" => Ok(Response::ResultSet(
+                ResultSet::with_rows(
+                    vec![ColumnDef::new("1", ColumnType::LongLong)],
+                    vec![vec![Value::I64(1)]],
+                )
+                .warning_count(3),
+            )),
+            "WARNOK" => Ok(Response::Ok(OkPacket {
+                warnings: 5,
+                ..OkPacket::new(1, 0)
+            })),
             _ => Ok(Response::ok()),
         }
     }
@@ -516,6 +532,71 @@ async fn prepared_statement_round_trips_binary_parameters() {
         vec![vec![Some("99".to_owned()), Some("bound".to_owned()), None]],
         "bound parameters should round trip through the binary protocol"
     );
+}
+
+/// #0204. A statement returning rows has nowhere but the packet terminating
+/// the result set to report a warning: there is no OK packet in that exchange.
+/// The count was hard-coded 0 there, so a client reading it was told a clean
+/// success for every statement MySQL warns about.
+///
+/// Both terminator shapes, because they carry the field at different offsets
+/// and in the other order: a bare EOF is `0xfe` then warnings then status,
+/// while the OK that replaces it under `DEPRECATE_EOF` puts the status first.
+/// Reading one and assuming the other lands on the status flags, which for
+/// AUTOCOMMIT is 2 -- a plausible-looking warning count.
+#[tokio::test]
+async fn a_result_set_terminator_carries_the_warning_count() {
+    let addr = start_server(None).await;
+
+    for deprecate_eof in [false, true] {
+        let mut client = Client::connect(&addr, "", deprecate_eof).await.unwrap();
+        client.send(0x03, b"WARNROWS").await.unwrap();
+
+        // Column count, one column definition, and the EOF that ends the
+        // definitions when the client did not deprecate it.
+        client.recv().await.unwrap();
+        client.recv().await.unwrap();
+        if !deprecate_eof {
+            client.recv().await.unwrap();
+        }
+        // The single row, then the terminator.
+        client.recv().await.unwrap();
+        let terminator = client.recv().await.unwrap();
+        assert_eq!(terminator[0], 0xfe, "expected a terminator");
+
+        let mut r = BufReader::new(&terminator);
+        r.u8().unwrap();
+        let warnings = if deprecate_eof {
+            r.lenenc_int().unwrap();
+            r.lenenc_int().unwrap();
+            r.u16().unwrap();
+            r.u16().unwrap()
+        } else {
+            r.u16().unwrap()
+        };
+        assert_eq!(
+            warnings, 3,
+            "the terminator must carry the count (deprecate_eof = {deprecate_eof})"
+        );
+    }
+}
+
+/// The other shape: a write reports its count in the OK packet's own field.
+#[tokio::test]
+async fn an_ok_packet_carries_the_warning_count() {
+    let addr = start_server(None).await;
+    let mut client = Client::connect(&addr, "", true).await.unwrap();
+
+    client.send(0x03, b"WARNOK").await.unwrap();
+    let packet = client.recv().await.unwrap();
+    assert_eq!(packet[0], 0x00, "expected an OK packet");
+
+    let mut r = BufReader::new(&packet);
+    r.u8().unwrap();
+    r.lenenc_int().unwrap();
+    r.lenenc_int().unwrap();
+    r.u16().unwrap();
+    assert_eq!(r.u16().unwrap(), 5);
 }
 
 #[tokio::test]

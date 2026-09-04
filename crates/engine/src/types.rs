@@ -902,6 +902,17 @@ impl SqlType {
                     // Non-strict clamps to the end of the range it overran and
                     // carries a warning: 300 into a TINYINT is 127 there, -300
                     // is -128, and -1 into an UNSIGNED column is 0.
+                    //
+                    // The condition is the error's own message at level
+                    // Warning, which is what 8.3 sends: the strict statement's
+                    // 1264 and the non-strict one's warning 1264 read
+                    // identically, row number included.
+                    let clamped = out_of_range(column);
+                    crate::diagnostics::raise(
+                        crate::diagnostics::Level::Warning,
+                        clamped.code,
+                        clamped.message,
+                    );
                     return Ok(self.tagged_int(if under { low } else { high }));
                 }
                 self.tagged_int(n)
@@ -1294,6 +1305,29 @@ fn out_of_range(column: &str) -> EngineError {
     )
 }
 
+/// 1265, which MySQL raises for a value it cut down to fit the column.
+///
+/// The same row a 1406 names, and for the same reason: a three-row INSERT
+/// whose second row is too wide says `at row 2` on 8.3 whether it refuses the
+/// statement or truncates and carries on.
+///
+/// The level is the caller's, because 8.3 uses both for this one code and the
+/// difference is whether anything written was lost. A `VARCHAR(3)` given
+/// `'abc  '` keeps every non-space character and gets a **Note**; the same
+/// column given `'abcdef'` gets a **Warning**. Measured, and measured under
+/// `STRICT_ALL_TABLES` too, where the Note is still a note and the Warning has
+/// become error 1406.
+fn raise_truncated(column: &str, level: crate::diagnostics::Level) {
+    crate::diagnostics::raise(
+        level,
+        1265,
+        format!(
+            "Data truncated for column '{column}' at row {}",
+            WRITE.with(|w| w.get().row)
+        ),
+    );
+}
+
 /// `text`, cut to what the column declares.
 ///
 /// Trailing spaces are the exception MySQL makes and the reason this is
@@ -1338,8 +1372,16 @@ fn fitted_text(mut text: String, capacity: Capacity, column: &str) -> EngineResu
         Capacity::Filled(_) | Capacity::Digits { .. } => return Ok(text),
     };
     // Everything past the width is a space, so nothing the column would
-    // have held is being dropped.
-    if text[limit..].chars().all(|c| c == ' ') || lenient() {
+    // have held is being dropped. Taken under every mode, and noted under
+    // every mode: `STRICT_ALL_TABLES` turns the truncation below into an
+    // error and leaves this one a Note.
+    if text[limit..].chars().all(|c| c == ' ') {
+        raise_truncated(column, crate::diagnostics::Level::Note);
+        text.truncate(limit);
+        return Ok(text);
+    }
+    if lenient() {
+        raise_truncated(column, crate::diagnostics::Level::Warning);
         text.truncate(limit);
         return Ok(text);
     }
@@ -1373,6 +1415,14 @@ fn fitted_bytes(mut bytes: Vec<u8>, capacity: Capacity, column: &str) -> EngineR
         if !lenient() {
             return Err(too_long(column));
         }
+        // A Warning and never a Note: a binary column has no trailing-space
+        // exemption to be inside of, so every byte past the width is one the
+        // client wrote and the column will not hold.
+        //
+        // Raised here rather than after the padding below, because a pad is
+        // not a truncation: measured on 8.3, a `CHAR(3)` given `'ab   '`
+        // raises no condition at all.
+        raise_truncated(column, crate::diagnostics::Level::Warning);
         bytes.truncate(limit as usize);
     }
     if fixed {
@@ -1535,9 +1585,9 @@ fn negative_decimal(value: &Value) -> bool {
 /// under either mode, which is measured — `INSERT IGNORE` of `'abcdef'` into a
 /// `VARCHAR(3)` stores `abc` on 8.3 with warning 1265.
 ///
-/// The warning itself is not carried: this engine has no diagnostics area, so
-/// `SHOW WARNINGS` is unsupported and a truncation here is silent where MySQL
-/// notes it. What is stored matches; what is reported about it does not.
+/// The warning is carried too, since #0204: `fitted_text`, `fitted_bytes` and
+/// the integer clamp each raise the condition 8.3 raises, and `SHOW WARNINGS`
+/// reads it back. See `crate::diagnostics`.
 fn lenient() -> bool {
     WRITE.with(|w| w.get().ignoring) || !crate::exec::strict()
 }

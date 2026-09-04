@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod collation;
 pub mod ddl;
 pub mod decimal;
+pub mod diagnostics;
 pub mod dialect;
 pub mod error;
 pub mod exec;
@@ -29,6 +30,7 @@ pub mod types;
 pub mod value;
 
 pub use catalog::{Catalog, Column, Database, Table};
+pub use diagnostics::{Condition, Diagnostics, Level};
 pub use dialect::SqlMode;
 pub use error::{EngineError, EngineResult};
 pub use exec::Engine;

@@ -93,11 +93,30 @@ const MAX_ALIAS_BYTES: usize = 256;
 /// 1 AS <300> ORDER BY <300>` is 1054 there and `ORDER BY <the first 256>`
 /// resolves. Cutting at the reporting site alone would report one name and
 /// resolve another.
+///
+/// The cut carries warning 1466, whose message is not what the code's name
+/// suggests and not what #0168 recorded: 8.3 answers `Leading spaces are
+/// removed from name '%s'` -- ER_REMOVED_SPACES, the one condition MySQL
+/// raises from `Item::set_name` for *either* reason it rewrites a name -- and
+/// it quotes the alias **as written**, uncut. Measured: a 416-character alias
+/// comes back as a 256-byte column name beside a message carrying all 416.
+///
+/// Raised once per position rather than once per call, because this is a pure
+/// function and six callers ask it the same question about the same alias --
+/// planning a projection, describing it, resolving an ORDER BY against it. See
+/// `diagnostics::raise_once`: the key is the position and not the text,
+/// because two aliases spelled identically are two conditions on 8.3.
 pub(crate) fn alias(ident: &Ident) -> String {
     let value = &ident.value;
     if value.len() <= MAX_ALIAS_BYTES {
         return value.clone();
     }
+    crate::diagnostics::raise_once(
+        (ident.span.start.line, ident.span.start.column),
+        crate::diagnostics::Level::Warning,
+        1466,
+        || format!("Leading spaces are removed from name '{value}'"),
+    );
     let mut at = MAX_ALIAS_BYTES;
     while !value.is_char_boundary(at) {
         at -= 1;

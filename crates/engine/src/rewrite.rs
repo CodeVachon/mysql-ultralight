@@ -33,6 +33,26 @@ pub enum Intercepted {
     },
     /// `DROP EVENT [IF EXISTS] name`, accepted as a no-op.
     DropEvent { if_exists: bool },
+    /// `SHOW WARNINGS`, `SHOW ERRORS` and the two `SHOW COUNT(*)` forms.
+    ShowDiagnostics(ShowDiagnostics),
+}
+
+/// Which question one of the diagnostics statements asks.
+///
+/// Intercepted rather than parsed because sqlparser has no node for any of
+/// them: `SHOW WARNINGS` reaches it as `ShowVariable { variable: [WARNINGS] }`,
+/// `SHOW WARNINGS LIMIT 2` does not parse at all, and neither does `SHOW
+/// COUNT(*) WARNINGS`. Reading them here is the same trade `PREPARE` and
+/// `EXECUTE` make above.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowDiagnostics {
+    /// `SHOW ERRORS`, which shows only the Error-level conditions. The count
+    /// forms split the same way: `SHOW COUNT(*) ERRORS` is `@@error_count`.
+    pub errors_only: bool,
+    /// `SHOW COUNT(*) ...`: how many, rather than which.
+    pub count_only: bool,
+    /// `LIMIT [offset,] row_count`, which 8.3 accepts on the list forms.
+    pub limit: Option<(u64, u64)>,
 }
 
 /// Recognises a statement the parser cannot take.
@@ -76,6 +96,42 @@ pub fn intercept(sql: &str) -> Option<Intercepted> {
         "DROP" if at(1) == "EVENT" => Some(Intercepted::DropEvent {
             if_exists: at(2) == "IF" && at(3) == "EXISTS",
         }),
+
+        // The diagnostics statements. Anything spelled otherwise is left to
+        // the parser, which is what makes a form this does not read a 1235
+        // rather than a wrong answer: `SHOW WARNINGS LIMIT x` is refused here
+        // instead of being taken as an unlimited `SHOW WARNINGS`.
+        "SHOW" if matches!(at(1), "WARNINGS" | "ERRORS") => {
+            let rest: Vec<&str> = upper[2..].iter().map(String::as_str).collect();
+            let limit = match rest.as_slice() {
+                [] => None,
+                // `words_of` splits on a comma as well as on whitespace, so
+                // `LIMIT 1,2` and `LIMIT 1, 2` arrive the same way.
+                ["LIMIT", count] => Some((0, count.parse().ok()?)),
+                ["LIMIT", offset, count] => Some((offset.parse().ok()?, count.parse().ok()?)),
+                _ => return None,
+            };
+            Some(Intercepted::ShowDiagnostics(ShowDiagnostics {
+                errors_only: at(1) == "ERRORS",
+                count_only: false,
+                limit,
+            }))
+        }
+
+        // `SHOW COUNT(*) WARNINGS`, whose middle is rejoined rather than
+        // matched word for word: the parentheses are not separators here, so
+        // `COUNT( * )` arrives as three words and `COUNT(*)` as one.
+        "SHOW"
+            if words.len() >= 3
+                && matches!(upper[upper.len() - 1].as_str(), "WARNINGS" | "ERRORS")
+                && upper[1..upper.len() - 1].concat() == "COUNT(*)" =>
+        {
+            Some(Intercepted::ShowDiagnostics(ShowDiagnostics {
+                errors_only: upper[upper.len() - 1] == "ERRORS",
+                count_only: true,
+                limit: None,
+            }))
+        }
 
         // ALTER TABLE <t> RENAME INDEX <old> TO <new>, and exactly that.
         //
@@ -1431,6 +1487,53 @@ mod tests {
                 name: "stmt".into()
             })
         );
+    }
+
+    /// The spellings of the four diagnostics statements, read out of the text
+    /// because sqlparser has a node for none of them. #0204.
+    #[test]
+    fn recognises_the_diagnostics_statements() {
+        let show = |sql| match intercept(sql) {
+            Some(Intercepted::ShowDiagnostics(show)) => show,
+            other => panic!("{sql} was read as {other:?}"),
+        };
+
+        assert_eq!(
+            show("SHOW WARNINGS"),
+            ShowDiagnostics {
+                errors_only: false,
+                count_only: false,
+                limit: None
+            }
+        );
+        assert!(show("show errors").errors_only);
+        assert_eq!(show("SHOW WARNINGS LIMIT 2").limit, Some((0, 2)));
+        // `words_of` splits on a comma, so the offset form arrives with or
+        // without the space after it.
+        assert_eq!(show("SHOW WARNINGS LIMIT 1,2").limit, Some((1, 2)));
+        assert_eq!(show("SHOW WARNINGS LIMIT 1, 2").limit, Some((1, 2)));
+
+        // The count forms, whose middle is not one word on every spelling: the
+        // parentheses do not separate words, so `COUNT( * )` is three.
+        assert!(show("SHOW COUNT(*) WARNINGS").count_only);
+        assert!(show("SHOW COUNT( * ) WARNINGS").count_only);
+        assert!(show("SHOW COUNT(*) ERRORS").errors_only);
+
+        // And what this does *not* read, which matters as much: an unreadable
+        // form has to reach the parser and be refused there, rather than
+        // arriving here as the nearest thing that does parse.
+        for sql in [
+            "SHOW WARNINGS LIMIT x",
+            "SHOW WARNINGS LIMIT 1, 2, 3",
+            "SHOW COUNT(*) NOTES",
+            "SHOW TABLES",
+            "SHOW VARIABLES",
+        ] {
+            assert!(
+                !matches!(intercept(sql), Some(Intercepted::ShowDiagnostics(_))),
+                "{sql} must not be read as a diagnostics statement"
+            );
+        }
     }
 
     #[test]

@@ -257,7 +257,7 @@ where
                     self.send_response(Response::ok(), started).await?;
                 }
                 // Deprecated, but the mysql CLI still sends it for completion.
-                Command::FieldList => self.write_eof_or_ok(false).await?,
+                Command::FieldList => self.write_eof_or_ok(false, 0).await?,
                 Command::SetOption => {
                     // The payload is a two-byte little-endian option: 0 turns
                     // multi-statement commands on, 1 turns them off.
@@ -712,14 +712,18 @@ where
             self.write(&w.into_inner()).await?;
         }
 
-        self.write_eof_or_ok(more).await
+        self.write_eof_or_ok(more, rs.warnings).await
     }
 
     /// Terminates a result set the way the negotiated capabilities require.
     ///
     /// The terminator carries the status flags, so a result set followed by
-    /// another announces it here rather than in its header.
-    async fn write_eof_or_ok(&mut self, more: bool) -> std::io::Result<()> {
+    /// another announces it here rather than in its header. It carries the
+    /// warning count too, which is the only place a statement returning rows
+    /// can report one — there is no OK packet to put it in. Both shapes get
+    /// it: a client that deprecated EOF reads the same number out of the OK
+    /// that replaces it.
+    async fn write_eof_or_ok(&mut self, more: bool, warnings: u16) -> std::io::Result<()> {
         let mut flags = status::AUTOCOMMIT;
         if more {
             flags |= status::MORE_RESULTS_EXISTS;
@@ -727,11 +731,12 @@ where
         let packet = if self.caps.contains(Capabilities::DEPRECATE_EOF) {
             let ok = OkPacket {
                 status_flags: flags,
+                warnings,
                 ..OkPacket::default()
             };
             ok.encode_as_eof(self.caps)
         } else {
-            encode_eof(self.caps, 0, flags)
+            encode_eof(self.caps, warnings, flags)
         };
         self.write(&packet).await
     }

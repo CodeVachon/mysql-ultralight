@@ -29,7 +29,10 @@ impl EngineHandler {
             .engine
             .execute(&mut self.session, sql, parameters)
             .map_err(ErrPacket::from)?;
-        Ok(Self::shape(outcome))
+        // The statement has just settled the diagnostics area, so this is its
+        // own count and not the previous statement's.
+        let warnings = self.session.diagnostics().wire_count();
+        Ok(Self::shape(outcome, warnings))
     }
 
     /// The columns a statement will return, as the wire declares them.
@@ -56,7 +59,13 @@ impl EngineHandler {
     }
 
     /// Turns one engine outcome into the response the wire carries.
-    fn shape(outcome: Outcome) -> Response {
+    ///
+    /// `warnings` is how many conditions the statement raised. Both shapes
+    /// carry it: an OK packet has a field for it, and a result set puts it in
+    /// the packet that terminates it -- a statement returning rows has no
+    /// other way to report one, so a hard-coded 0 there is a client told a
+    /// clean success where MySQL reports a problem. #0204.
+    fn shape(outcome: Outcome, warnings: u16) -> Response {
         match outcome {
             Outcome::Rows(rows) => {
                 let columns = rows.columns.iter().map(|c| c.to_wire()).collect();
@@ -65,12 +74,17 @@ impl EngineHandler {
                     .into_iter()
                     .map(|row| row.iter().map(EngineValue::to_wire).collect())
                     .collect();
-                Response::ResultSet(ResultSet::with_rows(columns, wire_rows))
+                Response::ResultSet(
+                    ResultSet::with_rows(columns, wire_rows).warning_count(warnings),
+                )
             }
             Outcome::Affected {
                 rows,
                 last_insert_id,
-            } => Response::Ok(OkPacket::new(rows, last_insert_id)),
+            } => Response::Ok(OkPacket {
+                warnings,
+                ..OkPacket::new(rows, last_insert_id)
+            }),
         }
     }
 }
@@ -100,8 +114,17 @@ impl Handler for EngineHandler {
             };
         }
         let executed = self.engine.execute_many(&mut self.session, sql, &[]);
+        // Each statement's own count, which is why `execute_many` collects
+        // them as it goes: by the time the batch is over the diagnostics area
+        // holds only the last statement's conditions.
+        let responses = executed
+            .outcomes
+            .into_iter()
+            .zip(executed.warnings)
+            .map(|(outcome, warnings)| Self::shape(outcome, warnings))
+            .collect();
         Answered {
-            responses: executed.outcomes.into_iter().map(Self::shape).collect(),
+            responses,
             error: executed.error.map(ErrPacket::from),
         }
     }
@@ -372,6 +395,95 @@ mod tests {
                 "after reset, with FOUND_ROWS = {found_rows}"
             );
         }
+    }
+
+    /// #0204. The count the client actually reads, taken off the packet
+    /// rather than off the session -- the field was hard-coded 0, so a
+    /// truncating write reached every client as a clean success.
+    ///
+    /// Both shapes, because they carry it in different packets: a write in the
+    /// OK packet's own field, a statement returning rows in the packet that
+    /// terminates the result set.
+    #[test]
+    fn the_wire_carries_the_count_of_what_a_statement_raised() {
+        let mut h = handler();
+        h.run("SET SESSION sql_mode = ''", &[]).unwrap();
+        h.run("CREATE TABLE T (a VARCHAR(3))", &[]).unwrap();
+
+        let warnings = |response: &Response| match response {
+            Response::Ok(ok) => ok.warnings,
+            Response::ResultSet(rs) => rs.warnings,
+        };
+
+        // Two of the three rows are too long for the column.
+        let write = h
+            .run("INSERT INTO T VALUES ('abcdef'), ('ok'), ('zzzzzz')", &[])
+            .unwrap();
+        assert_eq!(warnings(&write), 2);
+
+        // A reader leaves the area alone, so the count it reports is the same
+        // one -- which is also what 8.3 does.
+        let read = h.run("SHOW WARNINGS", &[]).unwrap();
+        assert_eq!(warnings(&read), 2);
+
+        // And a statement that raises nothing reports nothing, because it
+        // replaced the area rather than appending to it.
+        let clean = h.run("SELECT 1", &[]).unwrap();
+        assert_eq!(warnings(&clean), 0);
+    }
+
+    /// A batch reports each statement's own count, not the last one's. The
+    /// diagnostics area holds only the final statement's conditions by the
+    /// time the batch is over, so a count read at the end would tell the
+    /// client every statement in a migration raised whatever the last one did.
+    #[test]
+    fn every_statement_of_a_batch_reports_its_own_count() {
+        let mut h = handler();
+        let answered = h.query_multi(
+            "SET SESSION sql_mode = ''; \
+             CREATE TABLE T (a VARCHAR(3)); \
+             INSERT INTO T VALUES ('abcdef'), ('zzzzzz'); \
+             SELECT 1",
+            true,
+        );
+        assert!(answered.error.is_none(), "{:?}", answered.error);
+        let counts: Vec<u16> = answered
+            .responses
+            .iter()
+            .map(|response| match response {
+                Response::Ok(ok) => ok.warnings,
+                Response::ResultSet(rs) => rs.warnings,
+            })
+            .collect();
+        assert_eq!(counts, vec![0, 0, 2, 0]);
+    }
+
+    /// 8.3 refuses the diagnostics statements in the prepared-statement
+    /// protocol with 1295, measured -- so a client that prepares `SHOW
+    /// WARNINGS` gets an error there and must get one here. Answering it would
+    /// be this engine passing a statement a real server refuses, which is the
+    /// direction of gap it exists to close.
+    #[test]
+    fn the_diagnostics_statements_do_not_prepare() {
+        let mut h = handler();
+        for sql in [
+            "SHOW WARNINGS",
+            "SHOW WARNINGS LIMIT 1",
+            "SHOW ERRORS",
+            "SHOW COUNT(*) WARNINGS",
+            "SHOW COUNT(*) ERRORS",
+        ] {
+            let refused = h
+                .prepare(1, sql)
+                .expect_err("the prepared protocol refuses this");
+            assert_eq!(refused.code, 1295, "{sql}");
+        }
+        // And the text protocol still answers them, which is the half that
+        // would be lost by refusing in the wrong place.
+        assert!(matches!(
+            h.query("SHOW WARNINGS"),
+            Ok(Response::ResultSet(_))
+        ));
     }
 
     #[test]

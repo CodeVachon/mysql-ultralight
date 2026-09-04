@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::diagnostics::Diagnostics;
 use crate::error::{EngineError, EngineResult};
 use crate::value::Value;
 
@@ -15,6 +16,13 @@ const MIN_GROUP_CONCAT_MAX_LEN: u64 = 4;
 
 /// The stock 8.3 value of `cte_max_recursion_depth`, measured.
 const DEFAULT_CTE_MAX_RECURSION_DEPTH: u64 = 1000;
+
+/// The stock 8.3 value of `max_error_count`, measured.
+const DEFAULT_MAX_ERROR_COUNT: u64 = 1024;
+
+/// The largest value 8.3 keeps for `max_error_count`, measured: 99999999 is
+/// stored as this and -1 as 0.
+const MAX_MAX_ERROR_COUNT: i128 = 65535;
 
 /// Server configuration a session reports and can override.
 #[derive(Debug, Clone)]
@@ -96,7 +104,12 @@ pub struct Session {
     /// A whole-catalog copy is the honest trade for an in-memory test engine:
     /// the data is small, and undo logging would be a great deal of machinery
     /// for a database that discards everything at process exit.
-    pub transaction: Option<Transaction>,
+    ///
+    /// Boxed, which is a *stack* decision and not a heap one: see
+    /// `a_session_stays_within_its_stack_budget`. This is the largest field
+    /// here and the one almost every session leaves empty, so it is the one
+    /// that pays for the diagnostics area below.
+    pub transaction: Option<Box<Transaction>>,
     /// How many views deep evaluation currently is, so a self-referential view
     /// is refused rather than exhausting the stack.
     pub view_depth: usize,
@@ -137,6 +150,13 @@ pub struct Session {
     ///
     /// False by default, which is the meaning a client that says nothing gets.
     pub found_rows: bool,
+    /// What the last statement that raised anything raised.
+    ///
+    /// Private because the rule about it is a rule about *when* it changes —
+    /// a statement replaces it, a `SHOW WARNINGS` does not — and that rule
+    /// lives in `Engine::execute` rather than in every writer. See
+    /// `crate::diagnostics`.
+    diagnostics: Diagnostics,
 }
 
 impl Session {
@@ -160,7 +180,40 @@ impl Session {
             last_insert_id: 0,
             affected_rows: 0,
             found_rows: false,
+            diagnostics: Diagnostics::default(),
         }
+    }
+
+    /// The conditions the last statement raised: `SHOW WARNINGS`,
+    /// `@@warning_count`, and the count an OK packet carries.
+    pub fn diagnostics(&self) -> &Diagnostics {
+        &self.diagnostics
+    }
+
+    /// Replaces the diagnostics area with what a statement raised.
+    ///
+    /// Replaces and never appends, which is what 8.3 does: a statement that
+    /// raises nothing leaves an empty area, so a `SELECT 1` between a
+    /// truncating INSERT and a `SHOW WARNINGS` is why the list is empty.
+    pub(crate) fn set_diagnostics(&mut self, diagnostics: Diagnostics) {
+        self.diagnostics = diagnostics;
+    }
+
+    /// How many conditions the diagnostics area keeps, which MySQL spells
+    /// `max_error_count`.
+    ///
+    /// Read straight off the override for the reason the four readers below
+    /// give: it cannot change while the statement runs.
+    ///
+    /// The parse cannot fail for anything this engine stored:
+    /// `set_system_variable` refuses a non-integer and clamps the rest into
+    /// `0..=65535` first. 1024 for an absent override is the stock 8.3
+    /// default, measured.
+    pub fn max_error_count(&self) -> u64 {
+        self.overrides
+            .get("max_error_count")
+            .and_then(|stored| stored.parse().ok())
+            .unwrap_or(DEFAULT_MAX_ERROR_COUNT)
     }
 
     /// What an UPDATE reports as affected, given the rows it matched and the
@@ -262,6 +315,23 @@ impl Session {
             // the variable is a `u32`, which is where the high bound comes
             // from.
             "cte_max_recursion_depth" => clamped_integer(&name, value, 0, u32::MAX as i128)?,
+            // Clamped for the same reason again: the diagnostics area keeps
+            // this many conditions, so a value taken unchecked is a longer or
+            // shorter `SHOW WARNINGS` than MySQL's. Measured on 8.3: -1 is
+            // stored as 0, 99999999 as 65535, and a non-integer is 1232 like
+            // the four above.
+            "max_error_count" => clamped_integer(&name, value, 0, MAX_MAX_ERROR_COUNT)?,
+            // Read only on 8.3, and refused here rather than stored: an
+            // override would shadow the diagnostics area these two are read
+            // out of, so the session would report a count no statement
+            // produced. Measured: `SET SESSION warning_count = 5` is 1238.
+            "warning_count" | "error_count" => {
+                return Err(EngineError::new(
+                    1238,
+                    "HY000",
+                    format!("Variable '{name}' is a read only variable"),
+                ))
+            }
             _ => value.as_text(),
         };
         if name == "sql_mode" {
@@ -427,6 +497,18 @@ impl Session {
             "div_precision_increment" => {
                 int(crate::decimal::DEFAULT_DIV_PRECISION_INCREMENT as i64)
             }
+            // The diagnostics area, which is session state rather than
+            // configuration: `@@warning_count` counts every condition the last
+            // statement raised at every level, and `@@error_count` only the
+            // Error-level ones. Both are read *before* the statement reading
+            // them clears the area, which is why a `SELECT @@warning_count`
+            // answers what the statement before it raised.
+            "warning_count" => int(self.diagnostics.count() as i64),
+            "error_count" => int(self.diagnostics.error_count() as i64),
+            // Listed rather than left to materialise on the first write, for
+            // the reason `div_precision_increment` below gives. 1024 is the
+            // stock 8.3 default, measured.
+            "max_error_count" => int(DEFAULT_MAX_ERROR_COUNT as i64),
             "max_execution_time" => int(0),
             "default_storage_engine" => text("InnoDB"),
             "init_connect" => text(""),
@@ -463,6 +545,7 @@ impl Session {
             "lower_case_table_names",
             "max_allowed_packet",
             "max_connections",
+            "max_error_count",
             "max_execution_time",
             "net_read_timeout",
             "net_write_timeout",
@@ -584,6 +667,36 @@ fn normalize_scope(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `Session` is copied onto the stack at every level of a nested query
+    /// and the engine has no stack-growth guard, so the size of this struct is
+    /// a *budget* rather than a detail.
+    ///
+    /// Measured, on the tree before the diagnostics area was added: a `Session`
+    /// was 408 bytes, and adding **eight** bytes to it overflowed the 2MB test
+    /// stack in `a_deep_nest_of_scalar_subqueries_still_answers` -- a dummy
+    /// `[u8; 8]` field was enough on its own, with no other change. One byte
+    /// did not, because it fits the padding after `found_rows`. There was
+    /// nothing left.
+    ///
+    /// So the diagnostics area was paid for rather than added: `transaction`
+    /// went behind a `Box`, which frees 64 where the area costs 40. This
+    /// asserts the result, so the next field to arrive here fails on this line
+    /// with the reason beside it rather than as a stack overflow in a test
+    /// three files away that says nothing about what changed.
+    ///
+    /// If a field genuinely needs the room, the honest fix is to stop copying
+    /// a whole `Session` per recursion level, or to guard the recursion --
+    /// not to raise this number.
+    #[test]
+    fn a_session_stays_within_its_stack_budget() {
+        const BUDGET: usize = 408;
+        let size = std::mem::size_of::<Session>();
+        assert!(
+            size <= BUDGET,
+            "a Session is {size} bytes, over the {BUDGET}-byte budget; see this test"
+        );
+    }
 
     #[test]
     fn scopes_resolve_to_the_same_variable() {

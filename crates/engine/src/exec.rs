@@ -24,7 +24,7 @@ use crate::name;
 use crate::params;
 use crate::relation::Relation;
 use crate::result::{OutColumn, Outcome, ResultSet};
-use crate::rewrite::{self, Intercepted};
+use crate::rewrite::{self, Intercepted, ShowDiagnostics};
 use crate::session::{ServerConfig, Session};
 use crate::value::Value;
 
@@ -101,8 +101,23 @@ impl Engine {
     ) -> EngineResult<Option<Vec<OutColumn>>> {
         let _memo = SubqueryMemo::fresh();
         let bound = params::bind(sql, &vec![Value::Null; parameters]);
-        if rewrite::intercept(&bound).is_some() {
-            return Ok(None);
+        match rewrite::intercept(&bound) {
+            // 8.3 refuses the diagnostics statements in the prepared-statement
+            // protocol outright, measured: `COM_STMT_PREPARE` of `SHOW
+            // WARNINGS` is 1295 there, where every other statement intercepted
+            // here prepares. Answering one would be this engine doing
+            // something a real server will not -- a suite that prepares `SHOW
+            // WARNINGS` would pass here and fail against MySQL, which is the
+            // shape of gap this engine exists to close rather than to open.
+            Some(Intercepted::ShowDiagnostics(_)) => {
+                return Err(EngineError::new(
+                    1295,
+                    "HY000",
+                    "This command is not supported in the prepared statement protocol yet",
+                ))
+            }
+            Some(_) => return Ok(None),
+            None => {}
         }
 
         let normalised = std::rc::Rc::new(rewrite::normalise(&bound, session.sql_mode()));
@@ -499,7 +514,32 @@ impl Engine {
         parameters: &[Value],
     ) -> EngineResult<Outcome> {
         let _memo = SubqueryMemo::fresh();
-        let mut outcome = self.execute_at_depth(session, sql, parameters, 0)?;
+        // One statement is one diagnostics area. Opened here and not deeper
+        // because this is the boundary MySQL clears on: `EXECUTE` runs its
+        // prepared statement through `execute_at_depth` below, and the two
+        // together are one statement raising one set of conditions.
+        let collecting = crate::diagnostics::Collecting::open(session.max_error_count() as usize);
+        let ran = self.execute_at_depth(session, sql, parameters, 0);
+        // The statement's own error is a condition too, and the last one:
+        // under `STRICT_ALL_TABLES` an INSERT whose first row trims trailing
+        // spaces and whose second is too long leaves a Note 1265 and then an
+        // Error 1406, in that order.
+        if let Err(e) = &ran {
+            crate::diagnostics::raise(crate::diagnostics::Level::Error, e.code, e.message.clone());
+        }
+        let (raised, keep) = collecting.taken();
+        // A reader leaves the area exactly as it found it, so the same list
+        // can be read twice; everything else replaces it, with nothing when it
+        // raised nothing. See `crate::diagnostics`.
+        //
+        // A statement that *failed* replaces it whatever it asked for. Nothing
+        // reaches that today -- the readers cannot fail after saying `keep` --
+        // and the alternative is an error the client is never told about,
+        // which is the one outcome worth spending a condition on.
+        if !keep || ran.is_err() {
+            session.set_diagnostics(raised);
+        }
+        let mut outcome = ran?;
         // On the way out only: an intermediate result feeds another expression
         // and should keep exactly the value it computed, where a result that
         // is about to be sent has to match what the client will decode it by.
@@ -522,8 +562,11 @@ impl Engine {
             // through the splitter's output would re-render text the single
             // path already handles verbatim.
             return match self.execute(session, sql, parameters) {
-                Ok(outcome) => Executed::of(vec![outcome]),
-                Err(e) => Executed::failed(Vec::new(), e),
+                Ok(outcome) => {
+                    let warnings = vec![session.diagnostics().wire_count()];
+                    Executed::of(vec![outcome], warnings)
+                }
+                Err(e) => Executed::failed(Vec::new(), Vec::new(), e),
             };
         }
 
@@ -532,23 +575,30 @@ impl Engine {
         if !parameters.is_empty() {
             return Executed::failed(
                 Vec::new(),
+                Vec::new(),
                 unsupported("parameters with a multi-statement command"),
             );
         }
 
         let mut outcomes = Vec::with_capacity(statements.len());
+        let mut warnings = Vec::with_capacity(statements.len());
         for statement in statements {
             match self.execute(session, &statement, &[]) {
-                Ok(outcome) => outcomes.push(outcome),
+                Ok(outcome) => {
+                    outcomes.push(outcome);
+                    // Read here, while it is still this statement's: the next
+                    // one replaces the area.
+                    warnings.push(session.diagnostics().wire_count());
+                }
                 // The statements before the failure have already been applied,
                 // and there is no rollback here. Returning them with the error
                 // is what lets a caller see how far the command got, which for
                 // a migration is the difference between "did nothing" and
                 // "half applied".
-                Err(e) => return Executed::failed(outcomes, e),
+                Err(e) => return Executed::failed(outcomes, warnings, e),
             }
         }
-        Executed::of(outcomes)
+        Executed::of(outcomes, warnings)
     }
 
     /// `depth` bounds recursion through `EXECUTE`, which can otherwise run a
@@ -680,6 +730,15 @@ impl Engine {
             // No CREATE EVENT exists anywhere in the target codebase; the one
             // DROP is against a legacy event, so accepting it is enough.
             Intercepted::DropEvent { .. } => Ok(Outcome::ok()),
+
+            Intercepted::ShowDiagnostics(show) => {
+                // Said before the rows are built, not after: this is the one
+                // family of statements that reads the diagnostics area
+                // without replacing it, and saying so is what leaves the list
+                // there for the next reader.
+                crate::diagnostics::keep_area();
+                Ok(Outcome::Rows(show_diagnostics(session, &show)))
+            }
         }
     }
 
@@ -879,11 +938,11 @@ impl Engine {
             Statement::StartTransaction { .. } => {
                 // A nested BEGIN commits the open transaction in MySQL rather
                 // than nesting, so the snapshot is simply replaced.
-                session.transaction = Some(crate::session::Transaction {
+                session.transaction = Some(Box::new(crate::session::Transaction {
                     opened: self.catalog()?.clone(),
                     savepoints: Vec::new(),
                     modified: Vec::new(),
-                });
+                }));
                 session.in_transaction = true;
                 Ok(Outcome::ok())
             }
@@ -6286,20 +6345,35 @@ impl crate::expr::Executor for Engine {
 /// ran, and the error that stopped the rest.
 pub struct Executed {
     pub outcomes: Vec<Outcome>,
+    /// How many conditions each outcome's statement raised, in the same order.
+    ///
+    /// Parallel to `outcomes` rather than read off the session at the end: the
+    /// diagnostics area holds only the *last* statement's conditions by then,
+    /// and a batch shaped against it would tell the client that every
+    /// statement in a migration raised whatever the last one did.
+    pub warnings: Vec<u16>,
     pub error: Option<EngineError>,
 }
 
 impl Executed {
-    fn of(outcomes: Vec<Outcome>) -> Self {
+    fn of(outcomes: Vec<Outcome>, warnings: Vec<u16>) -> Self {
+        // The two lists are read by zipping them, which silently drops the
+        // tail of the longer one -- so a statement whose count went missing
+        // would take every response after it with it, and look like a batch
+        // that ran short rather than like a bug here.
+        debug_assert_eq!(outcomes.len(), warnings.len(), "one count per outcome");
         Self {
             outcomes,
+            warnings,
             error: None,
         }
     }
 
-    fn failed(outcomes: Vec<Outcome>, error: EngineError) -> Self {
+    fn failed(outcomes: Vec<Outcome>, warnings: Vec<u16>, error: EngineError) -> Self {
+        debug_assert_eq!(outcomes.len(), warnings.len(), "one count per outcome");
         Self {
             outcomes,
+            warnings,
             error: Some(error),
         }
     }
@@ -13317,6 +13391,69 @@ fn wire_type(value: &Value) -> ColumnType {
         // singling out a *computed* document would make it the one expression
         // whose type is known when dates and decimals are not.
         _ => ColumnType::VarString,
+    }
+}
+
+/// The answer to one of the diagnostics statements.
+///
+/// Column metadata measured on 8.3 rather than invented: `Level` and `Message`
+/// are VAR_STRING, `Code` is an **unsigned** LONG, and all three are NOT NULL,
+/// while the `SHOW COUNT(*)` forms answer a nullable unsigned LONGLONG named
+/// after the variable they stand for — `@@session.warning_count`. A client
+/// that reads `Code` as a signed 32-bit value still gets the right number, but
+/// the flags are what an ORM maps the column with, and #0111 is what happens
+/// when they are guessed.
+fn show_diagnostics(session: &Session, show: &ShowDiagnostics) -> ResultSet {
+    let area = session.diagnostics();
+
+    if show.count_only {
+        let (name, count) = match show.errors_only {
+            true => ("@@session.error_count", area.error_count()),
+            false => ("@@session.warning_count", area.count()),
+        };
+        let mut result = ResultSet::scalar(name, ColumnType::LongLong, Value::Int(count as i64));
+        result.columns[0].unsigned = true;
+        return result;
+    }
+
+    let mut level = OutColumn::new("Level", ColumnType::VarString);
+    level.nullable = false;
+    let mut code = OutColumn::new("Code", ColumnType::Long);
+    code.nullable = false;
+    code.unsigned = true;
+    let mut message = OutColumn::new("Message", ColumnType::VarString);
+    message.nullable = false;
+
+    // Filtered before it is limited, so `SHOW ERRORS LIMIT 1` is the first
+    // error and not the first condition if that happens to be one.
+    let shown: Vec<&crate::diagnostics::Condition> = match show.errors_only {
+        true => area.errors().collect(),
+        false => area.conditions().iter().collect(),
+    };
+    // `LIMIT offset, count`, with 0 for an absent offset. Saturating rather
+    // than indexing: an offset past the end is an empty answer on 8.3, not a
+    // panic here.
+    let shown = match show.limit {
+        Some((offset, count)) => shown
+            .into_iter()
+            .skip(offset as usize)
+            .take(count as usize)
+            .collect(),
+        None => shown,
+    };
+
+    ResultSet {
+        columns: vec![level, code, message],
+        rows: shown
+            .into_iter()
+            .map(|condition| {
+                vec![
+                    Value::text(condition.level.as_str().to_owned()),
+                    Value::Int(i64::from(condition.code)),
+                    Value::text(condition.message.clone()),
+                ]
+            })
+            .collect(),
     }
 }
 

@@ -15,6 +15,16 @@ use mysql_ultralight_protocol::{Capabilities, ColumnDef, ErrPacket, OkPacket, Va
 pub struct ResultSet {
     pub columns: Vec<ColumnDef>,
     pub rows: Vec<Vec<Value>>,
+    /// How many conditions the statement raised, for the packet that
+    /// terminates the result set.
+    ///
+    /// A result set carries the count in its trailing EOF (or the OK that
+    /// replaces one under `DEPRECATE_EOF`), which is the *only* place a SELECT
+    /// can report it: there is no OK packet to put it in, and a client that
+    /// does not ask `SHOW WARNINGS` learns about a condition here or nowhere.
+    /// Measured on 8.3: `SELECT CAST(CAST('"x"' AS JSON) AS UNSIGNED)` comes
+    /// back `1 row in set, 1 warning`.
+    pub warnings: u16,
 }
 
 impl ResultSet {
@@ -22,11 +32,22 @@ impl ResultSet {
         Self {
             columns,
             rows: Vec::new(),
+            warnings: 0,
         }
     }
 
     pub fn with_rows(columns: Vec<ColumnDef>, rows: Vec<Vec<Value>>) -> Self {
-        Self { columns, rows }
+        Self {
+            columns,
+            rows,
+            warnings: 0,
+        }
+    }
+
+    /// The count the terminating packet will carry. See [`Self::warnings`].
+    pub fn warning_count(mut self, warnings: u16) -> Self {
+        self.warnings = warnings;
+        self
     }
 
     pub fn push(&mut self, row: Vec<Value>) {
