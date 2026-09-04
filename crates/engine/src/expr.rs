@@ -171,6 +171,40 @@ pub enum LockOp {
 pub struct OuterRow {
     pub schema: Vec<ColumnRef>,
     pub values: Vec<Value>,
+    /// What each of those columns was *declared* as, where the scope that
+    /// built this row knew.
+    ///
+    /// Aligned with `schema` from the front and allowed to be shorter —
+    /// empty included. A row assembled from bare references has no
+    /// declarations at all, and a slot past the end is typed the way it was
+    /// before this field existed. Never longer, and never reordered:
+    /// `direct_column` reads this by the slot `schema` answered with, so a
+    /// hole in the middle would give a column its neighbour's type.
+    ///
+    /// It is here because a correlated reference takes the enclosing
+    /// relation's declaration and nothing else can answer it: `SELECT (SELECT
+    /// Cl.id FROM Cr) FROM Cl` is a LONG on 8.3, and the inner query has only
+    /// `Cr` to look `Cl.id` up in. #0243.
+    pub columns: Vec<crate::relation::RelColumn>,
+}
+
+impl OuterRow {
+    /// The row plus the enclosing one behind it, which is what a scope nested
+    /// inside another correlated scope can see.
+    ///
+    /// The names, the values and the declarations are extended together, so
+    /// the three stay aligned — except that a declaration list that cannot
+    /// cover its own names is dropped rather than appended at the wrong
+    /// offset, which is the one way this alignment can be lost.
+    pub fn behind(mut self, enclosing: &OuterRow) -> Self {
+        let complete = self.columns.len() == self.schema.len();
+        self.schema.extend(enclosing.schema.iter().cloned());
+        self.values.extend(enclosing.values.iter().cloned());
+        if complete {
+            self.columns.extend(enclosing.columns.iter().cloned());
+        }
+        self
+    }
 }
 
 /// The clause a name is reported under when the caller has not named one.
@@ -261,6 +295,11 @@ impl<'a> Context<'a> {
         Some(OuterRow {
             schema: row.schema.to_vec(),
             values: row.values.to_vec(),
+            // A `Context` is built over names and values, so there are no
+            // declarations to carry. This row is what a subquery is
+            // *evaluated* against; what it is *described* against comes from
+            // `probed_subquery`, which does have them.
+            columns: Vec::new(),
         })
     }
 

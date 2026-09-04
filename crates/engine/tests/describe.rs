@@ -1944,3 +1944,108 @@ fn a_write_is_resolved_at_prepare_though_it_describes_nothing() {
         );
     }
 }
+
+/// A correlated column reference is described as the column behind it.
+///
+/// #0243. `SELECT (SELECT Cl.id FROM Cr) FROM Cl` is a LONG on 8.3 and was a
+/// VAR_STRING here: `direct_column` maps a slot into the *input* columns,
+/// which are this query's relation alone, so an outer column's slot fell past
+/// the end and the type was lost. #0230 carried the enclosing row's values and
+/// #0227 its names; neither carried its declarations, which is the only thing
+/// that can answer this.
+///
+/// Asserted as "the same type as reading the column directly" rather than as a
+/// list of type codes, because that is the rule — a correlated reference is
+/// not a type of its own — and because it does not have to be rewritten when
+/// one of these columns is declared differently.
+///
+/// The *width* is deliberately not asserted: 8.3 reports `len 11` for the LONG
+/// above and this engine reports 20, and it does so for the uncorrelated
+/// `SELECT (SELECT Tw.i FROM Tw) FROM Tr` as well — `printed_width` has no arm
+/// for a subquery at all, so the width falls back to the type's default. That
+/// is a scalar subquery's width and not a correlated reference's, so asserting
+/// it here would pin an unrelated gap in place.
+#[test]
+fn a_correlated_column_reference_keeps_its_declared_type() {
+    let (engine, mut s) = setup();
+    for ddl in [
+        "CREATE TABLE Tw (i INT NOT NULL, bg BIGINT NOT NULL, vs VARCHAR(20) NOT NULL, \
+         dc DECIMAL(12,3) NOT NULL, dt DATETIME NOT NULL, nn INT NULL, PRIMARY KEY (i))",
+        "CREATE TABLE Tr (id INT NOT NULL, PRIMARY KEY (id))",
+        "INSERT INTO Tw VALUES (1, 2, 'x', 1.500, '2026-01-01 00:00:00', NULL)",
+        "INSERT INTO Tr VALUES (1)",
+    ] {
+        engine.execute(&mut s, ddl, &[]).unwrap();
+    }
+
+    let described = |sql: &str| {
+        engine
+            .describe(&s, sql, 0)
+            .unwrap_or_else(|e| panic!("refused: {sql} -> {e:?}"))
+            .unwrap_or_else(|| panic!("described nothing: {sql}"))
+    };
+
+    // Every declared family, because they are typed by different arms and a
+    // fix that reaches one reads exactly like a fix that reaches all of them.
+    // `nn` is there for the nullable case, which travels the same way.
+    for column in ["i", "bg", "vs", "dc", "dt", "nn"] {
+        let direct = described(&format!("SELECT {column} AS a FROM Tw"));
+        let correlated = described(&format!("SELECT (SELECT Tw.{column} FROM Tr) AS a FROM Tw"));
+        assert_eq!(
+            correlated[0].ty, direct[0].ty,
+            "(SELECT Tw.{column} FROM Tr) is not typed as Tw.{column}"
+        );
+        // Which is only evidence while at least one of them is not the
+        // fallback: `vs` is a VAR_STRING either way, and a comparison that
+        // passed for every column because both sides had collapsed to
+        // VAR_STRING is the shape this test exists to catch.
+        if column != "vs" {
+            assert_ne!(
+                correlated[0].ty,
+                mysql_ultralight_protocol::column::ColumnType::VarString,
+                "(SELECT Tw.{column} FROM Tr) fell back to VAR_STRING"
+            );
+        }
+        // The subquery is still nullable however the column was declared,
+        // because an empty inner table makes it NULL — 8.3 drops NOT_NULL for
+        // exactly that reason, and the type travelling must not bring the flag
+        // with it.
+        assert!(
+            correlated[0].nullable,
+            "(SELECT Tw.{column} FROM Tr) is described NOT NULL"
+        );
+    }
+
+    // The same reference through a derived table and through a LATERAL one,
+    // which reach the enclosing declarations by two other routes: the row
+    // `select` put in scope, and the row `lateral_join` puts there per left
+    // row. Measured on 8.3, `SELECT d.x, d.y FROM Tw, LATERAL (SELECT Tw.i AS
+    // x, Tw.dc AS y FROM Tr) d` is LONG len 11 and NEWDECIMAL len 14 dec 3.
+    let lateral = described(
+        "SELECT d.x, d.y, d.z FROM Tw, \
+         LATERAL (SELECT Tw.i AS x, Tw.dc AS y, Tw.vs AS z FROM Tr) d",
+    );
+    assert_eq!(
+        lateral
+            .iter()
+            .map(|c| {
+                let def = c.to_wire();
+                format!(
+                    "{} {:?} len {} dec {}",
+                    c.name, def.column_type, def.column_length, def.decimals
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            "x Long len 11 dec 0".to_owned(),
+            "y NewDecimal len 14 dec 3".to_owned(),
+            // The width matters here where it does not for a scalar subquery:
+            // MySQL keeps the source table on a derived table's column, so the
+            // differential harness compares it. `VARCHAR(20)` is 80 bytes
+            // under utf8mb4 on 8.3, and rebuilding the column from the
+            // expression instead of reading the enclosing declaration gave it
+            // the 512-character default — 2048.
+            "z VarString len 80 dec 0".to_owned(),
+        ]
+    );
+}

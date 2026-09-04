@@ -130,12 +130,18 @@ pub(crate) fn plan(cte: &Cte, name: &str) -> EngineResult<Option<Plan>> {
 /// Which entries of a WITH list anything could reach, one flag per CTE in
 /// declaration order.
 ///
-/// 8.3 does not look at a recursive CTE nothing reads at all. `WITH RECURSIVE
+/// 8.3 does not look at a CTE nothing reads at all. `WITH RECURSIVE
 /// unused AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM unused) SELECT 42`
 /// answers 42, where running it would be 3636 after a thousand iterations —
 /// and so does the same statement over a CTE whose recursive branch is
 /// written *first*, where resolving it would be 3574. So `materialise_ctes`
 /// skips one nothing names whole, rather than planning it and refusing.
+///
+/// The same for a plain `WITH`, measured separately rather than assumed from
+/// the recursive one: `WITH c AS (SELECT zz.q FROM Cr) SELECT 1` answers on
+/// 8.3 where resolving `c` is 1054. Which is why this lives here and is asked
+/// of every WITH list — the flags say what is *reachable*, and recursion is
+/// only what one of the callers does with the answer. #0245.
 ///
 /// Reachability is transitive, and that is measured too: in `WITH RECURSIVE
 /// a AS (<malformed>), b AS (SELECT n FROM a) SELECT 42`, `b` names `a` and

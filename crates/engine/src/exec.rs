@@ -1220,25 +1220,29 @@ impl Engine {
             return Ok(());
         };
 
-        // 8.3 does not look at a `WITH RECURSIVE` entry nothing reads at all —
-        // it neither runs it nor resolves it. Measured: a statement carrying a
-        // runaway recursive CTE the body never names answers, where running it
-        // would be 3636, and so does one carrying a *malformed* recursive CTE,
-        // where resolving it would be 3574. So such an entry is skipped whole
-        // rather than planned and refused.
+        // 8.3 does not look at a `WITH` entry nothing reads at all — it
+        // neither runs it nor resolves it. Measured for `WITH RECURSIVE` under
+        // #0192: a statement carrying a runaway recursive CTE the body never
+        // names answers, where running it would be 3636, and so does one
+        // carrying a *malformed* recursive CTE, where resolving it would be
+        // 3574.
+        //
+        // The rule is not the recursive keyword's. Measured on 8.3 for a plain
+        // `WITH`: `WITH c AS (SELECT zz.q FROM Cr) SELECT 1` answers where
+        // resolving `c` is 1054, and so do the same shapes over a missing
+        // table (1146), a miscalled function (1582) and a bad ESCAPE (1210).
+        // A *syntax* error in the entry is still 1064 there, because the whole
+        // statement is parsed before any of it is looked at — which this
+        // engine gets for the same reason. #0245.
         //
         // Computed once for the whole list rather than per entry, because
         // reachability is transitive and an entry cannot answer it alone. See
         // `recursive::read_ctes`, which errs towards "read".
-        let read = if with.recursive {
-            crate::recursive::read_ctes(query)
-        } else {
-            Vec::new()
-        };
+        let read = crate::recursive::read_ctes(query);
 
         for (position, cte) in with.cte_tables.iter().enumerate() {
             let name = cte.alias.name.value.clone();
-            if with.recursive && !read[position] {
+            if !read[position] {
                 continue;
             }
             // Only under `WITH RECURSIVE`: without the keyword a CTE naming
@@ -2034,6 +2038,24 @@ impl Engine {
             refs.extend(outer.schema.iter().cloned());
         }
 
+        // The declarations behind those names, in the same order, so a
+        // reference that resolves *outwards* is typed rather than falling past
+        // the end of this query's own columns and coming back a `VAR_STRING`.
+        // Borrowed where there is nothing to append, which is every
+        // uncorrelated query. #0243.
+        let input: std::borrow::Cow<'_, [crate::relation::RelColumn]> = match outer {
+            Some(outer) if outer.columns.len() == outer.schema.len() => {
+                let mut both = relation.columns.clone();
+                both.extend(outer.columns.iter().cloned());
+                std::borrow::Cow::Owned(both)
+            }
+            // An outer row that could not declare all of its own columns
+            // declares none of them here: appending a short list would put the
+            // enclosing scope's types under this query's slots, which is a
+            // wrong answer where the missing type is only a worse one.
+            _ => std::borrow::Cow::Borrowed(&relation.columns[..]),
+        };
+
         // Filter first so projections and aggregates see only matching rows.
         // Each candidate row is widened with the outer row's values so both
         // are visible to the predicate.
@@ -2178,6 +2200,8 @@ impl Engine {
                 select,
                 Input {
                     refs: &refs,
+                    columns: &input,
+                    own: relation.columns.len(),
                     columns: &relation.columns,
                     keys: &keys,
                     matching: &matching,
@@ -2262,7 +2286,7 @@ impl Engine {
             self.sort_rows(session, &refs, &mut matching, &keys)?
         };
 
-        let mut projected = self.project(session, select, &relation, &refs, &matching)?;
+        let mut projected = self.project(session, select, &relation, &refs, &input, &matching)?;
         // Finished here rather than by the caller, and before DISTINCT,
         // because `carried` lines up with these rows one for one — `project`
         // yields a row per matching row, in order — and a dedup would break
@@ -2517,7 +2541,7 @@ impl Engine {
                 // Built per row rather than once: evaluating it here would ask
                 // for a column of the table on the left, which is not in scope
                 // until there is a row to read it from.
-                TableFactor::JsonTable { .. } if item.joins.is_empty() => {
+                _ if is_lateral(&item.relation) && item.joins.is_empty() => {
                     self.lateral_join(session, relation, &item.relation, &cross)?
                 }
                 _ => {
@@ -2537,7 +2561,7 @@ impl Engine {
             // JSON_TABLE is implicitly LATERAL: its document is usually a
             // column of a table named earlier in the FROM, so it has to be
             // expanded once per row on the left rather than once for the join.
-            if let TableFactor::JsonTable { .. } = &join.relation {
+            if is_lateral(&join.relation) {
                 left = self.lateral_join(session, left, &join.relation, &join.join_operator)?;
                 continue;
             }
@@ -2604,13 +2628,15 @@ impl Engine {
             // kept behind it, so a subquery that names another table first can
             // still reach the row it is correlated to.
             let mut scoped = session.clone();
-            let mut schema = refs.clone();
-            let mut values = row.clone();
+            let mut here = OuterRow {
+                schema: refs.clone(),
+                values: row.clone(),
+                columns: left.columns.clone(),
+            };
             if let Some(enclosing) = &session.lateral {
-                schema.extend(enclosing.schema.iter().cloned());
-                values.extend(enclosing.values.iter().cloned());
+                here = here.behind(enclosing);
             }
-            scoped.lateral = Some(OuterRow { schema, values });
+            scoped.lateral = Some(here);
             let expanded = self.relation_of(&scoped, factor)?;
 
             // The shape does not depend on the row, so the first one settles it
@@ -2691,19 +2717,31 @@ impl Engine {
             Some(columns) => columns,
             None => {
                 let mut scoped = session.clone();
-                let mut schema = refs.clone();
-                let mut values = vec![Value::Null; schema.len()];
+                let mut here = OuterRow {
+                    values: vec![Value::Null; refs.len()],
+                    schema: refs.clone(),
+                    columns: left.columns.clone(),
+                };
                 if let Some(enclosing) = &session.lateral {
-                    schema.extend(enclosing.schema.iter().cloned());
-                    values.extend(enclosing.values.iter().cloned());
+                    here = here.behind(enclosing);
                 }
-                scoped.lateral = Some(OuterRow { schema, values });
+                scoped.lateral = Some(here);
                 self.relation_of(&scoped, factor)?.columns
             }
         };
 
         let mut all = left.columns;
-        all.extend(right_columns);
+        // A left join pads the right side with NULLs where nothing matched, so
+        // its columns are nullable however they were declared — the same
+        // relaxation `Relation::joined_columns` applies to an ordinary join,
+        // which this path does not go through. Measured: `SELECT Cl.id, d.x
+        // FROM Cl LEFT JOIN LATERAL (SELECT Cr.id AS x FROM Cr WHERE Cr.id =
+        // Cl.id) d ON TRUE` describes `x` nullable on 8.3, and this engine
+        // sent NOT_NULL over the NULL it padded with.
+        all.extend(right_columns.into_iter().map(|mut column| {
+            column.nullable |= outer_left;
+            column
+        }));
         Ok(Relation {
             columns: all,
             rows,
@@ -3032,7 +3070,21 @@ impl Engine {
             TableFactor::Derived {
                 subquery, alias, ..
             } => {
-                let inner = self.query(session, subquery)?;
+                // Run against whatever row is in scope, which is what makes a
+                // derived table inside a correlated subquery able to name the
+                // row that subquery is being run for: `SELECT k FROM Cl WHERE
+                // EXISTS (SELECT 1 FROM (SELECT id FROM Cr WHERE Cr.id =
+                // Cl.id) d)` answers on 8.3 and was 1054 in the WHERE here.
+                // #0230 carried the row as far as the ON and this is the
+                // clause it did not reach. #0239.
+                //
+                // Not a hole in LATERAL's rule. `session.lateral` holds the
+                // *enclosing query's* row, put there by `select` before the
+                // FROM is built; a sibling FROM item's row only ever gets
+                // there through `lateral_join`, which is the path `LATERAL`
+                // itself selects. So `SELECT k FROM Cl, (SELECT Cl.id ...) t`
+                // is still 1054, as it is on 8.3.
+                let inner = self.query_outer(session, subquery, session.lateral.as_ref())?;
                 // Whether the columns take the shape a temporary table would
                 // give them, or stay the expressions MySQL would have merged
                 // into this query. See `materialised_by_mysql`.
@@ -3103,6 +3155,10 @@ impl Engine {
             Some(outer) => (outer.schema.clone(), outer.values.clone()),
             None => (Vec::new(), Vec::new()),
         };
+        // The enclosing row's declarations, which type a name this query reads
+        // from it: with no FROM of its own, *every* column reference here is a
+        // correlated one. See `OuterRow::columns`.
+        let implicit_input = outer.map_or(&[][..], |outer| outer.columns.as_slice());
         let implicit_row = [&implicit_values];
 
         let items: Vec<(String, &Expr)> = select
@@ -3261,12 +3317,12 @@ impl Engine {
             });
             let mut column = OutColumn::new(
                 alias.clone(),
-                computed_column_type(e, &implicit_schema, &[], sub),
+                computed_column_type(e, &implicit_schema, implicit_input, sub),
             );
-            column.nullable = !never_null(e, &implicit_schema, &[], sub);
-            column.unsigned = unsigned_answer(e, &implicit_schema, &[], sub);
-            column.binary_values = binary_answer(e, &implicit_schema, sub);
-            let shape = item_shape(e, &implicit_schema, &[], sub);
+            column.nullable = !never_null(e, &implicit_schema, implicit_input, sub);
+            column.unsigned = unsigned_answer(e, &implicit_schema, implicit_input, sub);
+            column.binary_values = binary_answer(e, &implicit_schema, implicit_input, sub);
+            let shape = item_shape(e, &implicit_schema, implicit_input, sub);
             column.max_length = shape.max_length;
             column.decimals = shape.decimals;
             columns.push(column);
@@ -3334,12 +3390,18 @@ impl Engine {
         Ok(ResultSet { columns, rows })
     }
 
+    /// `input` is `refs`'s declarations, which is `relation.columns` plus the
+    /// enclosing query's where this one is correlated — see `select`. The two
+    /// are not interchangeable: a wildcard expands `relation.columns` and must
+    /// not reach outwards, while typing an expression reads `input` and has
+    /// to.
     fn project(
         &self,
         session: &Session,
         select: &Select,
         relation: &Relation,
         refs: &[ColumnRef],
+        input: &[crate::relation::RelColumn],
         matching: &[&Vec<Value>],
     ) -> EngineResult<ResultSet> {
         let sub = Some(Sub {
@@ -3408,15 +3470,15 @@ impl Engine {
                             // encodes by the declared type.
                             let mut column = OutColumn::new(
                                 alias.unwrap_or_else(|| render_expr(e)),
-                                computed_column_type(e, refs, &relation.columns, sub),
+                                computed_column_type(e, refs, input, sub),
                             );
                             // A ranking window numbers its rows and always has
                             // an answer; one that reaches past the frame has
                             // one only if it was given a default.
-                            column.nullable = !never_null(e, refs, &relation.columns, sub);
-                            column.unsigned = unsigned_answer(e, refs, &relation.columns, sub);
-                            column.binary_values = binary_answer(e, refs, sub);
-                            let shape = item_shape(e, refs, &relation.columns, sub);
+                            column.nullable = !never_null(e, refs, input, sub);
+                            column.unsigned = unsigned_answer(e, refs, input, sub);
+                            column.binary_values = binary_answer(e, refs, input, sub);
+                            let shape = item_shape(e, refs, input, sub);
                             column.max_length = shape.max_length;
                             column.decimals = shape.decimals;
                             columns.push(column);
@@ -3426,7 +3488,8 @@ impl Engine {
                         }
                     }
 
-                    let (column, projection) = self.plan_expr(e, alias, relation, refs, session)?;
+                    let (column, projection) =
+                        self.plan_expr(e, alias, relation, refs, input, session)?;
                     columns.push(column);
                     plan.push(projection);
                 }
@@ -3759,6 +3822,7 @@ impl Engine {
         alias: Option<String>,
         relation: &Relation,
         refs: &[ColumnRef],
+        input: &[crate::relation::RelColumn],
         session: &Session,
     ) -> EngineResult<(OutColumn, Projection)> {
         // A bare column reference keeps the column's declared type, which
@@ -3794,6 +3858,38 @@ impl Engine {
             return Ok((out, Projection::Column(i)));
         }
 
+        // The same thing for a column of the *enclosing* query, which
+        // `relation.index_of` cannot find because it is not this query's.
+        // `refs` gives its slot, `input` its declaration at that slot, and the
+        // rows `select` handed on are widened with the outer row's values — so
+        // it is a plain column read at a slot past this relation's end rather
+        // than an expression to re-derive.
+        //
+        // Which matters beyond the type code: everything a *computed* column
+        // is described with is the arithmetic this engine models loosely, so
+        // `SELECT d.x FROM Tw, LATERAL (SELECT Tw.vs AS x FROM Tr) d` over a
+        // `VARCHAR(20)` came back as the 512-character default rather than
+        // 8.3's 80. Below the relation's own end nothing changes: a name
+        // `index_of` turned down there is turned down for a reason of its own,
+        // and reading it here would answer a question that path already
+        // settled. #0243.
+        if let Some((slot, column)) = column_reference(e)
+            .and_then(|written| column_slot(refs, written))
+            .filter(|slot| *slot >= relation.columns.len())
+            .and_then(|slot| input.get(slot).map(|column| (slot, column)))
+        {
+            let out = OutColumn::from_sql_type(
+                alias.unwrap_or_else(|| column.name.clone()),
+                &column.ty,
+                column.nullable,
+            )
+            .in_table(&column.schema, &column.table)
+            // No base table: `base_table` reads this query's own sources, and
+            // the enclosing query's are not among them.
+            .projected_from(&column.name, None);
+            return Ok((out, Projection::Column(slot)));
+        }
+
         let name = alias.unwrap_or_else(|| render_expr(e));
         // A computed column is nullable because nothing here knows better —
         // except for a literal, which knows exactly. That distinction is not
@@ -3808,16 +3904,17 @@ impl Engine {
             engine: self,
             session,
         });
-        // `refs` and not `relation.refs()`: the two differ only by the
-        // enclosing query's columns, which `direct_column` cannot reach
-        // anyway — their slots fall past `relation.columns` — and which a
-        // scalar subquery described here does have to resolve against.
-        let mut column =
-            OutColumn::new(name, computed_column_type(e, refs, &relation.columns, sub));
-        column.nullable = !never_null(e, refs, &relation.columns, sub);
-        column.unsigned = unsigned_answer(e, refs, &relation.columns, sub);
-        column.binary_values = binary_answer(e, refs, sub);
-        let shape = item_shape(e, refs, &relation.columns, sub);
+        // `refs` and not `relation.refs()`: the two differ by the enclosing
+        // query's columns, which a scalar subquery described here has to
+        // resolve against. `input` is those same columns' declarations, so
+        // `direct_column` reaches an outer one rather than stopping at the end
+        // of this relation and calling it a `VAR_STRING` — `SELECT (SELECT
+        // Cl.id FROM Cr) FROM Cl` is a LONG on 8.3. #0243.
+        let mut column = OutColumn::new(name, computed_column_type(e, refs, input, sub));
+        column.nullable = !never_null(e, refs, input, sub);
+        column.unsigned = unsigned_answer(e, refs, input, sub);
+        column.binary_values = binary_answer(e, refs, input, sub);
+        let shape = item_shape(e, refs, input, sub);
         column.max_length = shape.max_length;
         column.decimals = shape.decimals;
         Ok((column, Projection::Expr(Box::new(e.clone()))))
@@ -3838,6 +3935,7 @@ impl Engine {
         let Input {
             refs,
             columns: input_columns,
+            own,
             keys,
             matching,
         } = input;
@@ -3905,13 +4003,7 @@ impl Engine {
         // and the per-row evaluation still looked for a column called `a`.
         let group_exprs = resolve_group_by(sub, written_groups, &select.projection, &items, refs)?;
         if let Some(having) = &select.having {
-            check_having_scope(
-                having,
-                &select.projection,
-                &group_exprs,
-                refs,
-                input_columns.len(),
-            )?;
+            check_having_scope(having, &select.projection, &group_exprs, refs, own)?;
         }
         refuse_at_resolve(
             Some(Sub {
@@ -4074,7 +4166,7 @@ impl Engine {
                     // even `SUM(1)`: an empty group has nothing to sum.
                     column.nullable = !never_null(e, refs, input_columns, sub);
                     column.unsigned = unsigned_answer(e, refs, input_columns, sub);
-                    column.binary_values = binary_answer(e, refs, sub);
+                    column.binary_values = binary_answer(e, refs, input_columns, sub);
                     let shape = item_shape(e, refs, input_columns, sub);
                     column.max_length = shape.max_length;
                     column.decimals = shape.decimals;
@@ -6306,7 +6398,16 @@ impl Engine {
         query: &Query,
         name: &str,
     ) -> EngineResult<Relation> {
-        let result = self.query(session, query)?;
+        // Against whatever row is in scope, for the reason `relation_of`'s
+        // derived table is: a CTE belongs to the query block that wrote it, so
+        // one written inside a correlated subquery may name the row that
+        // subquery is being run for. `query_with_outer` already puts the row
+        // on the session before the entries are materialised, which reached
+        // the ON — the body's own clauses resolve from this parameter, and it
+        // was `None`. Measured: `SELECT Ll.id, d.x FROM Ll, LATERAL (WITH q AS
+        // (SELECT Ll.id AS x FROM Lr) SELECT x FROM q) d` answers on 8.3.
+        // #0239.
+        let result = self.query_outer(session, query, session.lateral.as_ref())?;
         Ok(self.relation_from_result(session, &result.columns, result.rows, query, name))
     }
 
@@ -6954,6 +7055,16 @@ impl Executed {
 struct Input<'a> {
     refs: &'a [ColumnRef],
     columns: &'a [crate::relation::RelColumn],
+    /// How many of `refs` are this query's *own*, which is where the enclosing
+    /// query's columns begin.
+    ///
+    /// Not `columns.len()`, which it was until the declarations of the
+    /// enclosing query started travelling in `columns` too: a HAVING may name
+    /// what this query projects and an outer column is not that, so reading
+    /// the length let `SELECT MAX(x.b) FROM Hv x HAVING Hv.id > 2` resolve the
+    /// outer `Hv.id` as though the select list had projected it. Two facts,
+    /// two fields.
+    own: usize,
     /// The unique keys the FROM items brought, for the functional dependency
     /// ONLY_FULL_GROUP_BY admits. Built by the caller because it is the one
     /// that still has the FROM items: a column knows the name it is reached
@@ -8668,9 +8779,14 @@ fn is_null_literal(e: &Expr) -> bool {
 /// It is not the whole of what carries binariness either: a derived table, a
 /// CTE and a view never reach this, because they rebuild their columns from an
 /// `SqlType`. `OutColumn::sql_type` is the other half.
-fn binary_answer(e: &Expr, refs: &[ColumnRef], sub: Option<Sub<'_>>) -> bool {
+fn binary_answer(
+    e: &Expr,
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+    sub: Option<Sub<'_>>,
+) -> bool {
     match e {
-        Expr::Nested(inner) => binary_answer(inner, refs, sub),
+        Expr::Nested(inner) => binary_answer(inner, refs, input, sub),
         // Unary plus is not an operator — the parser hands its operand back —
         // so it answers whatever its operand does, exactly as parentheses do.
         // `+X'41'` is binary on 8.3 where `-X'41'` is a DOUBLE and not a
@@ -8678,7 +8794,7 @@ fn binary_answer(e: &Expr, refs: &[ColumnRef], sub: Option<Sub<'_>>) -> bool {
         Expr::UnaryOp {
             op: sqlparser::ast::UnaryOperator::Plus,
             expr,
-        } => binary_answer(expr, refs, sub),
+        } => binary_answer(expr, refs, input, sub),
         // A hex literal *is* bytes. `X'41'` is the binary character set on
         // 8.3, and the engine held it as `Value::Bytes` all along while
         // describing the column in the connection's character set — so a
@@ -8714,7 +8830,7 @@ fn binary_answer(e: &Expr, refs: &[ColumnRef], sub: Option<Sub<'_>>) -> bool {
                         | ColumnType::LongBlob
                 )
             };
-            subquery_column(sub, query, refs).is_some_and(|column| {
+            subquery_column(sub, query, refs, input).is_some_and(|column| {
                 textual(column.ty)
                     && column.to_wire().charset
                         == mysql_ultralight_protocol::column::charset::BINARY
@@ -8802,7 +8918,7 @@ fn unsigned_answer(
         // and so is `(SELECT yr FROM T) + 1` over a `YEAR`. Read off the wire
         // definition rather than off `OutColumn::unsigned`, because a YEAR
         // carries the flag from its type code and not from a field.
-        Expr::Subquery(query) => subquery_column(sub, query, refs).is_some_and(|column| {
+        Expr::Subquery(query) => subquery_column(sub, query, refs, input).is_some_and(|column| {
             column.to_wire().flags & mysql_ultralight_protocol::column::flags::UNSIGNED != 0
         }),
         // A whole number too big for an `i64` is a BIGINT UNSIGNED in MySQL,
@@ -9126,7 +9242,7 @@ fn never_null(
         // `(SELECT 1)`, which reads no table.
         Expr::Subquery(query) => {
             always_one_row(query)
-                && subquery_column(sub, query, refs).is_some_and(|column| !column.nullable)
+                && subquery_column(sub, query, refs, input).is_some_and(|column| !column.nullable)
         }
         // Only to a *numeric* target. `CAST(1 AS UNSIGNED)` is NOT NULL and
         // `CAST(1 AS CHAR)` is not, and nor is a cast to DATE — MySQL keeps
@@ -9454,7 +9570,7 @@ fn temporal_precision(
         // subquery's doing: `SELECT x + 0 FROM (SELECT NOW(3) AS x) d` loses
         // it the same way, because every relation this engine builds from a
         // computed column rebuilds it from a type code with no scale in it.
-        Expr::Subquery(query) => subquery_column(sub, query, refs)
+        Expr::Subquery(query) => subquery_column(sub, query, refs, input)
             .and_then(|column| column.declared.and_then(|declared| declared.length))
             .unwrap_or(0),
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => direct_column(e, refs, input)
@@ -9846,7 +9962,7 @@ fn item_shape(
         t if is_textual_code(t) || t == ColumnType::VarString => {
             match string_width(e, refs, input, sub) {
                 Some(bytes) => ItemShape {
-                    max_length: Some(wire_string_width(bytes, binary_answer(e, refs, sub))),
+                    max_length: Some(wire_string_width(bytes, binary_answer(e, refs, input, sub))),
                     decimals: Some(mysql_ultralight_protocol::column::NOT_FIXED_DEC),
                 },
                 None => ItemShape::default(),
@@ -10041,7 +10157,7 @@ fn string_width(
     // VAR_STRING of 32768 on 8.3, where four times that would have crossed
     // into MEDIUM_BLOB. `binary_answer` is the same question `binary_values`
     // asks, so the width and the charset cannot disagree about one column.
-    if binary_answer(e, refs, sub) {
+    if binary_answer(e, refs, input, sub) {
         return Some(counted);
     }
     Some(counted.saturating_mul(BYTES_PER_CHAR))
@@ -10474,7 +10590,7 @@ fn exact_shape(
         // A scalar subquery is described exactly as the column behind it is,
         // and reading it back off the wire definition is what keeps the two
         // from drifting: `(SELECT a FROM T) + 1` sizes from `a`'s own 12 and 2.
-        Expr::Subquery(query) => match subquery_column(sub, query, refs) {
+        Expr::Subquery(query) => match subquery_column(sub, query, refs, input) {
             // A column with a *fixed* number of places only. `NOT_FIXED_DEC`
             // is an answer and not a scale — an approximate or string column
             // reports it — and reading it as one gave `(SELECT AVG(d) FROM T)`
@@ -11193,6 +11309,7 @@ fn probed_subquery(
     sub: Option<Sub<'_>>,
     query: &Query,
     refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
 ) -> Option<ProbedSubquery> {
     let sub = sub?;
     let depth = SUBQUERY_DEPTH.with(|d| d.get());
@@ -11214,6 +11331,18 @@ fn probed_subquery(
         key.push_str(&r.name);
         key.push(',');
     }
+    // What those columns were *declared* as is part of the answer too, and
+    // not derivable from their names: a correlated reference takes the
+    // enclosing relation's type, so the same text under the same names is a
+    // LONG against one scope and a VARCHAR against another. A caller that
+    // only asks whether the interior resolves passes none, and keys under its
+    // own prefix for it — resolution does not read a type, so the two
+    // questions do not have to share one probe.
+    for column in input {
+        key.push_str(&column.ty.declared);
+        key.push(if column.nullable { '?' } else { '!' });
+        key.push(',');
+    }
     key.push_str("::");
     key.push_str(&query.to_string());
     if let Some(hit) = SUBQUERY_COLUMNS.with(|m| m.borrow().get(&key).cloned()) {
@@ -11223,10 +11352,12 @@ fn probed_subquery(
     // The enclosing columns with no values in them, exactly as `describe`
     // binds every parameter to NULL: a correlated subquery has to *resolve*
     // against the outer row, and nothing about which row it is changes the
-    // type it answers with.
+    // type it answers with. Its declarations do travel, because that is what
+    // types a correlated reference inside it — see `OuterRow::columns`.
     let outer = OuterRow {
         schema: refs.to_vec(),
         values: vec![Value::Null; refs.len()],
+        columns: input.to_vec(),
     };
 
     SUBQUERY_DEPTH.with(|d| d.set(d.get() + 1));
@@ -11252,8 +11383,13 @@ fn probed_subquery(
 /// swallowed and the column described anyway. `refused_while_resolving` reads
 /// the same probe for exactly that error, which is why it is kept rather than
 /// discarded here. #0227.
-fn subquery_column(sub: Option<Sub<'_>>, query: &Query, refs: &[ColumnRef]) -> Option<OutColumn> {
-    probed_subquery(sub, query, refs)?.ok().flatten()
+fn subquery_column(
+    sub: Option<Sub<'_>>,
+    query: &Query,
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+) -> Option<OutColumn> {
+    probed_subquery(sub, query, refs, input)?.ok().flatten()
 }
 
 /// Whether a query answers with a row whatever is in the database.
@@ -11734,7 +11870,7 @@ fn computed_column_type(
         //
         // `VAR_STRING` where the subquery cannot be described, which is what
         // every scalar subquery was answered before this arm existed.
-        Expr::Subquery(query) => subquery_column(sub, query, refs)
+        Expr::Subquery(query) => subquery_column(sub, query, refs, input)
             .map(|column| column.ty)
             .unwrap_or(ColumnType::VarString),
         Expr::Nested(inner) => computed_column_type(inner, refs, input, sub),
@@ -12109,6 +12245,22 @@ fn preserved_side(op: &sqlparser::ast::JoinOperator) -> PreservedSide {
     }
 }
 
+/// Whether a FROM item is expanded once per row of what precedes it.
+///
+/// `JSON_TABLE` always is, whether or not the word is written: its document is
+/// normally a column of a table named earlier in the same FROM, and MySQL
+/// treats it as implicitly LATERAL. A derived table is only when it says so,
+/// and that is the whole of the difference — measured on 8.3, `SELECT * FROM
+/// Cl, LATERAL (SELECT Cl.id AS x FROM Cr) d` answers and the same statement
+/// without the keyword is `Unknown column 'Cl.id' in 'field list'`. #0245.
+fn is_lateral(factor: &TableFactor) -> bool {
+    match factor {
+        TableFactor::JsonTable { .. } => true,
+        TableFactor::Derived { lateral, .. } => *lateral,
+        _ => false,
+    }
+}
+
 /// The name a joined table is addressed by, which is its alias where it has one.
 fn factor_name(factor: &TableFactor) -> Option<String> {
     match factor {
@@ -12380,7 +12532,12 @@ fn refused_while_resolving(
         }
     }
     let recur = |inner: &Expr| refused_while_resolving(sub, inner, refs);
-    let probe = |query: &Query| match probed_subquery(sub, query, refs) {
+    // No declarations: this asks only whether the interior *resolves*, which
+    // no column's type decides. `probed_subquery` keys them separately, so a
+    // question asked without them cannot answer one that needs them — which
+    // is what would happen here, since the resolve pass runs ahead of the
+    // pass that types the same select item.
+    let probe = |query: &Query| match probed_subquery(sub, query, refs, &[]) {
         Some(Err(bad)) if refused_at_prepare(&bad) => Some(bad),
         _ => None,
     };

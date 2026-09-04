@@ -35020,3 +35020,459 @@ fn a_view_keeps_the_sql_mode_it_was_created_under() {
          because its reader set the flag"
     );
 }
+
+/// A derived table's own clauses are read against the enclosing query's row.
+///
+/// #0239, the half #0230 did not reach. `SELECT k FROM Cl WHERE EXISTS (SELECT
+/// 1 FROM (SELECT id AS z FROM Cr WHERE Cr.id = Cl.id) d)` answers on 8.3 and
+/// was `Unknown column 'Cl.id' in 'where clause'` here, because `relation_of`
+/// ran the derived table's query with no outer row at all — so the correlation
+/// reached the ON, which is built from `session.lateral`, and nothing else.
+///
+/// Every clause of the derived table is asserted rather than the WHERE alone.
+/// They are resolved by different paths and the issue names only one of them,
+/// so a fix threaded into that path and no other passes the case it was
+/// written for and leaves the rest refusing.
+#[test]
+fn a_derived_table_reads_the_enclosing_row() {
+    let (engine, mut session) = engine();
+    for ddl in [
+        "CREATE TABLE Dl (id INT NOT NULL, k INT NULL, b INT NULL, PRIMARY KEY (id))",
+        "CREATE TABLE Dr (id INT NOT NULL, v INT NULL, PRIMARY KEY (id))",
+        "CREATE TABLE Dempty (id INT NOT NULL, v INT NULL, PRIMARY KEY (id))",
+        "CREATE TABLE Dlempty (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+        "INSERT INTO Dl VALUES (1, 10, 100), (2, 20, 200)",
+        "INSERT INTO Dr VALUES (1, 7), (3, 9)",
+    ] {
+        run(&engine, &mut session, ddl);
+    }
+
+    // The issue's statement: the correlation in the derived table's WHERE.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k FROM Dl WHERE EXISTS \
+             (SELECT 1 FROM (SELECT id AS z FROM Dr WHERE Dr.id = Dl.id) d) ORDER BY 1"
+        ),
+        vec![vec!["10"]]
+    );
+
+    // The other four clauses of the same derived table, each measured on 8.3
+    // to answer rather than refuse. The select list and the GROUP BY resolve
+    // through paths of their own; the HAVING and the ORDER BY through two
+    // more.
+    for sql in [
+        "SELECT k FROM Dl WHERE EXISTS (SELECT 1 FROM (SELECT Dl.id AS z FROM Dr) d) ORDER BY 1",
+        "SELECT k FROM Dl WHERE EXISTS \
+         (SELECT 1 FROM (SELECT COUNT(*) AS z FROM Dr GROUP BY Dl.id) d) ORDER BY 1",
+        "SELECT k FROM Dl WHERE EXISTS \
+         (SELECT 1 FROM (SELECT COUNT(*) AS z FROM Dr GROUP BY Dr.id HAVING Dl.id > 0) d) \
+         ORDER BY 1",
+        "SELECT k FROM Dl WHERE EXISTS \
+         (SELECT 1 FROM (SELECT Dr.id AS z FROM Dr ORDER BY Dl.id) d) ORDER BY 1",
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec!["10"], vec!["20"]],
+            "{sql}"
+        );
+    }
+
+    // An unqualified name the derived table's own FROM cannot answer to
+    // resolves outwards, which is the same scope rule with the qualifier left
+    // off — and `b` is 100 and 200, so nothing in `Dr` matches and the answer
+    // is empty rather than an error.
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT k FROM Dl WHERE EXISTS (SELECT 1 FROM (SELECT id AS z FROM Dr WHERE Dr.id = b) d)"
+    )
+    .is_empty());
+
+    // Two and three levels out. The row a subquery is handed already carries
+    // the level above it, so a derived table at the bottom of a nest reads the
+    // top of it.
+    for sql in [
+        "SELECT k FROM Dl WHERE EXISTS (SELECT 1 FROM Dr WHERE EXISTS \
+         (SELECT 1 FROM (SELECT id AS z FROM Dr c9 WHERE c9.id = Dl.id) d)) ORDER BY 1",
+        "SELECT k FROM Dl WHERE EXISTS (SELECT 1 FROM Dr WHERE EXISTS \
+         (SELECT 1 FROM Dr c8 WHERE EXISTS \
+          (SELECT 1 FROM (SELECT id AS z FROM Dr c9 WHERE c9.id = Dl.id) d))) ORDER BY 1",
+    ] {
+        assert_eq!(rows(&engine, &mut session, sql), vec![vec!["10"]], "{sql}");
+    }
+
+    // Which scope a name lands in, with two of them able to answer it. `Dw`
+    // and `Dr` both have a `v` and `Dl` has none, so the reference has to
+    // travel — and how far is the whole question. Measured on 8.3, three
+    // statements over the same three tables:
+    //
+    //   * the *nearest* enclosing scope wins, so `v` under `FROM Dr` is
+    //     `Dr.v` and not the `Dw.v` a level further out;
+    //   * a derived table does not read its FROM *sibling*, so the same
+    //     reference written inside one skips `Dr` entirely and reaches `Dw`;
+    //   * and `LATERAL` is exactly what puts the sibling back, so it reads
+    //     `Dr.v` again.
+    //
+    // The three differ by one word each and answer 7, 5 and 7. Appending the
+    // outer row in front of this query's columns, or handing it to a sibling,
+    // makes one of them wrong without touching the others.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Dw (id INT NOT NULL, v INT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Dw VALUES (1, 5), (2, 6)",
+    );
+    for (sql, near) in [
+        (
+            "SELECT Dw.id, (SELECT (SELECT v FROM Dl WHERE Dl.id = 1) FROM Dr \
+             WHERE Dr.id = Dw.id) AS n FROM Dw ORDER BY 1",
+            "7",
+        ),
+        (
+            "SELECT Dw.id, (SELECT d.z FROM Dr, (SELECT v AS z FROM Dl WHERE Dl.id = 1) d \
+             WHERE Dr.id = Dw.id) AS n FROM Dw ORDER BY 1",
+            "5",
+        ),
+        (
+            "SELECT Dw.id, (SELECT d.z FROM Dr, LATERAL (SELECT v AS z FROM Dl WHERE Dl.id = 1) d \
+             WHERE Dr.id = Dw.id) AS n FROM Dw ORDER BY 1",
+            "7",
+        ),
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec!["1", near], vec!["2", "NULL"]],
+            "{sql}"
+        );
+    }
+
+    // The empty halves. An empty table inside the derived query produces no
+    // row for the EXISTS, and an empty one outside produces no row to
+    // correlate against — and neither may become the 1054 this closes, which
+    // is where every bug in this family has hidden.
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT k FROM Dl WHERE EXISTS \
+         (SELECT 1 FROM (SELECT id AS z FROM Dempty WHERE Dempty.id = Dl.id) d)"
+    )
+    .is_empty());
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT k FROM Dlempty WHERE EXISTS \
+         (SELECT 1 FROM (SELECT id AS z FROM Dr WHERE Dr.id = Dlempty.id) d)"
+    )
+    .is_empty());
+
+    // A name in neither scope is still 1054, named for the clause it was
+    // written in. Widening the scope must not widen it to everything.
+    for (sql, clause) in [
+        (
+            "SELECT k FROM Dl WHERE EXISTS \
+             (SELECT 1 FROM (SELECT id AS z FROM Dr WHERE Dr.id = zz.q) d)",
+            "where clause",
+        ),
+        (
+            "SELECT k FROM Dl WHERE EXISTS (SELECT 1 FROM (SELECT zz.q AS z FROM Dr) d)",
+            "field list",
+        ),
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1054, "{sql} -> {err}");
+        assert_eq!(
+            err.message,
+            format!("Unknown column 'zz.q' in '{clause}'"),
+            "{sql}"
+        );
+    }
+
+    // A CTE's body is the same question one level over, and it was the same
+    // answer: the entries are materialised with the enclosing row on the
+    // session, which reached a join's ON, and the body's own clauses resolve
+    // from the parameter that was still `None`. #0230's note recorded the ON
+    // half of this as done; these are the clauses it did not cover.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM Dl WHERE EXISTS \
+             (WITH q AS (SELECT Dl.id AS z FROM Dr) SELECT 1 FROM q) ORDER BY 1"
+        ),
+        vec![vec!["1"], vec!["2"]]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM Dl WHERE EXISTS \
+             (WITH q AS (SELECT Dr.id AS z FROM Dr WHERE Dr.id = Dl.id) SELECT 1 FROM q) \
+             ORDER BY 1"
+        ),
+        vec![vec!["1"]]
+    );
+
+    // The distinction this must not collapse, and the reason the row travels
+    // on `session.lateral` rather than being handed to every FROM item: a
+    // derived table beside `Dl` in the *same* FROM is not correlated to it
+    // without LATERAL, and is 1054 on 8.3. A CTE written into one is the same
+    // — the FROM item is still a sibling however its query is spelled.
+    for sql in [
+        "SELECT k FROM Dl, (SELECT Dl.id AS z FROM Dr) t",
+        "SELECT k FROM Dl, (WITH q AS (SELECT Dl.id AS z FROM Dr) SELECT z FROM q) t",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1054, "{sql} -> {err}");
+        assert_eq!(
+            err.message, "Unknown column 'Dl.id' in 'field list'",
+            "{sql}"
+        );
+    }
+}
+
+/// A `WITH` entry nothing reads is not run and not resolved.
+///
+/// #0245. `WITH c AS (SELECT zz.q FROM Cr) SELECT 1` answers on 8.3 — the
+/// engine refusing it is the worse direction of divergence, a statement that
+/// passes against a real server and fails here. #0192 settled the rule for a
+/// `WITH RECURSIVE` entry; this is the measurement that the rule is the WITH
+/// list's rather than the recursive keyword's.
+///
+/// Every kind of fault the entry can carry is asserted, because they are
+/// raised at four different places: a name (1054), a missing table (1146), a
+/// miscalled function (1582) and a bad ESCAPE (1210). A skip applied where
+/// only the first is raised leaves the other three refusing.
+#[test]
+fn an_unreferenced_cte_is_never_resolved() {
+    let (engine, mut session) = engine();
+    for ddl in [
+        "CREATE TABLE Ur (id INT NOT NULL, v INT NULL, PRIMARY KEY (id))",
+        "CREATE TABLE Uempty (id INT NOT NULL, PRIMARY KEY (id))",
+        "INSERT INTO Ur VALUES (1, 7), (3, 9)",
+    ] {
+        run(&engine, &mut session, ddl);
+    }
+
+    for sql in [
+        "WITH c AS (SELECT zz.q FROM Ur) SELECT 1",
+        "WITH c AS (SELECT 1 FROM NoSuchTable) SELECT 1",
+        "WITH c AS (SELECT SIGN() FROM Ur) SELECT 1",
+        "WITH c AS (SELECT 1 LIKE 'a' ESCAPE '!!' FROM Ur) SELECT 1",
+        // Transitively: `b` reads `a` and the body reads neither, so neither
+        // is looked at. A single pass over "does any other entry mention it"
+        // gets this wrong.
+        "WITH a AS (SELECT zz.q FROM Ur), b AS (SELECT * FROM a) SELECT 1",
+        // Beside an entry that *is* read, so the skip is per entry rather than
+        // per statement.
+        "WITH a AS (SELECT zz.q FROM Ur), b AS (SELECT 1 AS n FROM Uempty) SELECT n FROM b",
+        // Over an empty scope on the outside, which is where the rest of this
+        // family's bugs have hidden.
+        "WITH c AS (SELECT zz.q FROM Ur) SELECT 1 FROM Uempty",
+        // Inside a correlated subquery, which is a second entry into
+        // `materialise_ctes` — `query_with_outer` puts the outer row in scope
+        // before the entries are run.
+        "SELECT id FROM Ur WHERE EXISTS \
+         (WITH q AS (SELECT zz.q FROM Ur) SELECT 1 FROM Ur u2 WHERE u2.id = Ur.id)",
+    ] {
+        run(&engine, &mut session, sql);
+    }
+
+    // The other side of the same rule, which is what says the skip is about
+    // reachability and not about switching the checks off: an entry the body
+    // *does* name is resolved, and refused exactly as before. Named in a
+    // subquery counts as named — measured on 8.3.
+    for sql in [
+        "WITH c AS (SELECT zz.q AS q FROM Ur) SELECT q FROM c",
+        "WITH c AS (SELECT zz.q FROM Ur) SELECT (SELECT COUNT(*) FROM c) AS n",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1054, "{sql} -> {err}");
+    }
+
+    // And an entry read only through another entry that is read is still run,
+    // so the reachable set grows outwards rather than stopping at the body.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH a AS (SELECT 1 AS n FROM Ur), b AS (SELECT n FROM a) SELECT n FROM b ORDER BY 1"
+        ),
+        vec![vec!["1"], vec!["1"]]
+    );
+}
+
+/// A `LATERAL` derived table is expanded once per row of what precedes it.
+///
+/// #0245, the second half. `SELECT * FROM Cl, LATERAL (SELECT Cl.id AS x FROM
+/// Cr) d` answers three columns on 8.3 and was `Unknown column 'Cl.id' in
+/// 'field list'` here: a derived table went through `join`, which builds it
+/// once against nothing, and only `JSON_TABLE` took the per-row path that puts
+/// the row on the left in scope. The keyword is now what selects that path.
+///
+/// Distinct from #0238, which is `LATERAL` parsed and ignored: the failure
+/// here is at resolution rather than at evaluation, and it survived #0230
+/// because that fix is in the ON.
+#[test]
+fn a_lateral_derived_table_reads_the_row_beside_it() {
+    let (engine, mut session) = engine();
+    for ddl in [
+        "CREATE TABLE Ll (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+        "CREATE TABLE Lr (id INT NOT NULL, v INT NULL, PRIMARY KEY (id))",
+        "CREATE TABLE Lnone (id INT NOT NULL, v INT NULL, PRIMARY KEY (id))",
+        "INSERT INTO Ll VALUES (1, 10), (2, 20)",
+        "INSERT INTO Lr VALUES (1, 7), (3, 9)",
+    ] {
+        run(&engine, &mut session, ddl);
+    }
+
+    // The issue's statement, and the same shape written as an explicit join
+    // with and without an ON. All three answer on 8.3, with the correlation in
+    // the derived table's select list.
+    for sql in [
+        "SELECT * FROM Ll, LATERAL (SELECT Ll.id AS x FROM Lr) d ORDER BY 1, 3",
+        "SELECT * FROM Ll JOIN LATERAL (SELECT Ll.id AS x FROM Lr) d ON TRUE ORDER BY 1, 3",
+        "SELECT * FROM Ll JOIN LATERAL (SELECT Ll.id AS x FROM Lr) d ORDER BY 1, 3",
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![
+                vec!["1", "10", "1"],
+                vec!["1", "10", "1"],
+                vec!["2", "20", "2"],
+                vec!["2", "20", "2"],
+            ],
+            "{sql}"
+        );
+    }
+
+    // The correlation in the derived table's WHERE, which is a different
+    // clause and a different resolution path from the select list above.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT * FROM Ll, LATERAL (SELECT Lr.id AS x FROM Lr WHERE Lr.id = Ll.id) d \
+             ORDER BY 1, 3"
+        ),
+        vec![vec!["1", "10", "1"]]
+    );
+
+    // A LEFT JOIN LATERAL keeps the left row where the correlation matched
+    // nothing, and describes the padded column as nullable — 8.3 does both,
+    // and this path does not go through `Relation::joined_columns`, which is
+    // where the relaxation lives for an ordinary join.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT Ll.id, d.x FROM Ll LEFT JOIN LATERAL \
+             (SELECT Lr.id AS x FROM Lr WHERE Lr.id = Ll.id) d ON TRUE ORDER BY 1"
+        ),
+        vec![vec!["1", "1"], vec!["2", "NULL"]]
+    );
+    let Outcome::Rows(padded) = run(
+        &engine,
+        &mut session,
+        "SELECT Ll.id, d.x FROM Ll LEFT JOIN LATERAL \
+         (SELECT Lr.id AS x FROM Lr WHERE Lr.id = Ll.id) d ON TRUE",
+    ) else {
+        panic!("no rows");
+    };
+    assert!(padded.columns[1].nullable, "a padded column is nullable");
+
+    // A LATERAL derived table that writes its own WITH: the entries are
+    // materialised inside the derived query, one level below where the row on
+    // the left was put in scope.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT Ll.id, d.x FROM Ll, \
+             LATERAL (WITH q AS (SELECT Ll.id AS x FROM Lr) SELECT x FROM q) d ORDER BY 1, 2"
+        ),
+        vec![
+            vec!["1", "1"],
+            vec!["1", "1"],
+            vec!["2", "2"],
+            vec!["2", "2"],
+        ]
+    );
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT Ll.id, d.x FROM Ll, \
+         LATERAL (WITH q AS (SELECT Ll.id AS x FROM Lnone) SELECT x FROM q) d"
+    )
+    .is_empty());
+
+    // Chained: the second LATERAL names the first one's alias, so the scope it
+    // is handed is everything to its left rather than the first table alone.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT Ll.id, e.y FROM Ll, LATERAL (SELECT Ll.id AS x FROM Lr) d, \
+             LATERAL (SELECT d.x AS y FROM Lr c3 WHERE c3.id = 1) e ORDER BY 1, 2"
+        ),
+        vec![
+            vec!["1", "1"],
+            vec!["1", "1"],
+            vec!["2", "2"],
+            vec!["2", "2"],
+        ]
+    );
+
+    // Inside a correlated subquery, so the row beside it and the row above it
+    // are in scope at once.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT id FROM Ll WHERE EXISTS \
+             (SELECT 1 FROM Lr, LATERAL (SELECT Ll.id AS y FROM Lr c3) d WHERE d.y = Lr.id) \
+             ORDER BY 1"
+        ),
+        vec![vec!["1"]]
+    );
+
+    // The empty halves. Nothing on the left expands nothing, and nothing on
+    // the right produces no row — and neither may be the 1054 this closes.
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT * FROM Lnone, LATERAL (SELECT Lnone.id AS x FROM Lr) d"
+    )
+    .is_empty());
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT * FROM Ll, LATERAL (SELECT Ll.id AS x FROM Lnone) d"
+    )
+    .is_empty());
+
+    // Without the keyword the same statement is 1054, which is the whole of
+    // what LATERAL means and is measured on 8.3 both ways.
+    for sql in [
+        "SELECT * FROM Ll, (SELECT Ll.id AS x FROM Lr) d",
+        "SELECT * FROM Ll, (SELECT Lr.id AS x FROM Lr WHERE Lr.id = Ll.id) d",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1054, "{sql} -> {err}");
+    }
+
+    // A LATERAL item may not name a *later* sibling, only an earlier one — and
+    // a name in no scope at all is still 1054.
+    for sql in [
+        "SELECT * FROM Ll, LATERAL (SELECT e.id AS x FROM Lr) d, Lr e",
+        "SELECT * FROM Ll, LATERAL (SELECT zz.q AS x FROM Lr) d",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1054, "{sql} -> {err}");
+    }
+}

@@ -9572,4 +9572,289 @@ pub const GROUPS: &[Group] = &[
             same("SELECT COUNT(*) AS left_after FROM Pw"),
         ],
     },
+    Group {
+        // #0239. A derived table's own clauses may name the row the query
+        // enclosing it is being run for: `SELECT k FROM Dl WHERE EXISTS
+        // (SELECT 1 FROM (SELECT id AS z FROM Dr WHERE Dr.id = Dl.id) d)`
+        // answers on 8.3 and was `Unknown column 'Dl.id' in 'where clause'`
+        // here. #0230 carried the enclosing row as far as a join's ON, which
+        // is built from `session.lateral`; a derived table was run with no
+        // outer row at all.
+        //
+        // All five clauses are here rather than the WHERE the issue names,
+        // because they are resolved by five different paths and a fix threaded
+        // into one of them reads exactly like a fix threaded into all five.
+        name: "a derived table's own clauses",
+        setup: &[
+            "CREATE TABLE Dl (id INT NOT NULL, k INT NULL, b INT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE Dr (id INT NOT NULL, v INT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE Dw (id INT NOT NULL, v INT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE Dempty (id INT NOT NULL, v INT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE Dlempty (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Dl VALUES (1, 10, 100), (2, 20, 200)",
+            "INSERT INTO Dr VALUES (1, 7), (3, 9)",
+            "INSERT INTO Dw VALUES (1, 5), (2, 6)",
+        ],
+        cases: &[
+            // The issue's statement, and then the same correlation moved into
+            // each of the derived table's other clauses.
+            same("SELECT k FROM Dl WHERE EXISTS \
+                  (SELECT 1 FROM (SELECT id AS z FROM Dr WHERE Dr.id = Dl.id) d) ORDER BY 1"),
+            same("SELECT k FROM Dl WHERE EXISTS \
+                  (SELECT 1 FROM (SELECT Dl.id AS z FROM Dr) d) ORDER BY 1"),
+            same("SELECT k FROM Dl WHERE EXISTS \
+                  (SELECT 1 FROM (SELECT COUNT(*) AS z FROM Dr GROUP BY Dl.id) d) ORDER BY 1"),
+            same("SELECT k FROM Dl WHERE EXISTS \
+                  (SELECT 1 FROM (SELECT COUNT(*) AS z FROM Dr GROUP BY Dr.id \
+                   HAVING Dl.id > 0) d) ORDER BY 1"),
+            same("SELECT k FROM Dl WHERE EXISTS \
+                  (SELECT 1 FROM (SELECT Dr.id AS z FROM Dr ORDER BY Dl.id) d) ORDER BY 1"),
+            // Unqualified, which resolves outwards only because the derived
+            // table's own FROM cannot answer to it.
+            same("SELECT k FROM Dl WHERE EXISTS \
+                  (SELECT 1 FROM (SELECT id AS z FROM Dr WHERE Dr.id = b) d)"),
+            // Two and three levels out: the row a subquery is handed already
+            // carries the level above it.
+            same("SELECT k FROM Dl WHERE EXISTS (SELECT 1 FROM Dr WHERE EXISTS \
+                  (SELECT 1 FROM (SELECT id AS z FROM Dr c9 WHERE c9.id = Dl.id) d)) ORDER BY 1"),
+            same("SELECT k FROM Dl WHERE EXISTS (SELECT 1 FROM Dr WHERE EXISTS \
+                  (SELECT 1 FROM Dr c8 WHERE EXISTS \
+                   (SELECT 1 FROM (SELECT id AS z FROM Dr c9 WHERE c9.id = Dl.id) d))) \
+                  ORDER BY 1"),
+            // How far the name travels when two scopes could answer it. `Dw`
+            // and `Dr` both have a `v` and `Dl` has none, so the three below
+            // differ by one word each and answer 7, 5 and 7 on 8.3: the
+            // nearest enclosing scope wins; a derived table does not see its
+            // FROM sibling, so the same reference inside one skips `Dr`
+            // entirely; and LATERAL is exactly what puts the sibling back.
+            same("SELECT Dw.id, (SELECT (SELECT v FROM Dl WHERE Dl.id = 1) FROM Dr \
+                  WHERE Dr.id = Dw.id) AS n FROM Dw ORDER BY 1"),
+            same("SELECT Dw.id, (SELECT d.z FROM Dr, (SELECT v AS z FROM Dl WHERE Dl.id = 1) d \
+                  WHERE Dr.id = Dw.id) AS n FROM Dw ORDER BY 1"),
+            same("SELECT Dw.id, \
+                  (SELECT d.z FROM Dr, LATERAL (SELECT v AS z FROM Dl WHERE Dl.id = 1) d \
+                   WHERE Dr.id = Dw.id) AS n FROM Dw ORDER BY 1"),
+            // The empty halves, which is where this family's bugs keep hiding:
+            // no row inside the derived table, and no row outside to correlate
+            // against. Neither may become the 1054 this closes.
+            same("SELECT k FROM Dl WHERE EXISTS \
+                  (SELECT 1 FROM (SELECT id AS z FROM Dempty WHERE Dempty.id = Dl.id) d)"),
+            same("SELECT k FROM Dlempty WHERE EXISTS \
+                  (SELECT 1 FROM (SELECT id AS z FROM Dr WHERE Dr.id = Dlempty.id) d)"),
+            // A name in neither scope is still 1054, named for the clause it
+            // was written in. Widening the scope must not widen it to
+            // everything.
+            same("SELECT k FROM Dl WHERE EXISTS \
+                  (SELECT 1 FROM (SELECT id AS z FROM Dr WHERE Dr.id = zz.q) d)"),
+            same("SELECT k FROM Dl WHERE EXISTS (SELECT 1 FROM (SELECT zz.q AS z FROM Dr) d)"),
+            // A CTE's body is the same question one level over, and was the
+            // same answer: the entries are materialised with the enclosing row
+            // on the session, which reached a join's ON, and the body's own
+            // clauses resolve from a parameter that was still absent.
+            same("SELECT id FROM Dl WHERE EXISTS \
+                  (WITH q AS (SELECT Dl.id AS z FROM Dr) SELECT 1 FROM q) ORDER BY 1"),
+            same("SELECT id FROM Dl WHERE EXISTS \
+                  (WITH q AS (SELECT Dr.id AS z FROM Dr WHERE Dr.id = Dl.id) SELECT 1 FROM q) \
+                  ORDER BY 1"),
+            // And the distinction the fix must not collapse: a derived table
+            // beside `Dl` in the *same* FROM is not correlated to it without
+            // LATERAL — however its query is spelled, a CTE inside it
+            // included, because the FROM item is still a sibling.
+            same("SELECT k FROM Dl, (SELECT Dl.id AS z FROM Dr) t"),
+            same("SELECT k FROM Dl, (WITH q AS (SELECT Dl.id AS z FROM Dr) SELECT z FROM q) t"),
+            // Half of this group is a refusal, and a group of refusals reads
+            // the same whether its setup ran or failed on both servers.
+            same("SELECT id, k, b FROM Dl ORDER BY id"),
+        ],
+    },
+    Group {
+        // #0245, first half. 8.3 does not look at a `WITH` entry nothing reads
+        // — it neither runs it nor resolves it — so `WITH c AS (SELECT zz.q
+        // FROM Ur) SELECT 1` answers there and was 1054 here. The engine
+        // refusing SQL a real server answers is the worse direction: a test
+        // that passes against MySQL fails against this.
+        //
+        // #0192 settled the rule for a `WITH RECURSIVE` entry. These are the
+        // measurement that it belongs to the WITH list rather than to the
+        // recursive keyword, and they carry one entry per *kind* of fault,
+        // because the four are raised at four different places.
+        name: "a WITH entry nothing reads",
+        setup: &[
+            "CREATE TABLE Ur (id INT NOT NULL, v INT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE Uempty (id INT NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Ur VALUES (1, 7), (3, 9)",
+        ],
+        cases: &[
+            // A name (1054), a missing table (1146), a miscalled function
+            // (1582) and a bad ESCAPE (1210) — every one of them answered
+            // rather than raised, because the entry is never looked at.
+            same("WITH c AS (SELECT zz.q FROM Ur) SELECT 1"),
+            same("WITH c AS (SELECT 1 FROM NoSuchTable) SELECT 1"),
+            same("WITH c AS (SELECT SIGN() FROM Ur) SELECT 1"),
+            same("WITH c AS (SELECT 1 LIKE 'a' ESCAPE '!!' FROM Ur) SELECT 1"),
+            // Transitively: `b` reads `a` and the body reads neither, so
+            // neither is looked at. A single pass over "does any other entry
+            // mention it" answers this one wrong.
+            same("WITH a AS (SELECT zz.q FROM Ur), b AS (SELECT * FROM a) SELECT 1"),
+            // Beside an entry that *is* read, so the skip is per entry rather
+            // than per statement.
+            same("WITH a AS (SELECT zz.q FROM Ur), b AS (SELECT 1 AS n FROM Uempty) \
+                  SELECT n FROM b"),
+            // Over an empty scope outside, and inside a correlated subquery —
+            // a second entry into the same materialisation, where the
+            // enclosing row is put in scope before the entries are run.
+            same("WITH c AS (SELECT zz.q FROM Ur) SELECT 1 FROM Uempty"),
+            same("SELECT id FROM Ur WHERE EXISTS \
+                  (WITH q AS (SELECT zz.q FROM Ur) SELECT 1 FROM Ur u2 WHERE u2.id = Ur.id) \
+                  ORDER BY 1"),
+            // The other side of the rule, which is what says this is about
+            // reachability and not about switching the checks off: an entry
+            // the body names is resolved and refused exactly as before, and
+            // naming it in a subquery counts as naming it.
+            same("WITH c AS (SELECT zz.q AS q FROM Ur) SELECT q FROM c"),
+            same("WITH c AS (SELECT zz.q FROM Ur) SELECT (SELECT COUNT(*) FROM c) AS n"),
+            // An entry read only through another entry that is read is still
+            // run, so the reachable set grows outwards from the body.
+            same("WITH a AS (SELECT 1 AS n FROM Ur), b AS (SELECT n FROM a) \
+                  SELECT n FROM b ORDER BY 1"),
+            // A *syntax* error in an unread entry is still 1064, because the
+            // whole statement is parsed before any of it is looked at.
+            same("WITH c AS (SELECT FROM) SELECT 1"),
+            same("SELECT id, v FROM Ur ORDER BY id"),
+        ],
+    },
+    Group {
+        // #0245, second half. `SELECT * FROM Ll, LATERAL (SELECT Ll.id AS x
+        // FROM Lr) d` answers three columns on 8.3 and was `Unknown column
+        // 'Ll.id' in 'field list'` here — a derived table was built once
+        // against nothing however it was written, and only `JSON_TABLE` took
+        // the per-row path that puts the row on the left in scope.
+        //
+        // Every case has its non-LATERAL twin somewhere in this group, because
+        // the keyword is the whole of the difference and a change that makes
+        // one work by making both work has answered a different question.
+        name: "a LATERAL derived table",
+        setup: &[
+            "CREATE TABLE Ll (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE Lr (id INT NOT NULL, v INT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE Lnone (id INT NOT NULL, v INT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Ll VALUES (1, 10), (2, 20)",
+            "INSERT INTO Lr VALUES (1, 7), (3, 9)",
+        ],
+        cases: &[
+            // The issue's statement, and the same shape as an explicit join
+            // with and without an ON. The correlation is in the select list.
+            same("SELECT * FROM Ll, LATERAL (SELECT Ll.id AS x FROM Lr) d ORDER BY 1, 3"),
+            same("SELECT * FROM Ll JOIN LATERAL (SELECT Ll.id AS x FROM Lr) d ON TRUE \
+                  ORDER BY 1, 3"),
+            same("SELECT * FROM Ll JOIN LATERAL (SELECT Ll.id AS x FROM Lr) d ORDER BY 1, 3"),
+            // The correlation in the derived table's WHERE, which is a
+            // different clause and a different resolution path.
+            same("SELECT * FROM Ll, LATERAL (SELECT Lr.id AS x FROM Lr WHERE Lr.id = Ll.id) d \
+                  ORDER BY 1, 3"),
+            // Unqualified, and inside an aggregate, so the row on the left is
+            // in scope for the whole of the inner query rather than for a bare
+            // reference in one clause.
+            same("SELECT * FROM Ll, LATERAL (SELECT Lr.id AS x FROM Lr WHERE Lr.id = k) d \
+                  ORDER BY 1, 3"),
+            same("SELECT * FROM Ll, LATERAL (SELECT COUNT(*) AS n FROM Lr \
+                  WHERE Lr.id <= Ll.id) d ORDER BY 1, 3"),
+            // A LEFT JOIN LATERAL keeps the left row where nothing matched,
+            // and the padded column is nullable — this path does not go
+            // through the relaxation an ordinary join's columns get.
+            same("SELECT Ll.id, d.x FROM Ll LEFT JOIN LATERAL \
+                  (SELECT Lr.id AS x FROM Lr WHERE Lr.id = Ll.id) d ON TRUE ORDER BY 1"),
+            // One that writes its own WITH, so the entries are materialised a
+            // level below where the row on the left was put in scope — and the
+            // same over an empty inner table, where nothing is produced to
+            // read the row back off.
+            same("SELECT Ll.id, d.x FROM Ll, \
+                  LATERAL (WITH q AS (SELECT Ll.id AS x FROM Lr) SELECT x FROM q) d \
+                  ORDER BY 1, 2"),
+            same("SELECT Ll.id, d.x FROM Ll, \
+                  LATERAL (WITH q AS (SELECT Ll.id AS x FROM Lnone) SELECT x FROM q) d"),
+            // Chained, so the scope handed to the second one is everything to
+            // its left rather than the first table alone.
+            same("SELECT Ll.id, e.y FROM Ll, LATERAL (SELECT Ll.id AS x FROM Lr) d, \
+                  LATERAL (SELECT d.x AS y FROM Lr c3 WHERE c3.id = 1) e ORDER BY 1, 2"),
+            // Inside a correlated subquery, so the row beside it and the row
+            // above it are in scope at once.
+            same("SELECT id FROM Ll WHERE EXISTS \
+                  (SELECT 1 FROM Lr, LATERAL (SELECT Ll.id AS y FROM Lr c3) d \
+                   WHERE d.y = Lr.id) ORDER BY 1"),
+            // The empty halves: nothing on the left expands nothing, and
+            // nothing on the right produces no row.
+            same("SELECT * FROM Lnone, LATERAL (SELECT Lnone.id AS x FROM Lr) d"),
+            same("SELECT * FROM Ll, LATERAL (SELECT Ll.id AS x FROM Lnone) d"),
+            // Without the keyword the same two statements are 1054, which is
+            // the whole of what LATERAL means.
+            same("SELECT * FROM Ll, (SELECT Ll.id AS x FROM Lr) d"),
+            same("SELECT * FROM Ll, (SELECT Lr.id AS x FROM Lr WHERE Lr.id = Ll.id) d"),
+            // A LATERAL item may name an earlier sibling and not a later one,
+            // and a name in no scope at all is still 1054.
+            same("SELECT * FROM Ll, LATERAL (SELECT e.id AS x FROM Lr) d, Lr e"),
+            same("SELECT * FROM Ll, LATERAL (SELECT zz.q AS x FROM Lr) d"),
+            same("SELECT id, k FROM Ll ORDER BY id"),
+        ],
+    },
+    Group {
+        // #0243. `SELECT (SELECT Tw.i FROM Tr) FROM Tw` is a LONG on 8.3 and
+        // was a VAR_STRING here: an outer column's slot falls past this
+        // query's own columns, so the type was lost and every correlated
+        // reference came back as the fallback. Prisma reads the described type
+        // to decode, so this is a wrong answer and not only a vague one.
+        //
+        // One case per declared family, because they are typed by different
+        // arms — and asked twice, once through a scalar subquery and once
+        // through a LATERAL derived table, which reach the enclosing
+        // declarations by two different routes.
+        name: "the type of a correlated column",
+        setup: &[
+            "CREATE TABLE Tw (i INT NOT NULL, bg BIGINT NOT NULL, vs VARCHAR(20) NOT NULL, \
+             dc DECIMAL(12,3) NOT NULL, dt DATETIME NOT NULL, nn INT NULL, PRIMARY KEY (i))",
+            "CREATE TABLE Tr (id INT NOT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE Tnone (id INT NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Tw VALUES (1, 2, 'x', 1.500, '2026-01-01 00:00:00', NULL)",
+            "INSERT INTO Tr VALUES (1)",
+        ],
+        cases: &[
+            same("SELECT (SELECT Tw.i FROM Tr) AS a FROM Tw"),
+            same("SELECT (SELECT Tw.bg FROM Tr) AS a FROM Tw"),
+            same("SELECT (SELECT Tw.vs FROM Tr) AS a FROM Tw"),
+            same("SELECT (SELECT Tw.dc FROM Tr) AS a FROM Tw"),
+            same("SELECT (SELECT Tw.nn FROM Tr) AS a FROM Tw"),
+            // A temporal through a scalar subquery comes back in the
+            // connection's character set on 8.3 and binary here — the same
+            // quirk `Case::value_kind` describes for a temporal that has been
+            // through a temporary table, and one this engine has no collation
+            // to propagate for. The type is the question, and it is still
+            // asked.
+            same("SELECT (SELECT Tw.dt FROM Tr) AS a FROM Tw").without_value_kind(),
+            // The same six through a LATERAL derived table, where MySQL keeps
+            // the source table on the column and so the width, the places and
+            // the flags are compared as well.
+            same("SELECT d.x FROM Tw, LATERAL (SELECT Tw.i AS x FROM Tr) d"),
+            same("SELECT d.x FROM Tw, LATERAL (SELECT Tw.bg AS x FROM Tr) d"),
+            same("SELECT d.x FROM Tw, LATERAL (SELECT Tw.vs AS x FROM Tr) d"),
+            same("SELECT d.x FROM Tw, LATERAL (SELECT Tw.dc AS x FROM Tr) d"),
+            // A temporal that has been through a derived table is the same
+            // quirk again, and it is not this correlation's: `SELECT d.y FROM
+            // (SELECT dt AS y FROM Tw) d` — no correlation anywhere in it —
+            // is `utf8mb4` and 76 wide on 8.3 and binary and 19 here, exactly
+            // as the LATERAL form is. So the width and the bytes are waived
+            // and the type is still asked, which is what this group is for.
+            same("SELECT d.x FROM Tw, LATERAL (SELECT Tw.dt AS x FROM Tr) d")
+                .without_value_kind()
+                .without_widths(),
+            same("SELECT d.x FROM Tw, LATERAL (SELECT Tw.nn AS x FROM Tr) d"),
+            // And through a derived table inside a correlated subquery, which
+            // is the third route and the one #0239 opened.
+            same("SELECT i FROM Tw WHERE EXISTS \
+                  (SELECT 1 FROM (SELECT Tw.dc AS z FROM Tr) d WHERE d.z > 0)"),
+            // Over no rows at all, where a type inferred from a value has none
+            // to infer from.
+            same("SELECT (SELECT Tw.i FROM Tnone) AS a FROM Tw"),
+            same("SELECT d.x FROM Tw, LATERAL (SELECT Tw.i AS x FROM Tnone) d"),
+        ],
+    },
 ];
