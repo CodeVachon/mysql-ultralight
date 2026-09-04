@@ -224,3 +224,7 @@
 {"at":"2026-09-04T08:53:05Z","id":246,"by":"Christopher Vachon","as":"user","type":"created","title":"The prepared parameter definition block is not typed or named","state":"Todo"}
 {"at":"2026-09-04T09:14:41Z","id":227,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-09-04T09:14:41Z","id":228,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T09:46:49Z","id":223,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T09:47:08Z","id":247,"by":"Christopher Vachon","as":"user","type":"created","title":"A statement too large to parse still aborts the process","state":"Todo"}
+{"at":"2026-09-04T09:47:08Z","id":248,"by":"Christopher Vachon","as":"user","type":"created","title":"Negative zero is lost through whole()","state":"Todo"}
+{"at":"2026-09-04T09:47:09Z","id":249,"by":"Christopher Vachon","as":"user","type":"created","title":"TRUNCATE has no exact path, so a decimal loses its declared scale","state":"Todo"}
