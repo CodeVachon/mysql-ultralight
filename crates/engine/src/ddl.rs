@@ -635,10 +635,10 @@ fn build_column_with_checks(
         }
         | ColumnOption::Default(e) = &option.option
         {
-            crate::exec::refuse_at_resolve([e])?;
+            crate::exec::refuse_at_resolve(None, &[], [e])?;
         }
         if let ColumnOption::Check(check) = &option.option {
-            crate::exec::refuse_at_resolve([check.expr.as_ref()])?;
+            crate::exec::refuse_at_resolve(None, &[], [check.expr.as_ref()])?;
         }
         match &option.option {
             ColumnOption::NotNull => column.nullable = false,

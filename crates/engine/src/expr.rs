@@ -326,7 +326,7 @@ pub fn probing<T>(f: impl FnOnce() -> T) -> T {
 /// `None` rather than an unconditional copy because this runs once per row the
 /// enclosing query filters, and a subquery without a qualified wildcard in it
 /// — which is nearly all of them — must not pay for a clone of the tree.
-fn wildcards_discarded(query: &Query) -> Option<Box<Query>> {
+pub(crate) fn wildcards_discarded(query: &Query) -> Option<Box<Query>> {
     if !discardable(&query.body) {
         return None;
     }

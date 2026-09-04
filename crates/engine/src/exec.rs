@@ -1367,7 +1367,15 @@ impl Engine {
             // handled before the single-SELECT path.
             SetExpr::SetOperation { .. } | SetExpr::Query(_) | SetExpr::Values(_) => {
                 let mut combined = self.set_expr(session, query.body.as_ref(), outer)?;
-                check_projected_order(&combined.columns, query.order_by.as_ref(), outer)?;
+                check_projected_order(
+                    Some(Sub {
+                        engine: self,
+                        session,
+                    }),
+                    &combined.columns,
+                    query.order_by.as_ref(),
+                    outer,
+                )?;
                 self.order_projected(&mut combined, session, query.order_by.as_ref(), &[])?;
                 apply_limit(&mut combined, session, query)?;
                 return Ok(combined);
@@ -1865,7 +1873,15 @@ impl Engine {
         // is 1054 on 8.3, and this engine answered it.
         if select.from.is_empty() {
             let result = self.select_without_table(session, select, outer)?;
-            check_projected_order(&result.columns, order, outer)?;
+            check_projected_order(
+                Some(Sub {
+                    engine: self,
+                    session,
+                }),
+                &result.columns,
+                order,
+                outer,
+            )?;
             return Ok(result);
         }
 
@@ -1939,7 +1955,15 @@ impl Engine {
         //
         // `project` runs this same pass again when it gets there; it is pure,
         // and one definition means a mutation to it neuters both.
-        resolve_field_list(&select.projection, &refs, &relation)?;
+        resolve_field_list(
+            Some(Sub {
+                engine: self,
+                session,
+            }),
+            &select.projection,
+            &refs,
+            &relation,
+        )?;
 
         // Resolved before the loop, not inside it. A predicate is only
         // evaluated once per row, so over a table with no rows -- an empty
@@ -1953,7 +1977,14 @@ impl Engine {
             // Same reason, one clause further in: an ESCAPE is settled per row
             // too, so `WHERE s LIKE 'a' ESCAPE '!!'` over an empty table came
             // back empty where 8.3 raises 1210.
-            refuse_at_resolve([predicate])?;
+            refuse_at_resolve(
+                Some(Sub {
+                    engine: self,
+                    session,
+                }),
+                &refs,
+                [predicate],
+            )?;
         }
 
         let mut matching: Vec<&Vec<Value>> = Vec::new();
@@ -2064,9 +2095,17 @@ impl Engine {
         };
         // Not aggregated: an aggregate anywhere in the select list or the
         // HAVING sent the statement down `grouped` instead.
-        let keys = resolve_order_by(order, &items, &refs, false, &|index| {
-            items[index].expr.clone()
-        })?;
+        let keys = resolve_order_by(
+            Some(Sub {
+                engine: self,
+                session,
+            }),
+            order,
+            &items,
+            &refs,
+            false,
+            &|index| items[index].expr.clone(),
+        )?;
         check_distinct_order(
             select.distinct.as_ref().and(order),
             &items,
@@ -2133,7 +2172,14 @@ impl Engine {
         // statement to `grouped` — and is passed rather than assumed so the
         // check has one contract wherever it is called from.
         check_having_scope(having, &select.projection, group_exprs, refs, own)?;
-        refuse_at_resolve([having])?;
+        refuse_at_resolve(
+            Some(Sub {
+                engine: self,
+                session,
+            }),
+            refs,
+            [having],
+        )?;
 
         let resolved = substitute_item_exprs(having, &select.projection);
         let mut keep = Vec::with_capacity(matching.len());
@@ -2256,7 +2302,14 @@ impl Engine {
         // nothing left it unread and `UPDATE Bare SET k = 1 WHERE id = 4242
         // ORDER BY zz.q LIMIT 1` reported nought rows affected where 8.3
         // refuses the statement outright. #0100.
-        resolve_dml_order(order_by, refs)?;
+        resolve_dml_order(
+            Some(Sub {
+                engine: self,
+                session,
+            }),
+            order_by,
+            refs,
+        )?;
 
         let mut chosen = matching;
 
@@ -2380,11 +2433,26 @@ impl Engine {
         // Before the loop over the left rows, for the reason an ordinary
         // join's is before its own: an empty left side expands nothing, so a
         // clause only read per produced row is never read at all.
+        let refs = left.refs();
         if let Some(JoinConstraint::On(predicate)) = constraint {
-            refuse_at_resolve([predicate])?;
+            // The enclosing query's columns too, for the reason `join` gives:
+            // a subquery in this ON may correlate outwards, and probing it
+            // against the left side alone would refuse a statement 8.3
+            // answers.
+            let mut scope = refs.clone();
+            if let Some(enclosing) = &session.lateral {
+                scope.extend(enclosing.schema.iter().cloned());
+            }
+            refuse_at_resolve(
+                Some(Sub {
+                    engine: self,
+                    session,
+                }),
+                &scope,
+                [predicate],
+            )?;
         }
 
-        let refs = left.refs();
         let mut columns: Option<Vec<crate::relation::RelColumn>> = None;
         let mut rows = Vec::new();
         let mut origins = Vec::new();
@@ -2570,8 +2638,6 @@ impl Engine {
         // one walk and arguments are another, and merging them is #0087's.
         // So one of the two orders has to be wrong, and arguments first — the
         // order that was already here — is right for three of those four.
-        refuse_at_resolve(condition.as_ref())?;
-
         // The enclosing query's columns as well as this join's, or an ON that
         // correlates outwards is refused for naming something that *is* in
         // scope: `SELECT k FROM A WHERE EXISTS (SELECT 1 FROM B JOIN C ON C.id
@@ -2587,9 +2653,25 @@ impl Engine {
         // to reach. Appended rather than prepended, so a name this join
         // answers to wins over the enclosing query's, which is MySQL's scoping
         // rule and the one `select` already applies to its own clauses.
+        //
+        // Built ahead of the refusal as well, which is #0227's half of the
+        // same scope: a subquery written in the ON correlates outwards exactly
+        // as a bare name does, so `... JOIN C ON C.id = (SELECT A.id)` answers
+        // on 8.3 and probing it against this join's own columns refused it.
+        // That is why the refusal is here rather than above the scope, where
+        // it used to sit — the order between it and the name check below is
+        // unchanged, and is the one the note above explains.
         let (outer_schema, outer_values) = correlated_scope(session);
         let mut scope = own_refs;
         scope.extend(outer_schema.iter().cloned());
+        refuse_at_resolve(
+            Some(Sub {
+                engine: self,
+                session,
+            }),
+            &scope,
+            condition.as_ref(),
+        )?;
         if let Some(e) = &condition {
             if let Some(name) = unresolved_column(e, &scope) {
                 return Err(EngineError::unknown_column(&name, "on clause"));
@@ -2900,7 +2982,14 @@ impl Engine {
         // The same helper the table-backed path resolves its field list with,
         // so a check added to either reaches both.
         for (_, e) in &items {
-            resolve_projected_expr(e, &implicit_schema)?;
+            resolve_projected_expr(
+                Some(Sub {
+                    engine: self,
+                    session,
+                }),
+                e,
+                &implicit_schema,
+            )?;
         }
 
         // The WHERE, which this path used to drop on the floor entirely:
@@ -2918,7 +3007,14 @@ impl Engine {
                 if let Some(name) = unresolved_column(predicate, &implicit_schema) {
                     return Err(EngineError::unknown_column(&name, "where clause"));
                 }
-                refuse_at_resolve([predicate])?;
+                refuse_at_resolve(
+                    Some(Sub {
+                        engine: self,
+                        session,
+                    }),
+                    &implicit_schema,
+                    [predicate],
+                )?;
                 expr::eval(predicate, &ctx)?.truthy() == Some(true)
             }
         };
@@ -2970,7 +3066,16 @@ impl Engine {
         // all the same, because a refusal it reaches only after substituting
         // an alias is a refusal the two paths have to share.
         if !group_exprs.is_empty() {
-            resolve_group_by(group_exprs, &select.projection, &items, &implicit_schema)?;
+            resolve_group_by(
+                Some(Sub {
+                    engine: self,
+                    session,
+                }),
+                group_exprs,
+                &select.projection,
+                &items,
+                &implicit_schema,
+            )?;
         }
 
         // Every item is evaluated even where the WHERE has already discarded
@@ -3060,7 +3165,14 @@ impl Engine {
             // unresolved position would widen it by the literal rather than by
             // the column it names.
             check_having_scope(having, &select.projection, &[], &implicit_schema, 0)?;
-            refuse_at_resolve([having])?;
+            refuse_at_resolve(
+                Some(Sub {
+                    engine: self,
+                    session,
+                }),
+                &implicit_schema,
+                [having],
+            )?;
             if let Some(projected) = rows.first() {
                 let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
                 let resolved = substitute_aliases(having, &names);
@@ -3118,7 +3230,15 @@ impl Engine {
         // anything else. Hoisted out of the loop below so the HAVING can be
         // settled between this and the window computation, which is where 8.3
         // settles it — see `filter_having`.
-        resolve_field_list(&select.projection, refs, relation)?;
+        resolve_field_list(
+            Some(Sub {
+                engine: self,
+                session,
+            }),
+            &select.projection,
+            refs,
+            relation,
+        )?;
 
         for item in &select.projection {
             match item {
@@ -3603,7 +3723,7 @@ impl Engine {
         if let Some(name) = items.iter().find_map(|(_, e)| unresolved_column(e, refs)) {
             return Err(EngineError::unknown_column(&name, "field list"));
         }
-        refuse_at_resolve(items.iter().map(|(_, e)| e))?;
+        refuse_at_resolve(sub, refs, items.iter().map(|(_, e)| e))?;
         // GROUP BY and HAVING, the two clauses #0093 left behind. Both are
         // only otherwise settled inside `for group in &groups`, so a query
         // that produces no groups never settles them: over an empty table
@@ -3639,7 +3759,7 @@ impl Engine {
         // #0229: `SELECT k AS a FROM Cl GROUP BY a` answers two rows on 8.3
         // and was 1054 here, because only the *resolver* admitted the alias
         // and the per-row evaluation still looked for a column called `a`.
-        let group_exprs = resolve_group_by(written_groups, &select.projection, &items, refs)?;
+        let group_exprs = resolve_group_by(sub, written_groups, &select.projection, &items, refs)?;
         if let Some(having) = &select.having {
             check_having_scope(
                 having,
@@ -3649,7 +3769,14 @@ impl Engine {
                 input_columns.len(),
             )?;
         }
-        refuse_at_resolve(select.having.as_ref())?;
+        refuse_at_resolve(
+            Some(Sub {
+                engine: self,
+                session,
+            }),
+            refs,
+            select.having.as_ref(),
+        )?;
 
         // The same resolution the ungrouped path uses, and ahead of the
         // grouping rules because that is the order 8.3 answers in: `SELECT id
@@ -3669,9 +3796,17 @@ impl Engine {
                 slot: column_slot(refs, e),
             })
             .collect();
-        let order_items = resolve_order_by(order, &out_items, refs, true, &|index| {
-            Expr::Identifier(sqlparser::ast::Ident::new(alias_name(index)))
-        })?;
+        let order_items = resolve_order_by(
+            Some(Sub {
+                engine: self,
+                session,
+            }),
+            order,
+            &out_items,
+            refs,
+            true,
+            &|index| Expr::Identifier(sqlparser::ast::Ident::new(alias_name(index))),
+        )?;
         let descending: Vec<bool> = order_items.iter().map(|i| i.descending).collect();
 
         // Under ONLY_FULL_GROUP_BY a selected column must be grouped by or
@@ -4452,7 +4587,13 @@ impl Engine {
                     // says 1146. Measured and left — moving it would mean
                     // splitting the written values the way the clause below
                     // is split, and the written values are #0102's half.
-                    refuse_at_resolve(values.rows.iter().flat_map(|row| row.iter()))?;
+                    // No `Sub`: this runs *before* the table is looked
+                    // up, so there is no scope for a subquery's interior to
+                    // correlate against and probing one here would resolve it
+                    // against nothing. `resolve_assigned_values` below, which
+                    // runs once the relation exists, is where a written value
+                    // carrying a subquery is settled.
+                    refuse_at_resolve(None, &[], values.rows.iter().flat_map(|row| row.iter()))?;
                     // Only the parameter count of the clause's values here, for
                     // exactly that reason: `INSERT INTO nosuch (k) VALUES (1)
                     // ON DUPLICATE KEY UPDATE k = SIGN(1, 2)` is 1582 on 8.3
@@ -4702,7 +4843,14 @@ impl Engine {
                     .iter()
                     .map(|c| ColumnRef::in_database(&db, &table.name, &c.name))
                     .collect();
-                resolve_assigned_values(assignments, &refs)?;
+                resolve_assigned_values(
+                    Some(Sub {
+                        engine: self,
+                        session,
+                    }),
+                    assignments,
+                    &refs,
+                )?;
             }
         }
 
@@ -4989,8 +5137,22 @@ impl Engine {
         // nope2 = 1` names `nope2` in the where clause, not `nope1`.
         //
         // The WHERE before the values, because 8.3 settles it first.
-        resolve_dml_where(selection, &refs)?;
-        resolve_assigned_values(assignments, &refs)?;
+        resolve_dml_where(
+            Some(Sub {
+                engine: self,
+                session,
+            }),
+            selection,
+            &refs,
+        )?;
+        resolve_assigned_values(
+            Some(Sub {
+                engine: self,
+                session,
+            }),
+            assignments,
+            &refs,
+        )?;
 
         // Resolved once, before any row is considered: whether writing to a
         // generated column is an error must not depend on the data, and
@@ -5140,8 +5302,22 @@ impl Engine {
         // measured on `UPDATE S a JOIN T a ON 1 SET a.k = 1 WHERE nope = 1`.
         // The ON clauses of the join are settled inside `join()`; this is the
         // WHERE and the assigned values.
-        resolve_dml_where(selection, &refs)?;
-        resolve_assigned_values(assignments, &refs)?;
+        resolve_dml_where(
+            Some(Sub {
+                engine: self,
+                session,
+            }),
+            selection,
+            &refs,
+        )?;
+        resolve_assigned_values(
+            Some(Sub {
+                engine: self,
+                session,
+            }),
+            assignments,
+            &refs,
+        )?;
 
         // Each assignment is resolved to a source table and a column within it.
         struct Target {
@@ -5418,7 +5594,14 @@ impl Engine {
         // only read per row, so `DELETE FROM LE WHERE s LIKE 'a' ESCAPE '!!'`
         // over an empty table reported nothing deleted where 8.3 raises 1210,
         // and `DELETE FROM Bare WHERE a.b = 1` nothing where it raises 1054.
-        resolve_dml_where(delete.selection.as_ref(), &refs)?;
+        resolve_dml_where(
+            Some(Sub {
+                engine: self,
+                session,
+            }),
+            delete.selection.as_ref(),
+            &refs,
+        )?;
 
         let mut matching = Vec::new();
         for (index, row) in table.rows.iter().enumerate() {
@@ -5579,7 +5762,14 @@ impl Engine {
         // ESCAPE '!!'` is 1066 there and was 1210 here, and adding the name
         // check at the old point would have made the same statement with an
         // unknown column 1054 where 8.3 still says 1066.
-        resolve_dml_where(delete.selection.as_ref(), &refs)?;
+        resolve_dml_where(
+            Some(Sub {
+                engine: self,
+                session,
+            }),
+            delete.selection.as_ref(),
+            &refs,
+        )?;
 
         // Collect first, delete after: removing as we go would shift the
         // indices the remaining join rows point at.
@@ -7899,6 +8089,7 @@ fn resolve_order_expr(
 /// `aggregated` says whether the query folds anything, because an aggregate in
 /// the clause is only meaningful if it does.
 fn resolve_order_by(
+    sub: Option<Sub<'_>>,
     order: Option<&OrderBy>,
     items: &[OutItem],
     refs: &[ColumnRef],
@@ -7949,7 +8140,7 @@ fn resolve_order_by(
             descending: item.options.asc == Some(false),
         });
     }
-    refuse_at_resolve(written.iter().map(|i| &i.expr))?;
+    refuse_at_resolve(sub, refs, written.iter().map(|i| &i.expr))?;
     Ok(keys)
 }
 
@@ -8086,6 +8277,7 @@ fn columns_read(e: &Expr, refs: &[ColumnRef]) -> Vec<usize> {
 /// row is being keyed, so over an empty result an out-of-range one was never
 /// looked at and the statement answered instead of being refused.
 fn check_projected_order(
+    sub: Option<Sub<'_>>,
     columns: &[OutColumn],
     order: Option<&OrderBy>,
     outer: Option<&OuterRow>,
@@ -8122,7 +8314,7 @@ fn check_projected_order(
     // FROM-less SELECT has, down a branch nothing takes — a malformed one was
     // never read and the statement answered where 8.3 raises 1210. The same
     // zero-rows shape as #0058 and #0093.
-    refuse_at_resolve(written.iter().map(|i| &i.expr))?;
+    refuse_at_resolve(sub, &refs, written.iter().map(|i| &i.expr))?;
     Ok(())
 }
 
@@ -8994,10 +9186,39 @@ fn is_temporal(t: ColumnType) -> bool {
 /// and `dt3 + 0` a NEWDECIMAL.
 fn arithmetic_operand_type(
     e: &Expr,
+    beside: Option<&Expr>,
     refs: &[ColumnRef],
     input: &[crate::relation::RelColumn],
     sub: Option<Sub<'_>>,
 ) -> ColumnType {
+    // A parameter has no type of its own, so in arithmetic it takes the one
+    // the *other* operand gives it. That is not this engine's invention: 8.3
+    // reports the type it settled on in the parameter block of
+    // `COM_STMT_PREPARE`, and it is a LONGLONG for `? + 1`, `? + i` over an
+    // INT and `? + bi` over a BIGINT, a NEWDECIMAL for `? + 1.5` and `? + d`
+    // over a DECIMAL, and a DOUBLE for `? + f` over a FLOAT. So the column is
+    // `LONGLONG len 22` for `SELECT ? + 1` there, where reading the parameter
+    // as the string it otherwise is made it a DOUBLE here. #0228.
+    //
+    // Two operands with no type between them is a DOUBLE, measured: `? + ?`
+    // is DOUBLE on both sides of the parameter block and DOUBLE as a column.
+    // A string beside it stays a string and the arithmetic makes a DOUBLE of
+    // the pair anyway — `? + 'x'` is DOUBLE there — so the two spellings of
+    // "nothing to take" land in the same place.
+    if parameter_marker(e) {
+        // Through this same function and not `computed_column_type`, so a
+        // temporal beside the parameter is read as the number arithmetic makes
+        // of it: `dt + ?` over a `DATETIME(3)` is NEWDECIMAL on 8.3 and
+        // `dd + ?` over a `DATE` is LONGLONG, which is what `dt + 0` and
+        // `dd + 0` already answer here. `None` for its own neighbour, which is
+        // this parameter and would ask the question back.
+        let beside = beside.map(|other| arithmetic_operand_type(other, None, refs, input, sub));
+        return match beside {
+            Some(t) if is_integer(t) => ColumnType::LongLong,
+            Some(t @ (ColumnType::Decimal | ColumnType::NewDecimal)) => t,
+            _ => ColumnType::Double,
+        };
+    }
     let ty = computed_column_type(e, refs, input, sub);
     if !is_temporal(ty) {
         return ty;
@@ -9222,9 +9443,61 @@ fn candidate_type(
     input: &[crate::relation::RelColumn],
     sub: Option<Sub<'_>>,
 ) -> (ColumnType, bool) {
+    // A parameter says nothing about what the others are, exactly as a written
+    // NULL says nothing — and `combined` already skips that. Measured on 8.3:
+    // `COALESCE(?, 1)`, `IFNULL(?, i)`, `IF(1, ?, 2)`, `GREATEST(?, 1)` and
+    // `CASE WHEN 1 THEN ? ELSE 1 END` are all `LONGLONG len 21` there, and
+    // `COALESCE(?, 'x')` is a VAR_STRING — the type comes from the branch that
+    // has one, never from the parameter. Typing the parameter a string here,
+    // which is what it is on its own, made every one of those a VAR_STRING and
+    // told a binary client to decode an integer column as text. #0228.
+    if parameter_marker(e) {
+        return (ColumnType::Null, false);
+    }
     let ty = computed_column_type(e, refs, input, sub);
     let unsigned = is_integer(ty) && unsigned_answer(e, refs, input, sub);
     (ty, unsigned)
+}
+
+/// [`combined`] over the branches of a conditional, which may be parameters.
+///
+/// `candidate_type` answers `NULL` for a parameter so the branch that has a
+/// type decides, and this is the other half of that: with nothing but
+/// parameters to go on there is no branch to take the type from, and the
+/// answer is what a parameter is on its own. Measured on 8.3 —
+/// `GREATEST(?, ?)` and `CASE WHEN 1 THEN ? ELSE ? END` are both
+/// `VAR_STRING len 65532` there, where `COALESCE(NULL, NULL)` beside them is
+/// `MYSQL_TYPE_NULL`. So the two spellings of "nothing decided" are not the
+/// same answer, and reading them as one is what makes this function rather
+/// than a line inside `combined`.
+fn combined_candidates<'a>(
+    candidates: impl IntoIterator<Item = &'a Expr>,
+    refs: &[ColumnRef],
+    input: &[crate::relation::RelColumn],
+    sub: Option<Sub<'_>>,
+) -> ColumnType {
+    let candidates: Vec<&Expr> = candidates.into_iter().collect();
+    let answer = combined(
+        candidates
+            .iter()
+            .map(|c| candidate_type(c, refs, input, sub)),
+    );
+    if !candidates.iter().any(|c| parameter_marker(c)) {
+        return answer;
+    }
+    match answer {
+        // Nothing but parameters to go on.
+        ColumnType::Null => ColumnType::VarString,
+        // A parameter is not free of consequence where the others *did*
+        // decide: it takes their kind, and takes it at the widest MySQL has,
+        // so the pair widens. Measured on 8.3 — `COALESCE(?, i)` over an `INT`
+        // is `LONGLONG len 21` there and not the `LONG` the column alone
+        // would give, because the parameter it is beside is a BIGINT. Under
+        // the column's own code the binary protocol would send four bytes for
+        // a value the parameter can carry eight of.
+        t if is_integer(t) => ColumnType::LongLong,
+        other => other,
+    }
 }
 
 /// The declaration a set operation's column takes when both branches are
@@ -9619,6 +9892,16 @@ fn string_chars(e: &Expr, refs: &[ColumnRef], input: &[crate::relation::RelColum
                 width
             })
         }
+        // Everything a parameter with no type can hold. `Item_param` is
+        // 65535 *bytes* wide on 8.3, which is 16383 characters of utf8mb4 —
+        // and both halves of that are visible on the wire, measured through
+        // `COM_STMT_PREPARE`: `SELECT ?` is `VAR_STRING len 65532`, its own
+        // width, while `CONCAT(?, ?)` is `MEDIUM_BLOB len 524256`, which is
+        // twice the character count times the four bytes a blob-coded item's
+        // width is reported in. Counting characters here is what makes both
+        // of those fall out of the arithmetic already in `string_width` and
+        // `string_code_for`, rather than being two separate rules.
+        e if parameter_marker(e) => Some(PARAMETER_CHARS),
         Expr::Value(v) => match &v.value {
             sqlparser::ast::Value::SingleQuotedString(text)
             | sqlparser::ast::Value::DoubleQuotedString(text) => {
@@ -10071,11 +10354,39 @@ fn exact_shape(
             if let Some(fixed) = crate::expr::reassociated(op, left, right) {
                 return exact_shape(&fixed, refs, input, sub);
             }
+            // A parameter's shape follows the type it took from the operand
+            // beside it, which is why this is here rather than in an arm of
+            // its own: a bare `?` has no shape to report and the same `?` in
+            // `? + 1.5` has `DECIMAL(65, 30)`'s. Measured in the parameter
+            // block of `COM_STMT_PREPARE` — `? + 1.5` and `? + d` over a
+            // `DECIMAL(10, 2)` are both `NEWDECIMAL len 67 dec 30` there, the
+            // widest decimal MySQL has and not the column's own shape, while
+            // `? / 2` is `LONGLONG len 21` and the quotient beside it carries
+            // the four places the division adds. #0228.
+            let operand = |e: &Expr, beside: &Expr| match parameter_marker(e) {
+                false => recur(e),
+                true => match arithmetic_operand_type(e, Some(beside), refs, input, sub) {
+                    // A temporal beside it makes the pair exact without making
+                    // the parameter a decimal of its own: 8.3 types the
+                    // parameter a `DATETIME(6)` there, and `dt + ?` over a
+                    // `DATETIME(3)` carries six places — neither the
+                    // parameter's thirty nor the column's three. Left
+                    // unmodelled rather than answered with a number that is
+                    // measured wrong.
+                    _ if is_temporal(computed_column_type(beside, refs, input, sub)) => {
+                        Exact::default()
+                    }
+                    ColumnType::Decimal | ColumnType::NewDecimal => sized(MAX_PRECISION, MAX_SCALE),
+                    t if is_integer(t) => Exact::new(PARAMETER_DIGITS, 0),
+                    // Approximate, which is not an exact shape at all.
+                    _ => Exact::default(),
+                },
+            };
             // Each child walked once, whatever the arm below does with it.
             // Two of them fall back to the scales alone, and reading those off
             // a second walk is what made a chain of unmodelled operators cost
             // exponential time.
-            let (left_shape, right_shape) = (recur(left), recur(right));
+            let (left_shape, right_shape) = (operand(left, right), operand(right, left));
             let scales = || Some(left_shape.scale?.max(right_shape.scale?));
             match op {
                 B::Plus | B::Minus => {
@@ -10389,6 +10700,10 @@ fn printed_width(
     }
     match e {
         Expr::Nested(inner) => recur(inner),
+        // A parameter typed an integer is as wide as a BIGINT prints: 21, the
+        // width 8.3 reports for the parameter itself, which makes `? + 1` a
+        // `len 22` after the carry the arithmetic below adds. #0228.
+        e if parameter_marker(e) => Some(PARAMETER_DIGITS),
         // A column reference is the display width it was declared with — 4 for
         // a `TINYINT`, 11 for an `INT`, 4 for a `YEAR` — which is what
         // `wire_length` already answers, and the same number MySQL reports for
@@ -10592,7 +10907,7 @@ fn direct_column<'a>(
 /// constraint, a unit test — where the answer stays what it was before this
 /// existed.
 #[derive(Clone, Copy)]
-struct Sub<'a> {
+pub(crate) struct Sub<'a> {
     engine: &'a Engine,
     session: &'a Session,
 }
@@ -10609,7 +10924,7 @@ thread_local! {
     /// Keyed by the scope as well as the text because a correlated subquery's
     /// answer depends on what encloses it, and one statement can write the
     /// same text under two of them.
-    static SUBQUERY_COLUMNS: std::cell::RefCell<HashMap<String, Option<OutColumn>>> =
+    static SUBQUERY_COLUMNS: std::cell::RefCell<HashMap<String, ProbedSubquery>> =
         std::cell::RefCell::new(HashMap::new());
 
     /// How many scalar subqueries deep the current description is.
@@ -10642,7 +10957,7 @@ impl Drop for SubqueryDepth {
 /// `ALTER TABLE` re-resolves the views over the table it changed — and a
 /// statement that cleared an enclosing one's memo would leave it describing
 /// nothing while still believing it had.
-struct SubqueryMemo(HashMap<String, Option<OutColumn>>);
+struct SubqueryMemo(HashMap<String, ProbedSubquery>);
 
 impl SubqueryMemo {
     fn fresh() -> Self {
@@ -10656,21 +10971,32 @@ impl Drop for SubqueryMemo {
     }
 }
 
-/// The one column a scalar subquery produces, described rather than evaluated.
+/// What one probe of a subquery's interior answered.
 ///
-/// Run as a probe over no rows, for the two reasons `describe` is: a type is
-/// not a value, so the rows are wasted work — and a `SELECT` is not free of
-/// consequences, so typing `(SELECT GET_LOCK('x', 0))` must not take the lock
-/// a second time. That also keeps this answering the same thing at prepare and
-/// at execute, which is the invariant `describe_matches_execute` holds.
+/// `Ok` carries the column a *scalar* subquery would be described with, which
+/// is `None` where the query produced anything other than exactly one column —
+/// 1241 on 8.3, and its own issue. `Err` is the error the interior raised, so
+/// the two questions asked of the same probe are both answered by one run of
+/// it: what type does this have, and does it resolve at all.
+type ProbedSubquery = Result<Option<OutColumn>, EngineError>;
+
+/// Runs a subquery's interior as a probe, and remembers what came of it.
 ///
-/// `None` where there is nothing to describe with, where the subquery does not
-/// resolve — a correlated reference this scope does not carry — or where it
-/// produces anything other than exactly one column. The last of those is 1241
-/// on 8.3 and answered here rather than refused, because this is a walker that
-/// types an expression and has no way to report an error; the refusal is its
-/// own issue.
-fn subquery_column(sub: Option<Sub<'_>>, query: &Query, refs: &[ColumnRef]) -> Option<OutColumn> {
+/// Over no rows, for the two reasons `describe` is: a type is not a value, so
+/// the rows are wasted work — and a `SELECT` is not free of consequences, so
+/// typing a subquery that takes a lock must not take it a second time. That
+/// also keeps this answering the same thing at prepare and at execute, which
+/// is the invariant `describe_matches_execute` holds.
+///
+/// `None` where there is nothing to probe with — a column default, a check
+/// constraint, a unit test — or where the nest is deeper than the limit. That
+/// is not the same as a probe that failed and must never be read as one: past
+/// the limit nothing has been asked, so nothing may be refused.
+fn probed_subquery(
+    sub: Option<Sub<'_>>,
+    query: &Query,
+    refs: &[ColumnRef],
+) -> Option<ProbedSubquery> {
     let sub = sub?;
     let depth = SUBQUERY_DEPTH.with(|d| d.get());
     if depth >= SUBQUERY_DEPTH_LIMIT {
@@ -10694,7 +11020,7 @@ fn subquery_column(sub: Option<Sub<'_>>, query: &Query, refs: &[ColumnRef]) -> O
     key.push_str("::");
     key.push_str(&query.to_string());
     if let Some(hit) = SUBQUERY_COLUMNS.with(|m| m.borrow().get(&key).cloned()) {
-        return hit;
+        return Some(hit);
     }
 
     // The enclosing columns with no values in them, exactly as `describe`
@@ -10708,19 +11034,29 @@ fn subquery_column(sub: Option<Sub<'_>>, query: &Query, refs: &[ColumnRef]) -> O
 
     SUBQUERY_DEPTH.with(|d| d.set(d.get() + 1));
     let _depth = SubqueryDepth;
-    let described = expr::probing(|| {
-        shaping(|| {
-            sub.engine
-                .query_outer(sub.session, query, Some(&outer))
-                .ok()
-        })
-    });
+    let described =
+        expr::probing(|| shaping(|| sub.engine.query_outer(sub.session, query, Some(&outer))));
     let answer = match described {
-        Some(result) if result.columns.len() == 1 => result.columns.into_iter().next(),
-        _ => None,
+        Ok(result) if result.columns.len() == 1 => Ok(result.columns.into_iter().next()),
+        Ok(_) => Ok(None),
+        Err(bad) => Err(bad),
     };
     SUBQUERY_COLUMNS.with(|m| m.borrow_mut().insert(key, answer.clone()));
-    answer
+    Some(answer)
+}
+
+/// The one column a scalar subquery produces, described rather than evaluated.
+///
+/// `None` where there is nothing to describe with, where the subquery does not
+/// resolve — a correlated reference this scope does not carry — or where it
+/// produces anything other than exactly one column. The middle one used to be
+/// the end of the story: this is a walker that types an expression and has no
+/// way to report an error, so a name the interior could not resolve was
+/// swallowed and the column described anyway. `refused_while_resolving` reads
+/// the same probe for exactly that error, which is why it is kept rather than
+/// discarded here. #0227.
+fn subquery_column(sub: Option<Sub<'_>>, query: &Query, refs: &[ColumnRef]) -> Option<OutColumn> {
+    probed_subquery(sub, query, refs)?.ok().flatten()
 }
 
 /// Whether a query answers with a row whatever is in the database.
@@ -10885,22 +11221,16 @@ fn computed_column_type(
                     // returned when the first is NULL. `COALESCE(i, 'x')` is a
                     // string in MySQL, and calling it a LONGLONG had the binary
                     // protocol send 0 for the `'x'`.
-                    combined(
-                        candidates
-                            .iter()
-                            .map(|a| candidate_type(a, refs, input, sub)),
-                    )
+                    combined_candidates(candidates.iter(), refs, input, sub)
                 }
                 // These hand back one of their arguments unchanged, so they
                 // keep its width: `GREATEST(tinyint, smallint)` really is a
                 // SMALLINT to MySQL, and a string argument makes the answer a
                 // string. Declaring them LONGLONG had the binary protocol
                 // send 0 for the string.
-                "greatest" | "least" => combined(
-                    function_arguments(f)
-                        .iter()
-                        .map(|a| candidate_type(a, refs, input, sub)),
-                ),
+                "greatest" | "least" => {
+                    combined_candidates(function_arguments(f).iter(), refs, input, sub)
+                }
                 // These keep the *kind* of what they were given but not its
                 // width — MySQL answers LONGLONG for every integer argument,
                 // however narrow, and a decimal or a double for those.
@@ -10926,21 +11256,21 @@ fn computed_column_type(
                 // either side has no numeric kind of its own.
                 "mod" => {
                     let args = function_arguments(f);
-                    let side = |i: usize| {
+                    // `beside` named rather than derived from `i`: a parameter
+                    // takes its type from the operand next to it, and reading
+                    // "the other one" off an index is a subtraction that only
+                    // happens to be in range for a call with two arguments.
+                    let side = |i: usize, beside: usize| {
                         args.get(i)
-                            .map(|a| arithmetic_operand_type(a, refs, input, sub))
+                            .map(|a| arithmetic_operand_type(a, args.get(beside), refs, input, sub))
                             .unwrap_or(ColumnType::Null)
                     };
-                    arithmetic_type(side(0), side(1))
+                    arithmetic_type(side(0, 1), side(1, 0))
                 }
                 // The same, except that the answer is whole, so an exact
                 // argument gives an integer rather than a decimal.
                 "ceiling" => numeric_answer(
-                    combined(
-                        function_arguments(f)
-                            .iter()
-                            .map(|a| candidate_type(a, refs, input, sub)),
-                    ),
+                    combined_candidates(function_arguments(f).iter(), refs, input, sub),
                     true,
                 ),
                 // `NULLIF` answers its first argument or NULL, and both fit
@@ -10965,6 +11295,16 @@ fn computed_column_type(
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => direct_column(e, refs, input)
             .map(|column| column.ty.column_type())
             .unwrap_or(ColumnType::VarString),
+        // A parameter with nothing to type it is a *string*, not the NULL
+        // that stands in its place. 8.3 gives `SELECT ?` a VAR_STRING at
+        // prepare and gives it one again at execute when NULL is what was
+        // bound; this engine described `MYSQL_TYPE_NULL`, which is the code
+        // for a column that holds nothing at all, and a client that reads the
+        // describe response to decide how to decode — which is every client
+        // that prepares — was told the wrong thing about every value that
+        // followed. #0228. `parameter_marker` says why NULL is the only
+        // spelling this catches.
+        e if parameter_marker(e) => ColumnType::VarString,
         // A literal is typed by what it is. A number with a point is a
         // DECIMAL to MySQL rather than a double, and NULL has its own code.
         Expr::Value(v) => match &v.value {
@@ -11072,9 +11412,10 @@ fn computed_column_type(
                 // approximate, and a decimal is the answer MySQL gives when
                 // neither side is.
                 B::Divide => {
-                    let approximate =
-                        |e| is_approximate_code(arithmetic_operand_type(e, refs, input, sub));
-                    if approximate(left) || approximate(right) {
+                    let approximate = |e, beside| {
+                        is_approximate_code(arithmetic_operand_type(e, beside, refs, input, sub))
+                    };
+                    if approximate(left, Some(&**right)) || approximate(right, Some(&**left)) {
                         ColumnType::Double
                     } else {
                         ColumnType::NewDecimal
@@ -11082,8 +11423,8 @@ fn computed_column_type(
                 }
                 B::MyIntegerDivide => ColumnType::LongLong,
                 B::Plus | B::Minus | B::Multiply | B::Modulo => arithmetic_type(
-                    arithmetic_operand_type(left, refs, input, sub),
-                    arithmetic_operand_type(right, refs, input, sub),
+                    arithmetic_operand_type(left, Some(right), refs, input, sub),
+                    arithmetic_operand_type(right, Some(left), refs, input, sub),
                 ),
                 // Every bitwise operator answers 64 unsigned bits whatever it
                 // was given: `1.5 ^ 1` is a LONGLONG in MySQL and so is
@@ -11177,12 +11518,14 @@ fn computed_column_type(
             conditions,
             else_result,
             ..
-        } => combined(
+        } => combined_candidates(
             conditions
                 .iter()
                 .map(|w| &w.result)
-                .chain(else_result.as_deref())
-                .map(|r| candidate_type(r, refs, input, sub)),
+                .chain(else_result.as_deref()),
+            refs,
+            input,
+            sub,
         ),
         // A scalar subquery is the type of the subquery's own projection, not
         // a type of its own: 8.3 answers LONG for `(SELECT sid FROM T)` over
@@ -11571,11 +11914,12 @@ fn written_name(e: &Expr) -> String {
     }
 }
 
-/// The first `LIKE ... ESCAPE` clause in `e` that names anything but one
-/// character.
+/// The first thing in `e` that 8.3 settles while *resolving* the item rather
+/// than while evaluating it: a malformed `LIKE ... ESCAPE`, or a subquery
+/// whose interior does not resolve.
 ///
-/// 8.3 settles the escape while *resolving* the item, not while evaluating it,
-/// so a malformed clause is an error even where nothing is ever evaluated:
+/// 8.3 settles the escape while resolving, not while evaluating, so a
+/// malformed clause is an error even where nothing is ever evaluated:
 ///
 /// ```sql
 /// SELECT s LIKE 'a' ESCAPE '!!' FROM L               -- 1210, L empty
@@ -11584,29 +11928,96 @@ fn written_name(e: &Expr) -> String {
 ///
 /// The evaluator settles it per row, which answers both of those with a
 /// result: an empty set for the first and 9 for the second. That is the same
-/// shape as the 1054 hole above it — over no rows, or down a branch nothing
-/// takes, a check that lives in the row path does not run — and it is fixed
-/// the same way, at the same three points, from the same `subexpressions`
-/// list.
+/// shape as the 1054 hole in `unresolved_column` above, and it is fixed the
+/// same way, at the same points, from the same `subexpressions` list.
 ///
-/// Ordered after `unresolved_column` at every one of them, because MySQL
-/// resolves names first: `SELECT nope LIKE 'x' ESCAPE '!!' FROM L` is 1054 on
-/// 8.3 and not 1210.
+/// A subquery's interior is the same hole one level down, and was the clause
+/// #0100 left open. `subquery_column` already runs the inner query as a probe
+/// to type it, and threw the error away with `.ok()` because a typing walker
+/// has nowhere to report one; this reads that same probe for the error.
+/// Measured on 8.3 through `COM_STMT_PREPARE`, with the outer table both empty
+/// and not — each of these is refused *at prepare* there and answered here:
 ///
-/// Conservative in the same way, and for the same reason: a variant missing
-/// from `subexpressions` is a place this looks at nothing and the statement is
-/// accepted as it is today, which is the safe direction.
-fn malformed_escape(e: &Expr) -> Option<EngineError> {
+/// ```sql
+/// SELECT (SELECT zz.q FROM Cr) FROM Cl               -- 1054 'field list'
+/// SELECT id FROM Cl WHERE id IN (SELECT zz.q FROM Cr)          -- 1054
+/// SELECT id FROM Cl WHERE EXISTS (SELECT zz.q FROM Cr)         -- 1054
+/// SELECT (SELECT q FROM Cr WHERE s LIKE 'a' ESCAPE '!!') FROM Cl  -- 1210
+/// SELECT id FROM Cl WHERE EXISTS (SELECT SIGN() FROM Cr)       -- 1582
+/// ```
+///
+/// The clause the 1054 names is the *inner* one, which falls out of running
+/// the inner query rather than being decided here: measured on 8.3, `(SELECT q
+/// FROM Cr WHERE zz.q = 1)` is `'where clause'`, `GROUP BY zz.q` inside one is
+/// `'group statement'`, its `ORDER BY` is `'order clause'`, its `HAVING` is
+/// `'having clause'` and its join's condition is `'on clause'`.
+///
+/// One walk rather than two because 8.3 resolves an item's parts
+/// *positionally*, and two walks cannot: measured there, `CONCAT((SELECT zz.q
+/// FROM Cr), s LIKE 'a' ESCAPE '!!')` is 1054 and the same two arguments the
+/// other way round are 1210. Asking the whole expression about escapes before
+/// asking it about subqueries answers 1210 for both.
+///
+/// Only the codes `refused_at_prepare` names are taken from the probe, and
+/// that is the safety rail rather than a filter: those four are facts about
+/// the *text* — a name nothing answers to, a table nothing answers to, an
+/// escape of two characters, a call written with the wrong number of arguments
+/// — so no row and no bound argument can make the statement legal. Anything
+/// else the probe turns down it may have turned down for being a probe, and
+/// refusing on it would turn working SQL into an error.
+///
+/// Conservative in the same way as `unresolved_column`, and for the same
+/// reason: a variant missing from `subexpressions` and from `nested_query` is
+/// a place this looks at nothing and the statement is accepted as it is today.
+fn refused_while_resolving(
+    sub: Option<Sub<'_>>,
+    e: &Expr,
+    refs: &[ColumnRef],
+) -> Option<EngineError> {
     if let Expr::Like { escape_char, .. } | Expr::ILike { escape_char, .. } = e {
         if let Err(bad) = crate::expr::like_escape(escape_char.as_ref()) {
             return Some(bad);
         }
     }
+    let recur = |inner: &Expr| refused_while_resolving(sub, inner, refs);
+    let probe = |query: &Query| match probed_subquery(sub, query, refs) {
+        Some(Err(bad)) if refused_at_prepare(&bad) => Some(bad),
+        _ => None,
+    };
     match e {
         // A call's own expressions are read here too, and `subexpressions`
         // does not carry them.
-        Expr::Function(f) => function_carried(f).iter().find_map(malformed_escape),
-        other => subexpressions(other).into_iter().find_map(malformed_escape),
+        Expr::Function(f) => function_carried(f).iter().find_map(recur),
+        // Every variant that carries a query, each ordered the way it is
+        // written: 8.3 resolves an item left to right, so `x IN (SELECT ...)`
+        // settles `x` before the subquery, and `subexpressions` yields the
+        // `x` alone for exactly that reason.
+        //
+        // `AnyOp` and `AllOp` are named here because `subexpressions` ends in
+        // a catch-all that does not carry them, so the subquery under
+        // `= ANY (SELECT ...)` would be walked into by nothing at all — the
+        // same shape the note on `check_aliases_in_expr` records. Their right
+        // side *is* an `Expr::Subquery`, so recursing reaches it.
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            recur(left).or_else(|| recur(right))
+        }
+        Expr::InSubquery { expr, subquery, .. } => recur(expr).or_else(|| probe(subquery)),
+        Expr::Subquery(query) => probe(query),
+        // MySQL throws an EXISTS subquery's select list away before it expands
+        // any `*` in it, so `EXISTS (SELECT o.* FROM t)` is legal on 8.3 even
+        // where nothing `t` provides is called `o` — and probing it as written
+        // would refuse a statement the reference server answers, which is the
+        // worst direction for this walk to fail in. `expr::eval` discards them
+        // through the same function when it runs one, so the probe and the
+        // evaluation agree about what query they are talking about.
+        //
+        // A *named* column in that position is still resolved and still 1054
+        // there, which is why the whole list is not simply skipped.
+        Expr::Exists { subquery, .. } => match crate::expr::wildcards_discarded(subquery) {
+            Some(discarded) => probe(&discarded),
+            None => probe(subquery),
+        },
+        other => subexpressions(other).into_iter().find_map(recur),
     }
 }
 
@@ -11683,6 +12094,13 @@ fn wrong_parameter_count(e: &Expr) -> Option<EngineError> {
     }
     match e {
         Expr::Function(f) => function_carried(f).iter().find_map(wrong_parameter_count),
+        // Named for the reason `refused_while_resolving` names them:
+        // `subexpressions` ends in a catch-all that carries neither, so the
+        // left of `SIGN() = ANY (SELECT ...)` was walked by nothing and the
+        // subquery's own fault answered where 8.3 says 1582.
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            wrong_parameter_count(left).or_else(|| wrong_parameter_count(right))
+        }
         other => subexpressions(other)
             .into_iter()
             .find_map(wrong_parameter_count),
@@ -11844,12 +12262,21 @@ fn unquoted_collation(variable: &str, value: &Expr) -> Option<Value> {
 /// order-clause 1054 all beat the 1235 — `SELECT GROUP_CONCAT('a' ORDER BY 2)
 /// OVER ()` is `Unknown column '2' in 'order clause'` there and not 1235 —
 /// and so does a name, which `resolve_projected_expr` settles first.
+/// `sub` and `refs` are what a subquery's interior needs to be resolved: the
+/// engine to run it against, and the scope it may correlate to. `None` is the
+/// answer for a caller that has no engine — `ddl.rs`, which resolves a stored
+/// expression at declaration time — and there the walk skips the interior
+/// rather than refusing it, which is the same conservative direction every
+/// other gap here takes. MySQL has no subquery in a DEFAULT or a CHECK to
+/// resolve anyway.
 pub(crate) fn refuse_at_resolve<'a>(
+    sub: Option<Sub<'_>>,
+    refs: &[ColumnRef],
     clauses: impl IntoIterator<Item = &'a Expr>,
 ) -> EngineResult<()> {
     let refusal = |e: &Expr| -> Option<EngineError> {
         wrong_parameter_count(e)
-            .or_else(|| malformed_escape(e))
+            .or_else(|| refused_while_resolving(sub, e, refs))
             .or_else(|| bad_aggregate_order_position(e))
             .or_else(|| group_concat_as_window(e))
     };
@@ -11907,11 +12334,11 @@ fn wildcard_written(kind: &sqlparser::ast::SelectItemQualifiedWildcardKind) -> S
 /// for a query with a FROM, and `select_without_table` for one without. A
 /// check added to either has to reach both, and a mutation to this neuters
 /// them together.
-fn resolve_projected_expr(e: &Expr, refs: &[ColumnRef]) -> EngineResult<()> {
+fn resolve_projected_expr(sub: Option<Sub<'_>>, e: &Expr, refs: &[ColumnRef]) -> EngineResult<()> {
     if let Some(name) = unresolved_column(e, refs) {
         return Err(EngineError::unknown_column(&name, "field list"));
     }
-    refuse_at_resolve([e])
+    refuse_at_resolve(sub, refs, [e])
 }
 
 /// Resolves the WHERE of an UPDATE or a DELETE, before any row is considered.
@@ -11941,7 +12368,11 @@ fn resolve_projected_expr(e: &Expr, refs: &[ColumnRef]) -> EngineResult<()> {
 /// because the scope is not this one — the clause resolves `VALUES(x)` too,
 /// and for an `INSERT ... SELECT` it sees the SELECT's FROM tables as well, so
 /// resolving it against the target table alone would refuse legal SQL.
-fn resolve_dml_where(selection: Option<&Expr>, refs: &[ColumnRef]) -> EngineResult<()> {
+fn resolve_dml_where(
+    sub: Option<Sub<'_>>,
+    selection: Option<&Expr>,
+    refs: &[ColumnRef],
+) -> EngineResult<()> {
     let Some(predicate) = selection else {
         return Ok(());
     };
@@ -11951,7 +12382,7 @@ fn resolve_dml_where(selection: Option<&Expr>, refs: &[ColumnRef]) -> EngineResu
     // After the name, because 8.3 resolves names first: `UPDATE LE SET s = 'x'
     // WHERE nope = 1 AND s LIKE 'a' ESCAPE '!!'` is 1054 there and was 1210
     // here — the ordering #0087 recorded as this issue's to correct.
-    refuse_at_resolve([predicate])
+    refuse_at_resolve(sub, refs, [predicate])
 }
 
 /// Resolves the names a GROUP BY writes, before any row is grouped.
@@ -11996,6 +12427,7 @@ fn resolve_dml_where(selection: Option<&Expr>, refs: &[ColumnRef]) -> EngineResu
 /// FROM and `select_without_table` for one without — so a mutation to it
 /// neuters both at once.
 fn resolve_group_by<E: std::borrow::Borrow<Expr>>(
+    sub: Option<Sub<'_>>,
     written_groups: &[Expr],
     projection: &[SelectItem],
     items: &[(String, E)],
@@ -12048,7 +12480,11 @@ fn resolve_group_by<E: std::borrow::Borrow<Expr>>(
         if let Some(name) = unresolved_column(&e, &named) {
             return Err(EngineError::unknown_column(&name, "group statement"));
         }
-        refuse_at_resolve([&e])?;
+        // `refs` and not `named`: a subquery written in this clause
+        // correlates against the relation, never against the select list's
+        // output names, so the scope the probe reads is the narrower of the
+        // two. The name check above is the one that admits an alias.
+        refuse_at_resolve(sub, refs, [&e])?;
         resolved.push(e);
     }
     Ok(resolved)
@@ -12233,12 +12669,16 @@ fn same_column(left: &Expr, right: &Expr, refs: &[ColumnRef]) -> bool {
 /// name and then every argument gets the second wrong — and gets it wrong
 /// where the per-row path had it right, which would have been a regression
 /// rather than a gap left open.
-fn resolve_dml_order(order_by: &[OrderByExpr], refs: &[ColumnRef]) -> EngineResult<()> {
+fn resolve_dml_order(
+    sub: Option<Sub<'_>>,
+    order_by: &[OrderByExpr],
+    refs: &[ColumnRef],
+) -> EngineResult<()> {
     for item in order_by {
         if let Some(name) = unresolved_column(&item.expr, refs) {
             return Err(EngineError::unknown_column(&name, "order clause"));
         }
-        refuse_at_resolve([&item.expr])?;
+        refuse_at_resolve(sub, refs, [&item.expr])?;
     }
     Ok(())
 }
@@ -12276,7 +12716,11 @@ fn resolve_dml_order(order_by: &[OrderByExpr], refs: &[ColumnRef]) -> EngineResu
 /// clauses were measured for it — `SET label = ('a' LIKE 'b' ESCAPE '!!'), sid
 /// = nope` is 1210 and the same two assignments the other way round are 1054,
 /// and so are the two spellings of the `ON DUPLICATE KEY UPDATE` pair.
-fn resolve_assigned_values(assignments: &[Assignment], refs: &[ColumnRef]) -> EngineResult<()> {
+fn resolve_assigned_values(
+    sub: Option<Sub<'_>>,
+    assignments: &[Assignment],
+    refs: &[ColumnRef],
+) -> EngineResult<()> {
     for assignment in assignments {
         // `SET k = DEFAULT` writes the column's declared default, and the
         // parser hands it over as a bare identifier indistinguishable from a
@@ -12296,7 +12740,7 @@ fn resolve_assigned_values(assignments: &[Assignment], refs: &[ColumnRef]) -> En
         if let Some(name) = unresolved_column(&assignment.value, refs) {
             return Err(EngineError::unknown_column(&name, "field list"));
         }
-        refuse_at_resolve([&assignment.value])?;
+        refuse_at_resolve(sub, refs, [&assignment.value])?;
     }
     Ok(())
 }
@@ -12321,6 +12765,7 @@ fn is_default_keyword(e: &Expr) -> bool {
 /// Called from `project` too, where these checks used to live, so a statement
 /// that never reaches the HAVING is resolved exactly as it was.
 fn resolve_field_list(
+    sub: Option<Sub<'_>>,
     projection: &[SelectItem],
     refs: &[ColumnRef],
     relation: &Relation,
@@ -12353,7 +12798,7 @@ fn resolve_field_list(
                 }
             }
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                resolve_projected_expr(e, refs)?;
+                resolve_projected_expr(sub, e, refs)?;
             }
             // Refused where the projection is built, because that is a gap in
             // this engine rather than a question about the statement.
@@ -13510,6 +13955,52 @@ fn literal_name(e: &Expr) -> Option<String> {
         // why `SELECT +TRUE` keeps its plus where `SELECT +1` does not.
         _ => None,
     }
+}
+
+/// How many characters wide a parameter with no type of its own is.
+///
+/// 65535 bytes is what MySQL sizes `Item_param` at, and this engine counts a
+/// string in characters of utf8mb4, so it is that over four. The three bytes
+/// the division drops are what makes `SELECT ?` come out `len 65532` rather
+/// than 65535 — which is the number 8.3 sends, because a VARCHAR-coded item is
+/// reported at the widest a `VARCHAR` really is.
+const PARAMETER_CHARS: u32 = 16383;
+
+/// How wide a parameter the statement typed as a whole number prints.
+///
+/// 8.3 reports 21 for it, which is what a `BIGINT` needs: twenty digits and a
+/// sign. Measured in the parameter block of `COM_STMT_PREPARE` — `? + 1` is
+/// `LONGLONG len 21` there — and visible in the column beside it, which is 22
+/// once the addition adds its carry.
+const PARAMETER_DIGITS: u32 = 21;
+
+/// Whether `e` is a parameter marker with no value to type it.
+///
+/// The binder substitutes each `?` with the literal text of the value bound to
+/// it before the statement is parsed, so by the time any of this runs there is
+/// no marker in the tree — there is the value. That is the right answer for
+/// every *typed* value: 8.3 re-describes `SELECT ?` by what was bound to it,
+/// measured through `COM_STMT_EXECUTE`, and answers `LONGLONG` for a 7 and
+/// `VAR_STRING` for an 'abc'.
+///
+/// NULL is the one binding that carries no type, and it is what `describe`
+/// binds *every* parameter to, because a statement's shape does not depend on
+/// its arguments. So this is the whole of "a parameter 8.3 would type from the
+/// statement rather than from a value": every parameter at prepare, and a
+/// parameter bound to NULL at execute. 8.3 answers both of those the same way
+/// — `SELECT ?` bound to NULL is `VAR_STRING len 65532` there, not the
+/// `MYSQL_TYPE_NULL` a written NULL gets — which is why one test can hold the
+/// two together.
+///
+/// Told from a written `NULL` by the mapping, exactly as `is_bound_parameter`
+/// tells a bound `'?'` from a written one: the tree cannot tell them apart and
+/// the offsets can.
+fn parameter_marker(e: &Expr) -> bool {
+    // Through the wrappers MySQL's parser discards, exactly as `literal_name`
+    // reads one: `SELECT (?)` and `SELECT +?` are both the parameter itself on
+    // 8.3, down to the width and the places.
+    matches!(peeled(e), Expr::Value(v)
+        if matches!(v.value, sqlparser::ast::Value::Null) && is_bound_parameter(&v.span))
 }
 
 /// Whether the literal at `span` is a bound parameter the binder wrote there.

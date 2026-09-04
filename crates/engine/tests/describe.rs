@@ -164,9 +164,12 @@ fn describe_matches_execute_with_parameters() {
     }
 
     // The one shape where the two legitimately differ, asserted rather than
-    // left in prose so it cannot drift: the parameter *is* the column, so
-    // there is nothing but the bound value to type it by, and the value is
-    // NULL when describing.
+    // left in prose so it cannot drift: the parameter *is* the column, and
+    // 8.3 re-describes it by the bound value's type at execute where the
+    // prepare has no value and types it from the statement. Both halves are
+    // pinned in `a_parameter_is_typed_from_the_statement_and_not_from_the_value`;
+    // what this line holds is only that the two are allowed to differ, and
+    // that they differ in the *type* and never in the name. #0228.
     let described = engine.describe(&s, "SELECT ? AS lit", 1).unwrap().unwrap();
     let Ok(Outcome::Rows(executed)) = engine.execute(&mut s, "SELECT ? AS lit", &[Value::Int(7)])
     else {
@@ -1386,5 +1389,495 @@ fn a_clause_is_refused_at_prepare_rather_than_at_the_first_row() {
             .describe(&s, "SELECT k AS a FROM Cl GROUP BY a", 0)
             .is_ok(),
         "refused a GROUP BY that names a select alias"
+    );
+}
+
+/// #0227: a subquery's interior is resolved at prepare, like every other clause.
+///
+/// The clause #0100 left open. `subquery_column` already ran the inner query
+/// as a probe to type `(SELECT ...)`, and threw away whatever it raised with
+/// `.ok()`, because a walker that types an expression has nowhere to report an
+/// error — so a name nothing answers to inside a subquery described a column
+/// happily and failed only once a row reached it, which over an empty outer
+/// table is never.
+///
+/// Every expectation below was measured on `mysql:8.3` through the `mysql`
+/// crate's `conn.prep` with the statement cache disabled — the CLI does not
+/// prepare, and the crate refreshes a cached statement's columns from the
+/// *execute* response, so a repeated statement hands back stale prepare
+/// metadata. Cross-checked against the server-side `PREPARE p FROM '...'`
+/// spelling, which agrees.
+///
+/// `Cl` is empty throughout, which is the whole point: 8.3 refuses each of
+/// these before any row exists, and so did none of them here.
+#[test]
+fn a_subquerys_interior_is_resolved_at_prepare() {
+    let (engine, mut s) = setup();
+    for ddl in [
+        "CREATE TABLE Cl (id INT NOT NULL, k INT NULL, s VARCHAR(20) NULL, PRIMARY KEY (id))",
+        "CREATE TABLE Cr (q INT NULL, s VARCHAR(20) NULL)",
+    ] {
+        engine.execute(&mut s, ddl, &[]).unwrap();
+    }
+
+    for (sql, code, message) in [
+        // A scalar subquery, which is the shape the issue was filed on.
+        (
+            "SELECT (SELECT zz.q FROM Cr) FROM Cl",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        // An IN subquery and an EXISTS, which `subquery_column` never even
+        // looked at: nothing types them, so nothing ran them.
+        (
+            "SELECT id FROM Cl WHERE id IN (SELECT zz.q FROM Cr)",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT id FROM Cl WHERE EXISTS (SELECT zz.q FROM Cr)",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        // `= ANY` and `> ALL` carry their subquery in a variant
+        // `subexpressions` does not name, so the walk has to name it itself.
+        (
+            "SELECT id FROM Cl WHERE id = ANY (SELECT zz.q FROM Cr)",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT id FROM Cl WHERE id > ALL (SELECT zz.q FROM Cr)",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        // The clause named in the 1054 is the *inner* one, not the outer one
+        // the subquery sits in. That falls out of running the inner query
+        // rather than being decided here, and each of these was measured:
+        (
+            "SELECT (SELECT q FROM Cr WHERE zz.q = 1) FROM Cl",
+            1054,
+            "Unknown column 'zz.q' in 'where clause'",
+        ),
+        (
+            "SELECT (SELECT q FROM Cr GROUP BY zz.q) FROM Cl",
+            1054,
+            "Unknown column 'zz.q' in 'group statement'",
+        ),
+        (
+            "SELECT (SELECT q FROM Cr ORDER BY zz.q) FROM Cl",
+            1054,
+            "Unknown column 'zz.q' in 'order clause'",
+        ),
+        (
+            "SELECT (SELECT q FROM Cr HAVING zz.q = 1) FROM Cl",
+            1054,
+            "Unknown column 'zz.q' in 'having clause'",
+        ),
+        (
+            "SELECT (SELECT q FROM Cr JOIN Cl ON Cl.id = zz.q) FROM Cl",
+            1054,
+            "Unknown column 'zz.q' in 'on clause'",
+        ),
+        // A subquery in the outer query's other clauses, which reach the same
+        // walk through a different caller.
+        (
+            "SELECT 1 FROM Cl WHERE 1 = 0 AND (SELECT zz.q FROM Cr) = 1",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT id FROM Cl GROUP BY (SELECT zz.q FROM Cr)",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT id FROM Cl ORDER BY (SELECT zz.q FROM Cr)",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT id FROM Cl HAVING (SELECT zz.q FROM Cr) = 1",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT Cl.id FROM Cl JOIN Cr ON Cl.id = (SELECT zz.q FROM Cr)",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        // Buried under a call, a CASE and a coalesce, where the old walk
+        // stopped at the subquery node.
+        (
+            "SELECT CONCAT((SELECT zz.q FROM Cr)) FROM Cl",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT CASE WHEN 0 THEN (SELECT zz.q FROM Cr) ELSE 1 END FROM Cl",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT MAX((SELECT zz.q FROM Cr)) FROM Cl",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        // Two levels down, which only works because the probe of the outer
+        // subquery resolves the inner one the same way.
+        (
+            "SELECT (SELECT (SELECT zz.q FROM Cr) FROM Cr) FROM Cl",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        // A correlated reference the *enclosing* query does not carry is a
+        // 1054 as much as a made-up qualifier is: `Cl` is not in scope with
+        // `Cr` alone in the outer FROM.
+        (
+            "SELECT (SELECT Cl.id FROM Cr) FROM Cr",
+            1054,
+            "Unknown column 'Cl.id' in 'field list'",
+        ),
+        // What a subquery's interior carries besides its names, settled the
+        // same way and in the same walk.
+        (
+            "SELECT (SELECT s LIKE 'a' ESCAPE '!!' FROM Cr) FROM Cl",
+            1210,
+            "Incorrect arguments to ESCAPE",
+        ),
+        (
+            "SELECT id FROM Cl WHERE id IN (SELECT q FROM Cr WHERE s LIKE 'a' ESCAPE '!!')",
+            1210,
+            "Incorrect arguments to ESCAPE",
+        ),
+        (
+            "SELECT id FROM Cl WHERE EXISTS (SELECT q FROM Cr WHERE s LIKE 'a' ESCAPE '!!')",
+            1210,
+            "Incorrect arguments to ESCAPE",
+        ),
+        (
+            "SELECT (SELECT SIGN() FROM Cr) FROM Cl",
+            1582,
+            "Incorrect parameter count in the call to native function 'SIGN'",
+        ),
+        (
+            "SELECT id FROM Cl WHERE EXISTS (SELECT SIGN() FROM Cr)",
+            1582,
+            "Incorrect parameter count in the call to native function 'SIGN'",
+        ),
+        // A qualified `*` no FROM clause provides is 1051 inside a scalar
+        // subquery and inside an IN — and *not* inside an EXISTS, which is
+        // the legal shape asserted below.
+        (
+            "SELECT (SELECT Cl.* FROM Cr) FROM Cl",
+            1051,
+            "Unknown table 'Cl'",
+        ),
+        // Names before arguments, inside the subquery, positionally: 8.3
+        // resolves an item left to right and answers whichever fault comes
+        // first, so these two orders give two different codes.
+        (
+            "SELECT (SELECT zz.q FROM Cr WHERE s LIKE 'a' ESCAPE '!!') FROM Cl",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT (SELECT s LIKE 'a' ESCAPE '!!' FROM Cr WHERE zz.q = 1) FROM Cl",
+            1210,
+            "Incorrect arguments to ESCAPE",
+        ),
+        // And positionally *across* the items of the enclosing list, which is
+        // what merging the subquery probe into the escape walk buys: a bad
+        // subquery in the first item beats a bad escape in the second, and the
+        // reverse order gives the reverse answer. Both measured on 8.3.
+        (
+            "SELECT (SELECT zz.q FROM Cr), s LIKE 'a' ESCAPE '!!' FROM Cr",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT s LIKE 'a' ESCAPE '!!', (SELECT zz.q FROM Cr) FROM Cr",
+            1210,
+            "Incorrect arguments to ESCAPE",
+        ),
+        // `= ANY` and `> ALL` carry their left operand where
+        // `subexpressions` does not look either, so the argument count of a
+        // call written there has to be found by the same named arms. 8.3
+        // raises 1582 in its parser, so it beats the subquery's own fault.
+        (
+            "SELECT id FROM Cl WHERE SIGN() = ANY (SELECT zz.q FROM Cr)",
+            1582,
+            "Incorrect parameter count in the call to native function 'SIGN'",
+        ),
+        // Still refused where the name is in no scope at all, which is what
+        // stops the correlated ON below from being a way to accept anything.
+        (
+            "SELECT k FROM Cl WHERE EXISTS \
+             (SELECT 1 FROM Cr JOIN Cr c3 ON c3.q = (SELECT zz.q FROM Cr))",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+    ] {
+        let Err(error) = engine.describe(&s, sql, 0) else {
+            panic!("described rather than refusing: {sql}");
+        };
+        assert_eq!(
+            (error.code, error.message.as_str()),
+            (code, message),
+            "{sql}"
+        );
+
+        // The same statement, executed rather than prepared, over the same
+        // empty tables. The invariant this file exists for: a refusal that
+        // only happens at one of the two is the bug, not the fix.
+        let Err(ran) = engine.execute(&mut s, sql, &[]) else {
+            panic!("ran rather than refusing: {sql}");
+        };
+        assert_eq!((ran.code, ran.message.as_str()), (code, message), "{sql}");
+    }
+
+    // The direction that matters more: none of these may be refused. Every one
+    // of them prepares on 8.3, and the correlated ones are exactly the shape a
+    // walk that resolved a subquery in the wrong scope would break.
+    for sql in [
+        "SELECT (SELECT q FROM Cr) FROM Cl",
+        "SELECT (SELECT Cl.id FROM Cr) FROM Cl",
+        "SELECT (SELECT id FROM Cr) FROM Cl",
+        "SELECT (SELECT MAX(q) FROM Cr WHERE Cr.q = Cl.id) FROM Cl",
+        "SELECT id FROM Cl WHERE id IN (SELECT q FROM Cr)",
+        "SELECT id FROM Cl WHERE EXISTS (SELECT 1 FROM Cr WHERE Cr.q = Cl.id)",
+        "SELECT id FROM Cl c1 WHERE EXISTS (SELECT 1 FROM Cl c2 WHERE c2.id = c1.id)",
+        // EXISTS throws its select list away before expanding any `*` in it,
+        // so a qualifier nothing provides is legal there where it is 1051 two
+        // lines up. Probing the subquery as written would have refused this.
+        "SELECT id FROM Cl WHERE EXISTS (SELECT Cl.* FROM Cr)",
+        "SELECT id FROM Cl WHERE EXISTS (SELECT nope.* FROM Cr)",
+        // More than one column is legal under EXISTS too, where a scalar
+        // subquery is 1241.
+        "SELECT id FROM Cl WHERE EXISTS (SELECT q, s FROM Cr)",
+        // A subquery written in a join's ON correlates outwards exactly as a
+        // bare name does, so the probe has to read the enclosing query's
+        // columns and not only the join's — the same scope `unresolved_column`
+        // was already given, and the one a probe against `refs` alone turned
+        // into a 1054 the moment either inner side was empty.
+        "SELECT k FROM Cl WHERE EXISTS (SELECT 1 FROM Cr JOIN Cr c3 ON c3.q = (SELECT Cl.id))",
+        "SELECT k FROM Cl WHERE EXISTS (SELECT 1 FROM Cr JOIN Cr c3 ON c3.q = Cl.id)",
+        "SELECT Cl.id FROM Cl, LATERAL (SELECT q FROM Cr) d",
+    ] {
+        engine
+            .describe(&s, sql, 0)
+            .unwrap_or_else(|e| panic!("refused a legal statement: {sql} -> {e:?}"))
+            .unwrap_or_else(|| panic!("described nothing: {sql}"));
+        engine
+            .execute(&mut s, sql, &[])
+            .unwrap_or_else(|e| panic!("refused a legal statement at execute: {sql} -> {e:?}"));
+    }
+}
+
+/// #0228: a parameter is typed from the statement, not from the value bound.
+///
+/// `describe` binds every parameter to NULL, because a statement's shape does
+/// not depend on its arguments — and this engine then typed the column by that
+/// NULL, so `SELECT ?` was `MYSQL_TYPE_NULL len 0`, the code for a column that
+/// holds nothing at all. A client reads the describe response to decide how to
+/// decode every value that follows, and Prisma prepares every statement.
+///
+/// Measured on `mysql:8.3` through the `mysql` crate's `conn.prep` with the
+/// statement cache disabled, reading the column definitions of
+/// `COM_STMT_PREPARE`. The differential harness cannot reach any of this:
+/// `Answer::from_binary` prepares but binds nothing, so a parameterised case
+/// fails client-side before any metadata is compared. That is why the coverage
+/// is here.
+///
+/// The rule, derived rather than tabulated: a parameter has no type of its
+/// own and takes the one its *position* gives it. With nothing to take — a
+/// bare `?`, a string beside it, a string function around it — it is a
+/// VAR_STRING as wide as `Item_param` is, 65532 bytes with `NOT_FIXED_DEC`
+/// places. In arithmetic it takes the other operand's: a whole number beside
+/// it makes it a LONGLONG 21 wide, an exact fraction makes it
+/// `DECIMAL(65, 30)`, an approximate one makes it a DOUBLE, and another
+/// parameter — nothing on either side — makes both DOUBLE.
+#[test]
+fn a_parameter_is_typed_from_the_statement_and_not_from_the_value() {
+    let (engine, mut s) = setup();
+    engine
+        .execute(
+            &mut s,
+            "CREATE TABLE P (i INT NOT NULL, d DECIMAL(10,2) NULL, f FLOAT NULL, \
+             s VARCHAR(10) NULL, dt DATETIME(3) NULL, dd DATE NULL)",
+            &[],
+        )
+        .unwrap();
+
+    let described = |sql: &str, parameters: usize| {
+        let columns = engine
+            .describe(&s, sql, parameters)
+            .unwrap_or_else(|e| panic!("refused: {sql} -> {e:?}"))
+            .unwrap_or_else(|| panic!("described nothing: {sql}"));
+        columns
+            .iter()
+            .map(|c| {
+                let def = c.to_wire();
+                format!(
+                    "{} {:?} len {} dec {}",
+                    c.name, def.column_type, def.column_length, def.decimals
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (sql, parameters, expected) in [
+        // Nothing types it: a string, its own width, and no fixed places.
+        ("SELECT ?", 1, "? VarString len 65532 dec 31"),
+        ("SELECT ? AS a", 1, "a VarString len 65532 dec 31"),
+        // Through the wrappers MySQL's parser discards.
+        ("SELECT (?)", 1, "? VarString len 65532 dec 31"),
+        ("SELECT +?", 1, "? VarString len 65532 dec 31"),
+        // A whole number beside it makes it one, and the column is a digit
+        // wider than the parameter for the carry.
+        ("SELECT ?+1", 1, "?+1 LongLong len 22 dec 0"),
+        ("SELECT 1+?", 1, "1+? LongLong len 22 dec 0"),
+        ("SELECT ?*2", 1, "?*2 LongLong len 22 dec 0"),
+        ("SELECT ? DIV 2", 1, "? DIV 2 LongLong len 21 dec 0"),
+        ("SELECT ? % 2", 1, "? % 2 LongLong len 21 dec 0"),
+        // An exact fraction makes it the widest decimal MySQL has.
+        ("SELECT ?+1.5", 1, "?+1.5 NewDecimal len 68 dec 30"),
+        // Division types the parameter from its own operand and then divides,
+        // which is where the four places come from.
+        ("SELECT ?/2", 1, "?/2 NewDecimal len 26 dec 4"),
+        // Nothing on either side: both parameters are approximate.
+        ("SELECT ?+?", 2, "?+? Double len 23 dec 31"),
+        // A string beside it leaves it a string, and the arithmetic makes a
+        // double of the pair anyway.
+        ("SELECT ?+'x'", 1, "?+'x' Double len 23 dec 31"),
+        // A string function keeps its argument's width, and two of them
+        // together outgrow a VARCHAR and are described as a blob — which is
+        // the same arithmetic the widths above are, not a second rule.
+        (
+            "SELECT CONCAT(?,?)",
+            2,
+            "CONCAT(?,?) MediumBlob len 524256 dec 31",
+        ),
+        (
+            "SELECT CONCAT(?, 'x')",
+            1,
+            "CONCAT(?, 'x') MediumBlob len 262144 dec 31",
+        ),
+        ("SELECT UPPER(?)", 1, "UPPER(?) VarString len 65532 dec 31"),
+        // A predicate over it is a predicate whatever it is over.
+        ("SELECT ? IS NULL", 1, "? IS NULL LongLong len 1 dec 0"),
+        // A conditional takes its type from the branch that *has* one, and
+        // the parameter is then the widest of that kind — so an INT column
+        // beside one comes out LONGLONG rather than LONG, because eight bytes
+        // is what the parameter can carry. Typing the parameter a string here
+        // instead, which is what it is on its own, described every one of
+        // these VAR_STRING and told a binary client to decode an integer as
+        // text.
+        (
+            "SELECT COALESCE(?, 1)",
+            1,
+            "COALESCE(?, 1) LongLong len 20 dec 0",
+        ),
+        (
+            "SELECT COALESCE(?, 'x')",
+            1,
+            "COALESCE(?, 'x') VarString len 4096 dec 0",
+        ),
+        ("SELECT IF(1, ?, 2)", 1, "IF(1, ?, 2) LongLong len 20 dec 0"),
+        (
+            "SELECT CASE WHEN 1 THEN ? ELSE 1 END",
+            1,
+            "CASE WHEN 1 THEN ? ELSE 1 END LongLong len 20 dec 0",
+        ),
+        (
+            "SELECT GREATEST(?, 1)",
+            1,
+            "GREATEST(?, 1) LongLong len 20 dec 0",
+        ),
+        // Nothing but parameters to take a type from, where a conditional
+        // over nothing but written NULLs is `MYSQL_TYPE_NULL` — the two
+        // spellings of "nothing decided" are not the same answer.
+        (
+            "SELECT GREATEST(?, ?)",
+            2,
+            "GREATEST(?, ?) VarString len 4096 dec 0",
+        ),
+        (
+            "SELECT COALESCE(NULL, NULL)",
+            0,
+            "COALESCE(NULL, NULL) Null len 0 dec 0",
+        ),
+    ] {
+        assert_eq!(
+            described(sql, parameters),
+            vec![expected.to_owned()],
+            "{sql}"
+        );
+    }
+
+    // Two parameters against a column, where the type comes from the column.
+    assert_eq!(
+        described("SELECT ?+i, ?+d, ?+f FROM P", 3),
+        vec![
+            "?+i LongLong len 22 dec 0".to_owned(),
+            "?+d NewDecimal len 68 dec 30".to_owned(),
+            "?+f Double len 23 dec 31".to_owned(),
+        ]
+    );
+
+    // A parameter that is not projected changes nothing about the columns.
+    assert_eq!(
+        described("SELECT i FROM P WHERE i = ? AND s = ?", 2),
+        vec!["i Long len 11 dec 0".to_owned()]
+    );
+
+    // The widest of the kind the column contributes, and not the column's own
+    // code: an INT beside a parameter is a LONGLONG on 8.3.
+    assert_eq!(
+        described("SELECT COALESCE(?, i), IFNULL(?, i), LEAST(?, i) FROM P", 3),
+        vec![
+            "COALESCE(?, i) LongLong len 20 dec 0".to_owned(),
+            "IFNULL(?, i) LongLong len 20 dec 0".to_owned(),
+            "LEAST(?, i) LongLong len 20 dec 0".to_owned(),
+        ]
+    );
+
+    // A temporal beside a parameter is read as the number arithmetic makes of
+    // it, exactly as a literal 0 beside it already was: a `DATETIME` computes
+    // exactly and a `DATE` computes whole. Reading it as the string a
+    // parameter otherwise is made both of these a DOUBLE.
+    assert_eq!(
+        described("SELECT dt + ?, ? + dd FROM P", 2),
+        vec![
+            "dt + ? NewDecimal len 20 dec 0".to_owned(),
+            "? + dd LongLong len 20 dec 0".to_owned(),
+        ]
+    );
+
+    // 8.3 re-describes by the bound value's *type* at execute — measured
+    // through `COM_STMT_EXECUTE`: `SELECT ?` bound to 7 comes back LONGLONG
+    // and bound to 'abc' comes back VAR_STRING — and never renames. NULL is
+    // the one binding that carries no type, and there 8.3 answers exactly what
+    // it answered at prepare, which is what holds the two halves of this rule
+    // together.
+    let mut executed = |sql: &str, params: &[Value]| {
+        let Ok(Outcome::Rows(rows)) = engine.execute(&mut s, sql, params) else {
+            panic!("{sql} did not return rows");
+        };
+        rows.columns
+            .iter()
+            .map(|c| {
+                let def = c.to_wire();
+                format!("{} {:?} len {}", c.name, def.column_type, def.column_length)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        executed("SELECT ?", &[Value::Null]),
+        vec!["? VarString len 65532".to_owned()]
+    );
+    assert_eq!(
+        executed("SELECT ?", &[Value::Int(7)]),
+        vec!["? LongLong len 2".to_owned()]
     );
 }

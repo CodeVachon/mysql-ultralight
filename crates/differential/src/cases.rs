@@ -4696,6 +4696,128 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // #0227, the one clause #0100 left open: a subquery's *interior*.
+        //
+        // `subquery_column` runs the inner query as a probe to type
+        // `(SELECT ...)` and threw away whatever it raised, because a walker
+        // that types an expression has nowhere to report an error. So a name
+        // nothing answers to inside a subquery described a column happily and
+        // failed only once a row reached it — which over an empty outer table
+        // is never. `IN`, `EXISTS`, `= ANY` and `> ALL` were worse still:
+        // nothing types those, so nothing ran them at all.
+        //
+        // These reach the prepare through the binary protocol, which is the
+        // one that matters here: `Answer::from_binary` calls `conn.prep`, so a
+        // name error inside a subquery is refused before the statement runs.
+        // The text protocol asks the same question of execution, and the two
+        // have to answer alike.
+        //
+        // Both tables are empty on purpose. The application under test writes
+        // 72 EXISTS subqueries and 29 subqueries in FROM, and a test database
+        // before its fixtures land is exactly this shape.
+        name: "a subquery's interior resolved before the first row",
+        setup: &[
+            "CREATE TABLE Sq (id INT NOT NULL, k INT NULL, s VARCHAR(20) NULL, PRIMARY KEY (id))",
+            "CREATE TABLE SqR (q INT NULL, s VARCHAR(20) NULL)",
+            "CREATE TABLE SqSeed (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+            "INSERT INTO SqSeed VALUES (1, 10)",
+        ],
+        cases: &[
+            // The four ways an expression carries a subquery.
+            same("SELECT (SELECT zz.q FROM SqR) FROM Sq"),
+            same("SELECT id FROM Sq WHERE id IN (SELECT zz.q FROM SqR)"),
+            same("SELECT id FROM Sq WHERE EXISTS (SELECT zz.q FROM SqR)"),
+            same("SELECT id FROM Sq WHERE id = ANY (SELECT zz.q FROM SqR)"),
+            same("SELECT id FROM Sq WHERE id > ALL (SELECT zz.q FROM SqR)"),
+            // 8.3 raises the argument count in its parser, so it beats the
+            // subquery's own fault — and the left of an `= ANY` is carried in
+            // a variant `subexpressions` does not name, so the arity walk has
+            // to name it too or the subquery answers instead.
+            same("SELECT id FROM Sq WHERE SIGN() = ANY (SELECT zz.q FROM SqR)"),
+            // With a row in the outer table as well, so the refusal is not
+            // something only an empty relation produces.
+            same("SELECT (SELECT zz.q FROM SqR) FROM SqSeed"),
+            same("SELECT id FROM SqSeed WHERE EXISTS (SELECT zz.q FROM SqR)"),
+            // The clause the 1054 names is the *inner* one, which is what
+            // running the inner query rather than inspecting it buys.
+            same("SELECT (SELECT q FROM SqR WHERE zz.q = 1) FROM Sq"),
+            same("SELECT (SELECT q FROM SqR GROUP BY zz.q) FROM Sq"),
+            same("SELECT (SELECT q FROM SqR ORDER BY zz.q) FROM Sq"),
+            same("SELECT (SELECT q FROM SqR HAVING zz.q = 1) FROM Sq"),
+            same("SELECT (SELECT q FROM SqR JOIN Sq ON Sq.id = zz.q) FROM Sq"),
+            // A subquery in the enclosing query's other clauses, each of which
+            // reaches the walk through a different caller.
+            same("SELECT 1 FROM Sq WHERE 1 = 0 AND (SELECT zz.q FROM SqR) = 1"),
+            same("SELECT id FROM Sq GROUP BY (SELECT zz.q FROM SqR)"),
+            same("SELECT id FROM Sq ORDER BY (SELECT zz.q FROM SqR)"),
+            same("SELECT id FROM Sq HAVING (SELECT zz.q FROM SqR) = 1"),
+            same("SELECT Sq.id FROM Sq JOIN SqR ON Sq.id = (SELECT zz.q FROM SqR)"),
+            // Buried under a call, a CASE and an aggregate, where the walk
+            // used to stop at the subquery node.
+            same("SELECT CONCAT((SELECT zz.q FROM SqR)) FROM Sq"),
+            same("SELECT CASE WHEN 0 THEN (SELECT zz.q FROM SqR) ELSE 1 END FROM Sq"),
+            same("SELECT MAX((SELECT zz.q FROM SqR)) FROM Sq"),
+            // Two levels down, and inside a derived table's own projection.
+            same("SELECT (SELECT (SELECT zz.q FROM SqR) FROM SqR) FROM Sq"),
+            same("SELECT * FROM (SELECT (SELECT zz.q FROM SqR) AS x FROM SqR) d"),
+            // A correlated reference the enclosing query does not carry.
+            same("SELECT (SELECT Sq.id FROM SqR) FROM SqR"),
+            // What a subquery's interior carries besides its names.
+            same("SELECT (SELECT s LIKE 'a' ESCAPE '!!' FROM SqR) FROM Sq"),
+            same("SELECT id FROM Sq WHERE id IN (SELECT q FROM SqR WHERE s LIKE 'a' ESCAPE '!!')"),
+            same("SELECT id FROM Sq WHERE EXISTS (SELECT q FROM SqR WHERE s LIKE 'a' ESCAPE '!!')"),
+            same("SELECT (SELECT SIGN() FROM SqR) FROM Sq"),
+            same("SELECT id FROM Sq WHERE EXISTS (SELECT SIGN() FROM SqR)"),
+            // A qualified `*` the inner FROM does not provide, which is 1051
+            // everywhere except under EXISTS.
+            same("SELECT (SELECT Sq.* FROM SqR) FROM Sq"),
+            same("SELECT id FROM Sq WHERE id IN (SELECT Sq.* FROM SqR)"),
+            // Positional resolution, inside one subquery and across the items
+            // of the enclosing list. Both orders of each pair, because a walk
+            // that asks every name and then every argument gets one of the two
+            // wrong and reads exactly like one that gets both right.
+            same("SELECT (SELECT zz.q FROM SqR WHERE s LIKE 'a' ESCAPE '!!') FROM Sq"),
+            same("SELECT (SELECT s LIKE 'a' ESCAPE '!!' FROM SqR WHERE zz.q = 1) FROM Sq"),
+            same("SELECT (SELECT zz.q FROM SqR), s LIKE 'a' ESCAPE '!!' FROM SqR"),
+            same("SELECT s LIKE 'a' ESCAPE '!!', (SELECT zz.q FROM SqR) FROM SqR"),
+            // The direction that matters more: nothing legal over the same
+            // empty tables became a refusal. The correlated shapes are what a
+            // walk resolving a subquery in the wrong scope would break, and
+            // EXISTS throws its select list away before expanding any `*` in
+            // it — so a qualifier nothing provides is legal there and 1051 two
+            // groups of lines up.
+            same("SELECT (SELECT q FROM SqR) FROM Sq"),
+            // Asked through `IS NULL` rather than projected: what belongs
+            // here is that a correlated subquery is not *refused*, and this
+            // engine types a correlated column reference VAR_STRING where 8.3
+            // gives it the column's own type — an unrelated gap in
+            // `direct_column`, whose slots stop at this query's own relation,
+            // and one that would make this case a divergence about something
+            // else entirely.
+            same("SELECT id FROM Sq WHERE (SELECT Sq.id FROM SqR) IS NULL"),
+            same("SELECT (SELECT MAX(q) FROM SqR WHERE SqR.q = Sq.id) FROM Sq"),
+            same("SELECT id FROM Sq WHERE id IN (SELECT q FROM SqR)"),
+            same("SELECT id FROM Sq WHERE EXISTS (SELECT 1 FROM SqR WHERE SqR.q = Sq.id)"),
+            same("SELECT id FROM Sq c1 WHERE EXISTS (SELECT 1 FROM Sq c2 WHERE c2.id = c1.id)"),
+            same("SELECT id FROM Sq WHERE EXISTS (SELECT Sq.* FROM SqR)"),
+            same("SELECT id FROM Sq WHERE EXISTS (SELECT nope.* FROM SqR)"),
+            same("SELECT id FROM Sq WHERE EXISTS (SELECT q, s FROM SqR)"),
+            same("SELECT id FROM SqSeed WHERE EXISTS (SELECT 1 FROM SqR WHERE SqR.q = SqSeed.id)"),
+            // A subquery written in a join's ON correlates outwards exactly as
+            // a bare name does, so the probe has to read the enclosing query's
+            // columns and not only the join's. `SqSeed` has the one row in
+            // this group, which is what makes these bite: the subquery has to
+            // run for its join to be built at all.
+            same("SELECT k FROM SqSeed WHERE EXISTS (SELECT 1 FROM Sq JOIN Sq c3 ON c3.id = (SELECT SqSeed.id))"),
+            same("SELECT k FROM SqSeed WHERE EXISTS (SELECT 1 FROM Sq JOIN Sq c3 ON c3.id = SqSeed.id)"),
+            // Nothing above wrote a row or took one out, and a group of
+            // nothing but refusals reads the same whether its setup ran.
+            same("SELECT COUNT(*) FROM Sq"),
+            same("SELECT COUNT(*) FROM SqR"),
+            same("SELECT id, k FROM SqSeed ORDER BY id"),
+        ],
+    },
+    Group {
         // #0070 and #0085. Arithmetic over a decimal went through an `f64` and
         // came back with whatever the float printed, so the scale MySQL
         // computes was lost at every operator: `a + b` over two columns
