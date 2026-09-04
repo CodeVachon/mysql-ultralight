@@ -1881,3 +1881,66 @@ fn a_parameter_is_typed_from_the_statement_and_not_from_the_value() {
         vec!["? LongLong len 2".to_owned()]
     );
 }
+
+/// A statement naming a table that is not there is refused at prepare.
+///
+/// Measured on 8.3 through `COM_STMT_PREPARE`: `SELECT * FROM NoSuch` is 1146
+/// there, and this engine prepared it and described zero columns. A client
+/// that prepares up front -- which Prisma does for every statement -- heard
+/// nothing until it ran. #0244.
+#[test]
+fn a_missing_table_is_refused_at_prepare() {
+    let (engine, session) = setup();
+    for sql in [
+        "SELECT * FROM NoSuch",
+        "SELECT 1 FROM NoSuch",
+        "SELECT (SELECT 1 FROM NoSuch) FROM Ty",
+        "UPDATE NoSuch SET k = 1",
+        "DELETE FROM NoSuch WHERE id = 1",
+    ] {
+        let refused = engine.describe(&session, sql, 0).unwrap_err();
+        assert_eq!(refused.code, 1146, "{sql} -> {refused}");
+    }
+}
+
+/// A write is resolved at prepare, even though it describes no columns.
+///
+/// 8.3 resolves the whole statement: `UPDATE Full SET k = 1 WHERE zz = 1` is
+/// 1054 at prepare, not at execute. The engine described writes as `None`
+/// without looking at them at all.
+///
+/// Resolved rather than probed, because the executor's own paths interleave
+/// resolution with writing -- running one here would apply the statement.
+#[test]
+fn a_write_is_resolved_at_prepare_though_it_describes_nothing() {
+    let (engine, mut session) = setup();
+    engine
+        .execute(&mut session, "CREATE TABLE Dm (k INT, id INT)", &[])
+        .unwrap();
+
+    for (sql, clause) in [
+        ("UPDATE Dm SET k = 1 WHERE zz = 1", "where clause"),
+        ("DELETE FROM Dm WHERE zz = 1", "where clause"),
+        ("UPDATE Dm SET k = zz", "field list"),
+    ] {
+        let refused = engine.describe(&session, sql, 0).unwrap_err();
+        assert_eq!(refused.code, 1054, "{sql} -> {refused}");
+        assert!(
+            refused.message.contains(clause),
+            "{sql} named the wrong clause: {refused}"
+        );
+    }
+
+    // And a write that resolves still describes no columns, which is what 8.3
+    // answers for one: prepared, zero columns.
+    for sql in [
+        "UPDATE Dm SET k = 1 WHERE id = 1",
+        "DELETE FROM Dm WHERE id = 1",
+        "INSERT INTO Dm VALUES (1, 2)",
+    ] {
+        assert!(
+            engine.describe(&session, sql, 0).unwrap().is_none(),
+            "{sql} should prepare without describing a column"
+        );
+    }
+}

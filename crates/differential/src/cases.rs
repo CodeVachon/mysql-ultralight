@@ -9539,4 +9539,37 @@ pub const GROUPS: &[Group] = &[
             same("SET sql_mode=''"),
         ],
     },
+    Group {
+        // What a prepare settles about a write. The harness runs every case
+        // through `conn.prep` on its binary pass, so a statement 8.3 refuses
+        // at prepare and this engine refused only at execute compared equal on
+        // the code alone -- which is how #0244 stayed invisible here. These
+        // ask it directly.
+        //
+        // The multi-table forms are deliberately absent: their target is named
+        // by alias and resolves against a relation the executor builds, so
+        // they still prepare unresolved. That is the smaller half of #0244 and
+        // is why `DELETE ... USING` is skipped rather than guessed at.
+        name: "what a prepare settles about a write",
+        setup: &[
+            "CREATE TABLE Pw (k INT, id INT)",
+            "INSERT INTO Pw VALUES (1, 1)",
+        ],
+        cases: &[
+            // A name nothing answers to, in each clause a write has.
+            same("UPDATE Pw SET k = 1 WHERE zz = 1"),
+            same("DELETE FROM Pw WHERE zz = 1"),
+            same("UPDATE Pw SET k = zz"),
+            // A table that is not there, through a read and through a write.
+            same("SELECT 1 FROM PwNoSuch"),
+            same("UPDATE PwNoSuch SET k = 1"),
+            same("DELETE FROM PwNoSuch WHERE id = 1"),
+            // And the writes that resolve still run, which is what says the
+            // resolution did not become a refusal of its own.
+            same("UPDATE Pw SET k = 2 WHERE id = 1"),
+            same("SELECT k FROM Pw ORDER BY k"),
+            same("DELETE FROM Pw WHERE id = 1"),
+            same("SELECT COUNT(*) AS left_after FROM Pw"),
+        ],
+    },
 ];

@@ -129,6 +129,19 @@ impl Engine {
         // #0218: refused here rather than described, because describing is one
         // of the walks that runs out of stack on a deep enough statement.
         let [Statement::Query(query)] = statements.as_slice() else {
+            // A write describes no columns, but 8.3 still *resolves* it at
+            // prepare: `UPDATE Full SET k = 1 WHERE zz = 1` is 1054 there and
+            // `UPDATE NoSuch SET k = 1` is 1146, where this engine prepared
+            // both and said nothing until they ran. Measured through
+            // COM_STMT_PREPARE. #0244.
+            //
+            // Resolved rather than probed. The executor's own paths interleave
+            // resolution with writing — they take the write lock and work on a
+            // copy of the database — so running one here would apply the
+            // statement. These read the catalog and nothing else.
+            if let Some(refused) = self.refuse_dml_at_prepare(session, &statements) {
+                return Err(refused);
+            }
             return Ok(None);
         };
         // `WITH ... UPDATE` is a query whose body writes, and probing it would
@@ -155,6 +168,103 @@ impl Engine {
             Err(e) if refused_at_prepare(&e) => Err(e),
             Err(_) => Ok(None),
         }
+    }
+
+    /// The reason 8.3 would refuse this write at prepare, if it would.
+    ///
+    /// `None` when the statement resolves, which is not the same as saying it
+    /// will succeed: a row can still violate a key, and a bound argument can
+    /// still be the wrong type. This answers only what the *text* settles —
+    /// the table exists, and every name in it resolves against that table's
+    /// columns.
+    ///
+    /// Single-table forms only. A multi-table UPDATE or DELETE resolves
+    /// against a relation this would have to build, and building one is the
+    /// executor's job; those still prepare unresolved, which is the smaller
+    /// half of the same gap.
+    fn refuse_dml_at_prepare(
+        &self,
+        session: &Session,
+        statements: &[Statement],
+    ) -> Option<EngineError> {
+        let (name, alias, assignments, selection) = match statements {
+            [Statement::Update(update)] if update.table.joins.is_empty() => {
+                match &update.table.relation {
+                    TableFactor::Table { name, alias, .. } => (
+                        name,
+                        alias.as_ref(),
+                        update.assignments.as_slice(),
+                        update.selection.as_ref(),
+                    ),
+                    _ => return None,
+                }
+            }
+            // `DELETE FROM a USING S a JOIN T b ON ...` names its target by
+            // *alias*, and the relation it resolves against lives in the USING
+            // clause rather than in `from`. Looking `a` up as a table finds
+            // nothing and answers 1146 where 8.3 resolves the whole thing and
+            // says 1054 -- caught by the corpus, which asks exactly that
+            // statement. Multi-table forms are the executor's to resolve.
+            [Statement::Delete(delete)] if delete.using.is_some() => return None,
+            [Statement::Delete(delete)] => match delete.from.clone() {
+                sqlparser::ast::FromTable::WithFromKeyword(items)
+                | sqlparser::ast::FromTable::WithoutKeyword(items) => {
+                    let [only] = items.as_slice() else {
+                        return None;
+                    };
+                    if !only.joins.is_empty() {
+                        return None;
+                    }
+                    match &only.relation {
+                        TableFactor::Table { name, .. } => {
+                            let owned = name.clone();
+                            return self.refuse_named_table(
+                                session,
+                                &owned,
+                                None,
+                                &[],
+                                delete.selection.as_ref(),
+                            );
+                        }
+                        _ => return None,
+                    }
+                }
+            },
+            _ => return None,
+        };
+        self.refuse_named_table(session, name, alias, assignments, selection)
+    }
+
+    /// The table half of `refuse_dml_at_prepare`, shared by its two shapes.
+    fn refuse_named_table(
+        &self,
+        session: &Session,
+        name: &ObjectName,
+        alias: Option<&sqlparser::ast::TableAlias>,
+        assignments: &[Assignment],
+        selection: Option<&Expr>,
+    ) -> Option<EngineError> {
+        let (db, table_name) = self.split_name(session, name).ok()?;
+        let addressed_as = alias
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| table_name.clone());
+        let catalog = self.catalog().ok()?;
+        let database = catalog.database(&db)?;
+        let Some(table) = database.table(&table_name) else {
+            return Some(EngineError::no_such_table(&table_name));
+        };
+        let refs: Vec<ColumnRef> = table
+            .columns
+            .iter()
+            .map(|c| ColumnRef::in_database(&db, &addressed_as, &c.name))
+            .collect();
+        drop(catalog);
+        // The same two resolvers the executor runs, in the same order, so a
+        // statement wrong in both places names the same one it would at
+        // execute.
+        resolve_assigned_values(None, assignments, &refs)
+            .and_then(|()| resolve_dml_where(None, selection, &refs))
+            .err()
     }
 
     /// Re-resolves every view in a database against the schema as it now is.
@@ -12111,7 +12221,14 @@ fn refused_at_prepare(e: &EngineError) -> bool {
     // more plainly than any of them: how many arguments a call was written
     // with is fixed by the text. Measured, not assumed — `PREPARE p FROM
     // 'SELECT SIGN()'` is 1582 on 8.3.
-    matches!(e.code, 1054 | 1051 | 1210 | 1582)
+    // ER_NO_SUCH_TABLE belongs on the same argument and was missing: whether
+    // a table exists is not something a row or a bound argument can change, so
+    // `PREPARE p FROM 'SELECT * FROM NoSuch'` is 1146 on 8.3 while this engine
+    // prepared it and described zero columns. A client that prepares its
+    // statements up front — which Prisma does for every one — heard nothing
+    // until it ran them. Measured against 8.3 through COM_STMT_PREPARE, for
+    // `SELECT *`, `SELECT 1`, and a missing table inside a subquery. #0244.
+    matches!(e.code, 1054 | 1051 | 1146 | 1210 | 1582)
 }
 
 /// The first column reference in `e` that nothing in scope answers to.
