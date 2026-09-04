@@ -4564,6 +4564,7 @@ impl Engine {
                             .map(|c| ColumnRef::in_database(&db, &table.name, &c.name))
                             .collect();
 
+                        let mut assigned: Vec<usize> = Vec::with_capacity(assignments.len());
                         for (assignment, slot) in assignments.iter().zip(&duplicate_targets) {
                             let slot = *slot;
                             let column_name = table.columns[slot].name.clone();
@@ -4584,7 +4585,34 @@ impl Engine {
                                 None => expr::eval(&assignment.value, &ctx)?,
                             };
                             updated[slot] = table.columns[slot].ty.store(value, &column_name)?;
+                            assigned.push(slot);
                         }
+
+                        // An upsert that updates is an update, and MySQL moves
+                        // an `ON UPDATE CURRENT_TIMESTAMP` column for it:
+                        // measured on 8.3, `INSERT ... ON DUPLICATE KEY UPDATE
+                        // v = v + 1` over a row whose timestamp defaulted to
+                        // 2020-01-01 leaves it there here and restamps it
+                        // there. #0193, and it is the same call the two UPDATE
+                        // paths make.
+                        //
+                        // Before the comparison below and not after, which is
+                        // the half of this that is not additive. #0089
+                        // established that MySQL decides "changed" *after* the
+                        // restamp, so the two have an order; restamping
+                        // afterwards would fix the timestamp and leave the
+                        // count reading a row the statement had already
+                        // finished with. `restamp_on_update` is itself a no-op
+                        // when nothing else moved, so an upsert that changes
+                        // nothing still answers 0 — measured, and the reason
+                        // the order works out rather than a coincidence.
+                        Self::restamp_on_update(
+                            table,
+                            &before,
+                            &mut updated,
+                            &assigned,
+                            &session_snapshot,
+                        )?;
 
                         let updated = self.finalise_row(table, updated, &session_snapshot)?;
                         foreign_keys::check(&fk_parents, &updated, &table_name)?;

@@ -1746,7 +1746,23 @@ pub fn cast(value: Value, ty: &DataType, source: &str) -> EngineResult<Value> {
                     |number| number.as_text(),
                 ),
             };
-            Value::decimal(crate::types::decimal_digits(&source, scale))
+            // Held to the precision the cast declares, which is a width like
+            // the column's and was not enforced here either: measured on 8.3,
+            // `CAST(999999999.99 AS DECIMAL(10,2))` is 99999999.99 and
+            // `CAST('99999999999' AS DECIMAL(10,2))` is the same number, where
+            // this answered the digits it was given. A cast clamps under every
+            // `sql_mode` — the strict one included, which is where the two
+            // part company: the column refuses there. See #0201.
+            let digits = crate::types::decimal_digits(&source, scale);
+            // `from_ast` fills the precision in for a bare `DECIMAL`, so this
+            // is either the number the cast wrote or the 10 MySQL supplies.
+            let clamped = target
+                .length
+                .and_then(|precision| {
+                    crate::types::clamped_digits(&digits, precision, scale as u64)
+                })
+                .unwrap_or(digits);
+            Value::decimal(clamped)
         }
         D::Char(_) | D::Varchar(_) | D::Text | D::CharacterVarying(_) | D::Character(_) => {
             Value::text(value.as_text())

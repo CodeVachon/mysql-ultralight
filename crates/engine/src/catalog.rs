@@ -235,10 +235,13 @@ impl Table {
                     )
                 });
                 if same {
+                    // Through the column rather than the value alone, because
+                    // a fixed-width binary column's padding is not part of
+                    // what MySQL names here. See `SqlType::key_text`.
                     let rendered: Vec<String> = positions
                         .iter()
-                        .filter_map(|p| candidate.get(*p))
-                        .map(Value::as_text)
+                        .filter_map(|p| Some((self.columns.get(*p)?, candidate.get(*p)?)))
+                        .map(|(column, value)| column.ty.key_text(value))
                         .collect();
                     return Err(EngineError::duplicate_entry(
                         &rendered.join("-"),

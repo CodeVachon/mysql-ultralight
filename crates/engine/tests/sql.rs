@@ -27827,6 +27827,93 @@ fn an_upsert_that_changes_nothing_reports_nothing() {
     }
 }
 
+/// An upsert that updates restamps `ON UPDATE CURRENT_TIMESTAMP`.
+///
+/// `restamp_on_update` was called from the two UPDATE paths and not from the
+/// upsert branch, so an `INSERT ... ON DUPLICATE KEY UPDATE` reported two rows
+/// affected and left the timestamp where the default had put it. Measured on
+/// 8.3, which moves it. Prisma's upserts compile to this statement. #0193.
+///
+/// The order is the part that is not additive, and it is asserted here beside
+/// the timestamp rather than left to the fix: #0089 established that MySQL
+/// decides "changed" *after* the restamp, so the counts below are the same
+/// test as the timestamps above them. `restamp_on_update` is itself a no-op
+/// when nothing else moved, which is what keeps an upsert that changes nothing
+/// at zero — under both readings of the count, because which one the client is
+/// told is the capability's decision and not the statement's.
+#[test]
+fn an_upsert_that_updates_restamps_an_on_update_timestamp() {
+    let (engine, mut session) = engine();
+    for found_rows in [false, true] {
+        session.found_rows = found_rows;
+        run(
+            &engine,
+            &mut session,
+            "CREATE TABLE Rs (k INT NOT NULL, v INT NOT NULL, \
+             ts TIMESTAMP DEFAULT '2020-01-01 00:00:00' ON UPDATE CURRENT_TIMESTAMP, \
+             PRIMARY KEY (k))",
+        );
+        run(
+            &engine,
+            &mut session,
+            "INSERT INTO Rs (k, v) VALUES (1, 1), (2, 5), (3, 5)",
+        );
+
+        // The row moves, so the timestamp moves with it -- and the count is
+        // still the two an updated row reports.
+        assert_eq!(
+            affected(
+                &engine,
+                &mut session,
+                "INSERT INTO Rs (k, v) VALUES (1, 9) ON DUPLICATE KEY UPDATE v = v + 1"
+            ),
+            2,
+            "with found_rows = {found_rows}"
+        );
+
+        // Nothing moves, so nothing is restamped and the count is the one
+        // #0089 settled: zero, or one under CLIENT_FOUND_ROWS.
+        assert_eq!(
+            affected(
+                &engine,
+                &mut session,
+                "INSERT INTO Rs (k, v) VALUES (2, 9) ON DUPLICATE KEY UPDATE v = v"
+            ),
+            u64::from(found_rows),
+            "with found_rows = {found_rows}"
+        );
+
+        // A statement that assigns the timestamp itself keeps what it wrote:
+        // the restamp is for a column the statement left alone.
+        assert_eq!(
+            affected(
+                &engine,
+                &mut session,
+                "INSERT INTO Rs (k, v, ts) VALUES (3, 7, '2021-06-06 06:06:06') \
+                 ON DUPLICATE KEY UPDATE v = v + 1, ts = VALUES(ts)"
+            ),
+            2,
+            "with found_rows = {found_rows}"
+        );
+
+        assert_eq!(
+            rows(
+                &engine,
+                &mut session,
+                "SELECT k, v, ts = '2020-01-01 00:00:00', ts = '2021-06-06 06:06:06' \
+                 FROM Rs ORDER BY k"
+            ),
+            vec![
+                vec!["1", "2", "0", "0"],
+                vec!["2", "5", "1", "0"],
+                vec!["3", "6", "0", "1"],
+            ],
+            "with found_rows = {found_rows}"
+        );
+        run(&engine, &mut session, "DROP TABLE Rs");
+    }
+}
+
 /// `WITH RECURSIVE` over a CTE that does not name itself is not a recursion,
 /// and 8.3 answers it. This was the whole of what the keyword did here before
 /// #0192 — it was refused with 1235 before anything was evaluated, which is
@@ -30329,6 +30416,319 @@ fn insert_ignore_stores_what_fits_under_a_strict_mode() {
         )
         .unwrap_err();
     assert_eq!(err.code, 1406, "{err}");
+}
+
+/// A DECIMAL is held to the precision it declares, not just to its scale.
+///
+/// The scale was applied here from the start and the precision was not, so a
+/// `DECIMAL(10,2)` stored 999999999.99 — nine integer digits in a column that
+/// declares eight — where 8.3 answers 1264. The target application declares
+/// 155 DECIMAL columns. #0201.
+///
+/// The range is read off the *rescaled* value, which is the same order the
+/// two-argument FLOAT follows: 99999999.995 is inside the column until it
+/// rounds, and it is refused because it rounds to 100000000.00. Measured, as
+/// is every number below.
+#[test]
+fn a_decimal_wider_than_the_column_declares_is_refused() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Money (k INT, a DECIMAL(10,2), u DECIMAL(5,1) UNSIGNED, \
+         w DECIMAL(2,2))",
+    );
+
+    for (sql, what) in [
+        (
+            "INSERT INTO Money (a) VALUES (999999999.99)",
+            "one too many",
+        ),
+        ("INSERT INTO Money (a) VALUES (99999999.995)", "rounds over"),
+        (
+            "INSERT INTO Money (a) VALUES (-99999999.999)",
+            "and negative",
+        ),
+        ("INSERT INTO Money (u) VALUES (99999.9)", "unsigned, over"),
+        // Below zero is out of range for an UNSIGNED column however small it
+        // is, which is the sign and not the width.
+        ("INSERT INTO Money (u) VALUES (-3)", "unsigned, negative"),
+        // A `DECIMAL(2,2)` has no integer digit at all, so 1 does not fit it.
+        ("INSERT INTO Money (w) VALUES (1)", "no integer digit"),
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 1264, "{what}: {sql}\n  -> {err}");
+        assert_eq!(err.sql_state, "22003", "{what}: {sql}");
+    }
+
+    // The values themselves, so a test that only ever saw failures cannot pass
+    // by refusing everything: the widest value each column holds, and a
+    // fraction that rounds *down* to it rather than past it.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Money (k, a, u, w) VALUES (1, 99999999.99, 9999.9, 0.99), \
+         (2, 99999999.994, 0.04, -0.994)",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT a, u, w FROM Money ORDER BY k"
+        ),
+        vec![
+            vec!["99999999.99", "9999.9", "0.99"],
+            vec!["99999999.99", "0.0", "-0.99"],
+        ]
+    );
+
+    // An UPDATE is held to the same precision, over rows that exist: an UPDATE
+    // matching nothing writes nothing and would report success whatever the
+    // column's width.
+    let err = engine
+        .execute(&mut session, "UPDATE Money SET a = 999999999.99", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1264, "{err}");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a FROM Money ORDER BY k"),
+        vec![vec!["99999999.99"], vec!["99999999.99"]],
+        "the refused UPDATE left the rows alone"
+    );
+
+    // A non-strict mode clamps to the end of the range it overran rather than
+    // refusing, in both directions — and an UNSIGNED column clamps a negative
+    // to zero, which is what the integer arm beside it does.
+    run(&engine, &mut session, "SET sql_mode = ''");
+    run(&engine, &mut session, "DELETE FROM Money");
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Money (k, a, u) VALUES (1, 999999999.99, 99999.9), \
+         (2, -999999999.99, -3)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT a, u FROM Money ORDER BY k"),
+        vec![vec!["99999999.99", "9999.9"], vec!["-99999999.99", "0.0"]]
+    );
+
+    // A cast declares a precision too, and clamps under every mode — the
+    // strict one included, which is the one place the two part company.
+    run(
+        &engine,
+        &mut session,
+        "SET sql_mode = 'STRICT_TRANS_TABLES'",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CAST(999999999.99 AS DECIMAL(10,2)), CAST('99999999999' AS DECIMAL(10,2)), \
+             CAST(5 AS DECIMAL(2,2)), CAST(-5 AS DECIMAL(2,2))"
+        ),
+        vec![vec!["99999999.99", "99999999.99", "0.99", "-0.99"]]
+    );
+}
+
+/// A `BINARY(n)` holds exactly `n` bytes, padded out with NULs.
+///
+/// The padding is the type rather than a decoration, and this engine stored
+/// the value as it arrived: a `BINARY(3)` given `'a'` was one byte here and is
+/// `0x610000` on 8.3. What it costs is not the length alone — the padded bytes
+/// are what a comparison and a unique key see, so `b = 'a'` finds nothing
+/// there and a row spelled `0x610000` collides with the row spelled `'a'`.
+/// All measured. A `VARBINARY` pads not at all, which is the control. #0201.
+#[test]
+fn a_binary_column_pads_its_value_out_to_its_declared_width() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Fixed (k INT, b BINARY(3), v VARBINARY(3), UNIQUE KEY ub (b))",
+    );
+
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Fixed VALUES (1, 'a', 'a'), (2, 'abc', 'abc'), (3, '', 'ab ')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT HEX(b), LENGTH(b), HEX(v), LENGTH(v) FROM Fixed ORDER BY k"
+        ),
+        vec![
+            vec!["610000", "3", "61", "1"],
+            vec!["616263", "3", "616263", "3"],
+            // An empty value is three NULs, not nothing: the type has no
+            // shorter form. A trailing space is a byte like any other, so the
+            // VARBINARY beside it keeps its own three.
+            vec!["000000", "3", "616220", "3"],
+        ]
+    );
+
+    // The padding is what a comparison sees, so the unpadded spelling matches
+    // nothing and the padded one matches the row.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT (SELECT COUNT(*) FROM Fixed WHERE b = 'a'), \
+             (SELECT COUNT(*) FROM Fixed WHERE b = 0x610000), \
+             (SELECT COUNT(*) FROM Fixed WHERE v = 'a')"
+        ),
+        vec![vec!["0", "1", "1"]]
+    );
+
+    // And what a unique key sees. The message names the value without the
+    // padding, as MySQL's does — a NUL in it stops the `mysql` client dead.
+    let err = engine
+        .execute(
+            &mut session,
+            "INSERT INTO Fixed VALUES (4, 0x610000, 'z')",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1062, "{err}");
+    assert_eq!(err.message, "Duplicate entry 'a' for key 'ub'");
+
+    // Wider than the column is still 1406 rather than a truncation: the
+    // padding fills a value out and never cuts one down.
+    let err = engine
+        .execute(
+            &mut session,
+            "INSERT INTO Fixed (k, b) VALUES (5, 'abcd')",
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(err.code, 1406, "{err}");
+
+    // A column with no value at all is padded too, through both the default
+    // the DDL wrote and the implicit one an IGNORE falls back to.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Filled (k INT, d BINARY(3) DEFAULT 'z', n BINARY(3) NOT NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT IGNORE INTO Filled (k) VALUES (1)",
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT HEX(d), HEX(n) FROM Filled"),
+        vec![vec!["7A0000", "000000"]]
+    );
+}
+
+/// Only a document and something MySQL reads as text may be stored in a JSON
+/// column.
+///
+/// A number is not JSON text however it is spelled, and 8.3 refuses one with
+/// 3140 rather than reading its digits as a document. This engine parsed the
+/// rendering and stored the number, so a JSON column held a value MySQL would
+/// not have taken — and the target application declares 54 of them. #0211.
+///
+/// Not a strictness: measured under an empty `sql_mode` and under `INSERT
+/// IGNORE`, both of which still refuse.
+#[test]
+fn a_non_json_value_is_refused_by_a_json_column() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Doc (k INT, doc JSON, e ENUM('1','x'), y YEAR, bl BLOB)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Doc (k, e, y, bl) VALUES (1, '1', 2020, '{\"a\": 1}')",
+    );
+
+    for (sql, what) in [
+        ("INSERT INTO Doc (doc) VALUES (2.5)", "a decimal"),
+        ("INSERT INTO Doc (doc) VALUES (7)", "an integer"),
+        ("INSERT INTO Doc (doc) VALUES (2.5e0)", "a double"),
+        ("INSERT INTO Doc (doc) VALUES (TRUE)", "a boolean"),
+        ("INSERT INTO Doc (doc) VALUES (1/2)", "a quotient"),
+        (
+            "INSERT INTO Doc (doc) SELECT y FROM Doc WHERE k = 1",
+            "a YEAR",
+        ),
+        ("UPDATE Doc SET doc = 3.5", "through an UPDATE"),
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 3140, "{what}: {sql}\n  -> {err}");
+        assert_eq!(err.sql_state, "22032", "{what}: {sql}");
+        assert!(
+            err.message.contains("not a JSON text, may need CAST"),
+            "{what}: {err}"
+        );
+    }
+
+    // A binary string has its own code, because MySQL refuses it for the
+    // character set rather than for the contents: the BLOB below spells a
+    // perfectly good document and is still 3144.
+    for sql in [
+        "INSERT INTO Doc (doc) SELECT bl FROM Doc WHERE k = 1",
+        "INSERT INTO Doc (doc) VALUES (x'7B7D')",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 3144, "{sql}\n  -> {err}");
+        assert_eq!(
+            err.message,
+            "Cannot create a JSON value from a string with CHARACTER SET 'binary'."
+        );
+    }
+
+    // Text that is not a document is refused too, and with the same code the
+    // engine has always raised for it.
+    let err = engine
+        .execute(&mut session, "INSERT INTO Doc (doc) VALUES ('hello')", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 3140, "{err}");
+
+    // What is taken, which is the control that stops this passing by refusing
+    // everything: a document, JSON text, a cast, an ENUM member and NULL. The
+    // ENUM is measured -- '1' into a JSON column is the document 1 on 8.3 --
+    // and CAST is the spelling MySQL's own message recommends.
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Doc (k, doc) VALUES (2, '\"hello\"'), (3, '2.5'), \
+         (4, CAST(2.5 AS JSON)), (5, JSON_OBJECT('a', 1)), (6, NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO Doc (k, doc) SELECT 7, e FROM Doc WHERE k = 1",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT k, doc FROM Doc WHERE k > 1 ORDER BY k"
+        ),
+        vec![
+            vec!["2", "\"hello\""],
+            vec!["3", "2.5"],
+            vec!["4", "2.5"],
+            vec!["5", "{\"a\": 1}"],
+            vec!["6", "NULL"],
+            vec!["7", "1"],
+        ]
+    );
+
+    // Neither a loose mode nor IGNORE downgrades it, which is what makes this
+    // different from every other value a column will not hold.
+    run(&engine, &mut session, "SET sql_mode = ''");
+    for sql in [
+        "INSERT INTO Doc (doc) VALUES (2.5)",
+        "INSERT IGNORE INTO Doc (doc) VALUES (2.5)",
+    ] {
+        let err = engine.execute(&mut session, sql, &[]).unwrap_err();
+        assert_eq!(err.code, 3140, "{sql}\n  -> {err}");
+    }
 }
 
 /// A default the column cannot hold is refused by the DDL that declares it.

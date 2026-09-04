@@ -5981,6 +5981,13 @@ pub const GROUPS: &[Group] = &[
             "INSERT INTO Rt (id, x) VALUES (1, 5)",
             "CREATE TABLE Rd (k INT NOT NULL, v INT NOT NULL, PRIMARY KEY (k))",
             "INSERT INTO Rd VALUES (1, 1)",
+            // #0193's shape: an upsert over a row with an ON UPDATE column,
+            // and the same fixed default `Rt` uses so the case asks whether
+            // the timestamp moved rather than comparing two clocks.
+            "CREATE TABLE Ru (k INT NOT NULL, v INT NOT NULL, \
+             ts TIMESTAMP NOT NULL DEFAULT '2020-01-01 00:00:00' ON UPDATE CURRENT_TIMESTAMP, \
+             PRIMARY KEY (k))",
+            "INSERT INTO Ru (k, v) VALUES (1, 1), (2, 5), (3, 5)",
             "CREATE TABLE Rn (probe INT NOT NULL, n BIGINT NOT NULL, PRIMARY KEY (probe))",
         ],
         cases: &[
@@ -6038,6 +6045,31 @@ pub const GROUPS: &[Group] = &[
             same("INSERT IGNORE INTO Rn (probe, n) VALUES (11, ROW_COUNT())"),
             same("INSERT INTO Rd VALUES (1, 9) ON DUPLICATE KEY UPDATE v = v + 1"),
             same("INSERT IGNORE INTO Rn (probe, n) VALUES (12, ROW_COUNT())"),
+            // An upsert that updates is an update, so MySQL moves an
+            // `ON UPDATE CURRENT_TIMESTAMP` column for it. This engine left it
+            // at the default until #0193, and the case could not be written
+            // before then: a baseline that is empty has nowhere to hold a
+            // divergence somebody already knows about.
+            same("INSERT INTO Ru (k, v) VALUES (1, 9) ON DUPLICATE KEY UPDATE v = v + 1"),
+            same("INSERT IGNORE INTO Rn (probe, n) VALUES (13, ROW_COUNT())"),
+            // The row that changes nothing keeps its default and reports
+            // nothing, which is the half an unconditional restamp would break
+            // — #0089 decides "changed" after the restamp, so the two are one
+            // question.
+            same("INSERT INTO Ru (k, v) VALUES (2, 9) ON DUPLICATE KEY UPDATE v = v"),
+            same("INSERT IGNORE INTO Rn (probe, n) VALUES (14, ROW_COUNT())"),
+            // A statement that assigns the column itself keeps what it wrote
+            // rather than the clock.
+            same(
+                "INSERT INTO Ru (k, v, ts) VALUES (3, 7, '2021-06-06 06:06:06') \
+                 ON DUPLICATE KEY UPDATE v = v + 1, ts = VALUES(ts)",
+            ),
+            same("INSERT IGNORE INTO Rn (probe, n) VALUES (15, ROW_COUNT())"),
+            // As comparisons, for the reason `Rt` above is read that way.
+            same(
+                "SELECT k, v, ts = '2020-01-01 00:00:00' AS ts_still_the_default, \
+                 ts = '2021-06-06 06:06:06' AS ts_as_written FROM Ru ORDER BY k",
+            ),
             // The counts themselves, and the rows they were counting.
             same("SELECT probe, n FROM Rn ORDER BY probe"),
             same("SELECT id, x, s, z FROM Ra ORDER BY id"),
@@ -7022,6 +7054,17 @@ pub const GROUPS: &[Group] = &[
             "INSERT INTO Upd VALUES (1, 'abc', 1), (2, 'xyz', 2)",
             "CREATE TABLE Gen (k INT NOT NULL, s VARCHAR(3) NULL, \
              g VARCHAR(2) AS (CONCAT(s, '!')) STORED)",
+            // A DECIMAL's precision is a declared width like any other, and
+            // was the one #0194 left out. #0201.
+            "CREATE TABLE DecW (k INT NOT NULL, a DECIMAL(10,2) NULL, \
+             u DECIMAL(5,1) UNSIGNED NULL, w DECIMAL(2,2) NULL, PRIMARY KEY (k))",
+            // A `BINARY(n)` is always exactly n bytes. The unique key is here
+            // because the padding is what one sees, not decoration on the way
+            // out: a row spelled `0x610000` collides with a row spelled 'a'.
+            "CREATE TABLE Bin (k INT NOT NULL, b BINARY(3) NULL, v VARBINARY(3) NULL, \
+             PRIMARY KEY (k), UNIQUE KEY ub (b))",
+            "CREATE TABLE BinDef (k INT NOT NULL, d BINARY(3) NULL DEFAULT 'z', \
+             n BINARY(3) NOT NULL, PRIMARY KEY (k))",
         ],
         cases: &[
             // A string wider than the column is refused, and the width counts
@@ -7095,6 +7138,110 @@ pub const GROUPS: &[Group] = &[
             same("INSERT INTO Gen (k, s) VALUES (1, 'ab')"),
             same("INSERT INTO Gen (k, s) VALUES (2, 'a')"),
             same("SELECT k, s, g FROM Gen ORDER BY k"),
+            // A DECIMAL is held to its precision and not only to its scale:
+            // a `DECIMAL(10,2)` has room for eight digits before the point.
+            same("INSERT INTO DecW (k, a) VALUES (1, 999999999.99)"),
+            // The range is read off the *rescaled* value, so a number inside
+            // the column until it rounds is out of range because it rounds.
+            same("INSERT INTO DecW (k, a) VALUES (2, 99999999.995)"),
+            same("INSERT INTO DecW (k, a) VALUES (3, -99999999.999)"),
+            same("INSERT INTO DecW (k, u) VALUES (4, 99999.9)"),
+            // Below zero is out of range for an UNSIGNED column whatever its
+            // width, which is the sign rather than the precision.
+            same("INSERT INTO DecW (k, u) VALUES (5, -3)"),
+            // A `DECIMAL(2,2)` has no integer digit at all, so 1 does not fit.
+            same("INSERT INTO DecW (k, w) VALUES (6, 1)"),
+            // The widest value each column holds, and a fraction that rounds
+            // down to it rather than past it — the control that stops this
+            // group passing by refusing everything.
+            same("INSERT INTO DecW (k, a, u, w) VALUES (7, 99999999.99, 9999.9, 0.99)"),
+            same("INSERT INTO DecW (k, a, u, w) VALUES (8, 99999999.994, 0.04, -0.994)"),
+            same("UPDATE DecW SET a = 999999999.99 WHERE k = 7"),
+            same("SELECT k, a, u, w FROM DecW ORDER BY k"),
+            // A cast declares a precision too, and clamps where the column
+            // under this mode refuses.
+            same(
+                "SELECT CAST(999999999.99 AS DECIMAL(10,2)) AS c1, \
+                 CAST('99999999999' AS DECIMAL(10,2)) AS c2, \
+                 CAST(5 AS DECIMAL(2,2)) AS c3, CAST(-5 AS DECIMAL(2,2)) AS c4",
+            ),
+            // A `BINARY(n)` pads a short value out with NULs and keeps them,
+            // where the `VARBINARY(n)` beside it pads not at all.
+            same("INSERT INTO Bin VALUES (1, 'a', 'a')"),
+            same("INSERT INTO Bin VALUES (2, 'abc', 'abc')"),
+            // An empty value is n NULs, not nothing: the type has no shorter
+            // form. A trailing space is a byte like any other.
+            same("INSERT INTO Bin VALUES (3, '', 'ab ')"),
+            // Wider is still 1406: the padding fills a value out and never
+            // cuts one down.
+            same("INSERT INTO Bin VALUES (4, 'abcd', 'x')"),
+            // The padded bytes are what the unique key sees.
+            same("INSERT INTO Bin VALUES (5, 0x610000, 'z')"),
+            same("SELECT k, HEX(b), LENGTH(b), HEX(v), LENGTH(v) FROM Bin ORDER BY k"),
+            // And what a comparison sees, so the unpadded spelling matches
+            // nothing where the padded one matches the row.
+            same(
+                "SELECT (SELECT COUNT(*) FROM Bin WHERE b = 'a') AS unpadded, \
+                 (SELECT COUNT(*) FROM Bin WHERE b = 0x610000) AS padded, \
+                 (SELECT COUNT(*) FROM Bin WHERE v = 'a') AS not_padded",
+            ),
+            // A column given no value at all is padded too, through the
+            // default the DDL wrote and through the implicit one IGNORE falls
+            // back to for a NOT NULL column.
+            same("INSERT IGNORE INTO BinDef (k) VALUES (1)"),
+            same("SELECT k, HEX(d), HEX(n) FROM BinDef ORDER BY k"),
+        ],
+    },
+    Group {
+        // What may be assigned to a JSON column at all. #0211: this engine
+        // read a number's rendering as a document and stored it, so a JSON
+        // column held values MySQL refuses — and the target application
+        // declares 54 of them.
+        //
+        // Every case is asked as a write and then read back, because a
+        // statement that stores the wrong document and one that stores none
+        // report the same count.
+        name: "a JSON column takes only a document",
+        setup: &[
+            "CREATE TABLE Jd (k INT NOT NULL, doc JSON NULL, e ENUM('1','x') NULL, \
+             y YEAR NULL, bl BLOB NULL, dt DATETIME NULL, PRIMARY KEY (k))",
+            "INSERT INTO Jd (k, e, y, bl, dt) VALUES \
+             (1, '1', 2020, '{\"a\": 1}', '2020-01-02 03:04:05')",
+        ],
+        cases: &[
+            // A number is not JSON text however it is spelled, and the code
+            // says so: 3140, with a message recommending a CAST.
+            same("INSERT INTO Jd (k, doc) VALUES (2, 2.5)"),
+            same("INSERT INTO Jd (k, doc) VALUES (3, 7)"),
+            same("INSERT INTO Jd (k, doc) VALUES (4, 2.5e0)"),
+            same("INSERT INTO Jd (k, doc) VALUES (5, TRUE)"),
+            same("INSERT INTO Jd (k, doc) VALUES (6, 1/2)"),
+            // A YEAR is a number too, where the ENUM further down is text.
+            same("INSERT INTO Jd (k, doc) SELECT 7, y FROM Jd WHERE k = 1"),
+            // A binary string has its own code, and for the character set
+            // rather than the contents: the BLOB below spells a good document
+            // and is refused anyway.
+            same("INSERT INTO Jd (k, doc) SELECT 8, bl FROM Jd WHERE k = 1"),
+            same("INSERT INTO Jd (k, doc) VALUES (9, x'7B7D')"),
+            // Text is handed to the parser, so it is refused for what it
+            // spells rather than for what it is — a bare word at the first
+            // character, a DATETIME at the first hyphen.
+            same("INSERT INTO Jd (k, doc) VALUES (10, 'hello')"),
+            same("INSERT INTO Jd (k, doc) SELECT 11, dt FROM Jd WHERE k = 1"),
+            // What is taken: JSON text, a cast, a constructor, NULL, and an
+            // ENUM member, which is text and reaches the parser like any.
+            same("INSERT INTO Jd (k, doc) VALUES (12, '\"hello\"')"),
+            same("INSERT INTO Jd (k, doc) VALUES (13, '2.5')"),
+            same("INSERT INTO Jd (k, doc) VALUES (14, CAST(2.5 AS JSON))"),
+            same("INSERT INTO Jd (k, doc) VALUES (15, JSON_OBJECT('a', 1))"),
+            same("INSERT INTO Jd (k, doc) VALUES (16, NULL)"),
+            same("INSERT INTO Jd (k, doc) SELECT 17, e FROM Jd WHERE k = 1"),
+            // The UPDATE path is held to it too.
+            same("UPDATE Jd SET doc = 3.5 WHERE k = 12"),
+            // And IGNORE does not downgrade it, which is what makes this
+            // unlike every other value a column will not hold.
+            same("INSERT IGNORE INTO Jd (k, doc) VALUES (18, 2.5)"),
+            same("SELECT k, doc FROM Jd ORDER BY k"),
         ],
     },
     Group {
@@ -7111,6 +7258,11 @@ pub const GROUPS: &[Group] = &[
             "CREATE TABLE Loose (k INT NOT NULL, v VARCHAR(3) NULL, b VARBINARY(3) NULL, \
              t TINYINT NULL, u INT UNSIGNED NULL)",
             "INSERT INTO Loose VALUES (1, 'ab', 'ab', 1, 1)",
+            "CREATE TABLE LooseDec (k INT NOT NULL, a DECIMAL(10,2) NULL, \
+             u DECIMAL(5,1) UNSIGNED NULL, PRIMARY KEY (k))",
+            // A JSON column is here to show what the mode does *not* reach:
+            // an invalid document is refused under every mode there is.
+            "CREATE TABLE LooseJson (k INT NOT NULL, doc JSON NULL, PRIMARY KEY (k))",
         ],
         cases: &[
             same("INSERT INTO Loose (k, v) VALUES (2, 'abcdef')"),
@@ -7127,6 +7279,18 @@ pub const GROUPS: &[Group] = &[
                 "SELECT k, CONCAT('[', v, ']'), HEX(b), t, u, CHAR_LENGTH(v), LENGTH(v) \
                  FROM Loose ORDER BY k",
             ),
+            // A DECIMAL clamps to the largest value its precision can spell,
+            // in both directions, and an UNSIGNED one clamps a negative to
+            // zero — the same rule the integer arm above follows. #0201.
+            same("INSERT INTO LooseDec (k, a) VALUES (1, 999999999.99)"),
+            same("INSERT INTO LooseDec (k, a) VALUES (2, -999999999.99)"),
+            same("INSERT INTO LooseDec (k, u) VALUES (3, 99999.9)"),
+            same("INSERT INTO LooseDec (k, u) VALUES (4, -3)"),
+            same("SELECT k, a, u FROM LooseDec ORDER BY k"),
+            // And the exception: a number is not JSON text under any mode, so
+            // dropping STRICT changes nothing about it. #0211.
+            same("INSERT INTO LooseJson (k, doc) VALUES (1, 2.5)"),
+            same("SELECT k, doc FROM LooseJson ORDER BY k"),
         ],
     },
     Group {

@@ -701,7 +701,17 @@ impl SqlType {
             // `b & 1` gave 0 for that row and 1235 for a normally inserted
             // one, because the bitwise operators refuse a binary operand and
             // this default was not one.
-            TypeKind::Blob => Value::Bytes(Vec::new()),
+            //
+            // Empty for everything but a `BINARY(n)`, which has no empty value
+            // to hold: it is always exactly `n` bytes, so its implicit default
+            // is `n` NULs. Measured on 8.3 — an `INSERT IGNORE` leaving a
+            // `BINARY(3) NOT NULL` out stores `0x000000` there, where this
+            // stored nothing and the column came back one byte short of its
+            // own declaration.
+            TypeKind::Blob => Value::Bytes(match self.capacity() {
+                Some(Capacity::Filled(width)) => vec![0; width as usize],
+                _ => Vec::new(),
+            }),
             TypeKind::Text | TypeKind::Set => Value::text(""),
         }
     }
@@ -783,9 +793,23 @@ impl SqlType {
                 "mediumblob" => Capacity::Bytes(16_777_215),
                 "longblob" => Capacity::Bytes(4_294_967_295),
                 // A bare `BINARY` is `BINARY(1)` and carries its length from
-                // `from_ast`; a `VARBINARY` with none is the same non-type as
-                // the `VARCHAR` above, and gets the same answer.
+                // `from_ast`. It is its own variant for the reason `CHAR` is:
+                // the padding is part of the type rather than of the width.
+                "binary" => Capacity::Filled(self.length.unwrap_or(1)),
+                // A `VARBINARY` with no length is the same non-type as the
+                // `VARCHAR` above, and gets the same answer.
                 _ => Capacity::Bytes(self.length?),
+            }),
+            // A DECIMAL's precision is a declared width like any other, and
+            // the digits before the point are what it limits: a
+            // `DECIMAL(10,2)` holds eight of them, so 99999999.99 is stored
+            // and 999999999.99 is 1264. Only a declaration carries one —
+            // `from_column_type` builds a bare `decimal` with no precision at
+            // all, and holding a computed value to a width nobody wrote is the
+            // mistake this whole function exists to avoid.
+            TypeKind::Decimal => Some(Capacity::Digits {
+                precision: self.length?,
+                scale: self.scale.unwrap_or(0),
             }),
             _ => None,
         }
@@ -812,9 +836,32 @@ impl SqlType {
                 self.collation,
             )),
             Value::Bytes(bytes) => Ok(Value::Bytes(fitted_bytes(bytes, capacity, column)?)),
+            Value::Decimal(digits, _) => {
+                Ok(Value::decimal(fitted_digits(digits, capacity, column)?))
+            }
             // NULL, and nothing else `coerce` answers for a column that
             // declares a width.
             other => Ok(other),
+        }
+    }
+
+    /// A stored value as an error message names it.
+    ///
+    /// A `BINARY(n)`'s padding is the type's and not the value's, and MySQL
+    /// leaves it out: measured on 8.3, a duplicate key over a `BINARY(3)`
+    /// holding `'a'` is `Duplicate entry 'a' for key ...`, while the same
+    /// three bytes written into a `VARBINARY(3)` are `'a\x00\x00'`. Which is
+    /// what makes this the column's question rather than the value's.
+    ///
+    /// It matters more than the wording: a message carrying a NUL is read as a
+    /// C string by the `mysql` client, which stopped at the first one and
+    /// printed `Duplicate entry 'a` with no key name after it.
+    pub(crate) fn key_text(&self, value: &Value) -> String {
+        match (value, self.capacity()) {
+            (Value::Bytes(bytes), Some(Capacity::Filled(_))) => {
+                String::from_utf8_lossy(trimmed_padding(bytes)).into_owned()
+            }
+            _ => value.as_text(),
         }
     }
 
@@ -835,21 +882,6 @@ impl SqlType {
             )
         };
 
-        // The row is a running count of what the statement has written, for
-        // the same reason `too_long` carries one: 8.3 names row 2 when the
-        // second row of a three-row INSERT is the one out of range, and this
-        // said row 1 for every row of every statement.
-        let out_of_range = || {
-            EngineError::new(
-                1264,
-                "22003",
-                format!(
-                    "Out of range value for column '{column}' at row {}",
-                    WRITE.with(|w| w.get().row)
-                ),
-            )
-        };
-
         Ok(match self.kind {
             TypeKind::Bool | TypeKind::Int => {
                 // Rounded, not truncated. A `VALUES (1.5)` into an INT is 2 on
@@ -865,7 +897,7 @@ impl SqlType {
                 let under = n < low || (self.unsigned && negative_decimal(&value));
                 if under || n > high {
                     if !lenient() {
-                        return Err(out_of_range());
+                        return Err(out_of_range(column));
                     }
                     // Non-strict clamps to the end of the range it overran and
                     // carries a warning: 300 into a TINYINT is 127 there, -300
@@ -881,14 +913,14 @@ impl SqlType {
             TypeKind::Year => {
                 let n = value.as_int().ok_or_else(mismatch)?;
                 if n != 0 && !(1901..=2155).contains(&n) {
-                    return Err(out_of_range());
+                    return Err(out_of_range(column));
                 }
                 Value::Int(n)
             }
             TypeKind::Float => {
                 let n = value.as_float().ok_or_else(mismatch)?;
                 if self.unsigned && n < 0.0 {
-                    return Err(out_of_range());
+                    return Err(out_of_range(column));
                 }
                 // The two-argument form is not a display rule. MySQL *stores*
                 // a `FLOAT(M,D)` or `DOUBLE(M,D)` rounded to D places, which
@@ -910,7 +942,7 @@ impl SqlType {
                         // 1264 because it *rounds* to 10000.00, while 9999.994
                         // is taken. So the check follows the rounding.
                         if !fits_digits(rounded, self.length, scale) {
-                            return Err(out_of_range());
+                            return Err(out_of_range(column));
                         }
                         rounded
                     }
@@ -927,7 +959,7 @@ impl SqlType {
                     // not a number any client reads back. MySQL refuses the
                     // statement, which is the only answer that stays true.
                     if narrowed.is_infinite() && n.is_finite() {
-                        return Err(out_of_range());
+                        return Err(out_of_range(column));
                     }
                     Value::Float32(narrowed)
                 } else {
@@ -960,7 +992,17 @@ impl SqlType {
                     Some(digits) if digits.chars().all(|c| c == '0' || c == '.') => {
                         digits.to_owned()
                     }
-                    Some(_) if self.unsigned => return Err(out_of_range()),
+                    // Below zero and no room for a sign. Non-strict clamps to
+                    // the end of the range it overran, exactly as the integer
+                    // arm above does and measured the same way: -3 into a
+                    // `DECIMAL(5,1) UNSIGNED` is 0.0 on 8.3 without
+                    // STRICT_TRANS_TABLES and 1264 with it.
+                    Some(_) if self.unsigned => {
+                        if !lenient() {
+                            return Err(out_of_range(column));
+                        }
+                        "0".to_owned()
+                    }
                     _ => text,
                 };
                 // At the column's own scale, which is what a DECIMAL *is*:
@@ -1078,6 +1120,52 @@ impl SqlType {
             // way in, and so does this: a column that accepted `{"a":1` would
             // fail every later read of it instead, far from the cause.
             TypeKind::Json => {
+                // Only a document and something MySQL reads as *text* may be
+                // assigned to a JSON column at all. A number is not JSON text
+                // however it is spelled, and 8.3 refuses one rather than
+                // reading its digits as a document: a DECIMAL, an INT, a
+                // DOUBLE, a YEAR and a boolean are all 3140 there, where this
+                // engine stored the number and left the column holding a
+                // document MySQL would not have taken. `CAST(2.5 AS JSON)` is
+                // the accepted spelling, and it arrives here already a
+                // document. See #0211.
+                //
+                // Not a strictness: measured under an empty `sql_mode` and
+                // under `INSERT IGNORE`, both of which still refuse, so this
+                // is deliberately outside `lenient()`.
+                //
+                // Text is anything MySQL would hand to its parser, which
+                // includes the two tagged kinds that carry characters: an ENUM
+                // member — `'1'` into a JSON column is the document 1 on 8.3 —
+                // and a temporal, which is refused for what its *text* spells
+                // rather than for being one, `'2020-01-02'` answering "the
+                // document root must not be followed by other values" at the
+                // hyphen. Both measured.
+                match &value {
+                    Value::Json(_) | Value::Text(..) | Value::Enum { .. } | Value::Temporal(_) => {}
+                    // A binary string has its own code, because MySQL refuses
+                    // it for the character set rather than for the contents:
+                    // a BLOB, a `BINARY` column and the literal `x'7B7D'` are
+                    // all 3144 there, `{}` and all.
+                    Value::Bytes(_) => {
+                        return Err(EngineError::new(
+                            3144,
+                            "22032",
+                            "Cannot create a JSON value from a string with \
+                             CHARACTER SET 'binary'.",
+                        ))
+                    }
+                    _ => {
+                        return Err(EngineError::new(
+                            3140,
+                            "22032",
+                            format!(
+                                "Invalid JSON text: \"not a JSON text, may need CAST\" \
+                                 in column '{column}'"
+                            ),
+                        ))
+                    }
+                }
                 // Through `document_of`, so a document written by a
                 // constructor keeps its numbers as they were built and only
                 // *text* is re-read the way MySQL's parser reads it. Storing
@@ -1087,7 +1175,9 @@ impl SqlType {
                 //
                 // Serde's own message, because "invalid" without a position is
                 // no help against a document of any size — and the sibling
-                // 3141 raised by `json::parse` already says where.
+                // 3141 raised by `json::parse` already says where. 8.3 spells
+                // this one `... at position 4 in value for column 'T.doc'.`,
+                // which names a table `store` is not given.
                 let parsed = crate::json::document_of(&value).map_err(|e| {
                     EngineError::new(
                         3140,
@@ -1142,7 +1232,7 @@ impl SqlType {
     }
 }
 
-/// The most a string column can hold, and in which unit it counts.
+/// The most a column can hold, and in which unit it counts.
 #[derive(Debug, Clone, Copy)]
 enum Capacity {
     /// A `VARCHAR(n)`, which counts characters.
@@ -1152,6 +1242,13 @@ enum Capacity {
     Padded(u64),
     /// A TEXT, a BLOB or a `VARBINARY(n)`, which count bytes.
     Bytes(u64),
+    /// A `BINARY(n)`, which counts bytes and is always exactly `n` of them:
+    /// MySQL pads a short value out with NULs and keeps them, where the CHAR
+    /// it is spelled after strips its padding again on the way out.
+    Filled(u64),
+    /// A `DECIMAL(M,D)`, which counts digits — `M - D` of them before the
+    /// point, whatever the sign.
+    Digits { precision: u64, scale: u64 },
 }
 
 /// 1406, which MySQL raises for a value wider than the column declares.
@@ -1166,6 +1263,32 @@ fn too_long(column: &str) -> EngineError {
         "22001",
         format!(
             "Data too long for column '{column}' at row {}",
+            WRITE.with(|w| w.get().row)
+        ),
+    )
+}
+
+/// `bytes` without the NULs a fixed-width binary column padded them out with.
+fn trimmed_padding(bytes: &[u8]) -> &[u8] {
+    let end = bytes
+        .iter()
+        .rposition(|b| *b != 0)
+        .map_or(0, |last| last + 1);
+    &bytes[..end]
+}
+
+/// 1264, which MySQL raises for a value outside the range the column declares.
+///
+/// The row is a running count of what the statement has written, for the same
+/// reason `too_long` carries one: 8.3 names row 2 when the second row of a
+/// three-row INSERT is the one out of range, and this said row 1 for every row
+/// of every statement.
+fn out_of_range(column: &str) -> EngineError {
+    EngineError::new(
+        1264,
+        "22003",
+        format!(
+            "Out of range value for column '{column}' at row {}",
             WRITE.with(|w| w.get().row)
         ),
     )
@@ -1209,6 +1332,10 @@ fn fitted_text(mut text: String, capacity: Capacity, column: &str) -> EngineResu
             }
             limit
         }
+        // Neither reaches this: `coerce` hands a binary column's value back
+        // as bytes and a DECIMAL's as a tagged decimal, so the two widths
+        // that count bytes and digits are answered by the functions below.
+        Capacity::Filled(_) | Capacity::Digits { .. } => return Ok(text),
     };
     // Everything past the width is a space, so nothing the column would
     // have held is being dropped.
@@ -1219,25 +1346,106 @@ fn fitted_text(mut text: String, capacity: Capacity, column: &str) -> EngineResu
     Err(too_long(column))
 }
 
-/// `bytes`, cut to what the column declares.
+/// `bytes`, cut to what the column declares — and padded out to it where the
+/// column is a fixed width.
 ///
 /// No space exemption and no character boundary to respect: a binary
 /// column holds bytes, and `VARBINARY(3)` given `'abc '` is 1406 on 8.3
 /// where a `VARCHAR(3)` given the same value is taken.
+///
+/// A `BINARY(n)` is always exactly `n` bytes, which is the half of the type
+/// this engine did not have: 8.3 stores `'a'` in a `BINARY(3)` as `0x610000`
+/// and `''` as `0x000000`, and the padding is *kept* rather than stripped on
+/// the way out the way a CHAR's spaces are. It is not cosmetic — the padded
+/// bytes are what a comparison and a unique key see, so `b = 'a'` finds
+/// nothing there and a second row spelled `0x610000` is 1062. All measured;
+/// a `VARBINARY` pads not at all. See #0201.
 fn fitted_bytes(mut bytes: Vec<u8>, capacity: Capacity, column: &str) -> EngineResult<Vec<u8>> {
-    // Always the byte arm — `capacity` counts characters only for a CHAR
-    // or a VARCHAR, and `coerce` never hands one of those back as bytes.
-    let Capacity::Bytes(limit) = capacity else {
-        return Ok(bytes);
+    // Always a byte arm — `capacity` counts characters only for a CHAR or a
+    // VARCHAR and digits only for a DECIMAL, and `coerce` never hands one of
+    // those back as bytes.
+    let (limit, fixed) = match capacity {
+        Capacity::Bytes(limit) => (limit, false),
+        Capacity::Filled(limit) => (limit, true),
+        Capacity::Chars(_) | Capacity::Padded(_) | Capacity::Digits { .. } => return Ok(bytes),
     };
-    if bytes.len() as u64 <= limit {
-        return Ok(bytes);
+    if bytes.len() as u64 > limit {
+        if !lenient() {
+            return Err(too_long(column));
+        }
+        bytes.truncate(limit as usize);
     }
-    if !lenient() {
-        return Err(too_long(column));
+    if fixed {
+        bytes.resize(limit as usize, 0);
     }
-    bytes.truncate(limit as usize);
     Ok(bytes)
+}
+
+/// `digits`, held to the precision the column declares.
+///
+/// The digits are already at the column's scale — `coerce` rescales before
+/// this sees them, and it is the rescaled value the range is read off, so
+/// 99999999.995 into a `DECIMAL(10,2)` is out of range because it *rounds* to
+/// 100000000.00. The same rule the two-argument FLOAT follows, measured the
+/// same way.
+///
+/// Out of range is 1264 under a strict mode and the largest value the column
+/// can spell otherwise, which is what MySQL clamps to: 999999999.99 into a
+/// `DECIMAL(10,2)` is 99999999.99 there with a warning, and -999999999.99 is
+/// -99999999.99. See #0201.
+fn fitted_digits(digits: String, capacity: Capacity, column: &str) -> EngineResult<String> {
+    let Capacity::Digits { precision, scale } = capacity else {
+        return Ok(digits);
+    };
+    match clamped_digits(&digits, precision, scale) {
+        None => Ok(digits),
+        Some(_) if !lenient() => Err(out_of_range(column)),
+        Some(clamped) => Ok(clamped),
+    }
+}
+
+/// The largest value `precision` can spell, when `digits` do not fit it.
+///
+/// `None` where they do, so the caller keeps the value it already had. What an
+/// overrun *means* is the caller's: a column refuses it under a strict mode
+/// and a cast never does.
+///
+/// Shared so the cast and the column agree on where the edge is, the same
+/// argument [`decimal_digits`] makes for the rescaling: `CAST(999999999.99 AS
+/// DECIMAL(10,2))` is 99999999.99 on 8.3, which is the same number a
+/// `DECIMAL(10,2)` column clamps a write to without STRICT_TRANS_TABLES.
+pub(crate) fn clamped_digits(digits: &str, precision: u64, scale: u64) -> Option<String> {
+    // Unreachable from a column, since `check_declaration_limits` answers 1427
+    // for `M < D` before a value can be stored in one, and from a cast, which
+    // `check_cast_precision` holds to the same rule. Kept so this stays total
+    // rather than relying on either from a distance.
+    let integral = precision.checked_sub(scale)?;
+    let negative = digits.starts_with('-');
+    let whole = digits.trim_start_matches('-');
+    let whole = whole.split('.').next().unwrap_or(whole);
+    // Leading zeros are spelling and not magnitude: a value below one is
+    // written `0.50`, and that zero is not a digit the precision has to make
+    // room for.
+    if whole.trim_start_matches('0').len() as u64 <= integral {
+        return None;
+    }
+    // All nines at the column's own shape. A `DECIMAL(2,2)` has no integer
+    // digit at all and still spells its maximum `0.99`, so the whole part is
+    // never empty.
+    let mut clamped = String::new();
+    if negative {
+        clamped.push('-');
+    }
+    if integral == 0 {
+        clamped.push('0');
+    } else {
+        clamped.push_str(&"9".repeat(integral as usize));
+    }
+    if scale > 0 {
+        clamped.push('.');
+        clamped.push_str(&"9".repeat(scale as usize));
+    }
+    Some(clamped)
 }
 
 /// The integer a value is stored as, rounded the way MySQL rounds it.
