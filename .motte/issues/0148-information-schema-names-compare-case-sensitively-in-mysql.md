@@ -1,11 +1,11 @@
 ---
 id: 148
 title: information_schema names compare case-sensitively in MySQL
-state: In Progress
+state: Done
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-09-01T06:09:08Z
-updated: 2026-09-04T00:23:07Z
+updated: 2026-09-04T02:47:23Z
 ---
 
 ## Description
@@ -28,3 +28,11 @@ The corpus tables added in #0137/#0138 are deliberately lower-case so this does 
 ### 2026-09-03T14:04:20Z — Christopher Vachon (user)
 
 VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed. ORDER BY TABLE_NAME puts Bee before apple on 8.3 and after it here; WHERE TABLE_NAME='bee' matches nothing there and matches Bee here.
+
+### 2026-09-04T02:47:22Z — Christopher Vachon (user)
+
+Landed in a67339c, gate green, differential 4612/0. NOT ONE RULE: information_schema's columns carry THREE collations on 8.3 -- utf8mb3_bin for schema/table/type names, utf8mb3_tolower_ci for column/index/constraint names, utf8mb3_general_ci for the rest. So = 'bee' finds nothing against Bee while COLUMN_NAME = 'ALPHA' matches, and only the first group is case-sensitive.
+
+It is a COLLATION and not a case-sensitivity flag, proved by TABLE_NAME = 'Bee ' answering one row on 8.3: utf8mb3_bin is PAD SPACE. A boolean flag could not produce that.
+
+Applied to the VALUES rather than to SqlType::collation, deliberately, so CREATE TABLE ... AS SELECT COLUMN_TYPE FROM information_schema.COLUMNS still reports utf8mb3_bin as 8.3 does.

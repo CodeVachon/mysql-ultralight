@@ -173,3 +173,8 @@
 {"at":"2026-09-04T02:00:32Z","id":219,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Cancelled"}
 {"at":"2026-09-04T02:18:15Z","id":168,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-09-04T02:18:15Z","id":204,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T02:36:38Z","id":220,"by":"Christopher Vachon","as":"user","type":"created","title":"COLLATION() and COERCIBILITY() are unsupported","state":"Todo"}
+{"at":"2026-09-04T02:36:38Z","id":221,"by":"Christopher Vachon","as":"user","type":"created","title":"SHOW ... WHERE is ignored entirely","state":"Todo"}
+{"at":"2026-09-04T02:36:38Z","id":222,"by":"Christopher Vachon","as":"user","type":"created","title":"SET NAMES for an unserved charset is silently ignored","state":"Todo"}
+{"at":"2026-09-04T02:47:23Z","id":148,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T02:47:23Z","id":154,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
