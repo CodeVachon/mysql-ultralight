@@ -203,3 +203,24 @@
 {"at":"2026-09-04T04:38:07Z","id":235,"by":"Christopher Vachon","as":"user","type":"created","title":"A foreign key pointing at another database is not enforced","state":"Todo"}
 {"at":"2026-09-04T04:48:45Z","id":205,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-09-04T04:48:45Z","id":206,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T04:49:43Z","id":227,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T04:49:43Z","id":228,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T04:49:43Z","id":229,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T04:49:43Z","id":230,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T04:49:43Z","id":218,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T04:49:43Z","id":223,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T08:10:22Z","id":236,"by":"Christopher Vachon","as":"user","type":"created","title":"HAVING prefers a select alias where MySQL prefers a grouped column","state":"Todo"}
+{"at":"2026-09-04T08:10:22Z","id":237,"by":"Christopher Vachon","as":"user","type":"created","title":"Functional dependency on a primary key is not recognised","state":"Todo"}
+{"at":"2026-09-04T08:10:22Z","id":238,"by":"Christopher Vachon","as":"user","type":"created","title":"LATERAL is parsed and ignored","state":"Todo"}
+{"at":"2026-09-04T08:10:22Z","id":239,"by":"Christopher Vachon","as":"user","type":"created","title":"A WHERE inside a derived table cannot see the enclosing row","state":"Todo"}
+{"at":"2026-09-04T08:10:40Z","id":240,"by":"Christopher Vachon","as":"user","type":"created","title":"An alias inside a function call is resolvable but not substitutable","state":"Todo"}
+{"at":"2026-09-04T08:10:40Z","id":241,"by":"Christopher Vachon","as":"user","type":"created","title":"An ambiguous unqualified name in an ON is not detected","state":"Todo"}
+{"at":"2026-09-04T08:10:40Z","id":242,"by":"Christopher Vachon","as":"user","type":"created","title":"JSON_TABLE over a NULL document raises 1366","state":"Todo"}
+{"at":"2026-09-04T08:14:42Z","id":229,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T08:14:42Z","id":230,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T08:53:05Z","id":243,"by":"Christopher Vachon","as":"user","type":"created","title":"A correlated column reference is typed VAR_STRING","state":"Todo"}
+{"at":"2026-09-04T08:53:05Z","id":244,"by":"Christopher Vachon","as":"user","type":"created","title":"1146 and DML are not refused at prepare","state":"Todo"}
+{"at":"2026-09-04T08:53:05Z","id":245,"by":"Christopher Vachon","as":"user","type":"created","title":"An unreferenced CTE and a comma-joined LATERAL are refused where MySQL answers","state":"Todo"}
+{"at":"2026-09-04T08:53:05Z","id":246,"by":"Christopher Vachon","as":"user","type":"created","title":"The prepared parameter definition block is not typed or named","state":"Todo"}
+{"at":"2026-09-04T09:14:41Z","id":227,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T09:14:41Z","id":228,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}

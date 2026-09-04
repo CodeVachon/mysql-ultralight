@@ -1,11 +1,11 @@
 ---
 id: 223
 title: ROUND over a double rounds half away from zero, not half to even
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor, app-priority-2]
 created: 2026-09-04T04:08:08Z
-updated: 2026-09-04T04:08:08Z
+updated: 2026-09-04T04:49:43Z
 ---
 
 ## Description

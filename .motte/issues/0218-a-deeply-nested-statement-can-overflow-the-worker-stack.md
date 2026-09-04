@@ -1,11 +1,11 @@
 ---
 id: 218
 title: A deeply nested statement can overflow the worker stack
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor, app-priority-2]
 created: 2026-09-04T02:00:21Z
-updated: 2026-09-04T02:00:21Z
+updated: 2026-09-04T04:49:43Z
 ---
 
 ## Description
