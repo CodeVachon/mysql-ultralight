@@ -321,6 +321,21 @@ pub struct View {
     /// does not, and `information_schema.COLUMNS` is read without a session to
     /// run the query against.
     pub shape: Vec<Column>,
+    /// The `sql_mode` the creating session held.
+    ///
+    /// MySQL freezes it into the view, so a body always means what it meant
+    /// when it was written: a view of `'a' || 'b'` created under
+    /// PIPES_AS_CONCAT answers `ab` to a reader who has cleared the flag, and
+    /// one created without it answers `0` to a reader who has set it. Resolving
+    /// the body under the *reader's* mode -- which is what happened before --
+    /// let an execution-time flag change a stored view's answers.
+    ///
+    /// ANSI_QUOTES and IGNORE_SPACE never had this problem: they reach the
+    /// code by rewriting the text before it is parsed, and that rewrite is
+    /// already frozen at CREATE VIEW. It is the flags carried on the
+    /// per-statement `Origin` -- PIPES_AS_CONCAT and REAL_AS_FLOAT -- that
+    /// needed the mode stored beside the text.
+    pub sql_mode: String,
 }
 
 /// A database, also called a schema.

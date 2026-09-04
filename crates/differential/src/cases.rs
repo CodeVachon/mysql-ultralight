@@ -9507,4 +9507,36 @@ pub const GROUPS: &[Group] = &[
             // about. The engine test carries the rename itself.
         ],
     },
+    Group {
+        // A view means what it meant when it was written. MySQL freezes the
+        // creating session's sql_mode into it, so an execution-time flag
+        // cannot change a stored view's answers; this engine re-resolved the
+        // body under the *reader's* mode. #0080.
+        //
+        // Asked through a predicate rather than by selecting the column: a
+        // concatenation is declared wider here than on 8.3 *and* 8.3 types it
+        // NOT_NULL where this engine does not (#0083, still open). Both are
+        // real and neither is what this group is about, so the cases ask
+        // whether the body concatenated -- which is #0080's whole subject --
+        // and let the column itself alone.
+        name: "a view keeps the sql_mode it was created under",
+        setup: &[
+            "SET sql_mode='PIPES_AS_CONCAT'",
+            "CREATE VIEW VmOn AS SELECT 'a' || 'b' AS v",
+            "SET sql_mode=''",
+            "CREATE VIEW VmOff AS SELECT 'c' || 'd' AS v",
+        ],
+        cases: &[
+            // Written with the flag, read without it: still a concatenation.
+            same("SELECT COUNT(*) AS reader_off_on FROM VmOn WHERE v = 'ab'"),
+            // Written without it, read without it: still an OR, so `v` is 0.
+            same("SELECT COUNT(*) AS reader_off_off FROM VmOff WHERE v = 0"),
+            // And the same two questions with the flag set on the reader,
+            // which is the direction that used to change the first answer.
+            same("SET sql_mode='PIPES_AS_CONCAT'"),
+            same("SELECT COUNT(*) AS reader_on_on FROM VmOn WHERE v = 'ab'"),
+            same("SELECT COUNT(*) AS reader_on_off FROM VmOff WHERE v = 0"),
+            same("SET sql_mode=''"),
+        ],
+    },
 ];

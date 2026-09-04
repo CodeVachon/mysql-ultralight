@@ -95,7 +95,7 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// answering it, which is the wrong answer the version check exists to
 /// prevent. An image is a file a user keeps and boots from with `--state`, so
 /// the stale one has to fail rather than mislead.
-pub const FORMAT_VERSION: u32 = 12;
+pub const FORMAT_VERSION: u32 = 13;
 
 /// Writes the whole catalog.
 pub fn encode(catalog: &Catalog) -> Vec<u8> {
@@ -339,6 +339,11 @@ fn write_view(w: &mut Writer, view: &View) {
     for column in &view.shape {
         write_column(w, column);
     }
+    // Appended after the shape, which is where the record ended at v12. The
+    // mode a view was created under decides what its body means, so a v12
+    // image read by this build would otherwise resolve every stored view
+    // under the reader's mode -- the bug this field exists to fix.
+    w.str(&view.sql_mode);
 }
 
 fn read_view(r: &mut Reader<'_>) -> EngineResult<View> {
@@ -349,11 +354,13 @@ fn read_view(r: &mut Reader<'_>) -> EngineResult<View> {
     for _ in 0..r.u32()? {
         shape.push(read_column(r)?);
     }
+    let sql_mode = r.str()?;
     Ok(View {
         name,
         definition,
         columns,
         shape,
+        sql_mode,
     })
 }
 

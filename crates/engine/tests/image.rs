@@ -986,10 +986,11 @@ fn a_boolean_never_reaches_the_image_and_is_written_as_its_integer_if_it_does() 
     // And the boolean did not move the version: 7 was #0068's ENUM tag, 8 was
     // #0069's unsigned one, 9 is #0126's binary collation, 10 is the column
     // collation #0129/#0134/#0152 needed, 11 is #0121's decimal mark inside a
-    // document and 12 is #0205's foreign key schema, none of them this. Pinned
-    // rather than derived, so the day something *does* give a boolean a tag of
-    // its own it has to come back here and say so.
-    assert_eq!(image::FORMAT_VERSION, 12);
+    // document, 12 is #0205's foreign key schema and 13 is the sql_mode a view
+    // was created under (#0080), none of them this. Pinned rather than
+    // derived, so the day something *does* give a boolean a tag of its own it
+    // has to come back here and say so.
+    assert_eq!(image::FORMAT_VERSION, 13);
 }
 
 #[test]

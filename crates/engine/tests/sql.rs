@@ -34970,3 +34970,53 @@ fn a_rename_into_another_database_is_refused_rather_than_stranding_the_table() {
         );
     }
 }
+
+/// A view means what it meant when it was written.
+///
+/// MySQL freezes the creating session's `sql_mode` into the view, so a flag
+/// the *reader* sets cannot change a stored view's answers. Measured on 8.3:
+/// a view of `'a' || 'b'` written under PIPES_AS_CONCAT answers `ab` to a
+/// reader who has cleared the flag, and one written without it answers `0` to
+/// a reader who has set it.
+#[test]
+fn a_view_keeps_the_sql_mode_it_was_created_under() {
+    let (engine, mut session) = engine();
+
+    run(&engine, &mut session, "SET sql_mode='PIPES_AS_CONCAT'");
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW VmOn AS SELECT 'a' || 'b' AS v",
+    );
+    run(&engine, &mut session, "SET sql_mode=''");
+    run(
+        &engine,
+        &mut session,
+        "CREATE VIEW VmOff AS SELECT 'c' || 'd' AS v",
+    );
+
+    // The reader has no flag: the first view still concatenates, the second
+    // still does not.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT v FROM VmOn"),
+        vec![vec!["ab"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT v FROM VmOff"),
+        vec![vec!["0"]]
+    );
+
+    // The reader sets the flag, which is the direction that used to change the
+    // second view's answer.
+    run(&engine, &mut session, "SET sql_mode='PIPES_AS_CONCAT'");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT v FROM VmOn"),
+        vec![vec!["ab"]]
+    );
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT v FROM VmOff"),
+        vec![vec!["0"]],
+        "a view written without PIPES_AS_CONCAT must not start concatenating \
+         because its reader set the flag"
+    );
+}

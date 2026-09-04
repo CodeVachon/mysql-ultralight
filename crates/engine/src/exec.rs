@@ -181,6 +181,9 @@ impl Engine {
         for view in views {
             let mut scoped = session.clone();
             scoped.current_database = Some(database.to_owned());
+            // Under the mode the view was created with, not the reader's. See
+            // `View::sql_mode`.
+            scoped.config.sql_mode = view.sql_mode.clone();
             let Ok(resolved) =
                 expr::probing(|| shaping(|| self.execute(&mut scoped, &view.definition, &[])))
             else {
@@ -825,6 +828,10 @@ impl Engine {
                     definition: pinned_definition(&create.query),
                     columns: explicit,
                     shape,
+                    // Taken from the creating session, which is the whole
+                    // point: the body is resolved under this mode every time
+                    // it runs, not under whatever the reader happens to hold.
+                    sql_mode: session.config.sql_mode.clone(),
                 };
 
                 let mut catalog = self.catalog_mut()?;
@@ -6403,6 +6410,10 @@ impl Engine {
         // double by the DOUBLE arm on the second pass, and lost them, while
         // the `float(10,4)` beside it kept them. Same rule, two answers,
         // decided by which arm the second pass happened to have.
+        // Under the mode the view was created with, not the reader's: a
+        // `'a' || 'b'` written under PIPES_AS_CONCAT stays a concatenation
+        // however the session reading it is set. See `View::sql_mode`.
+        scoped.config.sql_mode = view.sql_mode.clone();
         let outcome = self.execute_at_depth(&mut scoped, &view.definition, &[], 0)?;
         let Outcome::Rows(rows) = outcome else {
             return Err(EngineError::new(
