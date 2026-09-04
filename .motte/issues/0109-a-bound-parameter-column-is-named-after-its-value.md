@@ -1,11 +1,11 @@
 ---
 id: 109
 title: A bound parameter column is named after its value
-state: Todo
+state: Done
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-08-25T19:32:31Z
-updated: 2026-09-03T14:20:27Z
+updated: 2026-09-04T04:21:20Z
 ---
 
 ## Description
@@ -32,3 +32,11 @@ The offset mapping this was waiting on landed with #0060 in 2517c12, so half the
 What remains is the other half: params::bind splices bound values into the text before rewrite::normalise runs, so Normalised::written is the already-substituted text rather than the text with ? in it. Naming the column ? now needs bind to report its substitutions in the same piece terms the rewriter uses, so the two compose -- a binder change rather than a naming change.
 
 Behaviour stays pinned by a_bound_parameter_column_is_named_after_its_value_where_mysql_says_question_mark in crates/engine/tests/sql.rs, whose doc comment now says this.
+
+### 2026-09-04T04:21:20Z — Christopher Vachon (user)
+
+Landed in b996f04. 8.3 names the column for the MARKER: SELECT ? is '?', SELECT (?) and SELECT + ? peel to '?', SELECT -? and ? IS NULL keep the text as written, SELECT ?+1 is '?+1'. It re-describes by the bound value's TYPE at execute but never renames.
+
+Needed the parameter substitution to become a rewrite pass so #0060's offset mapping could carry a span back to the ? the client sent.
+
+The bigger half is filed as #0228: 8.3 types a parameter from the STATEMENT where this engine types it from the value bound (NULL when describing). That is real inference and is what Prisma reads to decide how to decode.

@@ -1,11 +1,11 @@
 ---
 id: 100
 title: Clauses other than the field list and WHERE are not resolved at prepare
-state: Todo
+state: Done
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-08-25T14:48:39Z
-updated: 2026-09-03T14:20:27Z
+updated: 2026-09-04T04:21:19Z
 ---
 
 ## Description
@@ -37,3 +37,15 @@ The full DML error ordering #0102 measured, which this fits into: 1146 missing t
 ### 2026-09-03T14:05:52Z — Christopher Vachon (user)
 
 NOT re-measured in the 2026-09-03 validation pass. The claims involve resolution at PREPARE time, which the text-protocol probe used for that pass cannot reach -- it needs a client that prepares a statement without executing it. Same for #0109 (a bound parameter's column name) and #0131 (a binary-protocol f32 rendering). Those three need the differential harness's binary path or a mysql2 client rather than the mysql CLI.
+
+### 2026-09-04T04:21:19Z — Christopher Vachon (user)
+
+ADVANCED, not closed, by b996f04 (gate green, differential 4802/0).
+
+Measured on 8.3 with the mysql crate's conn.prep: 8.3 resolves EVERY clause at prepare -- GROUP BY as 'group statement', HAVING, ORDER BY, a join's ON, a window's 'window partition by'/'window order by', and the same for UPDATE/DELETE/INSERT. A bad ESCAPE is 1210 and wrong arity 1582 in each. The clause names at prepare are identical to the ones #0099 measured at execute.
+
+Now closed: GROUP BY, join ON, window PARTITION BY/ORDER BY, DML ORDER BY. Already right beforehand: field list, WHERE, HAVING, SELECT ORDER BY, derived tables.
+
+STILL OPEN and split out as #0227: a subquery's interior. subquery_column swallows the inner probe with .ok() and is a typing walker with nowhere to report an error, so it needs a Result threaded through several walkers.
+
+Also learned and worth keeping: 8.3 resolves POSITIONALLY within a clause, not names-first. An earlier comment in this codebase asserted names-first without measuring; measurement says ON nope = 1 AND s LIKE 'a' ESCAPE '!!' is 1054 and the reverse order is 1210.

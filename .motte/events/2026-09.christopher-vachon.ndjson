@@ -178,3 +178,28 @@
 {"at":"2026-09-04T02:36:38Z","id":222,"by":"Christopher Vachon","as":"user","type":"created","title":"SET NAMES for an unserved charset is silently ignored","state":"Todo"}
 {"at":"2026-09-04T02:47:23Z","id":148,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
 {"at":"2026-09-04T02:47:23Z","id":154,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T02:48:17Z","id":100,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T02:48:17Z","id":109,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T02:48:18Z","id":205,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T02:48:18Z","id":206,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T02:48:18Z","id":212,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T02:48:18Z","id":215,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T04:08:08Z","id":223,"by":"Christopher Vachon","as":"user","type":"created","title":"ROUND over a double rounds half away from zero, not half to even","state":"Todo"}
+{"at":"2026-09-04T04:08:08Z","id":224,"by":"Christopher Vachon","as":"user","type":"created","title":"LENGTH over non-UTF-8 bytes counts the replacement characters","state":"Todo"}
+{"at":"2026-09-04T04:08:09Z","id":225,"by":"Christopher Vachon","as":"user","type":"created","title":"A cast of invalid bytes to a character type is not NULL","state":"Todo"}
+{"at":"2026-09-04T04:08:09Z","id":226,"by":"Christopher Vachon","as":"user","type":"created","title":"CONVERT and NCHAR casts are unsupported, and some targets are over-accepted","state":"Todo"}
+{"at":"2026-09-04T04:20:26Z","id":212,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T04:20:26Z","id":215,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T04:20:27Z","id":109,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T04:21:03Z","id":227,"by":"Christopher Vachon","as":"user","type":"created","title":"A subquery's interior is not resolved at prepare","state":"Todo"}
+{"at":"2026-09-04T04:21:03Z","id":228,"by":"Christopher Vachon","as":"user","type":"created","title":"A parameter is typed from its bound value, not from the statement","state":"Todo"}
+{"at":"2026-09-04T04:21:03Z","id":229,"by":"Christopher Vachon","as":"user","type":"created","title":"GROUP BY a select alias is refused at execute","state":"Todo"}
+{"at":"2026-09-04T04:21:03Z","id":230,"by":"Christopher Vachon","as":"user","type":"created","title":"A correlated ON is refused once the inner side has rows","state":"Todo"}
+{"at":"2026-09-04T04:21:03Z","id":231,"by":"Christopher Vachon","as":"user","type":"created","title":"Named windows are unsupported","state":"Todo"}
+{"at":"2026-09-04T04:21:19Z","id":100,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T04:38:06Z","id":232,"by":"Christopher Vachon","as":"user","type":"created","title":"RENAME TABLE and a cross-database rename do not work","state":"Todo"}
+{"at":"2026-09-04T04:38:06Z","id":233,"by":"Christopher Vachon","as":"user","type":"created","title":"An unnamed foreign key's auto index is named after the constraint","state":"Todo"}
+{"at":"2026-09-04T04:38:06Z","id":234,"by":"Christopher Vachon","as":"user","type":"created","title":"information_schema columns report the wrong Org_table and no NO_DEFAULT_VALUE","state":"Todo"}
+{"at":"2026-09-04T04:38:07Z","id":235,"by":"Christopher Vachon","as":"user","type":"created","title":"A foreign key pointing at another database is not enforced","state":"Todo"}
+{"at":"2026-09-04T04:48:45Z","id":205,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
+{"at":"2026-09-04T04:48:45Z","id":206,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}
