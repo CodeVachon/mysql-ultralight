@@ -1,11 +1,11 @@
 ---
 id: 80
 title: A view does not remember the sql_mode it was created under
-state: Todo
+state: Done
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-08-24T17:36:23Z
-updated: 2026-09-03T14:20:25Z
+updated: 2026-09-04T21:41:04Z
 ---
 
 ## Description
@@ -34,3 +34,11 @@ Narrow: only a REAL written inside a view body. A view over a REAL column is fin
 ### 2026-09-03T14:05:52Z — Christopher Vachon (user)
 
 VALIDATED 2026-09-03 against mysql:8.3, same client asking both servers. Confirmed. A view of 'a' || 'b' created under PIPES_AS_CONCAT answers 'ab' on 8.3 after the mode is cleared, and 0 here -- the view is re-parsed under the session's current mode instead of the one it was created under.
+
+### 2026-09-04T21:41:03Z — Christopher Vachon (user)
+
+Landed, gate green, differential 5378/0. Premise confirmed in BOTH directions: a view written under PIPES_AS_CONCAT answered 0 to a reader who cleared the flag, and one written without it answered 'cd' to a reader who set it.
+
+The fix is the mode stored on the View and routed through the two paths that run a definition -- the shape refresh and the relation read -- plus FORMAT_VERSION 12 -> 13, appended after the shape.
+
+Two corpus cases were reshaped rather than blessed: selecting the concatenated column exposes its declared width (wider here) and its nullability (8.3 says NOT_NULL, this engine does not -- that is #0083, still open). The cases now ask through a predicate whether the body concatenated, which is this issue's whole subject.

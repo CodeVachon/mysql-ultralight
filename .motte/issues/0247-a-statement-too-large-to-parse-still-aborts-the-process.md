@@ -1,11 +1,11 @@
 ---
 id: 247
 title: A statement too large to parse still aborts the process
-state: Todo
+state: Done
 parent: 9
 labels: [executor, app-priority-2]
 created: 2026-09-04T09:47:08Z
-updated: 2026-09-04T09:47:08Z
+updated: 2026-09-04T21:48:29Z
 ---
 
 ## Description
@@ -22,3 +22,17 @@ Two things are needed and neither is small:
   2. the PREPARE path: the cap is in Engine::execute only, because adding it to Engine::describe was measured and overflowed the deep-nest test
 
 Priority 2 because it is a process abort reachable from a client, which is worse in kind than any wrong answer -- it takes every other connection with it.
+
+## Notes
+
+### 2026-09-04T21:48:29Z — Christopher Vachon (user)
+
+Landed in 8636525, gate green.
+
+THE OBVIOUS FIXES WERE MEASURED AND REJECTED, which is the useful part of this. A bound on the statement's SIZE would refuse legitimate SQL: a 731 KB flat INSERT of 20000 rows parses fine and agrees with 8.3, while a 410 KB chain dies -- and the flat one has MORE TOKENS than the chain. Neither bytes nor tokens separate them; only the shape of the parse tree does, which is not knowable without parsing.
+
+So the fix is not a second limit. tokio's default 2 MB thread was never enough to PARSE what #0223's depth cap exists to refuse, so the cap was never reached. At 32 MB the parser survives and the cap does its job: measured against the real server, 70000-term and 100000-term chains both come back as a clean 1436 where they previously gave 'Lost connection to MySQL server during query'.
+
+Threshold before the fix: 60000 terms refused cleanly, 70000 aborted.
+
+The test spawns its own thread at CONNECTION_STACK on purpose -- on a cargo test thread's 2 MB this chain aborts the test binary rather than failing an assertion, which is what the mutation proving it bites demonstrates (SIGABRT).

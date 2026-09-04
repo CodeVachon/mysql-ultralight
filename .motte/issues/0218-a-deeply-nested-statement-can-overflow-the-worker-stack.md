@@ -5,7 +5,7 @@ state: In Progress
 parent: 9
 labels: [executor, app-priority-2]
 created: 2026-09-04T02:00:21Z
-updated: 2026-09-04T09:46:48Z
+updated: 2026-09-04T21:48:29Z
 ---
 
 ## Description
@@ -39,3 +39,9 @@ Every shape between 65 and 50000 terms now answers 1436 on a live connection whe
   2. the PREPARE path is uncovered -- adding the check to Engine::describe was measured and overflowed the deep-nest test, so the cap is in execute only.
 
 THE TRIPWIRE'S PREMISE IS STALE: size_of::<Session>() is 384 bytes today, not 408, and a dummy [u8; 4096] field leaves the deep-nest test passing where [u8; 16384] overflows. That came from the tree shrinking, not from this change. Note for anyone touching correlated queries: #0230 carries an enclosing row into a correlated ON, which adds stack per nesting level and lowers the ~90-term debug ceiling the cap of 64 is measured against.
+
+### 2026-09-04T21:48:29Z — Christopher Vachon (user)
+
+#0247 is now closed, which removes the abort this issue's note described as remaining: a connection thread gets 32 MB, so sqlparser survives long enough for the depth cap to refuse the statement. Measured: 70000 and 100000 terms both answer 1436 where they previously lost the connection.
+
+What remains for THIS issue is unchanged and is a divergence rather than a crash: 8.3 answers those statements and the engine refuses them at 64 levels. Also still open, from #0223's note: the depth check is in Engine::execute only, because adding it to Engine::describe overflowed the deep-nest test -- so the prepare path is uncovered.
