@@ -7993,13 +7993,12 @@ pub const GROUPS: &[Group] = &[
                  PRIMARY KEY (id)
              )",
             // `d` is 2.75 and not 2.5 deliberately: `ROUND` over an
-            // approximate value rounds half to *even* on 8.3 — `ROUND(2.5e0)`
-            // is 2 there and 3 here — and a tie in this data would make these
-            // cases ask about that gap instead of about the shape they are
-            // for. It is a divergence in the *value* — `ROUND(0.5e0)` is 0
-            // there and 1 here, and `ROUND(-2.5e0)` is -2 against -3 — and a
-            // gap of its own; the exact half is simply not what this group
-            // measures.
+            // approximate value rounds half to *even* on 8.3, and a tie in
+            // this data would make these cases ask about that rule instead of
+            // about the shape they are for. It was a divergence when this was
+            // written and #0223 closed it; the `round` group below asks the
+            // ties directly, and the value stays 2.75 so that these keep
+            // measuring only the scales.
             "INSERT INTO Prec VALUES
                  (1, 10.25, 2.125, 7, 3.500, 1.5, 0.125, 1.5, 1.5, 2.75, 2.5, 4,
                   '2026-01-02 03:04:05.678', '03:04:05.678901', '2026-01-02 03:04:05')",
@@ -8483,6 +8482,132 @@ pub const GROUPS: &[Group] = &[
                 "SELECT id, FORMAT(f4, 0), FORMAT(f4, 10), FORMAT(e, 2), FORMAT(ts, 2) \
                  FROM Fmt ORDER BY id",
             ),
+        ],
+    },
+    Group {
+        // #0223. `ROUND` broke every tie half away from zero, because it
+        // rounded every operand in an `f64` and `f64::round` is that rule.
+        // MySQL's rule belongs to the *operand*: only an integer or a decimal
+        // is exact and rounds half away from zero, and everything else — a
+        // double, a string, a document, a temporal — goes through a double and
+        // rounds half to even. The same split #0195 gave the write path and
+        // #0212 gave `FORMAT`, which is why the group sits next to that one.
+        //
+        // `TRUNCATE` is asked beside it deliberately: toward zero is toward
+        // zero whichever type the operand has, so it is the control that says
+        // the change did not reach past the tie.
+        name: "round",
+        setup: &[
+            // A BIGINT above 2^53 and a DECIMAL wider than one, which are the
+            // two values an `f64` cannot carry; a DOUBLE, a FLOAT, a string
+            // and a temporal, which are four routes to the approximate rule;
+            // and a DECIMAL with a declared scale, which is where the places
+            // are capped.
+            "CREATE TABLE Rnd (id INT NOT NULL, big BIGINT NOT NULL, n DECIMAL(30,2) NOT NULL, \
+             n3 DECIMAL(10,3) NOT NULL, d DOUBLE NOT NULL, f FLOAT NOT NULL, \
+             s VARCHAR(20) NOT NULL, dt DATETIME(1) NOT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Rnd VALUES \
+             (1, 9007199254740993, 12345678901234567890.25, 2.500, 2.5, 2.5, '2.5', \
+             '2024-01-05 10:20:30.5'), \
+             (2, -25, -0.05, -2.500, -2.5, -2.5, '-2.5', '1999-12-31 23:59:58.5')",
+        ],
+        cases: &[
+            // The five values the issue was opened over, in all three
+            // readings. The doubles were 1, 2, 3, -3 and 5 here; the string
+            // row is the half most likely to be got wrong, because the
+            // characters spell an exact number and MySQL still chooses by the
+            // argument's declared type.
+            same("SELECT ROUND(0.5e0), ROUND(1.5e0), ROUND(2.5e0), ROUND(-2.5e0), ROUND(4.5e0)"),
+            same("SELECT ROUND(0.5), ROUND(1.5), ROUND(2.5), ROUND(-2.5), ROUND(4.5)"),
+            same("SELECT ROUND('0.5'), ROUND('1.5'), ROUND('2.5'), ROUND('-2.5'), ROUND('4.5')"),
+            // A document and a binary string are the approximate reading too.
+            same("SELECT ROUND(CAST('2.5' AS JSON)), ROUND(CAST('2.5' AS BINARY))"),
+            // With a places argument. 0.125 is a tie under both rules, which
+            // is what makes the pair worth asking side by side.
+            same("SELECT ROUND(0.125e0, 2), ROUND(0.135e0, 2), ROUND(0.125, 2), \
+                  ROUND('0.125', 2)"),
+            same("SELECT ROUND(1.25e0, 1), ROUND(1.35e0, 1), ROUND(-1.25e0, 1), \
+                  ROUND(1.25, 1), ROUND(1.35, 1), ROUND(-1.25, 1)"),
+            // A decimal is rounded on its digits and not through a double,
+            // which is a different answer and not a tidier one: 1.005 is
+            // 1.00499999999999989 as a double, so the tie it has as a decimal
+            // is not a tie there and `ROUND(1.005, 2)` came back 1.
+            same("SELECT ROUND(1.005, 2), ROUND(1.0049999999, 2), ROUND(1.005e0, 2), \
+                  ROUND(2.675, 2), ROUND(2.675e0, 2)"),
+            // A place to the left of the point, where the rule still belongs
+            // to the operand: 25 is 30 and 25e0 is 20.
+            same("SELECT ROUND(25e0, -1), ROUND(35e0, -1), ROUND('25', -1), ROUND('35', -1)"),
+            // The same for an exact operand, and one rounding rather than two:
+            // 24.6 taken to zero places is 25 and then to tens is 30, where
+            // 8.3 answers 20. A scale deeper than the number is long answers a
+            // bare zero.
+            same("SELECT ROUND(24.6, -1), ROUND(25.4, -1), ROUND(-24.6, -1), ROUND(9.9, -1), \
+                  ROUND(0.6, -1), ROUND(2.5, -100)"),
+            // The widths of these are not asked, and it is nothing to do with
+            // rounding: 8.3 declares 21 for *any* whole-number function over a
+            // signed integer — `FLOOR(2.5)`, `CEILING(2.5)`, `TRUNCATE(25, -1)`
+            // and `ROUND(25, -1)` are all 21 there and 20 here — where
+            // `25 + 0`, `ABS(-25)` and `MOD(25, 7)` agree. That is the
+            // `Item::max_length` arithmetic `Case::widths` names, measured
+            // through `scripts/ask.sh` before these were added; the answers,
+            // which is what this group is for, are compared in full.
+            same("SELECT ROUND(25, -1), ROUND(35, -1), ROUND(15, -1), ROUND(-15, -1)")
+                .without_widths(),
+            // Carrying past the top of a BIGINT refuses rather than answering,
+            // the way the unsigned side already did. This answered
+            // 9.223372036854776e18.
+            same("SELECT ROUND(9223372036854775807, -1)"),
+            // Over columns, where the target application meets this. The
+            // widths go for the reason above: `big` is a signed BIGINT.
+            same("SELECT id, ROUND(big), ROUND(big, -1) FROM Rnd ORDER BY id").without_widths(),
+            // A DECIMAL wider than an `f64` can carry, which came back with
+            // zeros in the digits it dropped.
+            same("SELECT id, ROUND(n), ROUND(n, 1) FROM Rnd ORDER BY id"),
+            // Four approximate operands, one of them a temporal: a DATETIME(1)
+            // is not one of the two exact types, so `...:30.5` goes to the
+            // even second.
+            same("SELECT id, ROUND(d), ROUND(f), ROUND(s), ROUND(dt) FROM Rnd ORDER BY id"),
+            // The declared scale of the answer, which is
+            // `min(argument's scale, places)` and which the double path had
+            // nowhere to carry: `ROUND(n3, 2)` is 2.50 and `ROUND(n3, 5)` is
+            // 2.500.
+            same("SELECT id, ROUND(n3, 2), ROUND(n3, 5), ROUND(n3, -1) FROM Rnd ORDER BY id"),
+            // The control. `TRUNCATE` cuts toward zero whatever the operand
+            // is, so none of these moved — including the ties the row above
+            // splits two ways.
+            same("SELECT TRUNCATE(2.5e0, 0), TRUNCATE(2.5, 0), TRUNCATE('2.5', 0), \
+                  TRUNCATE(15.6, -1), TRUNCATE(1.567, 1)"),
+            // A place to the left of the point over an *approximate* operand,
+            // which is where the scaling itself was wrong rather than the
+            // rounding. `x * 10^places` is not `x / 10^-places` — the
+            // reciprocal of a power of ten is not one — and the difference is
+            // a whole unit: these answered 7599999 and 999999999, and 7599999
+            // is not even a multiple of 100000. About half of all doubles at
+            // those two scales were affected, and `TRUNCATE` had it too.
+            same("SELECT ROUND(7632213.593672946e0, -5), ROUND(612762203.7355423e0, -9), \
+                  ROUND('7632213.593672946', -5)"),
+            same("SELECT TRUNCATE(7632213.593672946e0, -5), \
+                  TRUNCATE(612762203.7355423e0, -9), TRUNCATE('7632213.593672946', -5)"),
+            same("SELECT ROUND(123456789e0, -3), ROUND(123456789e0, -6), \
+                  TRUNCATE(123456789e0, -3), TRUNCATE(123456789e0, -6)"),
+            // The power of ten has to be the one the decimal literal is, which
+            // `powi` is not past 10^22: `10f64.powi(300)` is six ulps over
+            // `1e300`, and dividing that back out moved these by a whole unit
+            // — 1.0000000000000006e300 for the first and 0 for the last.
+            same("SELECT ROUND(1e300, -300), ROUND(1e300, -308), TRUNCATE(1e300, -300)"),
+            // A count no `i32` holds. `places as i32` wrapped it to zero, so
+            // both of these answered the number back unrounded.
+            same("SELECT ROUND(2.5e0, -9223372036854775808), \
+                  ROUND(2.5e0, 9223372036854775807), \
+                  TRUNCATE(2.5e0, -9223372036854775808), \
+                  TRUNCATE(2.5e0, 9223372036854775807)"),
+            // The exact reading of the same scale. The width is not asked:
+            // 8.3 declares 9 digits for `ROUND(<16,9 literal>, -5)` and this
+            // engine 8, which is the `Item::max_length` arithmetic
+            // `Case::widths` names and not the value — measured through
+            // `scripts/ask.sh` beside the rows, which agree.
+            same("SELECT ROUND(7632213.593672946, -5), TRUNCATE(7632213.593672946, -5)")
+                .without_widths(),
         ],
     },
     Group {

@@ -788,6 +788,19 @@ mod tests {
     /// If a field genuinely needs the room, the honest fix is to stop copying
     /// a whole `Session` per recursion level, or to guard the recursion --
     /// not to raise this number.
+    ///
+    /// Re-measured for #0218, and the "nothing left" above is no longer true:
+    /// a `Session` is 384 bytes today, and a dummy `[u8; 4096]` field still
+    /// leaves `a_deep_nest_of_scalar_subqueries_still_answers` passing where
+    /// `[u8; 16384]` overflows. That headroom is the tree having shrunk around
+    /// this struct rather than anything #0218 did -- its depth limit lives at
+    /// the door, in `expr::within_walking_depth`, and never runs inside this
+    /// recursion at all. Adding a *call* to it in `Engine::describe` was
+    /// measured and did overflow this test, which is how little there is.
+    ///
+    /// The budget is left where it is because the reason for it stands: the
+    /// describe recursion this test exercises has no guard, and the room above
+    /// is a margin rather than a licence.
     #[test]
     fn a_session_stays_within_its_stack_budget() {
         const BUDGET: usize = 408;

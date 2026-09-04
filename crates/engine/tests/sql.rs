@@ -2794,7 +2794,11 @@ fn an_aggregate_nested_in_an_expression_still_groups() {
             &mut session,
             "SELECT ROUND(AVG(amount), 1) FROM Sale"
         ),
-        vec![vec!["90"]]
+        // 90.0 and not 90: `ROUND` over an exact operand answers a decimal
+        // shown at the places asked for, and the average of five integers is
+        // one. Measured on 8.3 — the bare 90 here was the `f64` this rounded
+        // through before #0223, which had no scale to show.
+        vec![vec!["90.0"]]
     );
     assert_eq!(
         rows(
@@ -8118,6 +8122,164 @@ fn a_rounding_at_a_negative_scale_stays_exact_over_an_unsigned_value() {
             "SELECT ROUND(bu, -1) FROM W WHERE id = 1",
             &[],
         )
+        .expect_err("rounding up leaves the range");
+    assert_eq!(error.code, 1690, "{}", error.message);
+}
+
+/// #0223. Which way `ROUND` breaks a tie is the *operand's* to decide, and
+/// MySQL decides it by the argument's declared result type: only an integer or
+/// a decimal is exact and rounds half away from zero, and everything else — a
+/// double, a string, a document, a temporal — goes through a double and rounds
+/// half to even. Every expectation below is measured on 8.3.
+#[test]
+fn round_breaks_a_tie_by_the_operands_type_and_not_by_the_function() {
+    let (engine, mut session) = engine();
+    // The five values #0223 was opened over, as doubles: half to *even*, so
+    // 0.5 and 2.5 both land on the even neighbour and 4.5 lands on 4. Through
+    // `f64::round` these were 1, 2, 3, -3 and 5.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROUND(0.5e0), ROUND(1.5e0), ROUND(2.5e0), ROUND(-2.5e0), ROUND(4.5e0)"
+        ),
+        vec![vec!["0", "2", "2", "-2", "4"]]
+    );
+    // The same five as decimals, which is the other rule: half away from zero.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROUND(0.5), ROUND(1.5), ROUND(2.5), ROUND(-2.5), ROUND(4.5)"
+        ),
+        vec![vec!["1", "2", "3", "-3", "5"]]
+    );
+    // A *string* takes the approximate path, which is the half most likely to
+    // be got wrong: the characters spell an exact number and MySQL still reads
+    // the argument's declared type, which is not an exact one. A document and
+    // a binary string are the same reading.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROUND('2.5'), ROUND('-2.5'), ROUND(CAST('2.5' AS JSON)), \
+             ROUND(CAST('2.5' AS BINARY))"
+        ),
+        vec![vec!["2", "-2", "2", "2"]]
+    );
+    // With a places argument, both kinds, and at a place to the left of the
+    // point. 0.125 is a tie as a double as well as as a decimal, which is what
+    // makes the pair worth asking: 0.12 against 0.13.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROUND(0.125e0, 2), ROUND(0.125, 2), ROUND(25e0, -1), ROUND(25, -1), \
+             ROUND('25', -1), ROUND(-15, -1)"
+        ),
+        vec![vec!["0.12", "0.13", "20", "30", "20", "-20"]]
+    );
+    // Rounding a *decimal* on its digits rather than through a double, which
+    // is not a refinement: 1.005 is 1.00499999999999989 as a double, so the
+    // tie the decimal has is not a tie there and the answer came back 1.
+    // The scale is the one MySQL declares — `min(argument's scale, places)` —
+    // which the double path had nowhere to carry.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROUND(1.005, 2), ROUND(1.0049999999, 2), ROUND(2.500, 2), ROUND(2.500, 5)"
+        ),
+        vec![vec!["1.01", "1.00", "2.50", "2.500"]]
+    );
+    // A decimal at a place to the left of the point, which is one rounding and
+    // not two: 24.6 taken to zero places is 25 and then to tens is 30, where
+    // 8.3 answers 20. A scale so deep that nothing is left of the number
+    // answers zero, and spells it `0` rather than at a width.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROUND(24.6, -1), ROUND(25.4, -1), ROUND(-24.6, -1), ROUND(9.9, -1), \
+             ROUND(0.6, -1), ROUND(2.5, -100)"
+        ),
+        vec![vec!["20", "30", "-20", "10", "0", "0"]]
+    );
+    // A BIGINT has digits an `f64` cannot hold: 9007199254740993 is above 2^53
+    // and came back as its even neighbour. So does a wide DECIMAL.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE R (id INT NOT NULL, big BIGINT NOT NULL, n DECIMAL(30,2) NOT NULL, \
+         dt DATETIME(1) NOT NULL, PRIMARY KEY (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO R VALUES (1, 9007199254740993, 12345678901234567890.25, \
+         '2024-01-05 10:20:30.5')",
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROUND(big), ROUND(big, -1), ROUND(n), ROUND(n, 1) FROM R"
+        ),
+        vec![vec![
+            "9007199254740993",
+            "9007199254740990",
+            "12345678901234567890",
+            "12345678901234567890.3",
+        ]]
+    );
+    // A temporal is not one of the two exact types, so its packed number goes
+    // through the double: `...:30.5` rounds to `...30` and not to `...31`.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT ROUND(dt) FROM R"),
+        vec![vec!["20240105102030"]]
+    );
+    // The scaling itself, at a place to the left of the point over an
+    // approximate operand. Multiplying by 10^places and dividing back is not
+    // the same arithmetic as dividing by 10^-places and multiplying back, and
+    // the difference is a whole unit of the answer: these came back 7599999
+    // and 999999999, and 7599999 is not a multiple of 100000 at all.
+    // `TRUNCATE` shares the scaling and shared the bug.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROUND(7632213.593672946e0, -5), ROUND(612762203.7355423e0, -9), \
+             ROUND('7632213.593672946', -5), TRUNCATE(7632213.593672946e0, -5)"
+        ),
+        vec![vec!["7600000", "1000000000", "7600000", "7600000"]]
+    );
+    // The power of ten has to be the double the decimal literal is, which
+    // `powi` stops being past 10^22: `10f64.powi(300)` is six ulps over
+    // `1e300`, and dividing that back out left the first of these
+    // 1.0000000000000006e300 and the second 0.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROUND(1e300, -300), TRUNCATE(1e300, -300), ROUND(1e300, -308)"
+        ),
+        vec![vec!["1e300", "1e300", "0"]]
+    );
+    // A count no `i32` holds. `places as i32` wrapped it to zero, so both of
+    // these handed the number back unrounded.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT ROUND(2.5e0, -9223372036854775808), ROUND(2.5e0, 9223372036854775807), \
+             TRUNCATE(2.5e0, -9223372036854775808)"
+        ),
+        vec![vec!["0", "2.5", "0"]]
+    );
+    // Carrying past the top of a BIGINT refuses rather than answering, the way
+    // the unsigned side already did. The double path answered 9.223372036854776e18.
+    let error = engine
+        .execute(&mut session, "SELECT ROUND(9223372036854775807, -1)", &[])
         .expect_err("rounding up leaves the range");
     assert_eq!(error.code, 1690, "{}", error.message);
 }
@@ -24980,6 +25142,57 @@ fn a_deep_nest_of_scalar_subqueries_still_answers() {
             engine.describe(&session, &deep, 0).unwrap().unwrap()[0].ty
         ),
         "VarString"
+    );
+}
+
+/// #0218. A statement that nests further than this engine walks is *refused*,
+/// and the session it was asked on carries on.
+///
+/// These are the two shapes neither guard already in the tree reaches:
+/// `sqlparser`'s recursion limit and `SUBQUERY_DEPTH_LIMIT` both bound
+/// *nesting*, and a flat `1 AND 1 AND ...` chain and a `UNION ALL` chain each
+/// nest once however long they are. Measured against the server before the
+/// check went in: 1150 terms answered and 1180 aborted the whole process with
+/// `fatal runtime error: stack overflow` on the tokio worker — not the
+/// statement, the process, and every other connection with it. A thousand
+/// `UNION ALL` arms answered and three thousand did the same. 8.3 answers 1436
+/// when its own thread stack runs out, which is the code asserted here.
+///
+/// Fixed counts and not a search: the limit is a *depth* checked before
+/// anything walks the tree, so it fires at the same term for every build, and a
+/// test that climbed towards the fatal depth would abort the whole binary
+/// rather than fail an assertion if it ever arrived there first.
+///
+/// The case just *inside* the limit is the tripwire the depth is chosen
+/// against. Under `cargo test` the walkers take a 2 MB thread at about ninety
+/// terms, so sixty-four is a margin rather than a coincidence — and if a walker
+/// ever grows enough to close that gap, this line is where it shows.
+#[test]
+fn a_statement_nesting_further_than_the_engine_walks_is_refused_not_fatal() {
+    let (engine, mut session) = engine();
+
+    for sql in [
+        format!("SELECT {}", vec!["1"; 100].join(" AND ")),
+        format!("SELECT {}", vec!["1"; 100].join(" + ")),
+        vec!["SELECT 1"; 100].join(" UNION ALL "),
+    ] {
+        let refused = engine
+            .execute(&mut session, &sql, &[])
+            .expect_err("this nests further than the engine walks");
+        assert_eq!(refused.code, 1436, "{}", refused.message);
+        assert_eq!(refused.sql_state, "HY000", "{}", refused.message);
+    }
+
+    // Just inside it still answers, so the limit is a limit and not a refusal
+    // of the shape.
+    let inside = format!("SELECT {}", vec!["1"; 64].join(" AND "));
+    assert_eq!(rows(&engine, &mut session, &inside), vec![vec!["1"]]);
+
+    // And the session is still usable, which is the whole difference between
+    // this and the abort it replaces.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT 1 AND 1 AND 1"),
+        vec![vec!["1"]]
     );
 }
 

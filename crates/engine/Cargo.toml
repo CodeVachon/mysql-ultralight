@@ -23,4 +23,8 @@ serde = "1"
 # src/json.rs: the feature also stops serde rejecting a number too big for a
 # double, which that function now does instead.
 serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
-sqlparser = "0.62"
+# `visitor` for the depth check `expr::within_walking_depth` makes at the door:
+# it derives a traversal over *every* node of the AST, which is what lets one
+# check cover every expression a statement carries rather than the handful a
+# hand-written walk remembers. See #0218.
+sqlparser = { version = "0.62", features = ["visitor"] }

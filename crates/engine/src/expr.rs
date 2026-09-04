@@ -396,6 +396,159 @@ const IMPURE: &[&str] = &[
     "rand",
 ];
 
+/// The deepest a statement's expressions may nest before the engine refuses it.
+///
+/// Measured against the depth at which nesting stops being answerable at all.
+/// A left-deep chain — `SELECT 1 AND 1 AND ...`, which is what an expression of
+/// N terms parses to — is walked by a dozen recursions before a row is touched,
+/// and none of them but this check has a guard. On a 2 MB thread they take the
+/// whole stack and abort the *process* at about 90 terms in a `cargo test`
+/// build, where a frame is fattest, and at about 3500 in a release one. 64 is
+/// comfortably under the smaller of those and is the same order as MySQL's own
+/// `MAX_SELECT_NESTING` of 63.
+///
+/// Counted rather than measured against the stack that is left, because the
+/// check has to run *before* anything walks the tree: the walkers that overflow
+/// finish before the evaluator is entered, so a guard inside the evaluator is
+/// never reached in time. A count is also the same number in every build, where
+/// a stack reading is not — and a limit that moves between `cargo test` and
+/// `--release` is a limit nobody can write a test for.
+///
+/// 8.3 answers a chain of twenty thousand terms, so this refuses statements
+/// MySQL does not. That is the trade the house rule asks for: a clear error
+/// rather than a wrong answer, and here rather than a dead connection.
+const MAX_EXPRESSION_DEPTH: usize = 64;
+
+/// How many set operations hang off the left of `body`, counted without
+/// recursing.
+///
+/// `A UNION B UNION C` parses left-deep, so the spine is as long as the
+/// statement and nothing in the AST nests to mark it: a `SetExpr` has no
+/// visitor hook, so a chain of these is walked by the *derived* traversal with
+/// nothing counting it. Measured before this existed: a thousand `UNION ALL`
+/// arms answered and three thousand aborted the process.
+///
+/// Only the left, because only the left can be long. A right-deep chain is
+/// written with parentheses, and each pair of those is a nested `Query` that
+/// `sqlparser`'s own recursion limit refuses at twenty-three.
+fn set_operation_spine(body: &SetExpr) -> usize {
+    let mut spine = 0;
+    let mut at = body;
+    while let SetExpr::SetOperation { left, .. } = at {
+        spine += 1;
+        at = left;
+    }
+    spine
+}
+
+/// Counts how deep a statement nests, and stops as soon as it is too deep.
+///
+/// The stopping is the point: `ControlFlow::Break` ends the derived traversal
+/// where it stands, so this walker cannot recurse further than the limit it is
+/// enforcing. A depth check that overflowed the stack measuring the depth would
+/// be no check at all.
+struct Nesting {
+    at: usize,
+}
+
+impl sqlparser::ast::Visitor for Nesting {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
+        // Before the traversal descends, because descending *is* the risk: the
+        // derived code walks the whole left spine before it reaches anything
+        // with a hook on it.
+        if set_operation_spine(&query.body) > MAX_EXPRESSION_DEPTH {
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, _expr: &Expr) -> std::ops::ControlFlow<()> {
+        self.at += 1;
+        if self.at > MAX_EXPRESSION_DEPTH {
+            return std::ops::ControlFlow::Break(());
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, _expr: &Expr) -> std::ops::ControlFlow<()> {
+        self.at -= 1;
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+/// Refuses a statement that nests deeper than this engine walks.
+///
+/// #0218. Every walker over the tree — the evaluator, the one that types a
+/// column, the ones that decide nullability and width — recurses once per node
+/// of an expression a *client* wrote, and none of them but the evaluator has a
+/// guard. So the depth of a statement decided whether the server lived:
+/// `SELECT 1 AND 1 AND ...` answered at 1150 terms and at 1180 aborted the
+/// whole process with `fatal runtime error: stack overflow` on the tokio
+/// worker, taking every other connection with it rather than failing the one
+/// statement.
+///
+/// Checked here, before anything walks the tree, because that is the only
+/// place a check helps: the walkers that overflow run *before* the evaluator
+/// and finish before it is entered.
+///
+/// Neither guard already in the tree reaches this. `sqlparser`'s recursion
+/// limit and `SUBQUERY_DEPTH_LIMIT` both bound *nesting* — measured, they
+/// refuse a nest of scalar subqueries or derived tables at 23 and parentheses
+/// at 48 — and a flat operator chain nests once however long it is.
+/// Measured once per statement a caller brings, not once per statement the
+/// engine runs on its way through it.
+///
+/// The probe that types a scalar subquery runs the subquery through `execute`,
+/// so a nest of twenty of them reaches this door twenty-one times — each
+/// traversal starting from a stack that is already twenty levels down. Measured:
+/// re-measuring at every level overflows the thread that
+/// `a_deep_nest_of_scalar_subqueries_still_answers` runs on. It answers nothing
+/// either, because an inner statement is a subtree of the outer one, which has
+/// already been found shallow enough.
+pub(crate) struct OutermostStatement(bool);
+
+impl Drop for OutermostStatement {
+    fn drop(&mut self) {
+        if self.0 {
+            DEPTH_MEASURED.with(|measured| measured.set(false));
+        }
+    }
+}
+
+thread_local! {
+    /// Whether a statement on this thread has already been measured.
+    static DEPTH_MEASURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn within_walking_depth(
+    statements: &[sqlparser::ast::Statement],
+) -> EngineResult<OutermostStatement> {
+    use sqlparser::ast::Visit;
+
+    if DEPTH_MEASURED.with(std::cell::Cell::get) {
+        return Ok(OutermostStatement(false));
+    }
+    DEPTH_MEASURED.with(|measured| measured.set(true));
+    // Bound before the loop, so the flag is given back however this leaves.
+    let outermost = OutermostStatement(true);
+    for statement in statements {
+        let mut nesting = Nesting { at: 0 };
+        if statement.visit(&mut nesting).is_break() {
+            return Err(EngineError::new(
+                1436,
+                "HY000",
+                format!(
+                    "Thread stack overrun: this statement nests more than \
+                     {MAX_EXPRESSION_DEPTH} deep, which is further than it can be walked"
+                ),
+            ));
+        }
+    }
+    Ok(outermost)
+}
+
 /// Evaluates an expression to a single value.
 pub fn eval(expr: &Expr, ctx: &Context<'_>) -> EngineResult<Value> {
     // A construct that extends an expression to its left can have been handed

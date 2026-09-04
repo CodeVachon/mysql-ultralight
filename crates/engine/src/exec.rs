@@ -126,6 +126,8 @@ impl Engine {
         let Ok(statements) = Parser::parse_sql(&MySqlDialect {}, &normalised.sql) else {
             return Ok(None);
         };
+        // #0218: refused here rather than described, because describing is one
+        // of the walks that runs out of stack on a deep enough statement.
         let [Statement::Query(query)] = statements.as_slice() else {
             return Ok(None);
         };
@@ -630,6 +632,10 @@ impl Engine {
         let _source = Source::set(&normalised, session);
         let statements = Parser::parse_sql(&MySqlDialect {}, &normalised.sql)
             .map_err(|e| EngineError::parse(format!("{e}")))?;
+        // #0218: before anything walks the tree, which is the only place a
+        // depth limit helps — the walkers that run out of stack finish before
+        // the evaluator is entered, so no guard inside it is reached in time.
+        let _outermost = crate::expr::within_walking_depth(&statements)?;
 
         match statements.len() {
             0 => Ok(Outcome::ok()),
