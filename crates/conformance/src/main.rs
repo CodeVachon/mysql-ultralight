@@ -318,7 +318,7 @@ fn engine_accepts(sql: &str, mode: &mysql_ultralight_engine::SqlMode) -> Result<
     if rewrite::intercept(sql).is_some() {
         return Ok(());
     }
-    let normalised = rewrite::normalise(sql, *mode).sql;
+    let normalised = rewrite::normalise(rewrite::Normalised::untouched(sql), *mode).sql;
     Parser::parse_sql(&MySqlDialect {}, &normalised)
         .map(|_| ())
         .map_err(|e| e.to_string())

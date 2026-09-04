@@ -5,25 +5,28 @@
 //! before a `LIMIT` that appears after it — so binding by evaluation order
 //! would silently pair parameters with the wrong placeholders. Substituting
 //! first makes position unambiguous.
+//!
+//! Where each `?` stood is found here and the substitution is applied in
+//! `rewrite::bind`, which records the edit so a column can still be named
+//! after the marker rather than after the value spliced into its place. See
+//! that function for why the two halves are split.
 
 use crate::value::Value;
 
-/// Replaces each `?` outside a string, identifier or comment with its bound
-/// parameter, rendered as a literal.
-pub fn bind(sql: &str, params: &[Value]) -> String {
-    if params.is_empty() && !sql.contains('?') {
-        return sql.to_owned();
-    }
-
+/// The byte offset of every `?` that is a placeholder rather than data.
+///
+/// A question mark inside a string, an identifier or a comment is text the
+/// client wrote, not a marker. `--`, `#` and `/* */` are all skipped: handling
+/// one comment syntax and not another makes this disagree with whatever else
+/// counts placeholders, and every later parameter then binds one position off.
+pub fn placeholders(sql: &str) -> Vec<usize> {
     let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len() + params.len() * 8);
-    let mut next = 0usize;
+    let mut at = Vec::new();
     let mut i = 0usize;
 
     while i < bytes.len() {
         match bytes[i] {
             q @ (b'\'' | b'"' | b'`') => {
-                let start = i;
                 i += 1;
                 while i < bytes.len() {
                     if bytes[i] == b'\\' && q != b'`' {
@@ -40,46 +43,28 @@ pub fn bind(sql: &str, params: &[Value]) -> String {
                     i += 1;
                 }
                 i = (i + 1).min(bytes.len());
-                out.push_str(&sql[start..i]);
             }
-            // `--` and `#` both start a line comment. Handling one and not
-            // the other makes this scanner disagree with the one that counts
-            // placeholders, and every later parameter binds one position off.
             b'#' | b'-' if bytes[i] == b'#' || bytes.get(i + 1) == Some(&b'-') => {
-                let start = i;
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
-                out.push_str(&sql[start..i]);
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                let start = i;
                 i += 2;
                 while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                     i += 1;
                 }
                 i = (i + 2).min(bytes.len());
-                out.push_str(&sql[start..i]);
             }
             b'?' => {
-                match params.get(next) {
-                    Some(value) => out.push_str(&literal(value)),
-                    // Leaving the placeholder in place lets the parser report
-                    // the mismatch, rather than inventing a NULL.
-                    None => out.push('?'),
-                }
-                next += 1;
+                at.push(i);
                 i += 1;
             }
-            _ => {
-                let len = utf8_len(bytes[i]);
-                out.push_str(&sql[i..(i + len).min(sql.len())]);
-                i += len;
-            }
+            _ => i += utf8_len(bytes[i]),
         }
     }
 
-    out
+    at
 }
 
 /// Renders a value as a SQL literal.
@@ -172,6 +157,16 @@ fn utf8_len(first: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bound statement, as the parser will see it.
+    ///
+    /// Through `rewrite::bind` because that is the only thing that binds: this
+    /// module finds the placeholders and renders the values, and the pass that
+    /// puts the two together lives there so the edit is recorded. Asserting on
+    /// its text keeps these cases where the scanner they exercise is.
+    fn bind(sql: &str, params: &[Value]) -> String {
+        crate::rewrite::bind(sql, params).sql
+    }
 
     #[test]
     fn binds_in_textual_order() {

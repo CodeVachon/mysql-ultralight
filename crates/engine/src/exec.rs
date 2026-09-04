@@ -21,7 +21,6 @@ use crate::foreign_keys::{self, Action};
 use crate::image;
 use crate::info_schema;
 use crate::name;
-use crate::params;
 use crate::relation::Relation;
 use crate::result::{OutColumn, Outcome, ResultSet};
 use crate::rewrite::{self, Intercepted, ShowDiagnostics};
@@ -100,8 +99,8 @@ impl Engine {
         parameters: usize,
     ) -> EngineResult<Option<Vec<OutColumn>>> {
         let _memo = SubqueryMemo::fresh();
-        let bound = params::bind(sql, &vec![Value::Null; parameters]);
-        match rewrite::intercept(&bound) {
+        let bound = rewrite::bind(sql, &vec![Value::Null; parameters]);
+        match rewrite::intercept(&bound.sql) {
             // 8.3 refuses the diagnostics statements in the prepared-statement
             // protocol outright, measured: `COM_STMT_PREPARE` of `SHOW
             // WARNINGS` is 1295 there, where every other statement intercepted
@@ -120,7 +119,7 @@ impl Engine {
             None => {}
         }
 
-        let normalised = std::rc::Rc::new(rewrite::normalise(&bound, session.sql_mode()));
+        let normalised = std::rc::Rc::new(rewrite::normalise(bound, session.sql_mode()));
         // Held for the whole call: a computed column is named after the text
         // it was written as, and that text is only available here.
         let _source = Source::set(&normalised, session);
@@ -619,15 +618,15 @@ impl Engine {
             ));
         }
 
-        let bound = params::bind(sql, parameters);
+        let bound = rewrite::bind(sql, parameters);
         let mode = session.sql_mode();
 
         // Statements the parser cannot take are recognised before it sees them.
-        if let Some(intercepted) = rewrite::intercept(&bound) {
+        if let Some(intercepted) = rewrite::intercept(&bound.sql) {
             return self.run_intercepted(session, intercepted, depth);
         }
 
-        let normalised = std::rc::Rc::new(rewrite::normalise(&bound, mode));
+        let normalised = std::rc::Rc::new(rewrite::normalise(bound, mode));
         let _source = Source::set(&normalised, session);
         let statements = Parser::parse_sql(&MySqlDialect {}, &normalised.sql)
             .map_err(|e| EngineError::parse(format!("{e}")))?;
@@ -2240,17 +2239,21 @@ impl Engine {
         order_by: &[OrderByExpr],
         limit: Option<&Expr>,
     ) -> EngineResult<Vec<usize>> {
+        // Before a row is chosen, not while they are being sorted: the clause
+        // was otherwise read once per matching row, so a WHERE that matched
+        // nothing left it unread and `UPDATE Bare SET k = 1 WHERE id = 4242
+        // ORDER BY zz.q LIMIT 1` reported nought rows affected where 8.3
+        // refuses the statement outright. #0100.
+        resolve_dml_order(order_by, refs)?;
+
         let mut chosen = matching;
 
         if !order_by.is_empty() {
             let mut keys: Vec<(Vec<Value>, usize)> = Vec::with_capacity(chosen.len());
             for index in chosen {
-                // `'order clause'`, measured: `UPDATE Bare SET k = 1 WHERE
-                // id = 9 ORDER BY zz.q LIMIT 1` with a matching row present is
-                // 1054 under that name on 8.3, where this said the field list.
-                // Resolving it *before* any row is read is #0100's, which owns
-                // every clause not yet settled at prepare; this is the name the
-                // refusal carries when a row does reach it.
+                // `'order clause'` here too, for a name only a row can turn
+                // up: `resolve_dml_order` has settled everything fixed by the
+                // text, and this evaluator still reports whatever is left.
                 let ctx = Context::for_row(refs, &rows[index], session)
                     .with_executor(self)
                     .in_clause("order clause");
@@ -2517,9 +2520,54 @@ impl Engine {
         // Settled before the loops, because the condition is only otherwise
         // read once per pair of rows: a join where either side is empty
         // produces no pair, so `ON a.s LIKE b.s ESCAPE '!!'` answered no rows
-        // where 8.3 raises 1210. A `USING` clause is built here rather than
-        // written, so it has no ESCAPE to be wrong.
+        // where 8.3 raises 1210, and `ON zz.q = Cr.id` answered an empty set
+        // where it raises 1054. That second one is #0100's half — the names,
+        // which are as fixed by the text as an ESCAPE is and were the one
+        // thing here still waiting for a row.
+        //
+        // `'on clause'`, measured, and the name a `USING` list's rewritten
+        // equality carries too — its own names are `'from clause'` and are
+        // resolved ahead of this, in `using_condition`. A clause built there
+        // rather than written has no ESCAPE and no unknown name to find.
+        //
+        // The name is asked *after* the arguments, which is the other way
+        // round from every other clause here, and deliberately. 8.3 reads an
+        // ON left to right and answers whichever fault comes first — measured,
+        // all four ways:
+        //
+        //     ON nope = 1 AND s LIKE 'a' ESCAPE '!!'   1054
+        //     ON s LIKE 'a' ESCAPE '!!' AND nope = 1   1210
+        //     ON nope = 1 AND SIGN() = 1               1582
+        //     ON SIGN() = 1 AND nope = 1               1582
+        //
+        // A single expression cannot be walked positionally here: names are
+        // one walk and arguments are another, and merging them is #0087's.
+        // So one of the two orders has to be wrong, and arguments first — the
+        // order that was already here — is right for three of those four.
         refuse_at_resolve(condition.as_ref())?;
+        if let Some(e) = &condition {
+            // The enclosing query's columns as well as this join's, or an ON
+            // that correlates outwards is refused for naming something that
+            // *is* in scope: `SELECT k FROM A WHERE EXISTS (SELECT 1 FROM B
+            // JOIN C ON C.id = A.id)` answers on 8.3, and reading only this
+            // join's columns turned it into a 1054 the moment either inner
+            // side was empty. `session.lateral` is where `select_from` puts
+            // the outer row while a relation is being built, for the
+            // JSON_TABLE case; a correlated ON needs the same thing.
+            //
+            // Only the *names*. Whether the evaluator can then read one is a
+            // separate gap — over a pair of rows it looks the reference up in
+            // this join's columns alone and raises the same 1054 — and this
+            // must not turn that into a refusal for the queries it does not
+            // already reach.
+            let mut scope = refs.clone();
+            if let Some(enclosing) = &session.lateral {
+                scope.extend(enclosing.schema.iter().cloned());
+            }
+            if let Some(name) = unresolved_column(e, &scope) {
+                return Err(EngineError::unknown_column(&name, "on clause"));
+            }
+        }
 
         let null_right = vec![Value::Null; right.columns.len()];
         let null_left = vec![Value::Null; left.columns.len()];
@@ -2883,16 +2931,13 @@ impl Engine {
         // The clause reads the select list's names as well as the relation's,
         // so `SELECT 1 AS a GROUP BY a` answers rather than raising.
         if !group_exprs.is_empty() {
-            let mut scope = implicit_schema.clone();
-            scope.extend(items.iter().map(|(alias, _)| ColumnRef::new("", alias)));
-            if let Some(name) = group_exprs
-                .iter()
-                .find_map(|e| unresolved_column(e, &scope))
-            {
-                return Err(EngineError::unknown_column(&name, "group statement"));
-            }
+            let aliases = items.iter().map(|(alias, _)| alias.as_str());
+            // The positions before the rest, which is the order `grouped`
+            // reads them in — the two paths answer the same statement and a
+            // clause settled one way here and another way there is a bug
+            // nothing but a FROM clause could tell apart.
             check_group_positions(group_exprs, items.len())?;
-            refuse_at_resolve(group_exprs.iter())?;
+            resolve_group_by(group_exprs, &implicit_schema, aliases)?;
         }
 
         // Every item is evaluated even where the WHERE has already discarded
@@ -3130,6 +3175,49 @@ impl Engine {
         };
         if spec.window_frame.is_some() {
             return Err(unsupported("window frames"));
+        }
+
+        // The OVER spec's two clauses, before the first partition rather than
+        // per row. `unresolved_column` walks into a call's arguments and stops
+        // at its OVER spec, deliberately: it carries one clause name for the
+        // whole expression and these two have names of their own, so the field
+        // list's pass over the projection cannot report them. That left them
+        // settled only by the evaluator, once per row — so over an empty table
+        // `SUM(k) OVER (PARTITION BY zz.q)` answered an empty set where 8.3
+        // raises 1054, and a prepared statement was accepted that MySQL
+        // refuses. #0100.
+        //
+        // `'window partition by'` and `'window order by'`, measured, and
+        // PARTITION BY first because that is the order 8.3 reads them in.
+        //
+        // Names only. What an OVER spec carries besides them is already
+        // settled, and settled earlier: `resolve_field_list` runs
+        // `refuse_at_resolve` over the whole projection item and
+        // `function_carried` descends into the spec, so a bad ESCAPE or a
+        // wrong arity in one is refused before this is reached at all. That
+        // puts the arguments ahead of the names here where 8.3 reads the list
+        // left to right — `PARTITION BY nope, s LIKE 'a' ESCAPE '!!'` is 1054
+        // there and 1210 here, and the other order agrees at 1210 — which is
+        // the same within-clause ordering gap #0087 owns for the WHERE, not
+        // something this site can settle on its own.
+        //
+        // `refs` and nothing else: an OVER spec does *not* see the select
+        // list's aliases, measured — `SELECT k AS a, SUM(id) OVER (PARTITION
+        // BY a) FROM Cl` is 1054 for `a` on 8.3, where the same alias in the
+        // query's own ORDER BY resolves.
+        if let Some(name) = spec
+            .partition_by
+            .iter()
+            .find_map(|e| unresolved_column(e, refs))
+        {
+            return Err(EngineError::unknown_column(&name, "window partition by"));
+        }
+        if let Some(name) = spec
+            .order_by
+            .iter()
+            .find_map(|item| unresolved_column(&item.expr, refs))
+        {
+            return Err(EngineError::unknown_column(&name, "window order by"));
         }
 
         let name = f.name.to_string().to_ascii_lowercase();
@@ -3541,12 +3629,19 @@ impl Engine {
         // `SELECT s FROM LE GROUP BY id HAVING s LIKE 'a' ESCAPE '!!'` is 1210
         // there, not the grouping complaint.
         //
-        // Split across the HAVING's own name check rather than kept as one
-        // call, because 8.3 settles the GROUP BY clause before the HAVING and
-        // a clause's names before its arguments: `GROUP BY s LIKE 'a' ESCAPE
-        // '!!' HAVING zz > 1` is 1210 there and `HAVING zz LIKE 'a' ESCAPE
-        // '!!'` is 1054. One helper still, so a mutation to it neuters both.
-        refuse_at_resolve(group_exprs.iter())?;
+        // Split from the HAVING's own checks rather than kept as one call,
+        // because 8.3 settles the GROUP BY clause before the HAVING: `GROUP BY
+        // s LIKE 'a' ESCAPE '!!' HAVING zz > 1` is 1210 there and `HAVING zz
+        // LIKE 'a' ESCAPE '!!'` is 1054.
+        //
+        // Its names as well as its arguments now, and here rather than in the
+        // grouping loop above because that loop runs once per row: over an
+        // empty table `GROUP BY zz.q` came back as an empty set where 8.3
+        // raises 1054, and a prepared statement was accepted that MySQL
+        // refuses at prepare. #0100. `resolve_group_by` reads the list item by
+        // item so the clause answers the same over an empty table as over a
+        // full one, which the loop's own reading already did.
+        resolve_group_by(&group_exprs, refs, names.iter().map(String::as_str))?;
         if let Some(having) = &select.having {
             check_having_scope(
                 having,
@@ -10386,7 +10481,10 @@ fn definition_materialised_by_mysql(session: &Session, definition: &str) -> bool
     //
     // A definition that will not parse is left unnarrowed rather than guessed
     // at; running the view is what reports the problem.
-    let normalised = rewrite::normalise(definition, session.sql_mode());
+    let normalised = rewrite::normalise(
+        rewrite::Normalised::untouched(definition),
+        session.sql_mode(),
+    );
     let Ok(statements) = Parser::parse_sql(&MySqlDialect {}, &normalised.sql) else {
         return false;
     };
@@ -11788,6 +11886,101 @@ fn resolve_dml_where(selection: Option<&Expr>, refs: &[ColumnRef]) -> EngineResu
     refuse_at_resolve([predicate])
 }
 
+/// Resolves the names a GROUP BY writes, before any row is grouped.
+///
+/// The clause is otherwise only read while a key is being built, once per row,
+/// so a query producing no groups never read it at all: over an empty table
+/// `SELECT k FROM Cl GROUP BY zz.q` came back as an empty set where 8.3 raises
+/// 1054, and a `COM_STMT_PREPARE` of it succeeded where 8.3 refuses. #0100.
+///
+/// `'group statement'` — MySQL's name for this clause in this message, and not
+/// the `'group clause'` the pattern of the others would suggest.
+///
+/// `aliases` is the select list's output names, which the clause admits beside
+/// the relation's columns: `SELECT k AS a FROM t GROUP BY a` is legal on 8.3
+/// and `SELECT 1 AS a GROUP BY a` is too. They are in scope here so this
+/// cannot refuse ahead of the first row what the row would have allowed —
+/// which is the trap #0100 records against this clause. Resolving such an
+/// alias to the item it names, once a row does arrive, is a separate matter
+/// and one the table-backed path still gets wrong.
+///
+/// Item by item, because 8.3 reads the list left to right and answers whatever
+/// is wrong with the first item that is — a name or an argument, whichever the
+/// item carries. Measured both ways, over a table with rows and over an empty
+/// one, with the same answer each time:
+///
+/// ```sql
+/// GROUP BY nope, s LIKE 'a' ESCAPE '!!'   -- 1054
+/// GROUP BY s LIKE 'a' ESCAPE '!!', nope   -- 1210
+/// ```
+///
+/// Checking every name and then every argument gets the second of those
+/// wrong, and it is the shape the per-row path already answered correctly —
+/// so a whole-clause pass would have made a settled statement worse to settle
+/// an unsettled one. Within *one* item the two are still separate walks, and
+/// merging them is #0087's.
+///
+/// One definition for the two paths that group — `grouped` for a query with a
+/// FROM and `select_without_table` for one without — so a mutation to it
+/// neuters both at once.
+fn resolve_group_by<'a>(
+    group_exprs: &[Expr],
+    refs: &[ColumnRef],
+    aliases: impl Iterator<Item = &'a str>,
+) -> EngineResult<()> {
+    let mut scope = refs.to_vec();
+    scope.extend(aliases.map(|alias| ColumnRef::new("", alias)));
+    for e in group_exprs {
+        if let Some(name) = unresolved_column(e, &scope) {
+            return Err(EngineError::unknown_column(&name, "group statement"));
+        }
+        refuse_at_resolve([e])?;
+    }
+    Ok(())
+}
+
+/// Resolves the ORDER BY of an UPDATE or a DELETE, before any row is chosen.
+///
+/// The last clause of a DML statement to be settled per row rather than ahead
+/// of them, and the worst place for it: the clause decides *which* rows are
+/// written, so a statement whose WHERE matched nothing never read it at all.
+/// Measured on 8.3 through `COM_STMT_PREPARE`, which refuses all three before
+/// the statement is ever executed:
+///
+/// ```sql
+/// UPDATE Bare SET k = 1 WHERE id = 4242 ORDER BY zz.q LIMIT 1  -- 1054, was 0 rows
+/// UPDATE LE SET s = 'x' ORDER BY s LIKE 'a' ESCAPE '!!'        -- 1210, was applied
+/// UPDATE LE SET s = 'x' ORDER BY SIGN()                        -- 1582, was applied
+/// ```
+///
+/// `'order clause'`, measured, and not the `'field list'` the evaluator
+/// reported when a row did happen to reach it.
+///
+/// Last of the DML resolvers, which is 8.3's order: with a bad ORDER BY beside
+/// a bad anything else, the other clause is named. Placed at the top of
+/// `dml_row_order` so the two statements that have the clause share one
+/// definition and a mutation to it neuters both.
+///
+/// No select list means no output alias for the clause to admit, which is the
+/// trap a SELECT's ORDER BY has and this one does not: `UPDATE t SET k = 1
+/// ORDER BY k` names a column of the table and nothing else can be named.
+///
+/// Item by item, as `resolve_group_by` above is and for the same measurement:
+/// 8.3 reads the list left to right, so `ORDER BY nope, s LIKE 'a' ESCAPE
+/// '!!'` is 1054 and `ORDER BY s LIKE 'a' ESCAPE '!!', nope` is 1210. Every
+/// name and then every argument gets the second wrong — and gets it wrong
+/// where the per-row path had it right, which would have been a regression
+/// rather than a gap left open.
+fn resolve_dml_order(order_by: &[OrderByExpr], refs: &[ColumnRef]) -> EngineResult<()> {
+    for item in order_by {
+        if let Some(name) = unresolved_column(&item.expr, refs) {
+            return Err(EngineError::unknown_column(&name, "order clause"));
+        }
+        refuse_at_resolve([&item.expr])?;
+    }
+    Ok(())
+}
+
 /// Resolves the values an assignment list writes, before any row is
 /// considered.
 ///
@@ -13027,6 +13220,19 @@ fn literal_name(e: &Expr) -> Option<String> {
     let Expr::Value(value) = peeled(e) else {
         return None;
     };
+    // A bound parameter reaches the parser as the literal it was bound to, and
+    // would otherwise be named by that literal's contents: `SELECT ?` bound to
+    // `'hello world'` was named `hello world` and described `NULL`, because a
+    // describe has no value to splice. MySQL names it `?` at prepare and `?`
+    // at execute, whatever is bound — measured through `COM_STMT_PREPARE` and
+    // `COM_STMT_EXECUTE`, along with `SELECT ?+1` naming `?+1` and `SELECT
+    // CONCAT(?,?)` naming `CONCAT(?,?)`, spacing and all. Those two come out
+    // of `source_text` on their own once the binder records its edits; this is
+    // the one shape that never reaches it, because a literal is named where it
+    // is read and never asks for the text that spelled it. #0109.
+    if is_bound_parameter(&value.span) {
+        return Some("?".to_owned());
+    }
     use sqlparser::ast::Value as V;
     match &value.value {
         V::SingleQuotedString(s) | V::DoubleQuotedString(s) | V::NationalStringLiteral(s) => Some(
@@ -13042,6 +13248,40 @@ fn literal_name(e: &Expr) -> Option<String> {
         // why `SELECT +TRUE` keeps its plus where `SELECT +1` does not.
         _ => None,
     }
+}
+
+/// Whether the literal at `span` is a bound parameter the binder wrote there.
+///
+/// Answered through the mapping, which is the only thing that still knows: by
+/// the time this runs the placeholder has been replaced by the value's literal
+/// text and the two are indistinguishable in the tree — a bound `'?'` and a
+/// written `'?'` parse to the same node.
+///
+/// The statement is asked first, and it is what keeps this off the hot path:
+/// converting a span to a byte offset walks the text, twice, and a query with
+/// a hundred literals in its select list would pay for it a hundred times.
+/// Nearly every statement has no parameters at all, and one that has none
+/// cannot have a span that maps back to a `?`.
+///
+/// `false` outside a statement, where nothing set `SOURCE`, and `false` for a
+/// span the mapping cannot place — the caller then names the literal the way
+/// it did before this existed, which is the answer for every literal that is
+/// not a parameter anyway.
+fn is_bound_parameter(span: &sqlparser::tokenizer::Span) -> bool {
+    let Some(origin) = SOURCE.with(|s| s.borrow().as_ref().map(|c| std::rc::Rc::clone(&c.source)))
+    else {
+        return false;
+    };
+    if !origin.has_parameters() {
+        return false;
+    }
+    let Some(start) = rewrite::byte_offset(&origin.sql, span.start) else {
+        return false;
+    };
+    let Some(end) = rewrite::byte_offset(&origin.sql, span.end) else {
+        return false;
+    };
+    origin.as_written(start..end) == Some("?")
 }
 
 /// A string literal's contents as MySQL would name a column with them.

@@ -217,58 +217,23 @@ impl Handler for EngineHandler {
 /// Counts `?` placeholders outside strings, identifiers and comments.
 ///
 /// The count must match what the client will send, or the connection
-/// desynchronises on the next COM_STMT_EXECUTE.
+/// desynchronises on the next COM_STMT_EXECUTE. It must also match what the
+/// engine *binds*, or every parameter after the first disagreement lands in
+/// the wrong place — which is why this asks the engine's own scanner rather
+/// than keeping a second copy of it here. The two were separate copies, alike
+/// enough to look maintained and free to drift on the next comment syntax
+/// either one learned about.
+///
+/// Saturating rather than wrapping: `COM_STMT_PREPARE` has a 16-bit parameter
+/// count, and a statement with more markers than that cannot be told to the
+/// client honestly in either direction. Reporting the cap is the answer that
+/// leaves the client complaining about the count rather than reading a short
+/// one and desynchronising.
 fn count_placeholders(sql: &str) -> u16 {
-    let bytes = sql.as_bytes();
-    let mut count: u16 = 0;
-    let mut i = 0;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            q @ (b'\'' | b'"' | b'`') => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' && q != b'`' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == q {
-                        if bytes.get(i + 1) == Some(&q) {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'#' => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i += 2;
-            }
-            b'?' => {
-                count = count.saturating_add(1);
-                i += 1;
-            }
-            _ => i += 1,
-        }
-    }
-
-    count
+    mysql_ultralight_engine::params::placeholders(sql)
+        .len()
+        .try_into()
+        .unwrap_or(u16::MAX)
 }
 
 #[cfg(test)]

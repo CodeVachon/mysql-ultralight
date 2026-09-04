@@ -8,6 +8,7 @@
 
 use crate::dialect::SqlMode;
 use crate::temporal::Compound;
+use crate::value::Value;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
@@ -173,16 +174,32 @@ pub struct Normalised {
     written: String,
     /// `sql` back to `written`.
     map: Mapping,
+    /// Whether `bind` substituted a parameter into this statement.
+    ///
+    /// Carried so a reader can skip the mapping entirely for the statements
+    /// that have nothing to find in it, which is nearly all of them: naming a
+    /// column asks whether a literal was written as `?`, and answering that
+    /// through `as_written` costs two scans of the text per literal.
+    bound: bool,
 }
 
 impl Normalised {
     /// A statement no pass has touched.
-    fn untouched(sql: &str) -> Self {
+    pub fn untouched(sql: &str) -> Self {
         Self {
             sql: sql.to_owned(),
             written: sql.to_owned(),
             map: Mapping::identity(sql.len()),
+            bound: false,
         }
+    }
+
+    /// Whether any of this statement's text was a bound parameter.
+    ///
+    /// `false` means no span in it can map back to a `?`, so a caller looking
+    /// for one can stop before touching the mapping.
+    pub fn has_parameters(&self) -> bool {
+        self.bound
     }
 
     /// What the client wrote where the rewrite says `range`.
@@ -235,14 +252,58 @@ impl Normalised {
             sql,
             written: self.written,
             map,
+            bound: self.bound,
         }
     }
 }
 
-/// Rewrites text the parser would reject but that needs no special handling.
-pub fn normalise(sql: &str, mode: SqlMode) -> Normalised {
-    let mut out = Normalised::untouched(sql);
+/// Substitutes each bound parameter into the statement, as a mapped pass.
+///
+/// The substitution has to be a *pass* rather than a string edit, because
+/// what it replaces is the one thing a client can still see afterwards. MySQL
+/// names the column of `SELECT ?` by the marker and not by what was bound —
+/// `?` at prepare and `?` at execute, whatever the value — and this engine
+/// splices the value in before the parser ever sees the statement, so the
+/// naming rule for a literal (#0059) was landing on the substituted text: a
+/// bound `'hello world'` named the column `hello world`, `'  x'` picked up
+/// the leading-whitespace trim, and a 300-byte string was cut at 255. Going
+/// through `Rewriter` records where each value stands, so `as_written` hands
+/// back the `?` the client actually sent and the name is right at both
+/// prepare and execute. #0109.
+///
+/// A placeholder with no parameter behind it is left in place, so the parser
+/// reports the mismatch rather than this inventing a NULL.
+pub fn bind(sql: &str, params: &[Value]) -> Normalised {
+    // A statement with neither a parameter nor a question mark in it has
+    // nothing to substitute, and a pass copies the whole text whether it edits
+    // anything or not. That is the overwhelming majority of statements.
+    if params.is_empty() && !sql.contains('?') {
+        return Normalised::untouched(sql);
+    }
+    let markers = crate::params::placeholders(sql);
+    let mut out = Normalised::untouched(sql).rewrite(|w| {
+        for (nth, at) in markers.iter().copied().enumerate() {
+            if let Some(value) = params.get(nth) {
+                w.substitute(at, at + 1, &crate::params::literal(value));
+            }
+        }
+    });
+    // Only where something was actually substituted. A statement whose `?`
+    // markers all went unbound still has them in the text the client sent, so
+    // reading one back through the mapping would find a `?` that no value
+    // replaced — and name a column after a marker the parser is about to
+    // reject anyway.
+    out.bound = !markers.is_empty() && !params.is_empty();
+    out
+}
 
+/// Rewrites text the parser would reject but that needs no special handling.
+///
+/// Takes the statement rather than its text, so a caller has to say where it
+/// came from: `bind` above produces one that already carries a mapping, and
+/// starting a fresh one over its output would throw that mapping away and
+/// leave every name pointing at the substituted value again.
+pub fn normalise(mut out: Normalised, mode: SqlMode) -> Normalised {
     // `SET @x := 1` is the same statement as `SET @x = 1`; only the spelling
     // is unsupported, so it is rewritten rather than intercepted.
     if starts_with_keyword(&out.sql, "SET") {
@@ -610,6 +671,7 @@ fn mod_operator_to_percent(text: Normalised) -> Normalised {
         sql: out,
         written: text.written,
         map,
+        bound: text.bound,
     }
 }
 
@@ -1462,7 +1524,7 @@ mod tests {
 
     /// The text `normalise` hands the parser, which is all these look at.
     fn normalise(sql: &str, mode: SqlMode) -> String {
-        super::normalise(sql, mode).sql
+        super::normalise(Normalised::untouched(sql), mode).sql
     }
 
     #[test]
@@ -1807,7 +1869,7 @@ mod review_regressions {
 
     /// The text `normalise` hands the parser, which is all these look at.
     fn normalise(sql: &str, mode: SqlMode) -> String {
-        super::normalise(sql, mode).sql
+        super::normalise(Normalised::untouched(sql), mode).sql
     }
 
     /// MySQL's `ANSI` as 8.3 expands it, so the name does not describe one
@@ -1928,7 +1990,7 @@ mod in_list_expansion {
     use super::*;
 
     fn expand(sql: &str) -> String {
-        normalise(sql, SqlMode::default()).sql
+        normalise(Normalised::untouched(sql), SqlMode::default()).sql
     }
 
     /// MySQL accepts an IN list of scalar subqueries; the parser reads the
@@ -2010,7 +2072,7 @@ mod in_list_review_regressions {
     use super::*;
 
     fn expand(sql: &str) -> String {
-        normalise(sql, SqlMode::default()).sql
+        normalise(Normalised::untouched(sql), SqlMode::default()).sql
     }
 
     /// Slicing to a fixed byte length panics when it lands mid-character, and
@@ -2080,6 +2142,11 @@ mod in_list_review_regressions {
 #[cfg(test)]
 mod offset_mapping {
     use super::*;
+
+    /// A statement put through every pass, from the text as the client sent it.
+    fn normalise(sql: &str, mode: SqlMode) -> Normalised {
+        super::normalise(Normalised::untouched(sql), mode)
+    }
 
     /// MySQL's `ANSI` as 8.3 expands it, so a fixture cannot describe one mode
     /// while its name describes another.

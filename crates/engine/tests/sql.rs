@@ -5863,6 +5863,211 @@ fn a_1054_names_the_clause_the_reference_was_written_in() {
     );
 }
 
+/// The same clauses, refused before a row rather than by one.
+///
+/// #0100. Every statement in the test above evaluates its clause, because it
+/// runs over a table with rows in it. Over an *empty* table the clause was
+/// never read at all: a GROUP BY, a join's ON, an OVER spec's two clauses and
+/// a DML ORDER BY were all settled once per row, so a query answered an empty
+/// set and — far worse — an `UPDATE` whose WHERE matched nothing reported
+/// nought rows affected, where 8.3 refuses all of them outright. A caller
+/// cannot tell "nothing matched" from "the statement was illegal".
+///
+/// Measured on 8.3 through the `mysql` crate's `COM_STMT_PREPARE`, which
+/// refuses each of these before the statement is executed at all — the CLI
+/// never prepares, so the text-protocol probe this repo usually reaches for
+/// could not see any of it. This engine refuses a query at prepare too (see
+/// `describe.rs`); a DML statement it still prepares and then refuses on
+/// execute, because `describe` will not probe a body that writes.
+///
+/// The clause names are the same strings the test above pins, deliberately
+/// asserted again from the other path: the two are settled by different code
+/// and a divergence between them is exactly what a client would trip over.
+#[test]
+fn a_clause_is_refused_over_an_empty_table_rather_than_answered() {
+    let (engine, mut session) = engine();
+    for ddl in [
+        "CREATE TABLE ClE (id INT NOT NULL, k INT NULL, s VARCHAR(20) NULL, PRIMARY KEY (id))",
+        "CREATE TABLE CrE (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+        // The one table here with a row in it, for the correlated-ON cases at
+        // the end: a subquery has to run for its join to be built at all.
+        "CREATE TABLE Seed (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+        "INSERT INTO Seed VALUES (1, 10)",
+    ] {
+        run(&engine, &mut session, ddl);
+    }
+
+    for (sql, code, message) in [
+        (
+            "SELECT k FROM ClE GROUP BY zz.q",
+            1054,
+            "Unknown column 'zz.q' in 'group statement'",
+        ),
+        (
+            "SELECT ClE.k FROM ClE JOIN CrE ON zz.q = CrE.id",
+            1054,
+            "Unknown column 'zz.q' in 'on clause'",
+        ),
+        (
+            "SELECT ClE.k FROM ClE LEFT JOIN CrE ON zz.q = CrE.id",
+            1054,
+            "Unknown column 'zz.q' in 'on clause'",
+        ),
+        (
+            "SELECT SUM(k) OVER (PARTITION BY zz.q) FROM ClE",
+            1054,
+            "Unknown column 'zz.q' in 'window partition by'",
+        ),
+        (
+            "SELECT SUM(k) OVER (ORDER BY zz.q) FROM ClE",
+            1054,
+            "Unknown column 'zz.q' in 'window order by'",
+        ),
+        // The DML ORDER BY #0100's note leads with, in both statement forms
+        // and with and without a LIMIT. `'order clause'`, measured — the
+        // evaluator reported `'field list'` for the one shape that did reach
+        // it, which was a row-bearing table and a WHERE that matched.
+        (
+            "UPDATE ClE SET k = 1 ORDER BY zz.q",
+            1054,
+            "Unknown column 'zz.q' in 'order clause'",
+        ),
+        (
+            "UPDATE ClE SET k = 1 WHERE id = 4242 ORDER BY zz.q LIMIT 1",
+            1054,
+            "Unknown column 'zz.q' in 'order clause'",
+        ),
+        (
+            "DELETE FROM ClE ORDER BY zz.q",
+            1054,
+            "Unknown column 'zz.q' in 'order clause'",
+        ),
+        (
+            "DELETE FROM ClE WHERE id = 4242 ORDER BY zz.q LIMIT 1",
+            1054,
+            "Unknown column 'zz.q' in 'order clause'",
+        ),
+        // And what those clauses carry besides their names, which 8.3 settles
+        // at the same moment.
+        (
+            "UPDATE ClE SET k = 1 ORDER BY s LIKE 'a' ESCAPE '!!'",
+            1210,
+            "Incorrect arguments to ESCAPE",
+        ),
+        (
+            "DELETE FROM ClE ORDER BY SIGN()",
+            1582,
+            "Incorrect parameter count in the call to native function 'SIGN'",
+        ),
+        (
+            "SELECT SUM(k) OVER (PARTITION BY s LIKE 'a' ESCAPE '!!') FROM ClE",
+            1210,
+            "Incorrect arguments to ESCAPE",
+        ),
+        (
+            "SELECT ClE.k FROM ClE JOIN CrE ON ClE.s LIKE 'a' ESCAPE '!!'",
+            1210,
+            "Incorrect arguments to ESCAPE",
+        ),
+        // The ORDER BY is the last clause a DML statement settles, so anything
+        // else wrong at the same time is named instead. 8.3's order, measured.
+        (
+            "UPDATE ClE SET k = zz.q ORDER BY yy.r",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "UPDATE ClE SET k = 1 WHERE zz.q = 1 ORDER BY yy.r",
+            1054,
+            "Unknown column 'zz.q' in 'where clause'",
+        ),
+        // Within one clause 8.3 reads the list left to right and answers
+        // whatever is wrong with the first item that is — a name or an
+        // argument, whichever that item carries. Measured both ways for both
+        // list clauses, over an empty table and over one with rows in it, and
+        // the same answer each time. A pass that checked every name and then
+        // every argument got the second of each pair wrong, and got it wrong
+        // where the per-row path had it right.
+        (
+            "SELECT k FROM ClE GROUP BY nope, s LIKE 'a' ESCAPE '!!'",
+            1054,
+            "Unknown column 'nope' in 'group statement'",
+        ),
+        (
+            "SELECT k FROM ClE GROUP BY s LIKE 'a' ESCAPE '!!', nope",
+            1210,
+            "Incorrect arguments to ESCAPE",
+        ),
+        (
+            "UPDATE ClE SET k = 1 ORDER BY nope, s LIKE 'a' ESCAPE '!!'",
+            1054,
+            "Unknown column 'nope' in 'order clause'",
+        ),
+        (
+            "UPDATE ClE SET k = 1 ORDER BY s LIKE 'a' ESCAPE '!!', nope",
+            1210,
+            "Incorrect arguments to ESCAPE",
+        ),
+        // An ON is one expression and not a list, so it cannot be read item by
+        // item and one of the two orders has to be wrong. Arguments first is
+        // right for three of the four 8.3 answers, and it is the order that
+        // was already here — the name check was added behind it rather than
+        // in front of it for exactly that reason.
+        (
+            "SELECT ClE.k FROM ClE JOIN CrE ON ClE.s LIKE 'a' ESCAPE '!!' AND nope = 1",
+            1210,
+            "Incorrect arguments to ESCAPE",
+        ),
+        (
+            "SELECT ClE.k FROM ClE JOIN CrE ON SIGN() = 1 AND nope = 1",
+            1582,
+            "Incorrect parameter count in the call to native function 'SIGN'",
+        ),
+        (
+            "SELECT ClE.k FROM ClE JOIN CrE ON nope = 1 AND SIGN() = 1",
+            1582,
+            "Incorrect parameter count in the call to native function 'SIGN'",
+        ),
+        // Reading the enclosing query's columns into the ON's scope must not
+        // turn the check into one that accepts anything: a name in neither
+        // scope is still refused, and still under the ON's own clause name.
+        (
+            "SELECT k FROM Seed WHERE EXISTS (SELECT 1 FROM ClE JOIN ClE c3 ON c3.id = Seed.zz)",
+            1054,
+            "Unknown column 'Seed.zz' in 'on clause'",
+        ),
+    ] {
+        let err = refusal_of(&engine, &mut session, sql);
+        assert_eq!(err.code, code, "for: {sql}");
+        assert_eq!(err.message, message, "for: {sql}");
+    }
+
+    // The direction that matters more: nothing legal over the same empty
+    // tables became an error. A resolver that refuses what MySQL answers turns
+    // working SQL into a failure, which is worse than the silence it replaces.
+    for sql in [
+        "SELECT k AS a FROM ClE ORDER BY a",
+        "SELECT k FROM ClE GROUP BY k",
+        "SELECT ClE.k FROM ClE JOIN CrE ON ClE.id = CrE.id",
+        "SELECT SUM(k) OVER (PARTITION BY k ORDER BY id) FROM ClE",
+        "UPDATE ClE SET k = 1 ORDER BY id LIMIT 1",
+        "DELETE FROM ClE ORDER BY id LIMIT 1",
+        // An ON that correlates outwards names something that *is* in scope,
+        // and the enclosing query's columns are not the join's — so resolving
+        // one ahead of its first pair of rows has to read both, or an inner
+        // side with no rows in it turns a query 8.3 answers into a 1054.
+        // Measured there: both of these answer.
+        //
+        // Over `Seed`, which has the row: the subquery has to run for its join
+        // to be built, and its own tables have to be empty for the resolver
+        // rather than the evaluator to be what answers.
+        "SELECT k FROM Seed WHERE EXISTS (SELECT 1 FROM ClE JOIN ClE c3 ON c3.id = Seed.id)",
+        "SELECT k FROM Seed WHERE id IN (SELECT ClE.id FROM ClE JOIN CrE c2 ON Seed.id = c2.id)",
+    ] {
+        run(&engine, &mut session, sql);
+    }
+}
+
 /// `ON DUPLICATE KEY UPDATE` resolves its names before anything collides.
 ///
 /// The fifth entry point with #0009's recurring shape, and the one #0102 left
@@ -13522,68 +13727,119 @@ fn a_rewritten_statement_names_its_columns_after_what_the_client_wrote() {
     }
 }
 
-/// Pins a divergence rather than claiming a fix.
+/// A bound parameter names its column `?`, as MySQL does.
 ///
 /// A parameter is spliced into the statement text before parsing, so by the
-/// time a column is named there is no placeholder left to name it after — the
-/// name is the *value's*. MySQL names that column `?` and nothing else,
-/// measured on 8.3 through a real prepared statement: `?` in the prepare
-/// response and `?` on every execute, whatever is bound. So this engine
-/// disagrees with MySQL and, worse, with itself: describing binds NULL and
-/// answers `NULL` where executing answers the value.
+/// time a column was named there was no placeholder left to name it after and
+/// the name came out of the *value*: a bound `'hello world'` named the column
+/// `hello world`, `'  x'` picked up the leading-whitespace trim meant for a
+/// written literal, and a 300-byte string was cut at 255. Describing bound
+/// NULL and so answered `NULL`, which made the engine disagree with itself as
+/// well as with MySQL.
 ///
-/// Naming a spliced parameter `?` needs the binder to report where it wrote,
-/// through a normaliser that did not preserve offsets. Half of that is now
-/// there: #0060 gave the rewriter an offset mapping, so a range of the parsed
-/// text can be carried back to the text it came from. What is still missing is
-/// the other half — `params::bind` reporting its own substitutions in the same
-/// terms, so the two compose — which is a change to the binder rather than to
-/// naming, and is not made here. This test exists so the behaviour cannot
-/// drift unnoticed while it waits. See also the `SELECT ?` assertion in
-/// `crates/engine/tests/describe.rs`.
+/// MySQL names that column `?` and nothing else, measured on 8.3 through a
+/// real prepared statement — the `mysql` crate's `COM_STMT_PREPARE` and
+/// `COM_STMT_EXECUTE`, because the CLI never prepares: `?` in the prepare
+/// response and `?` on every execute, whatever is bound.
+///
+/// The fix is in the binder rather than in naming. `rewrite::bind` substitutes
+/// through the same `Rewriter` every other pass uses, so the offset mapping
+/// #0060 added carries a range of the parsed text back to the `?` the client
+/// sent; everything but a bare parameter then falls out of `source_text`,
+/// which already reads a name through that mapping. #0109. See also the
+/// `SELECT ?` assertion in `crates/engine/tests/describe.rs`.
 #[test]
-fn a_bound_parameter_column_is_named_after_its_value_where_mysql_says_question_mark() {
+fn a_bound_parameter_names_its_column_for_the_marker_and_not_the_value() {
     let (engine, mut session) = engine();
 
-    // MySQL: `?`.
     assert_eq!(
         engine.describe(&session, "SELECT ?", 1).unwrap().unwrap()[0].name,
-        "NULL"
+        "?"
     );
 
-    for (bound, name) in [
-        (Value::text("hello world"), "hello world"),
-        // The literal-naming rules reach a value nobody wrote as a literal:
-        // this is the leading-whitespace trim applied to a bound string.
-        (Value::text("  x"), "x"),
-        (Value::Int(7), "7"),
-        (Value::Null, "NULL"),
+    for bound in [
+        Value::text("hello world"),
+        // The literal-naming rules used to reach a value nobody wrote as a
+        // literal: this is the leading-whitespace trim, applied to a bound
+        // string.
+        Value::text("  x"),
+        Value::Int(7),
+        // Rendered `-7`, which parses as a unary minus over a literal and not
+        // as one — so it is named through `source_text` where the others are
+        // named where the literal is read.
+        Value::Int(-7),
+        Value::Null,
+        Value::Bool(true),
+        // The 255-byte cut for a generated name landed on this one.
+        Value::text("z".repeat(300)),
+        // Rendered as a hex literal rather than a quoted string.
+        Value::Bytes(vec![0xde, 0xad]),
     ] {
         let Ok(Outcome::Rows(executed)) =
             engine.execute(&mut session, "SELECT ?", std::slice::from_ref(&bound))
         else {
             panic!("expected rows for {bound:?}");
         };
-        // MySQL: `?`.
-        assert_eq!(executed.columns[0].name, name, "{bound:?}");
+        assert_eq!(executed.columns[0].name, "?", "{bound:?}");
     }
 
-    // And the 255-byte cut lands on a bound value too.
-    let Ok(Outcome::Rows(executed)) =
-        engine.execute(&mut session, "SELECT ?", &[Value::text("z".repeat(300))])
-    else {
-        panic!("expected rows for a long bound string");
-    };
-    assert_eq!(executed.columns[0].name.len(), 255);
+    // The marker keeps its place inside a larger expression, spacing and all:
+    // 8.3 names these `?+1`, `CONCAT(?,?)` and `COALESCE(?, 1)`, which is the
+    // text the client wrote and not the rendered tree.
+    for (sql, params, expected) in [
+        ("SELECT ?+1", vec![Value::Int(5)], "?+1"),
+        (
+            "SELECT CONCAT(?,?)",
+            vec![Value::text("a"), Value::text("b")],
+            "CONCAT(?,?)",
+        ),
+        ("SELECT COALESCE(?, 1)", vec![Value::Null], "COALESCE(?, 1)"),
+        ("SELECT ? IS NULL", vec![Value::Int(1)], "? IS NULL"),
+        // Parentheses and unary plus are peeled off a parameter exactly as
+        // they are off a literal, both measured on 8.3.
+        ("SELECT (?)", vec![Value::Int(1)], "?"),
+        ("SELECT + ?", vec![Value::Int(1)], "?"),
+        // Through a second pass, which is what the binder has to *compose*
+        // with rather than replace: infix `MOD` is rewritten to `%` before the
+        // parser sees it, so the name of either item is only recoverable if
+        // both passes' mappings hold. 8.3 names these `? MOD 3` and `? mod 3`,
+        // keeping the spelling, and the bare marker beside one `?`.
+        ("SELECT ? MOD 3", vec![Value::Int(7)], "? MOD 3"),
+        ("SELECT ? mod 3", vec![Value::Int(7)], "? mod 3"),
+        ("SELECT ?, 1 MOD 3", vec![Value::text("zz")], "?"),
+    ] {
+        let described = engine
+            .describe(&session, sql, params.len())
+            .unwrap()
+            .unwrap();
+        assert_eq!(described[0].name, expected, "describing {sql}");
+        let Ok(Outcome::Rows(executed)) = engine.execute(&mut session, sql, &params) else {
+            panic!("expected rows for {sql}");
+        };
+        assert_eq!(executed.columns[0].name, expected, "running {sql}");
+    }
 
-    // An alias is the one spelling that agrees with MySQL, because it never
-    // looks at the value.
+    // An alias still wins over the marker, and always agreed with MySQL
+    // because it never looks at what is underneath it.
     let Ok(Outcome::Rows(executed)) =
         engine.execute(&mut session, "SELECT ? AS lit", &[Value::text("q")])
     else {
         panic!("expected rows for an aliased parameter");
     };
     assert_eq!(executed.columns[0].name, "lit");
+
+    // A `?` inside a string is data and not a marker: it is named for its
+    // contents, which happen to spell the same thing, and it must still be
+    // *there* — a scanner that substituted into it would have eaten the value.
+    let Ok(Outcome::Rows(executed)) =
+        engine.execute(&mut session, "SELECT '?', ?", &[Value::Int(1)])
+    else {
+        panic!("expected rows for a quoted question mark");
+    };
+    let names: Vec<&str> = executed.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["?", "?"]);
+    assert_eq!(executed.rows[0][0], Value::text("?"));
+    assert_eq!(executed.rows[0][1], Value::Int(1));
 }
 
 /// MySQL reports at most 255 bytes of a generated column name, and cuts on a

@@ -4576,6 +4576,126 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        // #0100, the remainder of #0058. The group above asks what a 1054 is
+        // *named*; this one asks whether the clause is read at all, and the
+        // only difference between them is that these tables are empty.
+        //
+        // A clause settled by evaluating it is settled once per row, so with
+        // no row it was never settled: a query answered an empty set and an
+        // `UPDATE` reported nought rows affected, where MySQL refuses the
+        // statement. On a write that silence is the worst spelling of it —
+        // the caller cannot tell "nothing matched" from "this was illegal".
+        //
+        // MySQL raises every one of these at *prepare*, before the statement
+        // runs. The harness records a code and a SQLSTATE rather than which
+        // round trip carried them, so a case here is green whichever of the
+        // two refuses — which is the whole of what a client sees for a DML
+        // statement this engine cannot probe. Where it can, `describe.rs`
+        // asserts the refusal comes from the prepare.
+        name: "a clause resolved before the first row",
+        setup: &[
+            "CREATE TABLE ClE (id INT NOT NULL, k INT NULL, s VARCHAR(20) NULL, \
+             PRIMARY KEY (id))",
+            "CREATE TABLE CrE (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+            "CREATE TABLE Seed (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+            "INSERT INTO Seed VALUES (1, 10)",
+        ],
+        cases: &[
+            // The two #0058 settled, over an empty table as well, so a change
+            // that puts either back behind a row is visible here.
+            same("SELECT zz.q FROM ClE"),
+            same("SELECT k FROM ClE WHERE zz.q = 1"),
+            // The clauses this closes.
+            same("SELECT k FROM ClE GROUP BY zz.q"),
+            same("SELECT k FROM ClE GROUP BY ABS(zz.q)"),
+            same("SELECT ClE.k FROM ClE JOIN CrE ON zz.q = CrE.id"),
+            same("SELECT ClE.k FROM ClE LEFT JOIN CrE ON zz.q = CrE.id"),
+            same("SELECT ClE.k FROM ClE JOIN CrE USING (zz)"),
+            same("SELECT SUM(k) OVER (PARTITION BY zz.q) FROM ClE"),
+            same("SELECT SUM(k) OVER (ORDER BY zz.q) FROM ClE"),
+            // An OVER spec does not read the select list's aliases, where the
+            // query's own ORDER BY does — both measured on 8.3.
+            same("SELECT k AS a, SUM(id) OVER (PARTITION BY a) FROM ClE"),
+            same("SELECT k AS a FROM ClE ORDER BY a"),
+            // The clauses already settled ahead of a row, asked over an empty
+            // table too: the same mechanism carries all of them now.
+            same("SELECT k FROM ClE GROUP BY k HAVING zz.q > 1"),
+            same("SELECT k FROM ClE ORDER BY zz.q"),
+            // A DML ORDER BY, in both statement forms, with and without a
+            // LIMIT, and with a WHERE that matches nothing so no row can reach
+            // the clause even on a table that has some.
+            same("UPDATE ClE SET k = 1 ORDER BY zz.q"),
+            same("UPDATE ClE SET k = 1 WHERE id = 4242 ORDER BY zz.q LIMIT 1"),
+            same("DELETE FROM ClE ORDER BY zz.q"),
+            same("DELETE FROM ClE WHERE id = 4242 ORDER BY zz.q LIMIT 1"),
+            // What a clause carries besides its names is fixed by the text in
+            // the same way, and was in the same row-shaped hole.
+            same("UPDATE ClE SET k = 1 ORDER BY s LIKE 'a' ESCAPE '!!'"),
+            same("UPDATE ClE SET k = 1 ORDER BY SIGN()"),
+            same("DELETE FROM ClE ORDER BY s LIKE 'a' ESCAPE '!!'"),
+            same("DELETE FROM ClE ORDER BY SIGN()"),
+            same("SELECT SUM(k) OVER (PARTITION BY s LIKE 'a' ESCAPE '!!') FROM ClE"),
+            same("SELECT SUM(k) OVER (ORDER BY s LIKE 'a' ESCAPE '!!') FROM ClE"),
+            same("SELECT SUM(k) OVER (PARTITION BY SIGN()) FROM ClE"),
+            same("SELECT ClE.k FROM ClE JOIN CrE ON ClE.s LIKE 'a' ESCAPE '!!'"),
+            same("SELECT ClE.k FROM ClE JOIN CrE ON SIGN() = CrE.id"),
+            // A DML ORDER BY is the last clause settled, so anything else
+            // wrong at the same time decides the answer.
+            same("UPDATE ClE SET k = zz.q ORDER BY yy.r"),
+            same("UPDATE ClE SET k = 1 WHERE zz.q = 1 ORDER BY yy.r"),
+            // Within one clause MySQL reads the list left to right and answers
+            // whatever is wrong with the first item that is — a name or an
+            // argument, whichever that item carries. A pass that checked every
+            // name and then every argument got the second of each pair wrong,
+            // and got it wrong where the per-row path had it right.
+            same("SELECT k FROM ClE GROUP BY nope, s LIKE 'a' ESCAPE '!!'"),
+            same("SELECT k FROM ClE GROUP BY s LIKE 'a' ESCAPE '!!', nope"),
+            same("UPDATE ClE SET k = 1 ORDER BY nope, s LIKE 'a' ESCAPE '!!'"),
+            same("UPDATE ClE SET k = 1 ORDER BY s LIKE 'a' ESCAPE '!!', nope"),
+            same("DELETE FROM ClE ORDER BY nope, s LIKE 'a' ESCAPE '!!'"),
+            same("DELETE FROM ClE ORDER BY s LIKE 'a' ESCAPE '!!', nope"),
+            // An ON is one expression rather than a list, so it cannot be read
+            // item by item and one of the two orders has to be wrong. These
+            // are the three of the four that are right; the fourth — `ON nope
+            // = 1 AND s LIKE 'a' ESCAPE '!!'`, which MySQL answers 1054 and
+            // this engine 1210 — is the within-clause ordering gap #0087 owns
+            // and is deliberately not a case here.
+            same("SELECT ClE.k FROM ClE JOIN CrE ON ClE.s LIKE 'a' ESCAPE '!!' AND nope = 1"),
+            same("SELECT ClE.k FROM ClE JOIN CrE ON SIGN() = 1 AND nope = 1"),
+            same("SELECT ClE.k FROM ClE JOIN CrE ON nope = 1 AND SIGN() = 1"),
+            // And an ON that correlates outwards names something that *is* in
+            // scope, so resolving one ahead of its first pair of rows has to
+            // read the enclosing query's columns as well as the join's.
+            //
+            // `Seed` has the one row in this group, and it is what makes these
+            // bite: the subquery has to run for its join to be built at all,
+            // and its own tables have to be empty for the resolver rather than
+            // the evaluator to be the thing that answers. With both sides
+            // empty the subquery never runs and the case tests nothing.
+            same("SELECT k FROM Seed WHERE EXISTS (SELECT 1 FROM ClE JOIN ClE c3 ON c3.id = Seed.id)"),
+            same("SELECT k FROM Seed WHERE id IN (SELECT ClE.id FROM ClE JOIN CrE c2 ON Seed.id = c2.id)"),
+            // Still refused where the name is not in either scope, which is
+            // what stops the line above from being a way to accept anything.
+            same("SELECT k FROM Seed WHERE EXISTS (SELECT 1 FROM ClE JOIN ClE c3 ON c3.id = Seed.zz)"),
+            // The direction that matters more than any of the above: nothing
+            // legal over these same empty tables became a refusal. Refusing
+            // what MySQL answers turns working SQL into an error, which is
+            // worse than the silence this replaces.
+            same("SELECT k FROM ClE GROUP BY k"),
+            same("SELECT ClE.k FROM ClE JOIN CrE ON ClE.id = CrE.id"),
+            same("SELECT SUM(k) OVER (PARTITION BY k ORDER BY id) FROM ClE"),
+            same("SELECT k FROM ClE WHERE id IN (SELECT id FROM CrE)"),
+            same("UPDATE ClE SET k = 1 ORDER BY id LIMIT 1"),
+            same("DELETE FROM ClE ORDER BY id LIMIT 1"),
+            // Nothing above put a row in either table or took one out, and a
+            // group of nothing but refusals reads the same whether its setup
+            // ran or failed on both servers.
+            same("SELECT COUNT(*) FROM ClE"),
+            same("SELECT id, k, s FROM ClE ORDER BY id"),
+            same("SELECT id, k FROM Seed ORDER BY id"),
+        ],
+    },
+    Group {
         // #0070 and #0085. Arithmetic over a decimal went through an `f64` and
         // came back with whatever the float printed, so the scale MySQL
         // computes was lost at every operator: `a + b` over two columns

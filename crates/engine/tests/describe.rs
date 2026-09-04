@@ -123,11 +123,19 @@ fn describe_matches_execute() {
 
 /// A statement is described with every parameter bound to NULL, because its
 /// shape does not depend on its arguments. Where the parameter *is* the whole
-/// column, that is visible: `SELECT ?` describes as a string and executes as
-/// whatever was bound. MySQL declares `VAR_STRING` at prepare time too, so the
-/// declared type is right; what differs is the name, which is `NULL` here and
-/// `?` in MySQL, because the value is substituted before the statement is
-/// parsed.
+/// column, that is visible: `SELECT ?` is described by the NULL it was bound
+/// to and executes as whatever the client sent.
+///
+/// The *name* is not one of the things that may differ, and since #0109 it
+/// does not: `?` at prepare and `?` at execute, which is what 8.3 answers
+/// through a real prepared statement whatever is bound.
+///
+/// The declared *type* still differs from MySQL's, and is not this issue's:
+/// measured through `COM_STMT_PREPARE`, 8.3 describes `SELECT ?` as
+/// `VAR_STRING` of 65532 bytes and this engine as `MYSQL_TYPE_NULL` of nought,
+/// because 8.3 types a parameter from the statement and this engine types it
+/// from the value it was bound to. That is parameter type inference rather
+/// than naming, and it is unfiled.
 #[test]
 fn describe_matches_execute_with_parameters() {
     let (engine, mut s) = setup();
@@ -158,7 +166,7 @@ fn describe_matches_execute_with_parameters() {
     // The one shape where the two legitimately differ, asserted rather than
     // left in prose so it cannot drift: the parameter *is* the column, so
     // there is nothing but the bound value to type it by, and the value is
-    // NULL when describing. The name is what MySQL would call `?`.
+    // NULL when describing.
     let described = engine.describe(&s, "SELECT ? AS lit", 1).unwrap().unwrap();
     let Ok(Outcome::Rows(executed)) = engine.execute(&mut s, "SELECT ? AS lit", &[Value::Int(7)])
     else {
@@ -168,9 +176,16 @@ fn describe_matches_execute_with_parameters() {
     assert_eq!(executed.columns[0].name, "lit");
     assert_ne!(described[0].ty, executed.columns[0].ty);
 
-    // Unaliased, the column is named for the bound NULL rather than `?`.
+    // The *name* is not one of the things that may differ, and unaliased it is
+    // the one thing left to compare: `?` at describe and `?` at execute, which
+    // is what 8.3 answers through a real prepared statement whatever is bound.
+    // #0109 — it used to be `NULL` here and the value there.
     let bare = engine.describe(&s, "SELECT ?", 1).unwrap().unwrap();
-    assert_eq!(bare[0].name, "NULL");
+    let Ok(Outcome::Rows(ran)) = engine.execute(&mut s, "SELECT ?", &[Value::Int(7)]) else {
+        panic!("SELECT ? did not return rows");
+    };
+    assert_eq!(bare[0].name, "?");
+    assert_eq!(ran.columns[0].name, "?");
 }
 
 /// A lateral `JSON_TABLE` over a table with no rows.
@@ -1241,4 +1256,135 @@ fn a_cast_to_an_impossible_shape_is_described_rather_than_crashing() {
             .unwrap_or_else(|| panic!("described nothing: {sql}"));
         assert_eq!(described.len(), 1, "{sql}");
     }
+}
+
+/// Every clause is resolved at prepare, not when the first row reaches it.
+///
+/// #0100, the remainder of #0058. A `describe` is a probe over no rows, and
+/// this engine settled a GROUP BY, a join's ON and an OVER spec's two clauses
+/// by *evaluating* them — once per row. With no row there was nothing to
+/// evaluate, so `COM_STMT_PREPARE` came back declaring columns for statements
+/// MySQL refuses outright, and a client that prepares up front was told they
+/// were fine.
+///
+/// Measured on 8.3 through the `mysql` crate's `COM_STMT_PREPARE`, which the
+/// CLI cannot reach because it never prepares: every statement below is
+/// refused there at prepare, with the code and the clause name asserted here.
+///
+/// The tables are empty on purpose, so the refusal cannot be coming from a
+/// row. The same statements over a table with rows in it are `sql.rs`'s
+/// `a_1054_names_the_clause_the_reference_was_written_in`, which is where
+/// these names were first pinned.
+#[test]
+fn a_clause_is_refused_at_prepare_rather_than_at_the_first_row() {
+    let (engine, mut s) = setup();
+    for ddl in [
+        "CREATE TABLE Cl (id INT NOT NULL, k INT NULL, s VARCHAR(20) NULL, PRIMARY KEY (id))",
+        "CREATE TABLE Cr (id INT NOT NULL, k INT NULL, PRIMARY KEY (id))",
+    ] {
+        engine.execute(&mut s, ddl, &[]).unwrap();
+    }
+
+    for (sql, code, message) in [
+        // The two #0058 already settled, kept beside the rest so a change that
+        // undoes the mechanism shows up as more than one line.
+        (
+            "SELECT zz.q FROM Cl",
+            1054,
+            "Unknown column 'zz.q' in 'field list'",
+        ),
+        (
+            "SELECT k FROM Cl WHERE zz.q = 1",
+            1054,
+            "Unknown column 'zz.q' in 'where clause'",
+        ),
+        // The four clauses this closes.
+        (
+            "SELECT k FROM Cl GROUP BY zz.q",
+            1054,
+            "Unknown column 'zz.q' in 'group statement'",
+        ),
+        (
+            "SELECT Cl.k FROM Cl JOIN Cr ON zz.q = Cr.id",
+            1054,
+            "Unknown column 'zz.q' in 'on clause'",
+        ),
+        (
+            "SELECT Cl.k FROM Cl LEFT JOIN Cr ON zz.q = Cr.id",
+            1054,
+            "Unknown column 'zz.q' in 'on clause'",
+        ),
+        (
+            "SELECT SUM(k) OVER (PARTITION BY zz.q) FROM Cl",
+            1054,
+            "Unknown column 'zz.q' in 'window partition by'",
+        ),
+        (
+            "SELECT SUM(k) OVER (ORDER BY zz.q) FROM Cl",
+            1054,
+            "Unknown column 'zz.q' in 'window order by'",
+        ),
+        // An OVER spec does not see the select list's aliases where the
+        // query's own ORDER BY does, measured both ways on 8.3 — which is why
+        // the scope here is the relation's and not the projection's.
+        (
+            "SELECT k AS a, SUM(id) OVER (PARTITION BY a) FROM Cl",
+            1054,
+            "Unknown column 'a' in 'window partition by'",
+        ),
+        // What a clause carries besides its names travels with it, and 8.3
+        // settles all of it at prepare too.
+        (
+            "SELECT SUM(k) OVER (PARTITION BY s LIKE 'a' ESCAPE '!!') FROM Cl",
+            1210,
+            "Incorrect arguments to ESCAPE",
+        ),
+        (
+            "SELECT SUM(k) OVER (ORDER BY SIGN()) FROM Cl",
+            1582,
+            "Incorrect parameter count in the call to native function 'SIGN'",
+        ),
+        (
+            "SELECT Cl.k FROM Cl JOIN Cr ON Cl.s LIKE 'a' ESCAPE '!!'",
+            1210,
+            "Incorrect arguments to ESCAPE",
+        ),
+    ] {
+        let Err(error) = engine.describe(&s, sql, 0) else {
+            panic!("described rather than refusing: {sql}");
+        };
+        assert_eq!(error.code, code, "{sql}");
+        assert_eq!(error.message, message, "{sql}");
+    }
+
+    // And the shapes that are legal over the same empty tables still describe,
+    // which is the direction that matters most: refusing something MySQL
+    // answers is worse than the gap this closes.
+    for sql in [
+        "SELECT k AS a FROM Cl ORDER BY a",
+        "SELECT k FROM Cl GROUP BY k",
+        "SELECT Cl.k FROM Cl JOIN Cr ON Cl.id = Cr.id",
+        "SELECT SUM(k) OVER (PARTITION BY k ORDER BY id) FROM Cl",
+        "SELECT k FROM Cl WHERE id IN (SELECT id FROM Cr)",
+    ] {
+        engine
+            .describe(&s, sql, 0)
+            .unwrap_or_else(|e| panic!("refused a legal statement: {sql} -> {e:?}"))
+            .unwrap_or_else(|| panic!("described nothing: {sql}"));
+    }
+
+    // A GROUP BY reads the select list's output names beside the relation's
+    // columns — `SELECT k AS a FROM Cl GROUP BY a` is a legal query on 8.3 —
+    // so the check above must not refuse one. Asserted apart from the list
+    // because this engine describes *nothing* for it rather than the column
+    // 8.3 declares: the ONLY_FULL_GROUP_BY check behind it does not see the
+    // alias as covering the item, which is its own divergence and not this
+    // one. What matters here is only that resolving ahead of the first row did
+    // not turn a query MySQL answers into a refusal.
+    assert!(
+        engine
+            .describe(&s, "SELECT k AS a FROM Cl GROUP BY a", 0)
+            .is_ok(),
+        "refused a GROUP BY that names a select alias"
+    );
 }
