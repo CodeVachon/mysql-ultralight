@@ -1,11 +1,11 @@
 ---
 id: 236
 title: HAVING prefers a select alias where MySQL prefers a grouped column
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor, app-priority-2]
 created: 2026-09-04T08:10:22Z
-updated: 2026-09-04T08:10:22Z
+updated: 2026-09-04T10:04:43Z
 ---
 
 ## Description

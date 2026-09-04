@@ -1,11 +1,11 @@
 ---
 id: 249
 title: TRUNCATE has no exact path, so a decimal loses its declared scale
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor, app-priority-2]
 created: 2026-09-04T09:47:09Z
-updated: 2026-09-04T09:47:09Z
+updated: 2026-09-04T10:04:43Z
 ---
 
 ## Description

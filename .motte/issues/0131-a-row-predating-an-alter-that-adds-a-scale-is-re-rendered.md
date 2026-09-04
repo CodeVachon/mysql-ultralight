@@ -1,11 +1,11 @@
 ---
 id: 131
 title: A row predating an ALTER that adds a scale is re-rendered
-state: Todo
+state: In Progress
 parent: 9
 labels: [compat, app-priority-2]
 created: 2026-08-26T16:18:44Z
-updated: 2026-09-03T14:20:28Z
+updated: 2026-09-04T10:04:43Z
 ---
 
 ## Description

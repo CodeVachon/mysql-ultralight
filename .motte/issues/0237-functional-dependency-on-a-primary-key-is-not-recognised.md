@@ -1,11 +1,11 @@
 ---
 id: 237
 title: Functional dependency on a primary key is not recognised
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor, app-priority-2]
 created: 2026-09-04T08:10:22Z
-updated: 2026-09-04T08:10:22Z
+updated: 2026-09-04T10:04:43Z
 ---
 
 ## Description

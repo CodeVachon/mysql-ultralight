@@ -1,11 +1,11 @@
 ---
 id: 245
 title: An unreferenced CTE and a comma-joined LATERAL are refused where MySQL answers
-state: Todo
+state: In Progress
 parent: 9
 labels: [executor, app-priority-2]
 created: 2026-09-04T08:53:05Z
-updated: 2026-09-04T08:53:05Z
+updated: 2026-09-04T10:04:43Z
 ---
 
 ## Description

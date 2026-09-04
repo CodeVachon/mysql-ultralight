@@ -228,3 +228,11 @@
 {"at":"2026-09-04T09:47:08Z","id":247,"by":"Christopher Vachon","as":"user","type":"created","title":"A statement too large to parse still aborts the process","state":"Todo"}
 {"at":"2026-09-04T09:47:08Z","id":248,"by":"Christopher Vachon","as":"user","type":"created","title":"Negative zero is lost through whole()","state":"Todo"}
 {"at":"2026-09-04T09:47:09Z","id":249,"by":"Christopher Vachon","as":"user","type":"created","title":"TRUNCATE has no exact path, so a decimal loses its declared scale","state":"Todo"}
+{"at":"2026-09-04T10:04:43Z","id":236,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T10:04:43Z","id":237,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T10:04:43Z","id":239,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T10:04:43Z","id":243,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T10:04:43Z","id":245,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T10:04:43Z","id":249,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T10:04:43Z","id":131,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"In Progress"}
+{"at":"2026-09-04T21:13:26Z","id":250,"by":"Christopher Vachon","as":"user","type":"created","title":"Threading the outer scope deeper overflows the stack at 20 levels","state":"Todo"}
