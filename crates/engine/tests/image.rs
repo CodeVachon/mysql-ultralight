@@ -985,11 +985,11 @@ fn a_boolean_never_reaches_the_image_and_is_written_as_its_integer_if_it_does() 
 
     // And the boolean did not move the version: 7 was #0068's ENUM tag, 8 was
     // #0069's unsigned one, 9 is #0126's binary collation, 10 is the column
-    // collation #0129/#0134/#0152 needed and 11 is #0121's decimal mark inside
-    // a document, none of them this. Pinned rather than derived, so the day
-    // something *does* give a boolean a tag of its own it has to come back
-    // here and say so.
-    assert_eq!(image::FORMAT_VERSION, 11);
+    // collation #0129/#0134/#0152 needed, 11 is #0121's decimal mark inside a
+    // document and 12 is #0205's foreign key schema, none of them this. Pinned
+    // rather than derived, so the day something *does* give a boolean a tag of
+    // its own it has to come back here and say so.
+    assert_eq!(image::FORMAT_VERSION, 12);
 }
 
 #[test]
@@ -1264,4 +1264,80 @@ fn a_decimal_inside_a_document_survives_the_image_as_a_decimal() {
             vec!["2", r#"{"v": 2.5}"#, "DOUBLE"],
         ]
     );
+}
+
+/// v12: a foreign key's parent is two fields, and both survive.
+///
+/// The database the constraint wrote is held apart from the parent's name
+/// because the join cannot be undone — `REFERENCES app.P(id)` and
+/// ``REFERENCES `app.P`(id)`` render to the same `app.P`, and a reader
+/// splitting that turns a table actually called `app.P` into a table `P` in a
+/// database `app`. 8.3 reports the first as `app`/`P` and the second as this
+/// database and `app.P`, measured, so a v11 image genuinely cannot hold the
+/// difference.
+///
+/// Through the image and not only through the catalog, because the field is
+/// what the version was bumped for: a schema written and not read back would
+/// reload as the unqualified case and answer both columns wrongly.
+#[test]
+fn a_foreign_keys_parent_keeps_its_database_and_its_name_apart() {
+    let (engine, mut session) = engine();
+    engine.bootstrap_database("appdb").unwrap();
+    run(&engine, &mut session, "CREATE TABLE P (id INT PRIMARY KEY)");
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE appdb.X (id INT PRIMARY KEY)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE `a.b` (id INT PRIMARY KEY)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Q (pid INT, CONSTRAINT fkq FOREIGN KEY (pid) REFERENCES testdb.P (id))",
+    );
+    // A parent in *another* database, which is the only shape where the stored
+    // schema is not the child's own — and so the only one that can tell a
+    // field that round trips from one that is re-derived on the way in.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE A (pid INT, CONSTRAINT fka FOREIGN KEY (pid) REFERENCES appdb.X (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Dot (pid INT, CONSTRAINT fkd FOREIGN KEY (pid) REFERENCES `a.b` (id))",
+    );
+
+    let read = "SELECT CONSTRAINT_NAME, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME \
+                FROM information_schema.key_column_usage \
+                WHERE CONSTRAINT_SCHEMA = 'testdb' AND REFERENCED_TABLE_NAME IS NOT NULL \
+                ORDER BY CONSTRAINT_NAME";
+    let expected = vec![
+        vec!["fka", "appdb", "X"],
+        // The dotted name is a name and not a qualification, so the schema is
+        // the child's own.
+        vec!["fkd", "testdb", "a.b"],
+        vec!["fkq", "testdb", "P"],
+    ];
+    assert_eq!(rows(&engine, &mut session, read), expected);
+
+    let decoded = image::decode(&image::encode(&engine.catalog_snapshot().unwrap())).unwrap();
+    let restored = Engine::from_catalog(decoded, ServerConfig::default()).unwrap();
+    let mut session = Session::new(ServerConfig::default(), 1);
+    session.current_database = Some("testdb".to_owned());
+    assert_eq!(rows(&restored, &mut session, read), expected);
+
+    // And the dotted parent is still the parent it names, which is the half
+    // `information_schema` cannot show: a key resolved by splitting would look
+    // for a table `b` in a database `a` and find nothing, so every write would
+    // be waved through.
+    let err = restored
+        .execute(&mut session, "INSERT INTO Dot VALUES (7)", &[])
+        .unwrap_err();
+    assert_eq!(err.code, 1452, "{err}");
 }

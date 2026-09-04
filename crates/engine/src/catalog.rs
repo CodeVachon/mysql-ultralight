@@ -80,10 +80,61 @@ pub struct Index {
 pub struct ForeignKey {
     pub name: String,
     pub columns: Vec<String>,
+    /// The database the constraint wrote in front of its parent, where it
+    /// wrote one at all.
+    ///
+    /// Held apart from the name rather than joined onto it, because the join
+    /// cannot be undone: `name::dotted` renders `REFERENCES app.P(id)` and
+    /// ``REFERENCES `app.P`(id)`` as the same `app.P`, and splitting that back
+    /// turns a table actually called `app.P` into a table `P` in a database
+    /// `app`. Measured on 8.3, a parent called `a.b` reports
+    /// `REFERENCED_TABLE_NAME` = `a.b` with the child's own schema beside it —
+    /// so the two are different answers and one string cannot carry both.
+    pub referenced_schema: Option<String>,
+    /// The parent's own name, with no qualification on it.
     pub referenced_table: String,
     pub referenced_columns: Vec<String>,
     pub on_delete: String,
     pub on_update: String,
+}
+
+impl ForeignKey {
+    /// The database this key points at, and the parent's name.
+    ///
+    /// 8.3 reports the two in separate columns — `REFERENCES app.P(id)` is
+    /// `REFERENCED_TABLE_NAME` = `P` and `REFERENCED_TABLE_SCHEMA` = `app`,
+    /// measured — and a key that wrote no database points inside the database
+    /// its own table lives in, which is what `own_database` supplies.
+    pub fn referenced_parts<'a>(&'a self, own_database: &'a str) -> (&'a str, &'a str) {
+        (
+            self.referenced_schema.as_deref().unwrap_or(own_database),
+            self.referenced_table.as_str(),
+        )
+    }
+
+    /// Whether this key's parent lives in `database`.
+    ///
+    /// A key that wrote no database is inside whichever one its own table is,
+    /// so this is asked with that database's name.
+    pub fn points_inside(&self, database: &str) -> bool {
+        self.referenced_schema
+            .as_deref()
+            .is_none_or(|schema| schema.eq_ignore_ascii_case(database))
+    }
+
+    /// Whether this key points at `table` in `database`.
+    ///
+    /// Both halves, because the name alone is not the table: a key written
+    /// `REFERENCES other.P` and one written `REFERENCES P` from a child in
+    /// `app` name two different parents, and comparing only the name made a
+    /// rename or a drop of `app.P` reach both.
+    ///
+    /// `own_database` is the database the key's *own* table lives in, which is
+    /// where an unqualified name resolves.
+    pub fn points_at(&self, own_database: &str, database: &str, table: &str) -> bool {
+        let (schema, name) = self.referenced_parts(own_database);
+        schema.eq_ignore_ascii_case(database) && name.eq_ignore_ascii_case(table)
+    }
 }
 
 /// A table and its rows.

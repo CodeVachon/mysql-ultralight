@@ -107,7 +107,15 @@ pub fn snapshot(database: &Database, table: &Table) -> Vec<ParentKeys> {
                 return None;
             }
 
-            let parent = database.table(&constraint.referenced_table);
+            // Only inside this database. `referenced_table` is the parent's
+            // bare name, so a key written `REFERENCES other.P` would otherwise
+            // resolve against a table `P` *here* and be enforced against the
+            // wrong parent. A key pointing outside is inert, which is where it
+            // already was and is a gap of its own.
+            let parent = constraint
+                .points_inside(&database.name)
+                .then(|| database.table(&constraint.referenced_table))
+                .flatten();
             let keys = match parent {
                 Some(parent) => {
                     let positions: Vec<usize> = constraint
@@ -134,8 +142,7 @@ pub fn snapshot(database: &Database, table: &Table) -> Vec<ParentKeys> {
             };
 
             let self_positions = constraint
-                .referenced_table
-                .eq_ignore_ascii_case(&table.name)
+                .points_at(&database.name, &database.name, &table.name)
                 .then(|| {
                     constraint
                         .referenced_columns
@@ -185,10 +192,9 @@ pub fn dependents(database: &Database, parent: &Table) -> Vec<Dependent> {
     let mut out = Vec::new();
     for child in database.tables.values() {
         for constraint in &child.foreign_keys {
-            if !constraint
-                .referenced_table
-                .eq_ignore_ascii_case(&parent.name)
-            {
+            // Both halves of the name, so a key written `REFERENCES other.P`
+            // does not make this database's `P` its parent.
+            if !constraint.points_at(&database.name, &database.name, &parent.name) {
                 continue;
             }
             let child_positions: Vec<usize> = constraint

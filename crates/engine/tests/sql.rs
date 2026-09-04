@@ -32925,3 +32925,524 @@ fn a_cast_to_a_width_truncates_under_a_strict_mode_where_a_column_refuses() {
         vec![vec!["99999999.99", "99999999.99", "3.8"]]
     );
 }
+
+/// The whole `information_schema.referential_constraints` row for every key in
+/// `testdb`, so a change that fixes one column and breaks another cannot pass.
+fn referential_rows(engine: &Engine, session: &mut Session) -> Vec<Vec<String>> {
+    rows(
+        engine,
+        session,
+        "SELECT CONSTRAINT_NAME, UNIQUE_CONSTRAINT_SCHEMA, UNIQUE_CONSTRAINT_NAME, \
+         MATCH_OPTION, UPDATE_RULE, DELETE_RULE, TABLE_NAME, REFERENCED_TABLE_NAME \
+         FROM information_schema.referential_constraints \
+         WHERE CONSTRAINT_SCHEMA = 'testdb' ORDER BY CONSTRAINT_NAME",
+    )
+}
+
+/// #0206: an action the constraint did not write is `NO ACTION` and not
+/// `RESTRICT`.
+///
+/// Measured on 8.3, every spelling of the clause beside the unwritten case:
+/// `RESTRICT` stays `RESTRICT` there, so the two are told apart in what a
+/// client reads even though InnoDB enforces them alike. The target application
+/// reads this table more often than any other in `information_schema`, and the
+/// keys that write no action are exactly the ones that diverged.
+///
+/// The two columns are independent, which is the half a single-column check
+/// would miss: `ON DELETE CASCADE` alone reports `CASCADE` beside an
+/// `UPDATE_RULE` of `NO ACTION`, and the same the other way round.
+#[test]
+fn an_unwritten_referential_action_is_no_action_and_not_restrict() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE P (id INT PRIMARY KEY)");
+    for (name, clause) in [
+        ("k1none", ""),
+        ("k2restrict", "ON DELETE RESTRICT ON UPDATE RESTRICT"),
+        ("k3noaction", "ON DELETE NO ACTION ON UPDATE NO ACTION"),
+        ("k4cascade", "ON DELETE CASCADE ON UPDATE CASCADE"),
+        ("k5setnull", "ON DELETE SET NULL ON UPDATE SET NULL"),
+        (
+            "k6setdefault",
+            "ON DELETE SET DEFAULT ON UPDATE SET DEFAULT",
+        ),
+        ("k7delonly", "ON DELETE CASCADE"),
+        ("k8uponly", "ON UPDATE CASCADE"),
+    ] {
+        run(
+            &engine,
+            &mut session,
+            &format!(
+                "CREATE TABLE C{name} (id INT PRIMARY KEY, pid INT, \
+                 CONSTRAINT {name} FOREIGN KEY (pid) REFERENCES P (id) {clause})"
+            ),
+        );
+    }
+
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CONSTRAINT_NAME, UPDATE_RULE, DELETE_RULE \
+             FROM information_schema.referential_constraints \
+             WHERE CONSTRAINT_SCHEMA = 'testdb' ORDER BY CONSTRAINT_NAME"
+        ),
+        vec![
+            vec!["k1none", "NO ACTION", "NO ACTION"],
+            vec!["k2restrict", "RESTRICT", "RESTRICT"],
+            vec!["k3noaction", "NO ACTION", "NO ACTION"],
+            vec!["k4cascade", "CASCADE", "CASCADE"],
+            vec!["k5setnull", "SET NULL", "SET NULL"],
+            vec!["k6setdefault", "SET DEFAULT", "SET DEFAULT"],
+            vec!["k7delonly", "NO ACTION", "CASCADE"],
+            vec!["k8uponly", "CASCADE", "NO ACTION"],
+        ]
+    );
+
+    // What the engine *does* with an unwritten action has not moved with what
+    // it says about one: `NO ACTION` is still RESTRICT to InnoDB, so the
+    // parent row is still refused. Asserted through a write rather than
+    // through the metadata twice — the whole risk of renaming the stored
+    // string was that enforcement read it.
+    run(&engine, &mut session, "INSERT INTO P VALUES (1)");
+    run(&engine, &mut session, "INSERT INTO Ck1none VALUES (1, 1)");
+    let err = fails(&engine, &mut session, "DELETE FROM P WHERE id = 1");
+    assert_eq!(err.code, 1451, "{err}");
+}
+
+/// #0206's other half: the three rule columns are an ENUM on the wire.
+///
+/// 8.3 declares `MATCH_OPTION` `enum('NONE','PARTIAL','FULL')` and both rules
+/// `enum('NO ACTION','RESTRICT','CASCADE','SET NULL','SET DEFAULT')`, and
+/// sends all three with ENUM_FLAG. The widths were already right —
+/// `char(7)`/`char(11)` are the same bytes — so the flag is the whole of what
+/// a client reading the member list was missing, and a width assertion alone
+/// would have passed before the fix.
+#[test]
+fn the_referential_action_columns_are_an_enum_on_the_wire() {
+    use mysql_ultralight_protocol::column::flags;
+
+    let (engine, session) = engine();
+    let sql = "SELECT MATCH_OPTION, UPDATE_RULE, DELETE_RULE, CONSTRAINT_NAME \
+               FROM information_schema.referential_constraints";
+    let described: Vec<String> = engine
+        .describe(&session, sql, 0)
+        .unwrap()
+        .unwrap_or_else(|| panic!("described nothing: {sql}"))
+        .iter()
+        .map(|c| {
+            let wire = c.to_wire();
+            format!(
+                "{} {:?} len {} enum {}",
+                c.name,
+                wire.column_type,
+                wire.column_length,
+                wire.flags & flags::ENUM != 0
+            )
+        })
+        .collect();
+    assert_eq!(
+        described,
+        vec![
+            // Lengths in bytes: `PARTIAL` and `SET DEFAULT` are the widest
+            // members, four bytes per character.
+            "MATCH_OPTION String len 28 enum true",
+            "UPDATE_RULE String len 44 enum true",
+            "DELETE_RULE String len 44 enum true",
+            // The column beside them is not an ENUM, so a blanket flag would
+            // fail here.
+            "CONSTRAINT_NAME VarString len 256 enum false",
+        ]
+    );
+}
+
+/// #0205: `RENAME TO` carries the table's foreign keys with it.
+///
+/// The table half of the propagation #0179/#0180/#0184 built for columns.
+/// Left behind, a child's `REFERENCED_TABLE_NAME` names a table that is not
+/// there, which is both a wrong answer to a client and an unenforceable
+/// constraint — an unresolvable parent makes the key inert.
+///
+/// Every case measured on 8.3: the parent, a table that is parent and child at
+/// once, a self-referencing key, and a rename that changes only case.
+#[test]
+fn a_renamed_table_carries_its_foreign_keys_with_it() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE P (id INT PRIMARY KEY)");
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Midt (id INT PRIMARY KEY, pid INT, \
+         CONSTRAINT fkm FOREIGN KEY (pid) REFERENCES P (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Leaf (id INT PRIMARY KEY, mid INT, \
+         CONSTRAINT fkl FOREIGN KEY (mid) REFERENCES Midt (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Selfy (id INT PRIMARY KEY, parent_id INT, \
+         CONSTRAINT fks FOREIGN KEY (parent_id) REFERENCES Selfy (id))",
+    );
+
+    run(&engine, &mut session, "ALTER TABLE P RENAME TO P2");
+    // A table that is a parent and a child at once moves on both sides: its
+    // own key still points at P2 and Leaf's now points at Midt2.
+    run(&engine, &mut session, "ALTER TABLE Midt RENAME TO Midt2");
+    // A self-referencing key is on both sides of one rename.
+    run(&engine, &mut session, "ALTER TABLE Selfy RENAME TO Selfy2");
+    assert_eq!(
+        referential_rows(&engine, &mut session),
+        vec![
+            vec![
+                "fkl",
+                "testdb",
+                "PRIMARY",
+                "NONE",
+                "NO ACTION",
+                "NO ACTION",
+                "Leaf",
+                "Midt2"
+            ],
+            vec![
+                "fkm",
+                "testdb",
+                "PRIMARY",
+                "NONE",
+                "NO ACTION",
+                "NO ACTION",
+                "Midt2",
+                "P2"
+            ],
+            vec![
+                "fks",
+                "testdb",
+                "PRIMARY",
+                "NONE",
+                "NO ACTION",
+                "NO ACTION",
+                "Selfy2",
+                "Selfy2"
+            ],
+        ]
+    );
+    // The same fact through the other table that reports it, because a client
+    // reads the referenced name from either.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CONSTRAINT_NAME, TABLE_NAME, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME \
+             FROM information_schema.key_column_usage \
+             WHERE CONSTRAINT_SCHEMA = 'testdb' AND REFERENCED_TABLE_NAME IS NOT NULL \
+             ORDER BY CONSTRAINT_NAME"
+        ),
+        vec![
+            vec!["fkl", "Leaf", "testdb", "Midt2"],
+            vec!["fkm", "Midt2", "testdb", "P2"],
+            vec!["fks", "Selfy2", "testdb", "Selfy2"],
+        ]
+    );
+
+    // A rename that changes only case is still a rename, and 8.3 carries it
+    // into the children too.
+    run(&engine, &mut session, "ALTER TABLE P2 RENAME TO p2");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT REFERENCED_TABLE_NAME FROM information_schema.referential_constraints \
+             WHERE CONSTRAINT_SCHEMA = 'testdb' AND CONSTRAINT_NAME = 'fkm'"
+        ),
+        vec![vec!["p2"]]
+    );
+
+    // The key is enforced under the new name, which is the half
+    // `information_schema` cannot show: a constraint whose parent no longer
+    // resolves is skipped rather than checked, so a read-back alone would pass
+    // over a key that had gone inert.
+    let err = fails(&engine, &mut session, "INSERT INTO Midt2 VALUES (1, 7)");
+    assert_eq!(err.code, 1452, "{err}");
+    run(&engine, &mut session, "INSERT INTO p2 VALUES (7)");
+    run(&engine, &mut session, "INSERT INTO Midt2 VALUES (1, 7)");
+}
+
+/// The child's side of the same rename: MySQL rewrites the names of the keys
+/// named after the table.
+///
+/// A textual rule and not one about which keys MySQL named itself, which is
+/// measured: `CONSTRAINT Named_ibfk_9` written by hand on a table `Named`
+/// becomes `Named2_ibfk_9` when the table does, while `other_ibfk_1` on a
+/// table `Odd` renamed to `Odd2` is left exactly as it is. So the prefix
+/// decides.
+///
+/// The *index* behind the key keeps its own name, also measured on 8.3.
+#[test]
+fn a_rename_rewrites_the_keys_named_after_the_table() {
+    let (engine, mut session) = engine();
+    run(&engine, &mut session, "CREATE TABLE P (id INT PRIMARY KEY)");
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Auto (id INT PRIMARY KEY, pid INT, \
+         FOREIGN KEY (pid) REFERENCES P (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Named (id INT PRIMARY KEY, pid INT, \
+         CONSTRAINT Named_ibfk_9 FOREIGN KEY (pid) REFERENCES P (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Odd (id INT PRIMARY KEY, pid INT, \
+         CONSTRAINT other_ibfk_1 FOREIGN KEY (pid) REFERENCES P (id))",
+    );
+    // The prefix is compared byte for byte, both halves of it, which is the
+    // one identifier comparison in `ddl.rs` that is not case-insensitive.
+    // Measured on 8.3: `T_IBFK_1` on `T` renamed to `T2` stays `T_IBFK_1`, and
+    // `Lc_ibfk_5` written as `lc_ibfk_5` on `Lc` stays that too.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Uc (id INT PRIMARY KEY, pid INT, \
+         CONSTRAINT Uc_IBFK_1 FOREIGN KEY (pid) REFERENCES P (id))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Lc (id INT PRIMARY KEY, pid INT, \
+         CONSTRAINT lc_ibfk_5 FOREIGN KEY (pid) REFERENCES P (id))",
+    );
+
+    run(&engine, &mut session, "ALTER TABLE Auto RENAME TO Auto2");
+    run(&engine, &mut session, "ALTER TABLE Named RENAME TO Named2");
+    run(&engine, &mut session, "ALTER TABLE Odd RENAME TO Odd2");
+    run(&engine, &mut session, "ALTER TABLE Uc RENAME TO Uc2");
+    run(&engine, &mut session, "ALTER TABLE Lc RENAME TO Lc2");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT TABLE_NAME, CONSTRAINT_NAME FROM information_schema.table_constraints \
+             WHERE CONSTRAINT_SCHEMA = 'testdb' AND CONSTRAINT_TYPE = 'FOREIGN KEY' \
+             ORDER BY TABLE_NAME"
+        ),
+        vec![
+            vec!["Auto2", "Auto2_ibfk_1"],
+            // The infix is the wrong case, so the name is not one MySQL made.
+            vec!["Lc2", "lc_ibfk_5"],
+            vec!["Named2", "Named2_ibfk_9"],
+            // Not the table's name, so not touched.
+            vec!["Odd2", "other_ibfk_1"],
+            vec!["Uc2", "Uc_IBFK_1"],
+        ]
+    );
+
+    // The index keeps the name it was created under.
+    assert_eq!(
+        index_layout(&engine, &mut session, "Named2"),
+        vec![
+            vec!["Named_ibfk_9", "1", "pid", "1"],
+            vec!["PRIMARY", "1", "id", "0"],
+        ]
+    );
+}
+
+/// A constraint that wrote its parent's database on the front reports the two
+/// halves apart, and a rename reaches a child in another database.
+///
+/// Measured on 8.3: `REFERENCES probe.p(id)` answers `REFERENCED_TABLE_NAME` =
+/// `p` and `REFERENCED_TABLE_SCHEMA` = `probe`, where this engine reported the
+/// joined `probe.p` under the name and the *child's* own database under the
+/// schema. Renaming `probe.p` there rewrites the key on `other.oc` too, so the
+/// propagation is not one database's business.
+#[test]
+fn a_qualified_parent_reports_its_schema_apart_from_its_name() {
+    let (engine, mut session) = engine();
+    engine.bootstrap_database("otherdb").unwrap();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE P (id INT PRIMARY KEY, u INT NOT NULL, UNIQUE KEY uq (u))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Cq (id INT PRIMARY KEY, pid INT, \
+         CONSTRAINT fkq FOREIGN KEY (pid) REFERENCES testdb.P (u))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE otherdb.Oc (id INT PRIMARY KEY, pid INT, \
+         CONSTRAINT fko FOREIGN KEY (pid) REFERENCES testdb.P (u))",
+    );
+
+    let read = |session: &mut Session| {
+        rows(
+            &engine,
+            session,
+            "SELECT CONSTRAINT_SCHEMA, CONSTRAINT_NAME, REFERENCED_TABLE_SCHEMA, \
+             REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
+             FROM information_schema.key_column_usage \
+             WHERE REFERENCED_TABLE_NAME IS NOT NULL \
+             AND CONSTRAINT_SCHEMA IN ('testdb', 'otherdb') ORDER BY CONSTRAINT_NAME",
+        )
+    };
+    assert_eq!(
+        read(&mut session),
+        vec![
+            vec!["otherdb", "fko", "testdb", "P", "u"],
+            vec!["testdb", "fkq", "testdb", "P", "u"],
+        ]
+    );
+
+    // Both halves of one statement reach the child in the other database.
+    // Measured on 8.3, where `ALTER TABLE m3.PP RENAME COLUMN u TO w` leaves a
+    // key on `m4.CC` reporting `w`: carrying the table name across databases
+    // and the column name only within one renamed half of such a child, so the
+    // constraint named the right parent and a column that had gone.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE P RENAME COLUMN u TO w, RENAME TO P2",
+    );
+    assert_eq!(
+        read(&mut session),
+        vec![
+            vec!["otherdb", "fko", "testdb", "P2", "w"],
+            vec!["testdb", "fkq", "testdb", "P2", "w"],
+        ]
+    );
+    // The database the constraint wrote is kept: only the parent's own name
+    // moved, so the key still names the database it always named.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT UNIQUE_CONSTRAINT_SCHEMA, UNIQUE_CONSTRAINT_NAME, REFERENCED_TABLE_NAME \
+             FROM information_schema.referential_constraints \
+             WHERE CONSTRAINT_SCHEMA = 'otherdb'"
+        ),
+        vec![vec!["testdb", "uq", "P2"]]
+    );
+
+    // A key written with *this* database on the front is enforced, which it
+    // was not while the two halves were one string: the parent was looked up
+    // under the joined `testdb.P` and never found, so every write went
+    // through.
+    let err = fails(&engine, &mut session, "INSERT INTO Cq VALUES (1, 9)");
+    assert_eq!(err.code, 1452, "{err}");
+    run(&engine, &mut session, "INSERT INTO P2 VALUES (1, 9)");
+    run(&engine, &mut session, "INSERT INTO Cq VALUES (1, 9)");
+
+    // A key pointing at *another* database is still inert — the parent is
+    // resolved inside the child's own database — and the schema is what keeps
+    // that from becoming worse than inert. `otherdb` has a `P2` of its own
+    // with no row in it, so a key resolved on the bare name alone would
+    // enforce `otherdb.Oc` against the wrong parent and refuse this. 8.3
+    // accepts it too, checking the `testdb.P2` the constraint actually names.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE otherdb.P2 (id INT PRIMARY KEY, w INT NOT NULL, UNIQUE KEY uq (w))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO otherdb.Oc VALUES (1, 9)",
+    );
+}
+
+/// `UNIQUE_CONSTRAINT_NAME` names the key on the *parent* that the constraint
+/// resolves against, and not the literal `PRIMARY` this engine wrote for every
+/// one of them.
+///
+/// Measured on 8.3 against a parent carrying a primary key and two unique
+/// ones: `REFERENCES Up(u)` reports `uq` there and `Up(v)` reports `vq`. A
+/// leading prefix of a unique index counts — `UNIQUE KEY wq (a, b)` with
+/// `REFERENCES Wp(a)` is `wq` — and a parent whose only index over the column
+/// is a plain `KEY` is NULL, which is why this is not "some index covers it".
+#[test]
+fn unique_constraint_name_names_the_key_on_the_parent() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Up (id INT NOT NULL PRIMARY KEY, u INT NOT NULL, v INT NOT NULL, \
+         UNIQUE KEY uq (u), UNIQUE KEY vq (v))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Wp (a INT NOT NULL, b INT NOT NULL, UNIQUE KEY wq (a, b))",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Np (id INT NOT NULL PRIMARY KEY, n INT NOT NULL, KEY nk (n))",
+    );
+    // A unique key declared *before* the primary one over the same column.
+    // 8.3 reports `PRIMARY` here, measured — InnoDB's dictionary puts the
+    // clustered index first however the DDL was written — so this cannot be
+    // "the first index that serves".
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Op (id INT NOT NULL, UNIQUE KEY aq (id), PRIMARY KEY (id))",
+    );
+    for (name, parent) in [
+        ("kpri", "Up (id)"),
+        ("kuq", "Up (u)"),
+        ("kvq", "Up (v)"),
+        // A leading prefix of a unique index.
+        ("kpre", "Wp (a)"),
+        // Nothing unique over it, so NULL.
+        ("knull", "Np (n)"),
+        ("kord", "Op (id)"),
+    ] {
+        run(
+            &engine,
+            &mut session,
+            &format!(
+                "CREATE TABLE C{name} (pid INT, \
+                 CONSTRAINT {name} FOREIGN KEY (pid) REFERENCES {parent})"
+            ),
+        );
+    }
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT CONSTRAINT_NAME, UNIQUE_CONSTRAINT_NAME \
+             FROM information_schema.referential_constraints \
+             WHERE CONSTRAINT_SCHEMA = 'testdb' ORDER BY CONSTRAINT_NAME"
+        ),
+        vec![
+            vec!["knull", "NULL"],
+            vec!["kord", "PRIMARY"],
+            vec!["kpre", "wq"],
+            vec!["kpri", "PRIMARY"],
+            vec!["kuq", "uq"],
+            vec!["kvq", "vq"],
+        ]
+    );
+
+    // And it follows the parent through a rename, because it is read from the
+    // parent rather than stored beside the key.
+    run(&engine, &mut session, "ALTER TABLE Up RENAME TO Up2");
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT REFERENCED_TABLE_NAME, UNIQUE_CONSTRAINT_NAME \
+             FROM information_schema.referential_constraints \
+             WHERE CONSTRAINT_SCHEMA = 'testdb' AND CONSTRAINT_NAME = 'kuq'"
+        ),
+        vec![vec!["Up2", "uq"]]
+    );
+}

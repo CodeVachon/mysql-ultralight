@@ -15,6 +15,18 @@ use crate::session::Session;
 use crate::types::SqlType;
 use crate::value::Value;
 
+/// The referential action a constraint that wrote none carries.
+///
+/// See where it is stored: `RESTRICT` is what InnoDB *does* with it, and
+/// `NO ACTION` is what `information_schema` says about it.
+const NO_ACTION: &str = "NO ACTION";
+
+/// The infix MySQL builds an unnamed foreign key's name around, between the
+/// table's name and the constraint's number.
+///
+/// A rename rewrites the name around it — see [`rename_own_auto_keys`].
+const IBFK: &str = "_ibfk_";
+
 pub fn create_table(
     engine: &Engine,
     session: &mut Session,
@@ -922,51 +934,136 @@ fn after_renames(columns: &[String], renames: &[(String, String)]) -> Vec<String
 /// column that is not there, which stops it being enforced at all — the
 /// referenced positions no longer resolve, and an unresolvable key is skipped.
 ///
-/// Returns the tables it changed, which a transaction has to know about for
-/// the same reason the altered table itself is marked.
+/// Every database and not only the altered table's own, for the same reason
+/// [`rename_referencing_tables`] crosses them: measured on 8.3,
+/// `ALTER TABLE m3.PP RENAME COLUMN u TO w` leaves a key on `m4.CC` written
+/// `REFERENCES m3.PP(u)` reporting `w`. Walking one database renamed half of
+/// such a child — the table name followed and the column did not, so the
+/// constraint named the right parent and a column that had gone.
+///
+/// Returns the tables it changed, by database, which a transaction has to know
+/// about for the same reason the altered table itself is marked.
 fn rename_referenced_columns(
-    database: &mut Database,
+    catalog: &mut Catalog,
+    database: &str,
     table_name: &str,
     renames: &[(String, String)],
-) -> Vec<String> {
-    let mut touched = Vec::new();
-    for other in database.tables.values_mut() {
-        let mut changed = false;
-        for fk in &mut other.foreign_keys {
-            if !references_table(fk, table_name) {
-                continue;
-            }
-            let renamed = after_renames(&fk.referenced_columns, renames);
-            if renamed != fk.referenced_columns {
-                fk.referenced_columns = renamed;
-                changed = true;
-            }
+) -> Vec<(String, String)> {
+    walk_referencing_keys(catalog, database, table_name, |fk| {
+        let renamed = after_renames(&fk.referenced_columns, renames);
+        if renamed == fk.referenced_columns {
+            return false;
         }
-        if changed {
-            touched.push(other.name.clone());
+        fk.referenced_columns = renamed;
+        true
+    })
+}
+
+/// Every foreign key in the server that points at `database`.`table_name`,
+/// handed to `change` — which says whether it changed anything.
+///
+/// Shared by the column half and the table half of the same propagation, so
+/// there is one answer to "which keys point here" rather than two that have to
+/// agree. Returns the tables `change` reported a change on, by database.
+fn walk_referencing_keys(
+    catalog: &mut Catalog,
+    database: &str,
+    table_name: &str,
+    mut change: impl FnMut(&mut ForeignKey) -> bool,
+) -> Vec<(String, String)> {
+    let mut touched = Vec::new();
+    for db_name in catalog.database_names() {
+        let Some(db) = catalog.database_mut(&db_name) else {
+            continue;
+        };
+        let own = db.name.clone();
+        for other in db.tables.values_mut() {
+            let mut changed = false;
+            for fk in &mut other.foreign_keys {
+                if fk.points_at(&own, database, table_name) && change(fk) {
+                    changed = true;
+                }
+            }
+            if changed {
+                touched.push((own.clone(), other.name.clone()));
+            }
         }
     }
     touched
 }
 
-/// Whether a foreign key points at the table called `table_name`.
+/// Carries a table's *own* rename into the names of the unnamed foreign keys
+/// it holds.
 ///
-/// `referenced_table` is stored as the constraint wrote it, so
-/// `REFERENCES app.P(id)` keeps the database on the front while the name being
-/// altered is bare. Compared whole, every qualified constraint fell outside
-/// the rules below and its parent's column could be dropped from under it.
+/// Measured on 8.3, and it is not the propagation the rest of this is about —
+/// this one is the child's side. `ALTER TABLE midt RENAME TO midt2` leaves
+/// `midt_ibfk_1` reported as `midt2_ibfk_1`, and it is a *textual* rule rather
+/// than one about which keys MySQL named itself: a constraint written
+/// `CONSTRAINT named_ibfk_9` on a table `named` becomes `named2_ibfk_9` when
+/// the table becomes `named2`, while `other_ibfk_1` on a table `odd` renamed
+/// to `odd2` is left exactly as it is. So the prefix decides, and nothing
+/// about how the name came to be.
 ///
-/// One database, which is what every other foreign key comparison here assumes
-/// too: `crate::foreign_keys` resolves a parent by name inside the child's own
-/// database, so a qualified name reaching a *different* one is a gap this does
-/// not close.
-fn references_table(fk: &ForeignKey, table_name: &str) -> bool {
-    let referenced = fk
-        .referenced_table
-        .rsplit('.')
-        .next()
-        .unwrap_or(&fk.referenced_table);
-    referenced.eq_ignore_ascii_case(table_name)
+/// **The one identifier comparison here that is case-sensitive**, and that is
+/// measured rather than assumed — it was written the other way first. On 8.3
+/// `CONSTRAINT T_IBFK_1` on a table `T` renamed to `T2` stays `T_IBFK_1`, and
+/// so does `tc_ibfk_5` on a table `Tc` renamed to `Tc2`. Both halves of the
+/// prefix are compared byte for byte, which is what a name built by
+/// concatenation rather than looked up in a catalog gets.
+///
+/// The *index* behind the key is not renamed with it, also measured: the
+/// `named_ibfk_9` index is still called that on `named2` afterwards.
+fn rename_own_auto_keys(table: &mut Table, old_name: &str, new_name: &str) {
+    let prefix = format!("{old_name}{IBFK}");
+    for fk in &mut table.foreign_keys {
+        // Something has to follow the prefix. Every name measured on 8.3
+        // carried a number after it, and a name that is the prefix and nothing
+        // else was not, so it is left alone rather than guessed at.
+        match fk.name.strip_prefix(&prefix) {
+            Some(tail) if !tail.is_empty() => fk.name = format!("{new_name}{IBFK}{tail}"),
+            _ => {}
+        }
+    }
+}
+
+/// Carries a table's rename into every foreign key that points at it.
+///
+/// The table half of what `rename_referenced_columns` does for columns, and
+/// #0205: left behind, a child's `REFERENCED_TABLE_NAME` names a table that no
+/// longer exists, so the constraint is both wrong in `information_schema` and
+/// unenforceable — `crate::foreign_keys::snapshot` finds no parent and the key
+/// goes inert.
+///
+/// Every database and not only the renamed table's own, because a child
+/// elsewhere is a child: measured on 8.3, renaming `probe.p` to `p2` rewrites
+/// the key on `other.oc` that was written `REFERENCES probe.p(id)`. The
+/// database the constraint named is untouched — only the parent's own name
+/// moves — so a key that named its parent's database goes on naming it.
+///
+/// Returns the tables it changed, by database, which a transaction has to know
+/// about for the same reason the renamed table itself is marked.
+fn rename_referencing_tables(
+    catalog: &mut Catalog,
+    database: &str,
+    old_name: &str,
+    new_name: &str,
+) -> Vec<(String, String)> {
+    walk_referencing_keys(catalog, database, old_name, |fk| {
+        fk.referenced_table = new_name.to_owned();
+        true
+    })
+}
+
+/// Whether a foreign key on a table in `database` points at `table_name`,
+/// which is in that same database.
+///
+/// The database is compared and not just the name, because a key written
+/// `REFERENCES other.P` from a child in `app` names a different parent than a
+/// bare `REFERENCES P` does, and the rules below are about `app.P`. Compared
+/// against the joined `other.P`, every qualified constraint fell outside the
+/// rules below and its parent's column could be dropped from under it.
+fn references_table(fk: &ForeignKey, database: &str, table_name: &str) -> bool {
+    fk.points_at(database, database, table_name)
 }
 
 /// Whether an index can answer a lookup on exactly `columns`.
@@ -978,7 +1075,7 @@ fn references_table(fk: &ForeignKey, table_name: &str) -> bool {
 /// it on either side of the constraint: a parent carrying `UNIQUE uq (u)`
 /// beside `KEY spare (u)` accepts `DROP INDEX uq` there and refuses
 /// `DROP INDEX spare` afterwards.
-fn index_serves(index: &Index, columns: &[String]) -> bool {
+pub(crate) fn index_serves(index: &Index, columns: &[String]) -> bool {
     columns.len() <= index.columns.len()
         && columns
             .iter()
@@ -1191,7 +1288,7 @@ fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineRe
             let constraint_name = name
                 .as_ref()
                 .map(|n| n.value.clone())
-                .unwrap_or_else(|| format!("{}_ibfk_{}", table.name, table.foreign_keys.len() + 1));
+                .unwrap_or_else(|| format!("{}{IBFK}{}", table.name, table.foreign_keys.len() + 1));
             let key_columns: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
 
             // MySQL creates an index for a foreign key unless one already
@@ -1222,19 +1319,42 @@ fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineRe
                 )?;
             }
 
+            // The parent kept as the two parts it was written as, never joined
+            // with a dot: `name::dotted` says in as many words that its join
+            // is only for a name being *matched* against another built the
+            // same way, because ``REFERENCES `app.P` `` and
+            // `REFERENCES app.P` render identically and a split cannot tell
+            // them apart afterwards. Both halves are reported separately by
+            // `information_schema`, so both have to survive.
+            let mut parts = name::parts(foreign_table);
+            let referenced_table = parts.pop().unwrap_or_default();
+            let referenced_schema = parts.pop();
+
             table.foreign_keys.push(ForeignKey {
                 name: constraint_name,
                 columns: key_columns,
-                referenced_table: name::dotted(foreign_table),
+                referenced_schema,
+                referenced_table,
                 referenced_columns: referred_columns.iter().map(|c| c.value.clone()).collect(),
+                // `NO ACTION` and not `RESTRICT` for an action the constraint
+                // did not write, which is #0206: 8.3 reports `NO ACTION` in
+                // `REFERENTIAL_CONSTRAINTS` there and keeps `RESTRICT` for the
+                // one written that way, so the two spellings are told apart in
+                // what a client reads even though InnoDB enforces them alike.
+                // `foreign_keys::Action::parse` maps both onto `Restrict`, so
+                // nothing about enforcement moves with this.
+                //
+                // The two are independent: `ON DELETE CASCADE` alone reports
+                // `CASCADE` beside an `UPDATE_RULE` of `NO ACTION`, measured
+                // both ways round.
                 on_delete: on_delete
                     .as_ref()
                     .map(|a| a.to_string())
-                    .unwrap_or_else(|| "RESTRICT".into()),
+                    .unwrap_or_else(|| NO_ACTION.into()),
                 on_update: on_update
                     .as_ref()
                     .map(|a| a.to_string())
-                    .unwrap_or_else(|| "RESTRICT".into()),
+                    .unwrap_or_else(|| NO_ACTION.into()),
             });
         }
         TableConstraint::Check(check) => {
@@ -1886,6 +2006,13 @@ pub fn alter_table(
             // both.
             Some(new_name) => {
                 database.tables.remove(&key);
+                // Before the table is written back, because the keys being
+                // renamed are its own. Off the stored name rather than the one
+                // the statement typed, which can differ in case — the keys
+                // were named after the stored one, and this comparison is the
+                // one that is case-sensitive.
+                let was = table.name.clone();
+                rename_own_auto_keys(table, &was, &new_name);
                 table.name = new_name.clone();
                 database.tables.insert(new_name.clone(), table.clone());
                 // The name the table arrives under is marked too, and not only
@@ -1905,14 +2032,31 @@ pub fn alter_table(
     // constraints pointing at a column this statement renamed follow it. After
     // the write-back, so the table's own self-referencing keys are updated
     // where they now live.
-    let mut touched = match renamed_columns.is_empty() {
+    let mut touched: Vec<(String, String)> = match renamed_columns.is_empty() {
         true => Vec::new(),
-        false => rename_referenced_columns(database, &table_name, &renamed_columns),
+        false => rename_referenced_columns(&mut catalog, &db, &table_name, &renamed_columns),
     };
-    touched.extend(moved_to);
+
+    // The table half of the same propagation, and #0205. After the write-back
+    // too, and for the extra reason that a *self*-referencing key only points
+    // at the new name once the table is living under it.
+    //
+    // The new name whole, dot and all, because that is the key the table now
+    // lives under: `RENAME TO other.p3` puts it in this database under the
+    // name `other.p3` rather than moving it, which is a gap of its own, and a
+    // child naming anything else would point at nothing.
+    if let Some(new_name) = &moved_to {
+        touched.push((db.clone(), new_name.clone()));
+        touched.extend(rename_referencing_tables(
+            &mut catalog,
+            &db,
+            &table_name,
+            new_name,
+        ));
+    }
     drop(catalog);
-    for name in touched {
-        engine.mark_modified_public(session, &db, &name);
+    for (database, name) in touched {
+        engine.mark_modified_public(session, &database, &name);
     }
 
     Ok(Outcome::ok())
@@ -1944,7 +2088,7 @@ fn keys_pointing_at<'a>(
             // message reports the table as the catalog holds it, and for the
             // self case those two can differ in case.
             keys.iter()
-                .filter(|fk| references_table(fk, table_name))
+                .filter(|fk| references_table(fk, &database.name, table_name))
                 .map(move |fk| (other.name.as_str(), fk))
         })
         .collect()

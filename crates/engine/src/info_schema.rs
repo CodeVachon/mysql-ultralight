@@ -365,9 +365,24 @@ const COLUMN_SPEC: &[TableSpec] = &[
             ("UNIQUE_CONSTRAINT_CATALOG", "varchar(64) binary", true),
             ("UNIQUE_CONSTRAINT_SCHEMA", "varchar(64) binary", true),
             ("UNIQUE_CONSTRAINT_NAME", "varchar(64)", false),
-            ("MATCH_OPTION", "char(7) binary", true),
-            ("UPDATE_RULE", "char(11) binary", true),
-            ("DELETE_RULE", "char(11) binary", true),
+            // Three ENUMs and not three strings, which is #0206's other half:
+            // 8.3 declares them exactly as spelled here and sends all three
+            // with ENUM_FLAG, where `char(7)`/`char(11)` sent the same widths
+            // without it. The widths are unchanged — `PARTIAL` is the widest
+            // match option and `SET DEFAULT` the widest rule — so this is the
+            // flag a client introspecting the member list reads, and nothing
+            // else.
+            ("MATCH_OPTION", "enum('NONE','PARTIAL','FULL') binary", true),
+            (
+                "UPDATE_RULE",
+                "enum('NO ACTION','RESTRICT','CASCADE','SET NULL','SET DEFAULT') binary",
+                true,
+            ),
+            (
+                "DELETE_RULE",
+                "enum('NO ACTION','RESTRICT','CASCADE','SET NULL','SET DEFAULT') binary",
+                true,
+            ),
             ("TABLE_NAME", "varchar(64) binary", true),
             ("REFERENCED_TABLE_NAME", "varchar(64) binary", true),
         ],
@@ -1068,6 +1083,12 @@ fn key_column_usage(catalog: &Catalog) -> Table {
                 }
             }
             for fk in &table.foreign_keys {
+                // The parent's database and bare name, which is how 8.3
+                // reports them: a key written `REFERENCES app.P(id)` said
+                // `app.P` here under the name and the *child's* database under
+                // the schema, so both columns were wrong for every qualified
+                // constraint.
+                let (referenced_schema, referenced_table) = fk.referenced_parts(&name);
                 for (position, column) in fk.columns.iter().enumerate() {
                     rows.push(vec![
                         text("def"),
@@ -1078,8 +1099,8 @@ fn key_column_usage(catalog: &Catalog) -> Table {
                         text(column),
                         Value::Int(position as i64 + 1),
                         Value::Int(position as i64 + 1),
-                        text(&name),
-                        text(&fk.referenced_table),
+                        text(referenced_schema),
+                        text(referenced_table),
                         text(
                             fk.referenced_columns
                                 .get(position)
@@ -1110,6 +1131,56 @@ fn key_column_usage(catalog: &Catalog) -> Table {
     )
 }
 
+/// The key on the parent that a foreign key resolves against, as
+/// `REFERENTIAL_CONSTRAINTS.UNIQUE_CONSTRAINT_NAME` names it.
+///
+/// The literal `PRIMARY` used to be written here for every constraint, which
+/// is right only for a key that points at the primary key. Measured on 8.3
+/// against a parent carrying `PRIMARY KEY (id)`, `UNIQUE KEY uq (u)` and
+/// `UNIQUE KEY vq (v)`: `REFERENCES up(u)` reports `uq` there and `up(v)`
+/// reports `vq`, where this engine said `PRIMARY` for all three.
+///
+/// A *leading prefix* of a unique index counts, and not only an exact match:
+/// `UNIQUE KEY wq (a, b)` with `REFERENCES wp(a)` reports `wq`. Asked through
+/// the same predicate the DDL rules read, so there is one answer to "which
+/// index backs this key".
+///
+/// The primary key wins wherever it serves, whatever order the parent declared
+/// its indexes in — `UNIQUE KEY aq (id), PRIMARY KEY (id)` reports `PRIMARY`
+/// on 8.3, measured, because InnoDB's dictionary puts the clustered index
+/// first however the DDL was written. Among the rest it is declaration order:
+/// a parent carrying `uq1` and `uq2` over the same column reports `uq1`.
+///
+/// NULL when no unique index serves it, which is not a hypothetical — 8.3
+/// answers NULL for a parent whose only index over the referenced column is a
+/// plain `KEY`, measured. A parent this engine cannot resolve at all is the
+/// same NULL: naming an index of a table that is not there would be an answer
+/// invented rather than read.
+fn unique_constraint_name(
+    catalog: &Catalog,
+    schema: &str,
+    table: &str,
+    referenced_columns: &[String],
+) -> Value {
+    let Some(parent) = catalog.database(schema).and_then(|db| db.table(table)) else {
+        return Value::Null;
+    };
+    let serves =
+        |index: &&crate::catalog::Index| crate::ddl::index_serves(index, referenced_columns);
+    parent
+        .indexes
+        .iter()
+        .find(|index| index.primary && serves(index))
+        .or_else(|| {
+            parent
+                .indexes
+                .iter()
+                .find(|index| index.unique && serves(index))
+        })
+        .map(|index| text(&index.name))
+        .unwrap_or(Value::Null)
+}
+
 fn referential_constraints(catalog: &Catalog) -> Table {
     let mut rows = Vec::new();
     for name in catalog.database_names() {
@@ -1118,18 +1189,27 @@ fn referential_constraints(catalog: &Catalog) -> Table {
         };
         for table in db.tables.values() {
             for fk in &table.foreign_keys {
+                let (referenced_schema, referenced_table) = fk.referenced_parts(&name);
                 rows.push(vec![
                     text("def"),
                     text(&name),
                     text(&fk.name),
                     text("def"),
-                    text(&name),
-                    text("PRIMARY"),
+                    // The *parent's* database, not the child's, which is the
+                    // same fact `KEY_COLUMN_USAGE.REFERENCED_TABLE_SCHEMA`
+                    // reports and was wrong here for the same reason.
+                    text(referenced_schema),
+                    unique_constraint_name(
+                        catalog,
+                        referenced_schema,
+                        referenced_table,
+                        &fk.referenced_columns,
+                    ),
                     text("NONE"),
                     text(&fk.on_update),
                     text(&fk.on_delete),
                     text(&table.name),
-                    text(&fk.referenced_table),
+                    text(referenced_table),
                 ]);
             }
         }

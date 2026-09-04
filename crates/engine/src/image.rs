@@ -27,6 +27,16 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// not fail cleanly, it would silently produce a catalog with the wrong shape,
 /// and every test running against it would be wrong in a way nothing reports.
 ///
+/// v12 adds a field to a foreign key: the database its parent was written in,
+/// held apart from the parent's name. A v11 image holds the two joined with a
+/// dot, and the join cannot be undone — `REFERENCES app.P(id)` and
+/// ``REFERENCES `app.P`(id)`` are the same string there, so a reader splitting
+/// it turns a table actually called `app.P` into a table `P` in a database
+/// `app`. That is a wrong `REFERENCED_TABLE_NAME`, a wrong
+/// `REFERENCED_TABLE_SCHEMA` and a parent lookup that finds nothing, all
+/// silently. Measured on 8.3, which reports `a.b` as the name with the child's
+/// own schema beside it. See #0205.
+///
 /// v11 is a meaning change like v3, not a layout one. Tag 5 still holds a
 /// document's text, but that text is now the engine's *stored* form rather
 /// than MySQL's: a decimal inside a document wears an explicit zero exponent
@@ -85,7 +95,7 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// answering it, which is the wrong answer the version check exists to
 /// prevent. An image is a file a user keeps and boots from with `--state`, so
 /// the stale one has to fail rather than mislead.
-pub const FORMAT_VERSION: u32 = 11;
+pub const FORMAT_VERSION: u32 = 12;
 
 /// Writes the whole catalog.
 pub fn encode(catalog: &Catalog) -> Vec<u8> {
@@ -221,6 +231,9 @@ fn write_table(w: &mut Writer, table: &Table) {
         w.strs(&fk.referenced_columns);
         w.str(&fk.on_delete);
         w.str(&fk.on_update);
+        // Appended, because the format only ever grows at the end. The parent
+        // is written as two fields from v12 on -- see the version note.
+        w.opt_str(fk.referenced_schema.as_deref());
     }
 
     w.u32(table.checks.len() as u32);
@@ -275,9 +288,11 @@ fn read_table(r: &mut Reader<'_>) -> EngineResult<Table> {
         let referenced_columns = r.strs()?;
         let on_delete = r.str()?;
         let on_update = r.str()?;
+        let referenced_schema = r.opt_str()?;
         foreign_keys.push(ForeignKey {
             name,
             columns,
+            referenced_schema,
             referenced_table,
             referenced_columns,
             on_delete,

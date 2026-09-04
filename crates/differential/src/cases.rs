@@ -7702,20 +7702,22 @@ pub const GROUPS: &[Group] = &[
             same("SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME FROM information_schema.statistics \
                   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ('FkGo', 'FkSwap') \
                   ORDER BY TABLE_NAME, INDEX_NAME"),
-            same("SELECT CONSTRAINT_NAME, TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, \
-                  REFERENCED_COLUMN_NAME FROM information_schema.key_column_usage \
+            // Every key in the group and every column of the row, `QualC`
+            // included: both of these left it out while `REFERENCED_TABLE_NAME`
+            // reported the name the constraint was *written* with, and the
+            // referential_constraints read also left out DELETE_RULE and
+            // UPDATE_RULE while an unwritten action said `RESTRICT` here where
+            // 8.3 says `NO ACTION`. #0205 and #0206 respectively, both fixed,
+            // so both exclusions are gone.
+            same("SELECT CONSTRAINT_NAME, TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_SCHEMA, \
+                  REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
+                  FROM information_schema.key_column_usage \
                   WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL \
-                  AND TABLE_NAME <> 'QualC' ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION"),
-            // Without DELETE_RULE and UPDATE_RULE, which diverge for a reason
-            // that has nothing to do with any of this: an unwritten
-            // referential action is `NO ACTION` on 8.3 and `RESTRICT` here,
-            // and both columns are an ENUM there and a string here. Measured,
-            // and left for an issue of its own rather than smuggled in as a
-            // baseline line.
-            same("SELECT CONSTRAINT_NAME, TABLE_NAME, REFERENCED_TABLE_NAME \
+                  ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION"),
+            same("SELECT CONSTRAINT_NAME, UNIQUE_CONSTRAINT_SCHEMA, UNIQUE_CONSTRAINT_NAME, \
+                  MATCH_OPTION, UPDATE_RULE, DELETE_RULE, TABLE_NAME, REFERENCED_TABLE_NAME \
                   FROM information_schema.referential_constraints \
-                  WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME <> 'QualC' \
-                  ORDER BY CONSTRAINT_NAME"),
+                  WHERE CONSTRAINT_SCHEMA = DATABASE() ORDER BY CONSTRAINT_NAME"),
 
             // A key an ALTER adds is resolved against the table the statement
             // *leaves*, so both orders are 1072 — the second despite the add
@@ -7776,12 +7778,12 @@ pub const GROUPS: &[Group] = &[
             same("ALTER TABLE QualP DROP COLUMN id"),
             same("ALTER TABLE QualP DROP PRIMARY KEY"),
             same("ALTER TABLE QualP RENAME COLUMN id TO nid"),
-            // Without REFERENCED_TABLE_NAME, which diverges for a reason of
-            // its own: this engine reports the name the constraint was written
-            // with, `differential.QualP`, where 8.3 reports the bare `QualP`.
-            // Measured, and it is why the two group-wide reads below leave
-            // `QualC` out.
-            same("SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_COLUMN_NAME \
+            // With REFERENCED_TABLE_NAME now, which is #0205's other half:
+            // this engine reported the name the constraint was written with,
+            // `differential.QualP`, where 8.3 reports the bare `QualP` under
+            // the name and `differential` under the schema.
+            same("SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_SCHEMA, \
+                  REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
                   FROM information_schema.key_column_usage \
                   WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'QualC' \
                   AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY ORDINAL_POSITION"),
@@ -8484,6 +8486,184 @@ pub const GROUPS: &[Group] = &[
                 "SELECT CAST('99999999999' AS DECIMAL(10,2)), \
                  CAST(999999999.99 AS DECIMAL(10,2)), CAST('3.75' AS DECIMAL(10,1))",
             ),
+        ],
+    },
+    Group {
+        // What a foreign key says about itself: #0205 and #0206.
+        //
+        // Its own group because the reads here are group-wide -- every key in
+        // the database, every column of the row -- and a rename part-way
+        // through changes what the next one sees. Mixed into the ALTER group
+        // above, one added table would move a dozen unrelated answers.
+        //
+        // Every DDL below is followed by a read of information_schema, because
+        // a statement with no result set compares nothing.
+        name: "what a foreign key reports about itself",
+        setup: &[
+            // One parent, and a child per spelling of the referential action.
+            // The unwritten pair is the case that diverged.
+            "CREATE TABLE ActP (id INT NOT NULL PRIMARY KEY)",
+            "CREATE TABLE ActNone (id INT NOT NULL PRIMARY KEY, pid INT, \
+             CONSTRAINT act1none FOREIGN KEY (pid) REFERENCES ActP (id))",
+            "CREATE TABLE ActRestrict (id INT NOT NULL PRIMARY KEY, pid INT, \
+             CONSTRAINT act2restrict FOREIGN KEY (pid) REFERENCES ActP (id) \
+             ON DELETE RESTRICT ON UPDATE RESTRICT)",
+            "CREATE TABLE ActNoAction (id INT NOT NULL PRIMARY KEY, pid INT, \
+             CONSTRAINT act3noaction FOREIGN KEY (pid) REFERENCES ActP (id) \
+             ON DELETE NO ACTION ON UPDATE NO ACTION)",
+            "CREATE TABLE ActCascade (id INT NOT NULL PRIMARY KEY, pid INT, \
+             CONSTRAINT act4cascade FOREIGN KEY (pid) REFERENCES ActP (id) \
+             ON DELETE CASCADE ON UPDATE CASCADE)",
+            "CREATE TABLE ActSetNull (id INT NOT NULL PRIMARY KEY, pid INT, \
+             CONSTRAINT act5setnull FOREIGN KEY (pid) REFERENCES ActP (id) \
+             ON DELETE SET NULL ON UPDATE SET NULL)",
+            "CREATE TABLE ActSetDefault (id INT NOT NULL PRIMARY KEY, pid INT, \
+             CONSTRAINT act6setdefault FOREIGN KEY (pid) REFERENCES ActP (id) \
+             ON DELETE SET DEFAULT ON UPDATE SET DEFAULT)",
+            // One half written and the other not, both ways round: the two
+            // columns are independent and a check of only one would miss it.
+            "CREATE TABLE ActDelOnly (id INT NOT NULL PRIMARY KEY, pid INT, \
+             CONSTRAINT act7delonly FOREIGN KEY (pid) REFERENCES ActP (id) \
+             ON DELETE CASCADE)",
+            "CREATE TABLE ActUpOnly (id INT NOT NULL PRIMARY KEY, pid INT, \
+             CONSTRAINT act8uponly FOREIGN KEY (pid) REFERENCES ActP (id) \
+             ON UPDATE CASCADE)",
+            // The key on the parent a constraint resolves against, which is
+            // not always the primary one -- and is NULL when nothing unique
+            // covers the referenced column.
+            "CREATE TABLE UqP (id INT NOT NULL PRIMARY KEY, u INT NOT NULL, v INT NOT NULL, \
+             UNIQUE KEY uq (u), UNIQUE KEY vq (v))",
+            "CREATE TABLE UqC (pid INT, CONSTRAINT uq1u FOREIGN KEY (pid) REFERENCES UqP (u))",
+            "CREATE TABLE UqC2 (pid INT, CONSTRAINT uq2v FOREIGN KEY (pid) REFERENCES UqP (v))",
+            "CREATE TABLE UqWide (a INT NOT NULL, b INT NOT NULL, UNIQUE KEY wq (a, b))",
+            "CREATE TABLE UqPre (x INT, CONSTRAINT uq3pre FOREIGN KEY (x) REFERENCES UqWide (a))",
+            "CREATE TABLE UqPlain (id INT NOT NULL PRIMARY KEY, n INT NOT NULL, KEY nk (n))",
+            "CREATE TABLE UqNull (pid INT, CONSTRAINT uq4null FOREIGN KEY (pid) \
+             REFERENCES UqPlain (n))",
+            // The rename fixtures. RenTP is a parent, RenTM is a parent and a
+            // child at once, RenTS points at itself, and every `Ren` after
+            // them is about what a rename does to the *constraint's* name.
+            "CREATE TABLE RenTP (id INT NOT NULL PRIMARY KEY)",
+            "CREATE TABLE RenTM (id INT NOT NULL PRIMARY KEY, pid INT, \
+             CONSTRAINT rent1m FOREIGN KEY (pid) REFERENCES RenTP (id))",
+            "CREATE TABLE RenTL (id INT NOT NULL PRIMARY KEY, mid INT, \
+             CONSTRAINT rent2l FOREIGN KEY (mid) REFERENCES RenTM (id))",
+            "CREATE TABLE RenTS (id INT NOT NULL PRIMARY KEY, parent_id INT, \
+             CONSTRAINT rent3s FOREIGN KEY (parent_id) REFERENCES RenTS (id))",
+            "CREATE TABLE RenAuto (id INT NOT NULL PRIMARY KEY, pid INT, \
+             FOREIGN KEY (pid) REFERENCES RenTP (id))",
+            "CREATE TABLE RenNamed (id INT NOT NULL PRIMARY KEY, pid INT, \
+             CONSTRAINT RenNamed_ibfk_9 FOREIGN KEY (pid) REFERENCES RenTP (id))",
+            "CREATE TABLE RenOdd (id INT NOT NULL PRIMARY KEY, pid INT, \
+             CONSTRAINT other_ibfk_1 FOREIGN KEY (pid) REFERENCES RenTP (id))",
+            // The prefix is compared byte for byte, both halves of it: the
+            // wrong case in the infix or in the table's name leaves the
+            // constraint alone.
+            "CREATE TABLE RenUc (id INT NOT NULL PRIMARY KEY, pid INT, \
+             CONSTRAINT RenUc_IBFK_1 FOREIGN KEY (pid) REFERENCES RenTP (id))",
+            "CREATE TABLE RenLc (id INT NOT NULL PRIMARY KEY, pid INT, \
+             CONSTRAINT renlc_ibfk_5 FOREIGN KEY (pid) REFERENCES RenTP (id))",
+            // A unique key declared before the primary one over the same
+            // column: the clustered index wins whatever order the DDL wrote.
+            "CREATE TABLE UqOrd (id INT NOT NULL, UNIQUE KEY aq (id), PRIMARY KEY (id))",
+            "CREATE TABLE UqOrdC (pid INT, CONSTRAINT uq5ord FOREIGN KEY (pid) \
+             REFERENCES UqOrd (id))",
+            // A parent written with its database on the front, and one whose
+            // own name holds a dot -- which render to the same string once
+            // joined and are two different answers here.
+            "CREATE TABLE QuP (id INT NOT NULL PRIMARY KEY)",
+            "CREATE TABLE `a.b` (id INT NOT NULL PRIMARY KEY)",
+            "CREATE TABLE QuC (pid INT, CONSTRAINT qu1 FOREIGN KEY (pid) \
+             REFERENCES differential.QuP (id))",
+            "CREATE TABLE DotC (pid INT, CONSTRAINT qu2 FOREIGN KEY (pid) REFERENCES `a.b` (id))",
+        ],
+        cases: &[
+            // #0206. The whole row and not two columns of it: MATCH_OPTION,
+            // the catalogs and the schemas were never checked against 8.3
+            // either, and a fix that got DELETE_RULE right by moving one of
+            // those has to fail here.
+            same("SELECT CONSTRAINT_CATALOG, CONSTRAINT_SCHEMA, CONSTRAINT_NAME, \
+                  UNIQUE_CONSTRAINT_CATALOG, UNIQUE_CONSTRAINT_SCHEMA, UNIQUE_CONSTRAINT_NAME, \
+                  MATCH_OPTION, UPDATE_RULE, DELETE_RULE, TABLE_NAME, REFERENCED_TABLE_NAME \
+                  FROM information_schema.referential_constraints \
+                  WHERE CONSTRAINT_SCHEMA = DATABASE() ORDER BY CONSTRAINT_NAME"),
+            // The same keys through the other two tables that report them, so
+            // one answer cannot be right in one place and wrong in another.
+            same("SELECT CONSTRAINT_NAME, TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_SCHEMA, \
+                  REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
+                  FROM information_schema.key_column_usage \
+                  WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL \
+                  ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION"),
+            same("SELECT CONSTRAINT_NAME, TABLE_NAME, CONSTRAINT_TYPE, ENFORCED \
+                  FROM information_schema.table_constraints \
+                  WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_TYPE = 'FOREIGN KEY' \
+                  ORDER BY CONSTRAINT_NAME"),
+            // An unwritten action reads NO ACTION and is still enforced as
+            // RESTRICT, which the metadata cannot show: this is the half that
+            // would have gone quiet if the stored string were what enforcement
+            // read.
+            same("INSERT INTO ActP VALUES (1)"),
+            same("INSERT INTO ActNone VALUES (1, 1)"),
+            same("DELETE FROM ActP WHERE id = 1"),
+            same("SELECT id FROM ActP ORDER BY id"),
+
+            // #0205. The parent's side, the child's side, a table that is both
+            // at once, and a self-referencing key that is both in one rename.
+            same("ALTER TABLE RenTP RENAME TO RenTP2"),
+            same("ALTER TABLE RenTM RENAME TO RenTM2"),
+            same("ALTER TABLE RenTS RENAME TO RenTS2"),
+            same("SELECT CONSTRAINT_NAME, TABLE_NAME, REFERENCED_TABLE_NAME \
+                  FROM information_schema.referential_constraints \
+                  WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME LIKE 'rent%' \
+                  ORDER BY CONSTRAINT_NAME"),
+            // Twice over, because a child that followed the first rename and
+            // not the second is a child that followed the *statement* rather
+            // than the name -- and the target's migrations run RENAME TO more
+            // than once.
+            //
+            // Not the case-only spelling, which belongs in `tests/sql.rs`
+            // instead: every case here is asked twice, once per protocol, and
+            // `RENAME TO rentp2` succeeds the second time on this engine --
+            // table lookup is case-insensitive here, deliberately -- where a
+            // Linux MySQL answers 1146. That is the table-name case rule and
+            // has nothing to do with foreign keys.
+            same("ALTER TABLE RenTP2 RENAME TO RenTP3"),
+            same("SELECT CONSTRAINT_NAME, TABLE_NAME, REFERENCED_TABLE_NAME \
+                  FROM information_schema.key_column_usage \
+                  WHERE TABLE_SCHEMA = DATABASE() AND CONSTRAINT_NAME = 'rent1m'"),
+            // The key is live under the new name: an unresolvable parent makes
+            // a constraint inert rather than failing loudly, so a read-back
+            // alone would pass over one that had stopped being enforced.
+            same("INSERT INTO RenTM2 VALUES (1, 9)"),
+            // What a rename does to the constraint's own name, which is a
+            // textual rule about the `<table>_ibfk_` prefix and nothing about
+            // which keys MySQL named itself.
+            same("ALTER TABLE RenAuto RENAME TO RenAuto2"),
+            same("ALTER TABLE RenNamed RENAME TO RenNamed2"),
+            same("ALTER TABLE RenOdd RENAME TO RenOdd2"),
+            same("ALTER TABLE RenUc RENAME TO RenUc2"),
+            same("ALTER TABLE RenLc RENAME TO RenLc2"),
+            same("SELECT TABLE_NAME, CONSTRAINT_NAME FROM information_schema.table_constraints \
+                  WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_TYPE = 'FOREIGN KEY' \
+                  AND TABLE_NAME LIKE 'Ren%' ORDER BY TABLE_NAME"),
+            // A parent's column rename reaches the keys pointing at it, and a
+            // qualified constraint is one of them: read through the parent
+            // whose name is qualified and the one whose name holds a dot, so
+            // the two cannot be confused for each other.
+            same("ALTER TABLE QuP RENAME COLUMN id TO nid"),
+            same("ALTER TABLE `a.b` RENAME COLUMN id TO nid"),
+            same("SELECT CONSTRAINT_NAME, TABLE_NAME, REFERENCED_TABLE_SCHEMA, \
+                  REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
+                  FROM information_schema.key_column_usage \
+                  WHERE TABLE_SCHEMA = DATABASE() AND CONSTRAINT_NAME LIKE 'qu%' \
+                  ORDER BY CONSTRAINT_NAME"),
+            // And the table rename, which has to move the qualified parent's
+            // name without disturbing the database in front of it.
+            same("ALTER TABLE QuP RENAME TO QuP2"),
+            same("SELECT CONSTRAINT_NAME, UNIQUE_CONSTRAINT_SCHEMA, REFERENCED_TABLE_NAME \
+                  FROM information_schema.referential_constraints \
+                  WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME LIKE 'qu%' \
+                  ORDER BY CONSTRAINT_NAME"),
         ],
     },
 ];
