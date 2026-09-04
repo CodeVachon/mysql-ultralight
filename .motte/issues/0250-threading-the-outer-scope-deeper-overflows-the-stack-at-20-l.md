@@ -5,7 +5,7 @@ state: Todo
 parent: 9
 labels: [executor, app-priority-2]
 created: 2026-09-04T21:13:26Z
-updated: 2026-09-04T21:13:26Z
+updated: 2026-09-04T21:15:44Z
 ---
 
 ## Description
@@ -25,3 +25,23 @@ WHY IT WAS NOT LANDED: a process abort is the worst failure mode this engine has
 Note the interaction was predicted before the work started and the agent was warned: #0223's depth cap (MAX_EXPRESSION_DEPTH = 64) was measured against a ~90-term debug ceiling, and carrying more scope per level lowers it. The agent hit a weekly usage limit at its self-review step and never reported, so the diagnosis was never done.
 
 To resume: measure the per-level stack cost (the earlier prepare-time work found a Cow<Query> costing a whole Query per level and fixed it by boxing -- the same shape may apply), or box the per-level scope structure, then re-run the deep-nest test before merging.
+
+## Notes
+
+### 2026-09-04T21:15:44Z — Christopher Vachon (user)
+
+DIAGNOSIS NARROWED (coordinator, after the agent hit its limit). The overflow is purely stack, and the shortfall is measured:
+
+    RUST_MIN_STACK=2MB (the default)  FAIL -- SIGABRT
+    RUST_MIN_STACK=3MB                PASS
+    RUST_MIN_STACK=8MB                PASS
+
+So it needs between 2 and 3 MB where it previously fit in 2 -- roughly a 50% increase in the deep-nest path, not a marginal overrun.
+
+THIS IS A REAL CLIENT-FACING REGRESSION, not a test artifact: #0223's agent measured that the server sets no stack size, so a connection runs on tokio's default 2 MB worker. The test thread and a real connection have the same budget.
+
+A cheap fix I considered and rejected: Session::lateral is Option<OuterRow> inline, and OuterRow gained a third Vec (columns), so boxing it would save ~48 bytes per scoped Session clone -- about 1 KB over 20 levels against a ~1 MB shortfall. Not the cause; do not start there.
+
+Where to look instead: OuterRow::behind ACCUMULATES the enclosing scope, so at level N the schema/values/columns hold all N levels' columns. That makes the structure grow with depth rather than staying constant, which fits a ~50% increase far better than a fixed per-level cost. Sharing the enclosing scope by reference or Rc instead of rebuilding a combined OuterRow per level is the first thing to measure.
+
+Do NOT lower the deep-nest test's depth or raise its stack to make this pass -- both hide a regression a real client would hit.
