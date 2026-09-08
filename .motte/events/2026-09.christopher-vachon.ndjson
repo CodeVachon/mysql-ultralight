@@ -265,3 +265,4 @@
 {"at":"2026-09-08T14:30:10Z","id":257,"by":"Christopher Vachon","as":"user","type":"created","title":"A foreign key constraint name is not required to be unique in its database","state":"Todo"}
 {"at":"2026-09-08T15:18:36Z","id":255,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-09-08T15:40:17Z","id":258,"by":"Christopher Vachon","as":"user","type":"created","title":"A derived table's column list is checked after its subquery has run","state":"Todo"}
+{"at":"2026-09-08T15:44:01Z","id":256,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
