@@ -258,3 +258,4 @@
 {"at":"2026-09-04T22:08:26Z","id":245,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-09-04T22:08:26Z","id":250,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
 {"at":"2026-09-08T13:01:33Z","id":253,"by":"Christopher Vachon","as":"user","type":"created","title":"The engine on a small stack can abort where the server refuses","state":"Todo"}
+{"at":"2026-09-08T13:47:56Z","id":218,"by":"Christopher Vachon","as":"user","type":"state","from":"In Progress","to":"Done"}

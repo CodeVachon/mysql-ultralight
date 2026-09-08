@@ -1,11 +1,11 @@
 ---
 id: 218
 title: A deeply nested statement can overflow the worker stack
-state: In Progress
+state: Done
 parent: 9
 labels: [executor, app-priority-2]
 created: 2026-09-04T02:00:21Z
-updated: 2026-09-04T21:48:29Z
+updated: 2026-09-08T13:47:56Z
 ---
 
 ## Description
@@ -45,3 +45,28 @@ THE TRIPWIRE'S PREMISE IS STALE: size_of::<Session>() is 384 bytes today, not 40
 #0247 is now closed, which removes the abort this issue's note described as remaining: a connection thread gets 32 MB, so sqlparser survives long enough for the depth cap to refuse the statement. Measured: 70000 and 100000 terms both answer 1436 where they previously lost the connection.
 
 What remains for THIS issue is unchanged and is a divergence rather than a crash: 8.3 answers those statements and the engine refuses them at 64 levels. Also still open, from #0223's note: the depth check is in Engine::execute only, because adding it to Engine::describe overflowed the deep-nest test -- so the prepare path is uncovered.
+
+### 2026-09-08T13:47:56Z — Christopher Vachon (user)
+
+BOTH REMAINING ITEMS ARE DONE. Closing.
+
+1. THE PREPARE PATH IS NO LONGER UNCOVERED (fa9f9a5). The bound was in `Engine::execute` only, because adding it to `Engine::describe` had been measured to overflow the twenty-level nesting test on a 2 MB `cargo test` thread. #0247 removed that obstacle. The gap was real and it was the usual path: measured before the fix, a client that PREPARED a 50000-term statement got `IoError { server disconnected }` where executing the same text answered 1436, and prepared is the path Prisma takes for every statement. Now 300, 5000 and 50000 all answer 1436 at prepare.
+
+Review caught that the returned guard was dropped at the semicolon, which flips DEPTH_MEASURED straight back and re-walks a view definition from a stack already inside the probe. `OutermostStatement` is now `#[must_use]`, so the next dropped guard fails the build; mutate.sh confirms clippy refuses the dropped form.
+
+2. THE DIVERGENCE IS CLOSED FOR THE SHAPES THAT REACH IT (93f9726). This was recorded as "8.3 answers those statements and the engine refuses them at 64 levels" and treated as cosmetic. It was not: measured against 8.3, `findMany({ where: { OR: [ ...80 conditions ] } })` -- a plain Prisma query -- was answered by MySQL and refused 1436 by the engine. The limit of 64 was fitted to a 2 MB `cargo test` thread, not to the 32 MB a connection has had since #0247.
+
+MAX_EXPRESSION_DEPTH is now 256, measured on a connection thread: a debug build answers 1200 terms and loses the connection at 1500, release answered 16000, and per-level cost is dominated by the walker frames rather than by the terms -- correlated scalar subqueries and CONCAT over joined columns abort at the same point as `1 AND 1`, so the margin does not erode with shape.
+
+TWO WRONG TURNS, BOTH FOUND BY REVIEW, BOTH WORTH REMEMBERING:
+  - The first attempt exempted flat chains from the depth count and bounded their LENGTH separately. The two bounds composed: a chain whose leftmost term is a parenthesised chain pays one level of depth and 256 terms of stack per level, so six levels passed both bounds at ~1500 terms and ABORTED THE PROCESS. Reverted.
+  - It also had to classify operators, and got it wrong: `||` (which this engine evaluates as OR under the default sql_mode) and `XOR` were left out, so the divergence survived for those spellings.
+  - The same composing-bounds mistake was then found in code that predates all of this: `set_operation_spine` was a second budget reusing the same constant without adding to `at`, re-granted at every nested query. A 256-arm spine whose leftmost arm carries a 250-term chain passed both. It is folded into the one budget now.
+
+The lesson is one line: a flat chain costs exactly as much stack as nesting, because `a OR b OR c` IS a tree of depth three. Anything that costs frames goes into the same number or it composes with everything that does.
+
+WHAT IS NOT CLOSED, and is now #0253: the limit is measured against the stack the BINARY gives a connection, because that is the only way the engine ships. Driven as a library on a 2 MB thread it can now abort between roughly 90 and 256 levels where at 64 it refused. Also: nothing in the suite exercises a 2 MB stack any more, so a future engine test that writes a long chain and forgets to spawn a fat thread aborts the binary rather than failing, and the gate does not flag it.
+
+Still divergent from 8.3 above 256 levels, deliberately: 8.3 answers a 20000-term chain and this refuses it. That is the house rule's trade -- a clear error rather than a wrong answer, and rather than a dead connection.
+
+Differential 5544 statements, 0 divergences, with a new group covering 70-term OR and AND chains, compound terms, a chain in a projection, and the `||`/`XOR` spellings.
