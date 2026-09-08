@@ -126,8 +126,23 @@ impl Engine {
         let Ok(statements) = Parser::parse_sql(&MySqlDialect {}, &normalised.sql) else {
             return Ok(None);
         };
-        // #0218: refused here rather than described, because describing is one
-        // of the walks that runs out of stack on a deep enough statement.
+        // Bounded here for the reason `execute` bounds it: describing is
+        // itself one of the walks that runs out of stack, so a statement too
+        // deep to walk has to be refused before the walk starts.
+        //
+        // Left out when the bound was added, because the check's own frames
+        // overflowed the twenty-level nesting test on the 2 MB a `cargo test`
+        // thread gets. It fits now that a connection has the stack #0247
+        // measured it needs -- and leaving it out had a cost: a client that
+        // *prepared* a 50000-term statement disconnected the server, where
+        // executing the same text answered 1436. Prepared is the path Prisma
+        // takes for every statement. #0218.
+        //
+        // Bound to a name, not dropped at the semicolon: the guard is what
+        // stops a view's definition being re-measured from a stack already
+        // inside the probe, which is the case its own doc records as
+        // overflowing.
+        let _outermost = crate::expr::within_walking_depth(&statements)?;
         let [Statement::Query(query)] = statements.as_slice() else {
             // A write describes no columns, but 8.3 still *resolves* it at
             // prepare: `UPDATE Full SET k = 1 WHERE zz = 1` is 1054 there and

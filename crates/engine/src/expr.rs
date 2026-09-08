@@ -546,6 +546,11 @@ impl sqlparser::ast::Visitor for Nesting {
 /// `a_deep_nest_of_scalar_subqueries_still_answers` runs on. It answers nothing
 /// either, because an inner statement is a subtree of the outer one, which has
 /// already been found shallow enough.
+///
+/// `#[must_use]` because dropping the guard at the semicolon silently undoes
+/// what it is for -- the flag flips straight back -- and nothing in the gate
+/// notices. That is exactly how the `describe` call site was first written.
+#[must_use]
 pub(crate) struct OutermostStatement(bool);
 
 impl Drop for OutermostStatement {

@@ -2049,3 +2049,48 @@ fn a_correlated_column_reference_keeps_its_declared_type() {
         ]
     );
 }
+
+/// A statement too deep to walk is refused at prepare, not only at execute.
+///
+/// The bound went into `execute` first and was left out of `describe`, and the
+/// gap was reachable: a client that *prepared* a 50000-term statement
+/// disconnected the server, where executing the same text answered 1436.
+/// Prepared is the path Prisma takes for every statement. #0218.
+///
+/// Run on the stack a connection gets, for the reason
+/// `a_deep_nest_of_scalar_subqueries_still_answers` records: `cargo test`
+/// hands a thread 2 MB, and since #0247 a connection has far more, so holding
+/// the engine to the smaller figure would refuse work that is fine everywhere
+/// it runs.
+#[test]
+fn a_statement_too_deep_to_walk_is_refused_at_prepare() {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let (engine, session) = setup();
+            for terms in [200usize, 5_000, 50_000] {
+                let chain = std::iter::repeat_n("1", terms)
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                let refused = engine
+                    .describe(&session, &format!("SELECT {chain}"), 0)
+                    .unwrap_err();
+                assert_eq!(refused.code, 1436, "{terms} terms -> {refused}");
+            }
+            // And a statement inside the bound still describes its column,
+            // which is what says the guard refuses depth rather than length.
+            let shallow = std::iter::repeat_n("1", 8)
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            assert!(
+                engine
+                    .describe(&session, &format!("SELECT {shallow}"), 0)
+                    .unwrap()
+                    .is_some(),
+                "a statement within the bound must still describe"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("the prepare must refuse, not abort");
+}
