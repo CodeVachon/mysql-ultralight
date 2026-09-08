@@ -270,3 +270,4 @@
 {"at":"2026-09-08T17:13:24Z","id":260,"by":"Christopher Vachon","as":"user","type":"created","title":"An unnamed foreign key is numbered past the named ones","state":"Todo"}
 {"at":"2026-09-08T17:36:18Z","id":261,"by":"Christopher Vachon","as":"user","type":"created","title":"A generated CHECK name is numbered past a written one","state":"Todo"}
 {"at":"2026-09-08T17:51:44Z","id":262,"by":"Christopher Vachon","as":"user","type":"created","title":"An inline CHECK on ADD COLUMN is silently dropped","state":"Todo"}
+{"at":"2026-09-08T17:55:25Z","id":257,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
