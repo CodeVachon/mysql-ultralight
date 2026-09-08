@@ -90,7 +90,13 @@ start plus 26.1s of `prisma migrate deploy`. See [`baseline-mysql.md`](baseline-
   every error to execution. A parameter is typed from its position
 - **Diagnostics** — a warning can be raised and read back, and `ROW_COUNT()` reports rows
   changed or rows matched according to what the client negotiated
-
+- **A column list after an alias** — `(SELECT ...) AS d (x, y)` and
+  `(VALUES ROW(...), ROW(...)) AS t (col)` rename what the alias names, positionally, with
+  the original names no longer resolving. The `WITH w (x) AS ...` spelling shares the rule
+- **Indexes a foreign key made for itself** are provisional, as they are on MySQL: an
+  explicit index that can serve the key takes it over rather than colliding with it. That
+  is what `ADD CONSTRAINT x FOREIGN KEY (c)` followed by `CREATE INDEX x ON t (c)` needs,
+  which is a pair Prisma emits for every relation it adds
 - **Identifier limits** — an identifier longer than MySQL allows is refused, at the
   lengths MySQL uses
 
