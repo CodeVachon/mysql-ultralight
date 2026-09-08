@@ -96,6 +96,50 @@ const fn same(sql: &'static str) -> Case {
 
 pub const GROUPS: &[Group] = &[
     Group {
+        name: "a column list written after an alias",
+        setup: &["CREATE TABLE Al (a INT, b INT)", "INSERT INTO Al VALUES (1, 2)"],
+        cases: &[
+            // The shape the real migration history uses: a table value
+            // constructor named by an alias that also names its column. This
+            // was 1054 here and rows on 8.3, and it stopped `migrate deploy`
+            // at migration 407. #0256.
+            same("SELECT t.type FROM (VALUES ROW('ACKNOWLEDGE_FEEDBACK'), ROW('TIMESHEET_APPROVED')) AS t(type) ORDER BY t.type"),
+            same("SELECT * FROM (VALUES ROW(1), ROW(2)) AS t(x) ORDER BY x"),
+            // The same list over an ordinary derived table, which is where the
+            // rule actually lives -- it was only ever implemented for a CTE.
+            same("SELECT d.x, d.y FROM (SELECT a, b FROM Al) AS d(x, y)"),
+            same("SELECT * FROM (SELECT a FROM Al) AS d(x)"),
+            // The name it had before the list stops resolving.
+            same("SELECT d.a FROM (SELECT a FROM Al) AS d(x)"),
+            // A list of the wrong length, both ways round.
+            same("SELECT * FROM (SELECT a, b FROM Al) AS d(x)"),
+            same("SELECT * FROM (SELECT a FROM Al) AS d(x, y)"),
+            // A list that repeats a name, refused even though nothing selects
+            // the repeated column.
+            same("SELECT 1 FROM (SELECT a, b FROM Al) AS d(x, x)"),
+            // And the CTE spelling of all of it, which shares the rule.
+            same("WITH w(x) AS (SELECT a FROM Al) SELECT x FROM w"),
+            same("WITH w(x, y) AS (SELECT a FROM Al) SELECT 1 FROM w"),
+            same("WITH w(x, x) AS (SELECT a, b FROM Al) SELECT 1 FROM w"),
+            // A renamed column is what the rest of the query resolves against,
+            // including clauses that run after the projection.
+            same("SELECT d.x FROM (SELECT a, b FROM Al) AS d(x, y) ORDER BY d.y"),
+            same("SELECT SUM(d.x) FROM (SELECT a, b FROM Al) AS d(x, y) GROUP BY d.y"),
+            // An alias with no list still leaves the subquery's own names.
+            same("SELECT d.a FROM (SELECT a FROM Al) AS d"),
+            // A list belongs only after a derived table's alias. Everywhere
+            // else it parses here and is a syntax error on 8.3, and was being
+            // ignored -- rows answered with the columns still under their old
+            // names, which is a wrong answer rather than a clear error.
+            same("SELECT * FROM Al AS d(x, y)"),
+            same("SELECT * FROM Al AS d(x)"),
+            same("WITH w AS (SELECT a FROM Al) SELECT * FROM w AS d(x)"),
+            same("SELECT * FROM JSON_TABLE('[1,2]', '$[*]' COLUMNS(v INT PATH '$')) AS jt(z)"),
+            // Nor can a list give a column a type.
+            same("SELECT * FROM (SELECT a FROM Al) AS d(x INT)"),
+        ],
+    },
+    Group {
         name: "an index named after the foreign key that made it",
         // The constraints are set up rather than asked, because every case
         // runs in both protocols against one database and so runs twice --

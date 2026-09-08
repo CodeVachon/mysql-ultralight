@@ -35789,3 +35789,146 @@ fn the_index_a_foreign_key_made_is_only_taken_over_while_it_is_still_standing_in
         "a copied index is an ordinary index"
     );
 }
+
+/// A column list written after an alias renames what the alias names.
+///
+/// It was implemented for `WITH w (x) AS ...` and not for
+/// `(SELECT ...) AS d (x)`, and the missing half is the one the real migration
+/// history uses: `CROSS JOIN (VALUES ROW(...), ROW(...)) AS enum_values(type)`
+/// was 1054 here and rows on 8.3, stopping `migrate deploy` at migration 407.
+/// #0256.
+///
+/// Every code here was measured on 8.3 before it was written, and the same
+/// sequences are in the differential corpus.
+#[test]
+fn a_column_list_after_an_alias_renames_what_it_names() {
+    let (engine, mut session) = engine();
+    let run = |engine: &Engine, session: &mut Session, sql: &str| {
+        engine.execute(session, sql, &[]).map(|_| ())
+    };
+    run(&engine, &mut session, "CREATE TABLE Al (a INT, b INT)").unwrap();
+    run(&engine, &mut session, "INSERT INTO Al VALUES (1, 2)").unwrap();
+
+    // The migration's own shape.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT t.type FROM (VALUES ROW('A'), ROW('B')) AS t(type) ORDER BY t.type"
+        ),
+        vec![vec!["A"], vec!["B"]]
+    );
+
+    // Positional, over an ordinary derived table.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT d.x, d.y FROM (SELECT a, b FROM Al) AS d(x, y)"
+        ),
+        vec![vec!["1", "2"]]
+    );
+
+    // The name it had before the list stops resolving.
+    assert_eq!(
+        run(
+            &engine,
+            &mut session,
+            "SELECT d.a FROM (SELECT a FROM Al) AS d(x)"
+        )
+        .expect_err("the list replaced the name")
+        .code,
+        1054
+    );
+
+    // A list of the wrong length, both ways round.
+    for sql in [
+        "SELECT * FROM (SELECT a, b FROM Al) AS d(x)",
+        "SELECT * FROM (SELECT a FROM Al) AS d(x, y)",
+    ] {
+        assert_eq!(
+            run(&engine, &mut session, sql)
+                .expect_err("wrong length")
+                .code,
+            1353,
+            "{sql}"
+        );
+    }
+
+    // A repeated name, refused even though nothing selects it.
+    assert_eq!(
+        run(
+            &engine,
+            &mut session,
+            "SELECT 1 FROM (SELECT a, b FROM Al) AS d(x, x)"
+        )
+        .expect_err("the list repeats a name")
+        .code,
+        1060
+    );
+
+    // The CTE spelling shares the rule, including the repeat it did not use to
+    // refuse.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "WITH w(x) AS (SELECT a FROM Al) SELECT x FROM w"
+        ),
+        vec![vec!["1"]]
+    );
+    assert_eq!(
+        run(
+            &engine,
+            &mut session,
+            "WITH w(x, x) AS (SELECT a, b FROM Al) SELECT 1 FROM w"
+        )
+        .expect_err("a CTE list repeats a name too")
+        .code,
+        1060
+    );
+
+    // An alias with no list leaves the subquery's own names alone.
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT d.a FROM (SELECT a FROM Al) AS d"
+        ),
+        vec![vec!["1"]]
+    );
+
+    // A list belongs only after a derived table's alias. `sqlparser` accepts it
+    // in three other places where 8.3 answers 1064, and this engine used to
+    // ignore it there -- answering rows with the columns still under their old
+    // names, which is the wrong answer the house rule exists to prevent.
+    for sql in [
+        "SELECT * FROM Al AS d(x, y)",
+        "SELECT * FROM Al AS d(x)",
+        "WITH w AS (SELECT a FROM Al) SELECT * FROM w AS d(x)",
+        "SELECT * FROM JSON_TABLE('[1,2]', '$[*]' COLUMNS(v INT PATH '$')) AS jt(z)",
+        // Nor can the list give a column a type.
+        "SELECT * FROM (SELECT a FROM Al) AS d(x INT)",
+    ] {
+        assert_eq!(
+            run(&engine, &mut session, sql)
+                .expect_err("a column list does not belong here")
+                .code,
+            1064,
+            "{sql}"
+        );
+    }
+
+    // And both list errors are settled by the text, so a prepare must refuse
+    // rather than describe zero columns and let the client find out at execute
+    // -- which is the path Prisma takes for every statement.
+    for sql in [
+        "SELECT * FROM (SELECT a, b FROM Al) AS d(x)",
+        "SELECT 1 FROM (SELECT a, b FROM Al) AS d(x, x)",
+    ] {
+        assert!(
+            engine.describe(&session, sql, 0).is_err(),
+            "prepare must refuse: {sql}"
+        );
+    }
+}

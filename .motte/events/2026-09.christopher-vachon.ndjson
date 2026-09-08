@@ -263,3 +263,5 @@
 {"at":"2026-09-08T14:19:50Z","id":255,"by":"Christopher Vachon","as":"user","type":"created","title":"A foreign key's own index collides with the index the migration then creates","state":"Todo"}
 {"at":"2026-09-08T14:26:16Z","id":256,"by":"Christopher Vachon","as":"user","type":"created","title":"A derived table's column alias list is ignored","state":"Todo"}
 {"at":"2026-09-08T14:30:10Z","id":257,"by":"Christopher Vachon","as":"user","type":"created","title":"A foreign key constraint name is not required to be unique in its database","state":"Todo"}
+{"at":"2026-09-08T15:18:36Z","id":255,"by":"Christopher Vachon","as":"user","type":"state","from":"Todo","to":"Done"}
+{"at":"2026-09-08T15:40:17Z","id":258,"by":"Christopher Vachon","as":"user","type":"created","title":"A derived table's column list is checked after its subquery has run","state":"Todo"}

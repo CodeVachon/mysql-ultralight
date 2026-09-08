@@ -56,7 +56,7 @@ const db = await start({ image: '.cache/schema.mus', database: 'app' });
 ```
 
 Against a real 604-migration Prisma history that is **26.1s of `migrate deploy`
-down to about 1ms**, with 241 tables, 2,367 columns, seed rows and every
+down to about 1ms**, with 278 tables, 2,771 columns, seed rows and every
 constraint intact.
 
 Key the image file by a hash of your migrations directory, and rebake when it

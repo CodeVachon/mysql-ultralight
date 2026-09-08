@@ -1293,7 +1293,7 @@ impl Engine {
                 Some(plan) => self.recursive_cte(session, cte, &name, &plan)?,
                 None => {
                     let mut plain = self.relation_of_query(session, &cte.query, &name)?;
-                    rename_cte_columns(&mut plain, cte, &name)?;
+                    rename_cte_columns(&mut plain, cte)?;
                     plain
                 }
             };
@@ -1373,7 +1373,7 @@ impl Engine {
             &cte.query,
             name,
         );
-        rename_cte_columns(&mut scratch, cte, name)?;
+        rename_cte_columns(&mut scratch, cte)?;
         // Every column of a recursive CTE is nullable, whatever the anchor
         // declared. Measured on 8.3 rather than reasoned about: over a folder
         // table whose `id` is a primary key and whose `name` is NOT NULL, both
@@ -2986,6 +2986,7 @@ impl Engine {
 
     /// Materialises one table factor.
     fn relation_of(&self, session: &Session, factor: &TableFactor) -> EngineResult<Relation> {
+        refuse_column_list_on_a_plain_alias(factor)?;
         match factor {
             TableFactor::Table { name, alias, .. } => {
                 // A CTE shadows a table of the same name, and is looked up
@@ -3116,7 +3117,7 @@ impl Engine {
                 // there through `lateral_join`, which is the path `LATERAL`
                 // itself selects. So `SELECT k FROM Cl, (SELECT Cl.id ...) t`
                 // is still 1054, as it is on 8.3.
-                let inner = self.query_outer(session, subquery, session.lateral.as_ref())?;
+                let mut inner = self.query_outer(session, subquery, session.lateral.as_ref())?;
                 // Whether the columns take the shape a temporary table would
                 // give them, or stay the expressions MySQL would have merged
                 // into this query. See `materialised_by_mysql`.
@@ -3125,6 +3126,19 @@ impl Engine {
                     .as_ref()
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| "derived".to_owned());
+                // `AS d (x, y)` renames what the subquery returned, by the same
+                // rule a CTE's list follows. Applied before the columns are
+                // rebuilt below, so the new names are what the rest of the
+                // query resolves against — and the old ones stop resolving,
+                // which is what 8.3 does. #0256.
+                if let Some(alias) = alias {
+                    if let Some(names) = aliased_column_names(&alias.columns, inner.columns.len())?
+                    {
+                        for (column, renamed) in inner.columns.iter_mut().zip(names) {
+                            column.name = renamed;
+                        }
+                    }
+                }
                 Ok(Relation {
                     columns: inner
                         .columns
@@ -7858,28 +7872,111 @@ fn limit_reach(session: &Session, query: &Query) -> EngineResult<Option<usize>> 
 
 /// Applies a CTE's `WITH x (a, b) AS ...` column list, which renames the
 /// columns of its result.
-fn rename_cte_columns(
-    relation: &mut Relation,
-    cte: &sqlparser::ast::Cte,
-    name: &str,
-) -> EngineResult<()> {
-    if cte.alias.columns.is_empty() {
-        return Ok(());
+fn rename_cte_columns(relation: &mut Relation, cte: &sqlparser::ast::Cte) -> EngineResult<()> {
+    if let Some(names) = aliased_column_names(&cte.alias.columns, relation.columns.len())? {
+        for (column, renamed) in relation.columns.iter_mut().zip(names) {
+            column.name = renamed;
+        }
     }
-    if cte.alias.columns.len() != relation.columns.len() {
+    Ok(())
+}
+
+/// Applies a `(a, b)` column list written after an alias, which renames the
+/// columns of the thing it aliases.
+///
+/// One function for both places it can appear — after a CTE's name, and after
+/// a derived table's — because MySQL applies one rule and answers with one set
+/// of codes. Only the CTE spelling was implemented, which is how
+/// `CROSS JOIN (VALUES ROW(...), ROW(...)) AS enum_values(type)` came to be
+/// 1054 here and rows on 8.3, stopping the real migration history. #0256.
+///
+/// Measured on 8.3, all three:
+///
+/// * a list of the wrong length, either way, is 1353;
+/// * a list that repeats a name is 1060, and is refused even though nothing
+///   selects the repeated column;
+/// * the names map by position, and the original name stops resolving —
+///   `SELECT d.a FROM (SELECT 1 AS a) AS d(x)` is 1054.
+///
+/// Refuses `(a, b)` written after an alias that is not a derived table's.
+///
+/// MySQL's grammar takes a derived column list only after a derived table or a
+/// table value constructor, so every other place one can be *parsed* here is a
+/// syntax error there. Measured on 8.3, all 1064: `FROM Al AS d(x, y)` over a
+/// base table, the same over a CTE reference, and
+/// `JSON_TABLE(...) AS jt(z)`.
+///
+/// Refused rather than ignored, which is what this engine did: a list nobody
+/// applies is a query answered with the columns still under their old names —
+/// a wrong answer where the house rule asks for a clear error.
+fn refuse_column_list_on_a_plain_alias(factor: &TableFactor) -> EngineResult<()> {
+    let alias = match factor {
+        // The one place a list belongs. `Derived` covers the table value
+        // constructor too, which parses as a derived table over `VALUES`.
+        TableFactor::Derived { .. } => return Ok(()),
+        TableFactor::Table { alias, .. } => alias.as_ref(),
+        TableFactor::JsonTable { alias, .. } => alias.as_ref(),
+        // Everything else either takes no alias or is refused before it is
+        // reached, and inheriting a refusal is what this file avoids
+        // elsewhere: a factor added later should have to be considered.
+        _ => None,
+    };
+    match alias {
+        Some(alias) if !alias.columns.is_empty() => Err(EngineError::parse(format!(
+            "You have an error in your SQL syntax; a column list may only follow \
+             a derived table's alias, near '{}'",
+            alias.name.value
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Returns the names to use, or `None` where the alias wrote no list.
+///
+/// The checking is split from the applying because the two places this is
+/// needed hold different types — a CTE renames a `Relation`'s columns and a
+/// derived table renames a `ResultSet`'s — and the rule is about the list, not
+/// about what it is being applied to.
+fn aliased_column_names(
+    columns: &[sqlparser::ast::TableAliasColumnDef],
+    have: usize,
+) -> EngineResult<Option<Vec<String>>> {
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    if columns.len() != have {
         return Err(EngineError::new(
             1353,
             "HY000",
-            format!(
-                "In definition of view, derived table or common table expression, \
-                 SELECT and column names list have different column counts: '{name}'"
-            ),
+            // Word for word what 8.3 answers, with no name on the end: the
+            // engine used to append `: 'd'`, which nothing on the other side
+            // does.
+            "In definition of view, derived table or common table expression, \
+             SELECT list and column names list have different column counts",
         ));
     }
-    for (column, alias) in relation.columns.iter_mut().zip(&cte.alias.columns) {
-        column.name = alias.name.value.clone();
+    // Before any renaming, because a list that is refused renames nothing —
+    // and case-insensitively, which is how every other column name here is
+    // compared.
+    for (at, alias) in columns.iter().enumerate() {
+        if columns[..at]
+            .iter()
+            .any(|earlier| earlier.name.value.eq_ignore_ascii_case(&alias.name.value))
+        {
+            return Err(EngineError::duplicate_column(&alias.name.value));
+        }
     }
-    Ok(())
+    // `AS d (x INT)` parses here and is 1064 on 8.3 -- the grammar takes names
+    // and nothing else. Refused rather than tolerated, because tolerating it
+    // silently discards a declared type the statement asked for.
+    if let Some(typed) = columns.iter().find(|c| c.data_type.is_some()) {
+        return Err(EngineError::parse(format!(
+            "You have an error in your SQL syntax; a column list after an alias \
+             names columns and cannot give one a type, near '{}'",
+            typed.name.value
+        )));
+    }
+    Ok(Some(columns.iter().map(|c| c.name.value.clone()).collect()))
 }
 
 /// The comparison key for a whole row, under the server's collation.
@@ -12412,7 +12509,14 @@ fn refused_at_prepare(e: &EngineError) -> bool {
     // statements up front — which Prisma does for every one — heard nothing
     // until it ran them. Measured against 8.3 through COM_STMT_PREPARE, for
     // `SELECT *`, `SELECT 1`, and a missing table inside a subquery. #0244.
-    matches!(e.code, 1054 | 1051 | 1146 | 1210 | 1582)
+    // ER_VIEW_WRONG_LIST and ER_DUP_FIELDNAME join them on the same argument,
+    // and are reached by a column list written after an alias: how many names
+    // that list holds, and whether it repeats one, are fixed by the text.
+    // Measured through 8.3, which refuses both at prepare —
+    // `PREPARE p FROM 'SELECT * FROM (SELECT a, b FROM Al) AS d(x)'` is 1353
+    // there and `... AS d(x, x)` is 1060, where this engine prepared each and
+    // described zero columns. #0256.
+    matches!(e.code, 1054 | 1051 | 1060 | 1146 | 1210 | 1353 | 1582)
 }
 
 /// The first column reference in `e` that nothing in scope answers to.
