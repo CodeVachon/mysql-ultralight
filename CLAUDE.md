@@ -157,6 +157,19 @@ git config core.hooksPath .githooks
   *is* the format. Nothing may be reordered and nothing inserted in the middle; a change
   means a new `FORMAT_VERSION`. Readers bind fields to `let` bindings in write order for
   exactly this reason — a struct literal would make a reordering silent.
+- **Bounds on one resource go into one budget.** Two limits guarding the same stack
+  compose, and the composition is what a client sends. Measured twice, both reverted: a
+  depth limit plus a separate flat-chain length limit let a chain-of-parenthesised-chains
+  pay one level of depth per 256 terms and abort the process at ~1500; a set-operation
+  spine checked against its own copy of the limit did the same. Anything that costs frames
+  is added to the same counter, or it composes with everything that is. The corollary for
+  reviews: when a change adds a second limit, the question is not whether each is right
+  but what passes both.
+- **The engine's limits assume the stack the binary gives a connection**, 32 MB, because
+  the npm platform packages spawn the CLI and that is the only way it ships. A test that
+  walks a deep statement must spawn a thread that size; on the 2 MB a `cargo test` thread
+  gets, the walkers run out at about ninety terms and abort the *test binary* rather than
+  failing an assertion. #0253 tracks what this costs an embedder.
 - The conformance target is the real Appello schema at
-  `~/Repositories/Appello/application-mono-repo/apps/api/prisma` — 203 models, 605
-  migrations. See `docs/spike-wire-protocol.md`.
+  `~/Repositories/Appello/application-mono-repo/apps/api/prisma` — 203 models, 604
+  migrations (`ls` counts 605; one entry is `migration_lock.toml`). See `docs/spike-wire-protocol.md`.

@@ -69,6 +69,19 @@ pub struct Index {
     pub columns: Vec<String>,
     pub unique: bool,
     pub primary: bool,
+    /// Whether a foreign key created this index for itself rather than a
+    /// statement asking for it.
+    ///
+    /// Such an index is *provisional* on 8.3: any explicit index that can serve
+    /// the key replaces it, and the name it was holding comes free. An explicit
+    /// index that happens to have the same name and the same columns does not
+    /// behave that way, so this cannot be worked out by looking at the index —
+    /// measured on 8.3, `CREATE INDEX c ON J(r)` after a foreign key `c` on
+    /// `(r)` is accepted, and the identical statement after an *explicit* index
+    /// `c` on `(r)` that a later foreign key `c` reused is 1061. The two are
+    /// indistinguishable by name and columns, so where the index came from has
+    /// to be remembered. #0255.
+    pub implicit_for_foreign_key: bool,
 }
 
 /// A foreign key constraint.

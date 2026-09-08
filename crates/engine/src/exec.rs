@@ -843,20 +843,38 @@ impl Engine {
                     .table_mut(&table_name)
                     .ok_or_else(|| EngineError::no_such_table(&table_name))?;
 
-                match table
+                let Some(at) = table
                     .indexes
-                    .iter_mut()
-                    .find(|i| i.name.eq_ignore_ascii_case(&old))
+                    .iter()
+                    .position(|i| i.name.eq_ignore_ascii_case(&old))
+                else {
+                    return Err(EngineError::new(
+                        1176,
+                        "42000",
+                        format!("Key '{old}' doesn't exist in table '{table_name}'"),
+                    ));
+                };
+                // Refused before the rename, because a table holding two
+                // indexes of one name is a state nothing else here is written
+                // against: a rule that removes an index by name removes both,
+                // and if one of them was backing a foreign key the key is left
+                // with nothing. Measured on 8.3, where `RENAME INDEX c1 TO c2`
+                // with `c2` already present is `Duplicate key name 'c2'`, and
+                // was accepted here.
+                //
+                // Any index *other* than the one being renamed, because 8.3
+                // accepts `RENAME INDEX c TO c` -- measured, after assuming the
+                // opposite and writing the assumption down as if it were not
+                // one.
+                if table
+                    .indexes
+                    .iter()
+                    .enumerate()
+                    .any(|(i, held)| i != at && held.name.eq_ignore_ascii_case(&new))
                 {
-                    Some(index) => index.name = new,
-                    None => {
-                        return Err(EngineError::new(
-                            1176,
-                            "42000",
-                            format!("Key '{old}' doesn't exist in table '{table_name}'"),
-                        ))
-                    }
+                    return Err(EngineError::duplicate_key_name(&new));
                 }
+                table.indexes[at].name = new;
                 Ok(Outcome::ok())
             }
 

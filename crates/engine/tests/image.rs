@@ -986,11 +986,12 @@ fn a_boolean_never_reaches_the_image_and_is_written_as_its_integer_if_it_does() 
     // And the boolean did not move the version: 7 was #0068's ENUM tag, 8 was
     // #0069's unsigned one, 9 is #0126's binary collation, 10 is the column
     // collation #0129/#0134/#0152 needed, 11 is #0121's decimal mark inside a
-    // document, 12 is #0205's foreign key schema and 13 is the sql_mode a view
-    // was created under (#0080), none of them this. Pinned rather than
-    // derived, so the day something *does* give a boolean a tag of its own it
-    // has to come back here and say so.
-    assert_eq!(image::FORMAT_VERSION, 13);
+    // document, 12 is #0205's foreign key schema, 13 is the sql_mode a view was
+    // created under (#0080) and 14 is whether a foreign key made an index for
+    // itself (#0255), none of them this. Pinned rather than derived, so the day
+    // something *does* give a boolean a tag of its own it has to come back here
+    // and say so.
+    assert_eq!(image::FORMAT_VERSION, 14);
 }
 
 #[test]
@@ -1341,4 +1342,54 @@ fn a_foreign_keys_parent_keeps_its_database_and_its_name_apart() {
         .execute(&mut session, "INSERT INTO Dot VALUES (7)", &[])
         .unwrap_err();
     assert_eq!(err.code, 1452, "{err}");
+}
+
+/// A foreign key's index is still provisional after a round trip through the
+/// image.
+///
+/// The mark is what tells an index a key made for itself from one a statement
+/// asked for, and only the first may be taken over. Lose it in the image and
+/// the #0255 blocker comes back for anyone booting from `--state`: the very
+/// next `CREATE INDEX Job_x_fkey ON Job (x)` — which is what Prisma emits — is
+/// 1061 again, on a path no other test walks.
+///
+/// Asserted through behaviour rather than by reading the field, because the
+/// field is not public and because the behaviour is the thing that broke.
+#[test]
+fn a_foreign_keys_index_is_still_provisional_after_a_round_trip() {
+    let (engine, mut session) = engine();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE P (id INT NOT NULL PRIMARY KEY)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE J (id INT NOT NULL PRIMARY KEY, r INT NULL)",
+    );
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE J ADD CONSTRAINT c FOREIGN KEY (r) REFERENCES P (id)",
+    );
+
+    let decoded = image::decode(&image::encode(&engine.catalog_snapshot().unwrap())).unwrap();
+    let restored = Engine::from_catalog(decoded, ServerConfig::default()).unwrap();
+    let mut session = Session::new(ServerConfig::default(), 1);
+    session.current_database = Some("testdb".to_owned());
+
+    restored
+        .execute(&mut session, "CREATE INDEX c ON J (r)", &[])
+        .expect("the index the key made for itself must still be provisional");
+    assert_eq!(
+        rows(
+            &restored,
+            &mut session,
+            "SELECT INDEX_NAME FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'J' AND INDEX_NAME <> 'PRIMARY'"
+        ),
+        vec![vec!["c"]],
+        "taken over, not added beside"
+    );
 }

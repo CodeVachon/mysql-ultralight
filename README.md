@@ -13,6 +13,14 @@ It is **not** for production. There is no durability, and there never will be.
 
 It runs a real application's database. All **604 migrations** of a production Prisma
 history apply, `prisma db push` creates a schema, and Prisma Client does CRUD against it.
+(604 is what `prisma migrate deploy` itself reports for that directory; a plain `ls` says
+605, because one entry is `migration_lock.toml`.)
+
+It is also checked against MySQL itself, not only against its own tests: **5,570
+statements** of a differential corpus are put to a real `mysql:8.3` and to this engine over
+both the text and binary protocols, and the answers are compared. **0 diverge.** Every
+divergence found and not yet fixed is a filed issue rather than an accepted baseline —
+`crates/differential/baseline.txt` holds no entries, and may only shrink.
 
 | | Real MySQL 8 | mysql-ultralight |
 |---|---|---|
@@ -83,9 +91,10 @@ ready port=3307 socket=- startup_ms=1.312 instance=3f1c0a9b6d2e4517
 |---|---|
 | `crates/protocol` | Wire codec: framing, capabilities, auth, handshake, columns, values |
 | `crates/server` | Connection state machine, command dispatch, tracing |
-| `crates/engine` | Catalog, storage, expressions, executor, sessions, `information_schema` |
+| `crates/engine` | Catalog, storage, expressions, executor, sessions, `information_schema`, the state image |
 | `crates/cli` | The `mysql-ultralight` binary, and the engine/server adapter |
 | `crates/conformance` | Extracts a target codebase's SQL surface |
+| `crates/differential` | Runs the same SQL against MySQL and this engine and diffs the answers |
 | `packages/npm` | `@codevachon/mysql-ultralight`: the JS API and platform packages |
 | `examples/app` | The example application: one schema, one history, the controllers |
 | `examples/node-test` | Testing it with `node:test`, and the engine-level claims |
@@ -135,6 +144,34 @@ They run as part of the gate, so the documented path is the tested one.
 ./scripts/check.sh --fix    # format and apply clippy's suggestions first
 ./scripts/check.sh --fast   # skip the slower supply-chain checks
 ```
+
+### Checking this engine against MySQL rather than against memory
+
+The gate checks the engine against its own tests. Three scripts check it against a real
+`mysql:8.3` in Docker, which is a different question and the one that has been wrong more
+often.
+
+```sh
+./scripts/differential.sh   # the corpus: same SQL to both servers, diff the answers
+./scripts/ask.sh q.sql      # one question, right now, both servers, side by side
+./scripts/mutate.sh ...     # remove the code a test covers and confirm the test fails
+```
+
+`differential.sh` is deliberately **not** in the gate — it needs a MySQL to compare
+against, and a checkout cannot be assumed to have one. Run it when changing anything the
+engine answers with. It is the only thing here that compares this engine to MySQL rather
+than to what somebody remembered about MySQL. See
+[`crates/differential`](crates/differential/README.md).
+
+`ask.sh` is for settling one question before working it: an issue body is prose somebody
+wrote once, and in this project the prose has been wrong often enough that measuring first
+is cheaper than implementing a premise twice. `COLINFO=1` compares column metadata too,
+because a claim about a type, collation or flag is invisible in the rows.
+
+`mutate.sh` is for the other failure: a test that passes without the code it covers.
+Several here did — assertions that never ran, a test reading a struct field where the bug
+was in the wire flag, sample values that sorted the same way whether the comparison was
+right or wrong.
 
 The examples need their dependencies once — `for d in examples/*/; do npm install --prefix
 "$d"; done`. Until then the gate reports them as skips rather than passing over them.

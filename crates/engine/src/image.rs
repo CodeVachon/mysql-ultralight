@@ -27,6 +27,24 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// not fail cleanly, it would silently produce a catalog with the wrong shape,
 /// and every test running against it would be wrong in a way nothing reports.
 ///
+/// v14 adds a field to an index: whether a foreign key made it, rather than a
+/// statement asking for one. Such an index is provisional on 8.3 — any explicit
+/// index that can serve the key takes it over, and the name it was holding
+/// comes free — and an ordinary index of the same name and columns is not.
+/// A v13 image has nowhere to record the difference, so every index in it would
+/// reload ordinary, and the very statement pair Prisma emits
+/// (`ADD CONSTRAINT Job_x_fkey FOREIGN KEY (x)` then
+/// `CREATE INDEX Job_x_fkey ON Job (x)`) would answer 1061 again for anyone
+/// booting with `--state`. That is #0255 reintroduced by a reload, which is a
+/// migration history that stops rather than a wrong answer, but it stops
+/// somewhere the image is the only thing to blame. See #0255.
+///
+/// v13 adds a field to a view: the `sql_mode` its body was created under. MySQL
+/// freezes the creating session's mode into the view, so a v12 image would
+/// reload every view to be read under whatever mode the *reading* session
+/// happens to hold — and `ANSI_QUOTES` alone decides whether `"x"` in a view's
+/// body is a string or a column. See #0080.
+///
 /// v12 adds a field to a foreign key: the database its parent was written in,
 /// held apart from the parent's name. A v11 image holds the two joined with a
 /// dot, and the join cannot be undone — `REFERENCES app.P(id)` and
@@ -95,7 +113,7 @@ const MAGIC: &[u8; 4] = b"MULi";
 /// answering it, which is the wrong answer the version check exists to
 /// prevent. An image is a file a user keeps and boots from with `--state`, so
 /// the stale one has to fail rather than mislead.
-pub const FORMAT_VERSION: u32 = 13;
+pub const FORMAT_VERSION: u32 = 14;
 
 /// Writes the whole catalog.
 pub fn encode(catalog: &Catalog) -> Vec<u8> {
@@ -221,6 +239,7 @@ fn write_table(w: &mut Writer, table: &Table) {
         w.strs(&index.columns);
         w.bool(index.unique);
         w.bool(index.primary);
+        w.bool(index.implicit_for_foreign_key);
     }
 
     w.u32(table.foreign_keys.len() as u32);
@@ -272,11 +291,13 @@ fn read_table(r: &mut Reader<'_>) -> EngineResult<Table> {
         let columns = r.strs()?;
         let unique = r.bool()?;
         let primary = r.bool()?;
+        let implicit_for_foreign_key = r.bool()?;
         indexes.push(Index {
             name,
             columns,
             unique,
             primary,
+            implicit_for_foreign_key,
         });
     }
 

@@ -35544,3 +35544,248 @@ fn a_lateral_derived_table_reads_the_row_beside_it() {
         assert_eq!(err.code, 1054, "{sql} -> {err}");
     }
 }
+
+/// The index a foreign key made for itself is provisional, and an explicit one
+/// takes it over.
+///
+/// Prisma emits `ADD CONSTRAINT x FOREIGN KEY (c)` and then
+/// `CREATE INDEX x ON t (c)`, and refusing the second stopped the real
+/// 604-migration history at its twenty-third migration. #0255.
+///
+/// Every row here was measured against 8.3 before it was written; the same
+/// sequences are in the differential corpus, which is what checks them against
+/// MySQL rather than against this file.
+#[test]
+fn an_explicit_index_takes_over_the_one_a_foreign_key_made() {
+    let (engine, mut session) = engine();
+    let run = |engine: &Engine, session: &mut Session, sql: &str| {
+        engine.execute(session, sql, &[]).map(|_| ())
+    };
+
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE P (id INT NOT NULL PRIMARY KEY)",
+    )
+    .unwrap();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE J (id INT NOT NULL PRIMARY KEY, r INT NULL, s INT NULL)",
+    )
+    .unwrap();
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE J ADD CONSTRAINT c FOREIGN KEY (r) REFERENCES P (id)",
+    )
+    .unwrap();
+
+    // Same name, same column: the takeover, and the case the migrations hit.
+    run(&engine, &mut session, "CREATE INDEX c ON J (r)")
+        .expect("an index that serves the key takes it over");
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'J' AND INDEX_NAME <> 'PRIMARY'"),
+        vec![vec!["c"]],
+        "one index, not two"
+    );
+
+    // Having been taken over it is ordinary, so the next duplicate is 1061.
+    assert_eq!(
+        run(&engine, &mut session, "CREATE INDEX c ON J (r)")
+            .expect_err("no longer provisional")
+            .code,
+        1061
+    );
+
+    // Same name, a column that cannot serve the key: a real collision.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE J ADD CONSTRAINT c2 FOREIGN KEY (s) REFERENCES P (id)",
+    )
+    .unwrap();
+    assert_eq!(
+        run(&engine, &mut session, "CREATE INDEX c2 ON J (id)")
+            .expect_err("cannot serve the key, so the name is still taken")
+            .code,
+        1061
+    );
+
+    // A different name over the key's column takes over too, and the
+    // provisional index goes rather than being left beside it.
+    run(&engine, &mut session, "CREATE INDEX other ON J (s)").unwrap();
+    let held = rows(&engine, &mut session, "SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'J' AND INDEX_NAME <> 'PRIMARY' ORDER BY INDEX_NAME");
+    assert_eq!(
+        held,
+        vec![vec!["c"], vec!["other"]],
+        "c2 was provisional and is gone"
+    );
+
+    // The key still holds, which is what says an index moved rather than a
+    // constraint being dropped.
+    assert_eq!(
+        run(
+            &engine,
+            &mut session,
+            "INSERT INTO J (id, r) VALUES (1, 99)"
+        )
+        .expect_err("the foreign key still refuses an unmatched parent")
+        .code,
+        1452
+    );
+
+    // A primary key takes over as well. This was excluded on the assumption
+    // that it would not, and 8.3 said otherwise: `ADD PRIMARY KEY (r)` over a
+    // key on `(r)` leaves it holding PRIMARY alone.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE Q (id INT NOT NULL, r INT NOT NULL)",
+    )
+    .unwrap();
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE Q ADD CONSTRAINT q FOREIGN KEY (r) REFERENCES P (id)",
+    )
+    .unwrap();
+    run(&engine, &mut session, "ALTER TABLE Q ADD PRIMARY KEY (r)").unwrap();
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Q' ORDER BY INDEX_NAME"),
+        vec![vec!["PRIMARY"]],
+        "the primary key serves the foreign key, so nothing stands in for it"
+    );
+
+    // An explicit index a later key reuses the name of is not provisional.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE K (id INT NOT NULL PRIMARY KEY, r INT NULL)",
+    )
+    .unwrap();
+    run(&engine, &mut session, "CREATE INDEX e ON K (r)").unwrap();
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE K ADD CONSTRAINT e FOREIGN KEY (r) REFERENCES P (id)",
+    )
+    .unwrap();
+    assert_eq!(
+        run(&engine, &mut session, "CREATE INDEX e ON K (r)")
+            .expect_err("an explicit index is not provisional")
+            .code,
+        1061
+    );
+}
+
+/// The three ways the takeover must *not* happen, each of which was a fix with
+/// no test behind it until the review said so. #0255.
+#[test]
+fn the_index_a_foreign_key_made_is_only_taken_over_while_it_is_still_standing_in() {
+    let (engine, mut session) = engine();
+    let run = |engine: &Engine, session: &mut Session, sql: &str| {
+        engine.execute(session, sql, &[]).map(|_| ())
+    };
+    let index_names = |engine: &Engine, session: &mut Session, table: &str| {
+        rows(engine, session, &format!("SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{table}' AND INDEX_NAME <> 'PRIMARY' ORDER BY INDEX_NAME"))
+    };
+
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE P (id INT NOT NULL PRIMARY KEY)",
+    )
+    .unwrap();
+
+    // A refused statement must not have taken anything over on its way to the
+    // refusal. `create_index` holds the live catalog, so a takeover applied
+    // before the checks is not rolled back, and the key was left with no index
+    // at all -- a state 1553 exists to prevent.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE R (id INT NOT NULL PRIMARY KEY, r INT NULL)",
+    )
+    .unwrap();
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE R ADD CONSTRAINT c FOREIGN KEY (r) REFERENCES P (id)",
+    )
+    .unwrap();
+    run(&engine, &mut session, "INSERT INTO P (id) VALUES (1)").unwrap();
+    run(
+        &engine,
+        &mut session,
+        "INSERT INTO R (id, r) VALUES (1, 1), (2, 1)",
+    )
+    .unwrap();
+    assert_eq!(
+        run(&engine, &mut session, "CREATE UNIQUE INDEX c ON R (r)")
+            .expect_err("the rows already collide")
+            .code,
+        1062
+    );
+    assert_eq!(
+        index_names(&engine, &mut session, "R"),
+        vec![vec!["c"]],
+        "a refused statement must leave the key's index where it was"
+    );
+
+    // An index that outlived the key it was made for is an ordinary index.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE D (id INT NOT NULL PRIMARY KEY, r INT NULL)",
+    )
+    .unwrap();
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE D ADD CONSTRAINT c FOREIGN KEY (r) REFERENCES P (id)",
+    )
+    .unwrap();
+    run(&engine, &mut session, "ALTER TABLE D DROP FOREIGN KEY c").unwrap();
+    // Re-added, and covered by the index left behind, so no new one is made.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE D ADD CONSTRAINT c FOREIGN KEY (r) REFERENCES P (id)",
+    )
+    .unwrap();
+    run(&engine, &mut session, "CREATE INDEX z ON D (r)").unwrap();
+    assert_eq!(
+        index_names(&engine, &mut session, "D"),
+        vec![vec!["c"], vec!["z"]],
+        "an index that outlived its key is ordinary and is not taken over"
+    );
+
+    // `LIKE` copies indexes and not constraints, so nothing in the copy is
+    // standing in for a key.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE L (id INT NOT NULL PRIMARY KEY, r INT NULL)",
+    )
+    .unwrap();
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE L ADD CONSTRAINT c FOREIGN KEY (r) REFERENCES P (id)",
+    )
+    .unwrap();
+    run(&engine, &mut session, "CREATE TABLE L2 LIKE L").unwrap();
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE L2 ADD CONSTRAINT c FOREIGN KEY (r) REFERENCES P (id)",
+    )
+    .unwrap();
+    run(&engine, &mut session, "CREATE INDEX z ON L2 (r)").unwrap();
+    assert_eq!(
+        index_names(&engine, &mut session, "L2"),
+        vec![vec!["c"], vec!["z"]],
+        "a copied index is an ordinary index"
+    );
+}

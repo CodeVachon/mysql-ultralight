@@ -96,6 +96,75 @@ const fn same(sql: &'static str) -> Case {
 
 pub const GROUPS: &[Group] = &[
     Group {
+        name: "an index named after the foreign key that made it",
+        // The constraints are set up rather than asked, because every case
+        // runs in both protocols against one database and so runs twice --
+        // and 8.3 answers 1826 the second time a schema is given a foreign key
+        // name it already holds, which this engine does not yet (#0257). The
+        // claim being made here survives that: the CREATE INDEX is asked, and
+        // its second run is 1061 on both servers, because by then the takeover
+        // has happened and the index is an ordinary one.
+        setup: &[
+            "CREATE TABLE Fp (id VARCHAR(21) NOT NULL PRIMARY KEY)",
+            // A two-column parent, for the keys that need one below.
+            "CREATE TABLE Fn (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b), KEY na (a))",
+            "CREATE TABLE Fj (id VARCHAR(21) NOT NULL PRIMARY KEY, r VARCHAR(21) NULL, s VARCHAR(21) NULL)",
+            "ALTER TABLE Fj ADD CONSTRAINT c FOREIGN KEY (r) REFERENCES Fp (id) ON DELETE SET NULL ON UPDATE CASCADE",
+            "ALTER TABLE Fj ADD CONSTRAINT c2 FOREIGN KEY (s) REFERENCES Fp (id)",
+            "CREATE TABLE Fk (id VARCHAR(21) NOT NULL PRIMARY KEY, r VARCHAR(21) NULL)",
+            "CREATE INDEX e ON Fk (r)",
+            "ALTER TABLE Fk ADD CONSTRAINT e FOREIGN KEY (r) REFERENCES Fp (id)",
+            "CREATE TABLE Fq (id INT NOT NULL, r INT NOT NULL)",
+            "ALTER TABLE Fq ADD CONSTRAINT q FOREIGN KEY (r) REFERENCES Fn (a)",
+            "ALTER TABLE Fq ADD PRIMARY KEY (r)",
+            "CREATE TABLE Fw (id INT NOT NULL PRIMARY KEY, r INT NOT NULL, b INT NOT NULL)",
+            "ALTER TABLE Fw ADD CONSTRAINT w1 FOREIGN KEY (r) REFERENCES Fn (a)",
+            "ALTER TABLE Fw ADD CONSTRAINT w2 FOREIGN KEY (r, b) REFERENCES Fn (a, b)",
+        ],
+        cases: &[
+            // Prisma emits the constraint and then an index of the same name,
+            // and refusing the second stopped the real migration history at
+            // its twenty-third migration. 8.3 treats the index a foreign key
+            // made for itself as provisional: an explicit index that can serve
+            // the key takes it over. #0255.
+            same("CREATE INDEX c ON Fj (r)"),
+            // One index named c over r, not two, and not a refusal.
+            same("SELECT 'took over' AS stage, INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Fj' ORDER BY INDEX_NAME, SEQ_IN_INDEX"),
+            // A name the provisional index holds, over a column that cannot
+            // serve the key, is a real collision.
+            same("CREATE INDEX c2 ON Fj (id)"),
+            // A different name over the key's own column takes over too, and
+            // the provisional index goes with it.
+            same("CREATE INDEX other ON Fj (s)"),
+            same("SELECT 'after other' AS stage, INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Fj' ORDER BY INDEX_NAME, SEQ_IN_INDEX"),
+            // An explicit index a later key reused the name of is NOT
+            // provisional, so this is 1061 rather than a takeover.
+            same("CREATE INDEX e ON Fk (r)"),
+            // And the keys still hold, which is what says the takeover moved
+            // an index rather than quietly dropping a constraint.
+            same("SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Fj' AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY CONSTRAINT_NAME, COLUMN_NAME"),
+            same("INSERT INTO Fj (id, r) VALUES ('j1', 'nope')"),
+            // A primary key takes over too -- measured, 8.3 is left holding
+            // PRIMARY alone rather than PRIMARY beside the key's own index.
+            // Set up rather than asked, for the #0257 reason above.
+            same("SELECT 'primary took over' AS stage, INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Fq' ORDER BY INDEX_NAME, SEQ_IN_INDEX"),
+            // And so does another key's own index, when it covers the first
+            // key's columns: `(r, b)` covers `(r)`, and 8.3 keeps only `w2`.
+            same("SELECT 'key took over key' AS stage, INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'Fw' ORDER BY INDEX_NAME, SEQ_IN_INDEX"),
+            // Renaming an index onto a name the table already carries is 1061,
+            // and was accepted here -- which mattered once an index could be
+            // removed by name, because two of one name meant removing both and
+            // leaving a foreign key with nothing behind it. Both of these
+            // answer the same way however many times they run, which is what
+            // lets them be asked rather than set up.
+            same("ALTER TABLE Fw RENAME INDEX w2 TO na2"),
+            same("ALTER TABLE Fj RENAME INDEX c TO other"),
+            // And a rename to the name it already has is accepted, which is
+            // the opposite of what the refusal above was first written to do.
+            same("ALTER TABLE Fj RENAME INDEX c TO c"),
+        ],
+    },
+    Group {
         name: "answers I got wrong",
         setup: &[
             "CREATE TABLE W (id INT NOT NULL, doc JSON NULL, name VARCHAR(40) NULL, \

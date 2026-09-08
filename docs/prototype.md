@@ -3,6 +3,12 @@
 As of 2026-08-18 the engine runs a full Prisma stack end to end: `prisma db push` creates
 a schema, and Prisma Client performs CRUD against it.
 
+The numbered measurements below are that run and are left as they were taken. The
+capability lists are kept current; where a claim here has since been checked against a
+real `mysql:8.3` rather than reasoned about, the date of the measurement is given, because
+in this repository the reasoned-about ones have been wrong often enough to be worth
+distinguishing. `scripts/ask.sh` is how they get checked.
+
 ```
 $ mysql-ultralight --port 3307 --database testdb
 ready port=3307 socket=- startup_ms=0.431
@@ -68,6 +74,37 @@ start plus 26.1s of `prisma migrate deploy`. See [`baseline-mysql.md`](baseline-
 - **`information_schema`** — `SCHEMATA`, `TABLES`, `COLUMNS`, `STATISTICS`,
   `TABLE_CONSTRAINTS`, `KEY_COLUMN_USAGE`, `REFERENTIAL_CONSTRAINTS`, and the empty tables
   Prisma expects to exist, all queryable and joinable as ordinary tables
+- **Recursive CTEs** — `WITH RECURSIVE`, run rather than refused
+- **`RENAME TABLE`** — several pairs at once, applied in order so a chained rename through
+  a temporary name works, and all-or-nothing if any pair is bad. Renaming a table *into
+  another database* is refused with a clear 1235 rather than performed (#0251); it
+  previously built a table literally named `other.Alt` in the current database, whose rows
+  no qualified name could reach
+- **Types held to their declarations** — a write is refused when the declared type cannot
+  hold it, integers and decimals are materialised at the width and scale they were declared
+  with, and a `DECIMAL` keeps its own value rather than a float's idea of it
+- **Collations** — a string is folded and compared under the collation its column was
+  declared with, and a name is compared as bytes
+- **Prepared statements resolve** — `COM_STMT_PREPARE` settles a missing table, a missing
+  column, and the names a write uses, at prepare, the way 8.3 does, rather than deferring
+  every error to execution. A parameter is typed from its position
+- **Diagnostics** — a warning can be raised and read back, and `ROW_COUNT()` reports rows
+  changed or rows matched according to what the client negotiated
+
+- **Identifier limits** — an identifier longer than MySQL allows is refused, at the
+  lengths MySQL uses
+
+One behaviour is a deliberate divergence rather than a gap, and it is a refusal:
+
+**A statement is refused above 256 levels of nesting**, with 1436 `Thread stack overrun`,
+where 8.3 answers deeper ones. Every walk over a statement — the evaluator, the walkers
+that type a column and decide its nullability — recurses once per node, so a deep enough
+statement took down the process and every other connection with it. A flat chain costs the
+same as a hand-written nest, because `a OR b OR c` *is* a tree of depth three; treating the
+two differently was tried and had to be reverted, because the separate bounds composed into
+a shape that passed both and still aborted. The number is measured against the 32 MB stack
+the binary gives each connection, about five times under where a `cargo test` build stops
+answering. Driven as a *library* on a smaller thread the margin is not there — #0253.
 
 ## Parser coverage against the real corpus
 
@@ -338,11 +375,13 @@ is the widening every computed column has always had rather than anything about 
 expression, and a describing tool reads it as a given — so it is worth knowing before
 building a view whose columns are all computed.
 
-A `UNION` column is the same shape: it takes the declared type only where both branches
-declared the same one, because a column fed by a `SMALLINT` on one side and a `BIGINT` on
-the other holds values from both. MySQL aggregates the two into the wider type; this drops
-back to the widening rather than picking a side, which would describe a column narrower
-than what it returns.
+A `UNION` column used to be the same shape and mostly is not any more. Measured against
+8.3 on 2026-09-08: `VARCHAR(10)` against `VARCHAR(20)` is described identically by both,
+and so is `VARCHAR(10)` against itself, so differing widths are aggregated rather than
+widened away. What is left is the display width on a narrow numeric union — `SMALLINT`
+against `TINYINT` gives the right type on both sides and a length of 20 here against 6
+there, which is `BIGINT`'s width rather than `SMALLINT`'s (#0254). A union mixing a string
+with a number still falls to `VAR_STRING` where MySQL keeps `CHAR` (#0127).
 
 ## Review hardening (engine)
 

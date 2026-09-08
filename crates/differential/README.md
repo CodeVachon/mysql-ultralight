@@ -72,7 +72,7 @@ Two things fail a run:
 
 So the file only ever shrinks, and it shrinks by fixing things.
 
-**It is empty.** All 5530 statements answer exactly as MySQL 8.3 answers them,
+**It is empty.** All 5570 statements answer exactly as MySQL 8.3 answers them,
 in both protocols — the rows, and every part of the column definition listed
 under "What a column is compared on" below. It started at 108 divergences
 across 66 statements.
@@ -285,6 +285,24 @@ caught by MySQL rather than by review.
 Adding a case is one line. Prefer statements that a real application would
 write over ones that explore the grammar: the point is compatibility with what
 Prisma and a test suite emit, not coverage of MySQL.
+
+## The one-question companion
+
+This harness is for keeping every settled question settled, which makes it the
+wrong tool for settling one. `scripts/ask.sh` puts a `.sql` file to both
+servers with the same client and shows the answers side by side, and
+`COLINFO=1` compares column metadata as well.
+
+Reach for it *before* working an issue rather than after. An issue body is
+prose somebody wrote once, and in this repository the prose has been wrong
+often enough that measuring first is cheaper than implementing a premise twice:
+issues here have turned out already fixed, half fixed, or fixed in a way that
+made the remaining half smaller than the title suggested — and at least one was
+written from a mis-measurement, because the client in the container defaults to
+latin1 and reported the wrong collation for every string column.
+
+Once a question is settled, the answer belongs in `src/cases.rs`, which is what
+keeps it settled.
 
 ## What it does not do yet
 

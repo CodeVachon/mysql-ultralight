@@ -185,6 +185,7 @@ pub fn create_table(
                 columns: vec![name],
                 unique: true,
                 primary: false,
+                implicit_for_foreign_key: false,
             },
         )?;
     }
@@ -209,6 +210,7 @@ pub fn create_table(
                 columns: inline_pk,
                 unique: true,
                 primary: true,
+                implicit_for_foreign_key: false,
             },
         )?;
     }
@@ -513,6 +515,13 @@ fn create_table_like(
     // unique per schema, so carrying one over would give two tables the same
     // constraint name.
     table.foreign_keys.clear();
+    // And so no index in the copy was made *for* a key: `LIKE` copies indexes
+    // and not constraints, so an index that was provisional in the source is an
+    // ordinary one here. Left set, it would let a later `CREATE INDEX` take
+    // over an index 8.3 keeps.
+    for index in &mut table.indexes {
+        index.implicit_for_foreign_key = false;
+    }
     // The counter starts over rather than resuming the source's: the copy has
     // no rows, so a first insert taking the source's next id would leave a gap
     // that MySQL does not have.
@@ -1154,16 +1163,122 @@ fn auto_check_name(table: &Table) -> String {
 /// An index name is scoped to its table, so the same name on two tables is
 /// legal and nothing outside `table` is consulted. Measured on 8.3, where 1061
 /// is the answer for a duplicate inside one CREATE TABLE, for a second CREATE
-/// INDEX, and for ALTER TABLE ADD INDEX and ADD CONSTRAINT alike — including
-/// the index a foreign key creates for itself, which is why
-/// `ADD CONSTRAINT c FOREIGN KEY` reports 1061 and not the 1826 a constraint
-/// name reused across *tables* gets.
+/// INDEX, and for ALTER TABLE ADD INDEX and ADD CONSTRAINT alike.
+///
+/// The exception is an index a foreign key made for itself, which 8.3 treats as
+/// provisional: an explicit index that can serve the key takes over, and the
+/// provisional one — and the name it was holding — goes. That is not a detail.
+/// Prisma emits the pair
+///
+/// ```sql
+/// ALTER TABLE `Job` ADD CONSTRAINT `Job_rateTypeId_fkey` FOREIGN KEY ...;
+/// CREATE INDEX `Job_rateTypeId_fkey` ON `Job` (`rateTypeId`);
+/// ```
+///
+/// and refusing the second statement stopped the real migration history dead at
+/// its twenty-third migration. #0255.
+///
+/// Measured on 8.3, and the whole table is needed to get it right:
+///
+/// | after a foreign key `c` on `(r)` | |
+/// |---|---|
+/// | `CREATE INDEX c ON J(r)` | accepted, one index `c` on `r` |
+/// | `CREATE INDEX c ON J(s)` | 1061 — cannot serve the key, so `c` is still taken |
+/// | `CREATE INDEX other ON J(r)` | accepted, and provisional `c` is *gone* |
+/// | the same `CREATE INDEX c ON J(r)` twice | the second is 1061 |
+/// | an *explicit* `c` on `(r)` the key later reused | 1061 |
+///
+/// The last two rows are why `Index::implicit_for_foreign_key` is remembered
+/// rather than worked out: after the takeover the index is an ordinary one, and
+/// an explicit index is an ordinary one from the start, and neither is
+/// distinguishable from the provisional case by name and columns alone.
 fn add_index(table: &mut Table, index: Index) -> EngineResult<()> {
-    if !index.primary && index_name_taken(table, &index.name) {
+    // Worked out before anything is removed, and removed only once every
+    // refusal is behind us. `create_index` holds a borrow of the *live*
+    // catalog rather than a clone the way `alter_table` does, so a takeover
+    // applied ahead of a refusal is not rolled back: measured, superseding
+    // first left a refused `CREATE INDEX` having destroyed the index its
+    // foreign key was relying on, where 8.3 leaves the table untouched.
+    let superseded = provisional_indexes_superseded_by(table, &index);
+    if !index.primary && index_name_taken_apart_from(table, &index.name, &superseded) {
         return Err(EngineError::duplicate_key_name(&index.name));
     }
+    drop_superseded(table, &superseded);
     table.indexes.push(index);
     Ok(())
+}
+
+/// The provisional indexes that `index` would take over, named.
+///
+/// Worked out without touching the table, so a caller can decide whether a name
+/// is really taken before committing to anything — a name held by an index
+/// about to be taken over is exactly the case that must *not* be 1061.
+///
+/// Only a foreign key that still *has* its provisional index counts, so a key
+/// whose index was already taken over cannot nominate a second victim.
+///
+/// Nothing about the incoming index is excluded, and both exclusions that
+/// suggested themselves were measured on 8.3 and are wrong:
+///
+/// * a **primary key** takes over. `ADD PRIMARY KEY (r)` over a foreign key on
+///   `(r)` leaves 8.3 holding `PRIMARY` alone, not `PRIMARY` beside the key's
+///   own index.
+/// * so does **another foreign key's** provisional index. `c1 (r)` followed by
+///   `c2 (r, b)` leaves 8.3 holding `c2` alone, because `(r, b)` covers `(r)`.
+///
+/// Both are the same rule the explicit case follows — whatever can serve the
+/// key replaces what was standing in for it — which is the argument for not
+/// special-casing by where the index came from.
+fn provisional_indexes_superseded_by(table: &Table, index: &Index) -> Vec<String> {
+    table
+        .foreign_keys
+        .iter()
+        .filter(|fk| index_serves(index, &fk.columns))
+        .filter(|fk| {
+            table.indexes.iter().any(|held| {
+                held.implicit_for_foreign_key && held.name.eq_ignore_ascii_case(&fk.name)
+            })
+        })
+        .map(|fk| fk.name.clone())
+        .collect()
+}
+
+/// Whether the table holds an index called `name` other than one being taken
+/// over.
+/// `index_name_taken`, less the indexes about to be taken over.
+///
+/// The `!primary` filter is carried across deliberately and not by accident:
+/// `index_name_taken`'s own doc records that a primary key is left out because
+/// 8.3 answers 1280 for `` CREATE INDEX `PRIMARY` ``, and folding it in here
+/// would trade an accepted statement for a wrongly numbered refusal. Dropping
+/// it silently is what the first version of this function did.
+fn index_name_taken_apart_from(table: &Table, name: &str, superseded: &[String]) -> bool {
+    table.indexes.iter().any(|held| {
+        !held.primary && held.name.eq_ignore_ascii_case(name) && !is_superseded(held, superseded)
+    })
+}
+
+fn is_superseded(held: &Index, superseded: &[String]) -> bool {
+    held.implicit_for_foreign_key && superseded.iter().any(|n| held.name.eq_ignore_ascii_case(n))
+}
+
+/// An index that outlived the foreign key it was made for is an ordinary index.
+///
+/// The index survives the drop — 8.3 keeps it — but nothing is provisional on
+/// behalf of a key that is gone, so a later `CREATE INDEX` must collide with it
+/// rather than take it over.
+fn unmark_provisional(table: &mut Table, key: &str) {
+    for index in &mut table.indexes {
+        if index.implicit_for_foreign_key && index.name.eq_ignore_ascii_case(key) {
+            index.implicit_for_foreign_key = false;
+        }
+    }
+}
+
+fn drop_superseded(table: &mut Table, superseded: &[String]) {
+    table
+        .indexes
+        .retain(|held| !is_superseded(held, superseded));
 }
 
 /// The name MySQL gives an index the statement did not name.
@@ -1220,6 +1335,7 @@ fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineRe
                     columns: names,
                     unique: true,
                     primary: true,
+                    implicit_for_foreign_key: false,
                 },
             )?;
         }
@@ -1252,6 +1368,7 @@ fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineRe
                     columns: names,
                     unique: true,
                     primary: false,
+                    implicit_for_foreign_key: false,
                 },
             )?;
         }
@@ -1269,6 +1386,7 @@ fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineRe
                     columns: names,
                     unique: false,
                     primary: false,
+                    implicit_for_foreign_key: false,
                 },
             )?;
         }
@@ -1315,6 +1433,7 @@ fn apply_constraint(table: &mut Table, constraint: &TableConstraint) -> EngineRe
                         columns: key_columns.clone(),
                         unique: false,
                         primary: false,
+                        implicit_for_foreign_key: true,
                     },
                 )?;
             }
@@ -1901,6 +2020,7 @@ pub fn alter_table(
                 // where the doubled drops below are not — the pre-pass asks
                 // the table as it stands, so both see `ck1`.
                 drop_constraint_named(table, &name.value);
+                unmark_provisional(table, &name.value);
             }
             AlterTableOperation::DropForeignKey { name, .. } => {
                 if !drop_named(&mut table.foreign_keys, |f| {
@@ -1908,6 +2028,7 @@ pub fn alter_table(
                 }) {
                     return Err(EngineError::cant_drop(&name.value));
                 }
+                unmark_provisional(table, &name.value);
             }
             AlterTableOperation::DropPrimaryKey { .. } => {
                 // Asked of `has_primary_key` rather than of what the drop
@@ -2537,17 +2658,31 @@ pub fn create_index(
         .map(name::dotted)
         .unwrap_or_else(|| format!("{table_name}_idx"));
 
-    if create.if_not_exists && index_name_taken(table, &name) {
-        return Ok(Outcome::ok());
-    }
-
     let columns = index_column_names(&create.columns);
     let index = Index {
         name,
         columns,
         unique: create.unique,
         primary: false,
+        implicit_for_foreign_key: false,
     };
+
+    // Which provisional indexes this one would take over, worked out and not
+    // applied: this path checks the name itself before reaching `add_index`,
+    // for the ordering reason below, and a name held by an index about to be
+    // taken over is not taken. Nothing is removed here, because the checks
+    // that follow can still refuse and this path holds the live catalog rather
+    // than a clone. #0255.
+    let superseded = provisional_indexes_superseded_by(table, &index);
+
+    // After the takeover is worked out, not before it. A name held only by an
+    // index about to be taken over is not a reason to report success and
+    // create nothing: measured, doing that told the client the index existed
+    // and then let a later `CREATE INDEX` over the same column delete the one
+    // it had been shown.
+    if create.if_not_exists && index_name_taken_apart_from(table, &index.name, &superseded) {
+        return Ok(Outcome::ok());
+    }
 
     // Before the data is walked, which is the order 8.3 answers in: a
     // `CREATE UNIQUE INDEX` under a name the table already carries, over a
@@ -2555,7 +2690,7 @@ pub fn create_index(
     // rows would raise. A duplicate name also beats a column that does not
     // exist at all, so nothing about what the index covers can be the first
     // answer.
-    if index_name_taken(table, &index.name) {
+    if index_name_taken_apart_from(table, &index.name, &superseded) {
         return Err(EngineError::duplicate_key_name(&index.name));
     }
 
