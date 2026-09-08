@@ -438,13 +438,40 @@ const IMPURE: &[&str] = &[
 /// The deepest a statement's expressions may nest before the engine refuses it.
 ///
 /// Measured against the depth at which nesting stops being answerable at all.
+///
 /// A left-deep chain — `SELECT 1 AND 1 AND ...`, which is what an expression of
 /// N terms parses to — is walked by a dozen recursions before a row is touched,
-/// and none of them but this check has a guard. On a 2 MB thread they take the
-/// whole stack and abort the *process* at about 90 terms in a `cargo test`
-/// build, where a frame is fattest, and at about 3500 in a release one. 64 is
-/// comfortably under the smaller of those and is the same order as MySQL's own
-/// `MAX_SELECT_NESTING` of 63.
+/// and none of them but this check has a guard. So the number here is a number
+/// of stack frames, and every shape that costs frames is counted the same way:
+/// a flat chain and a hand-written nest reach the walkers identically, because
+/// `a OR b OR c` *is* a tree of depth three.
+///
+/// That last point is worth stating plainly, because getting it wrong is
+/// expensive. Exempting flat chains from this count and bounding their length
+/// separately was tried and reverted: the two bounds compose. A chain whose
+/// leftmost term is a parenthesised chain pays one level of depth and 256 terms
+/// of stack per level, so six levels passed both bounds at about 1500 terms and
+/// aborted the process — the precise failure the check exists to prevent.
+/// There is one budget, it is the longest root-to-leaf path, and this is it —
+/// which is why a set-operation spine is *added* to the running depth rather
+/// than checked on its own. Anything that costs frames is counted into the same
+/// number, or it composes with everything that is.
+///
+/// 256, measured on the stack a connection actually gets. The binary hands
+/// every connection 32 MB (#0247), and that is the only way the engine is
+/// shipped — the npm platform packages spawn the CLI. On that stack a
+/// `cargo test` build, where a frame is fattest, answers a chain of 1200 terms
+/// and loses the connection at 1500; a release build answered 16000. 256 sits
+/// about five times under the smaller, which is margin rather than
+/// coincidence: per-term cost depends on what the terms are, and a correlated
+/// `ON` adds stack per level (#0230).
+///
+/// It was 64 until #0218's second pass, fitted to the 2 MB a `cargo test`
+/// thread gets rather than to the stack the server runs on. That refused
+/// ordinary application queries — `findMany({ where: { OR: [ ...80 ] } })`
+/// became 1436 where 8.3 returned rows. Raising it narrows what the engine
+/// promises a caller who drives it as a library on a small thread; #0253
+/// carries that.
 ///
 /// Counted rather than measured against the stack that is left, because the
 /// check has to run *before* anything walks the tree: the walkers that overflow
@@ -453,10 +480,10 @@ const IMPURE: &[&str] = &[
 /// a stack reading is not — and a limit that moves between `cargo test` and
 /// `--release` is a limit nobody can write a test for.
 ///
-/// 8.3 answers a chain of twenty thousand terms, so this refuses statements
-/// MySQL does not. That is the trade the house rule asks for: a clear error
-/// rather than a wrong answer, and here rather than a dead connection.
-const MAX_EXPRESSION_DEPTH: usize = 64;
+/// 8.3 answers chains longer than this, so it refuses statements MySQL does
+/// not. That is the trade the house rule asks for: a clear error rather than a
+/// wrong answer, and here rather than a dead connection.
+const MAX_EXPRESSION_DEPTH: usize = 256;
 
 /// How many set operations hang off the left of `body`, counted without
 /// recursing.
@@ -494,12 +521,28 @@ impl sqlparser::ast::Visitor for Nesting {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
+        // Added to the running depth rather than checked against the limit on
+        // its own. A spine is stack like any other nesting, and a budget of its
+        // own would be a second budget: a 256-arm spine whose leftmost arm
+        // carries a 250-term chain passes two separate checks and puts both
+        // lots of frames on the stack at once, and a per-query budget is handed
+        // out again at every nested query. That is the composing-bounds shape
+        // that had to be reverted once already.
+        //
         // Before the traversal descends, because descending *is* the risk: the
         // derived code walks the whole left spine before it reaches anything
         // with a hook on it.
-        if set_operation_spine(&query.body) > MAX_EXPRESSION_DEPTH {
+        self.at += set_operation_spine(&query.body);
+        if self.at > MAX_EXPRESSION_DEPTH {
             return std::ops::ControlFlow::Break(());
         }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<()> {
+        // The same number `pre_visit_query` added: `set_operation_spine` is a
+        // pure function of the query, so the two cannot drift.
+        self.at -= set_operation_spine(&query.body);
         std::ops::ControlFlow::Continue(())
     }
 

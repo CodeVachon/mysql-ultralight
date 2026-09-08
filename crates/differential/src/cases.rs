@@ -9540,6 +9540,40 @@ pub const GROUPS: &[Group] = &[
         ],
     },
     Group {
+        name: "a flat chain of many terms",
+        setup: &[
+            "CREATE TABLE Fc (id INT, v INT)",
+            "INSERT INTO Fc VALUES (1, 1), (2, 2), (7, 7), (200, 200)",
+        ],
+        cases: &[
+            // The shape that motivated the bound: `OR: [ ... ]` in Prisma
+            // becomes one long chain, and `sqlparser` parses it left-deep, so
+            // seventy terms were seventy levels of tree and were refused 1436
+            // where 8.3 flattens them into one n-ary condition and answers.
+            same("SELECT id FROM Fc WHERE id = 0 OR id = 1 OR id = 2 OR id = 3 OR id = 4 OR id = 5 OR id = 6 OR id = 7 OR id = 8 OR id = 9 OR id = 10 OR id = 11 OR id = 12 OR id = 13 OR id = 14 OR id = 15 OR id = 16 OR id = 17 OR id = 18 OR id = 19 OR id = 20 OR id = 21 OR id = 22 OR id = 23 OR id = 24 OR id = 25 OR id = 26 OR id = 27 OR id = 28 OR id = 29 OR id = 30 OR id = 31 OR id = 32 OR id = 33 OR id = 34 OR id = 35 OR id = 36 OR id = 37 OR id = 38 OR id = 39 OR id = 40 OR id = 41 OR id = 42 OR id = 43 OR id = 44 OR id = 45 OR id = 46 OR id = 47 OR id = 48 OR id = 49 OR id = 50 OR id = 51 OR id = 52 OR id = 53 OR id = 54 OR id = 55 OR id = 56 OR id = 57 OR id = 58 OR id = 59 OR id = 60 OR id = 61 OR id = 62 OR id = 63 OR id = 64 OR id = 65 OR id = 66 OR id = 67 OR id = 68 OR id = 69 ORDER BY id"),
+            // The same length written with AND, the other connective that
+            // flattens.
+            same("SELECT id FROM Fc WHERE id <> 100 AND id <> 101 AND id <> 102 AND id <> 103 AND id <> 104 AND id <> 105 AND id <> 106 AND id <> 107 AND id <> 108 AND id <> 109 AND id <> 110 AND id <> 111 AND id <> 112 AND id <> 113 AND id <> 114 AND id <> 115 AND id <> 116 AND id <> 117 AND id <> 118 AND id <> 119 AND id <> 120 AND id <> 121 AND id <> 122 AND id <> 123 AND id <> 124 AND id <> 125 AND id <> 126 AND id <> 127 AND id <> 128 AND id <> 129 AND id <> 130 AND id <> 131 AND id <> 132 AND id <> 133 AND id <> 134 AND id <> 135 AND id <> 136 AND id <> 137 AND id <> 138 AND id <> 139 AND id <> 140 AND id <> 141 AND id <> 142 AND id <> 143 AND id <> 144 AND id <> 145 AND id <> 146 AND id <> 147 AND id <> 148 AND id <> 149 AND id <> 150 AND id <> 151 AND id <> 152 AND id <> 153 AND id <> 154 AND id <> 155 AND id <> 156 AND id <> 157 AND id <> 158 AND id <> 159 AND id <> 160 AND id <> 161 AND id <> 162 AND id <> 163 AND id <> 164 AND id <> 165 AND id <> 166 AND id <> 167 AND id <> 168 AND id <> 169 ORDER BY id"),
+            // Terms that are themselves compound, because a chain of bare
+            // comparisons is the cheapest shape and not the one applications
+            // send.
+            same("SELECT id FROM Fc WHERE (id = 0 AND v = 0) OR (id = 1 AND v = 1) OR (id = 2 AND v = 2) OR (id = 3 AND v = 3) OR (id = 4 AND v = 4) OR (id = 5 AND v = 5) OR (id = 6 AND v = 6) OR (id = 7 AND v = 7) OR (id = 8 AND v = 8) OR (id = 9 AND v = 9) OR (id = 10 AND v = 10) OR (id = 11 AND v = 11) OR (id = 12 AND v = 12) OR (id = 13 AND v = 13) OR (id = 14 AND v = 14) OR (id = 15 AND v = 15) OR (id = 16 AND v = 16) OR (id = 17 AND v = 17) OR (id = 18 AND v = 18) OR (id = 19 AND v = 19) OR (id = 20 AND v = 20) OR (id = 21 AND v = 21) OR (id = 22 AND v = 22) OR (id = 23 AND v = 23) OR (id = 24 AND v = 24) OR (id = 25 AND v = 25) OR (id = 26 AND v = 26) OR (id = 27 AND v = 27) OR (id = 28 AND v = 28) OR (id = 29 AND v = 29) OR (id = 30 AND v = 30) OR (id = 31 AND v = 31) OR (id = 32 AND v = 32) OR (id = 33 AND v = 33) OR (id = 34 AND v = 34) OR (id = 35 AND v = 35) OR (id = 36 AND v = 36) OR (id = 37 AND v = 37) OR (id = 38 AND v = 38) OR (id = 39 AND v = 39) ORDER BY id"),
+            // A chain in a projection rather than a filter: the walkers that
+            // decide a column's type run there, and they are the ones that
+            // overflow.
+            same("SELECT 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AND 1 AS chained FROM Fc LIMIT 1"),
+            // The other spellings of the same connective. These were counted
+            // as nesting for as long as the bound classified operators, and
+            // the classification is gone: one budget counts every node the
+            // walkers recurse through, whatever it is spelled.
+            same("SELECT id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 || id = 1 AS piped FROM Fc WHERE id = 1"),
+            same("SELECT id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 XOR id = 1 AS xored FROM Fc WHERE id = 1"),
+            // And the ordinary short chain still answers, which is what says
+            // the counting did not break the common case.
+            same("SELECT id FROM Fc WHERE id = 1 OR id = 2 ORDER BY id"),
+        ],
+    },
+    Group {
         // What a prepare settles about a write. The harness runs every case
         // through `conn.prep` on its binary pass, so a statement 8.3 refuses
         // at prepare and this engine refused only at execute compared equal on

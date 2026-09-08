@@ -25423,52 +25423,99 @@ fn a_deep_nest_of_scalar_subqueries_still_answers() {
 /// #0218. A statement that nests further than this engine walks is *refused*,
 /// and the session it was asked on carries on.
 ///
-/// These are the two shapes neither guard already in the tree reaches:
+/// These are the shapes neither guard already in the tree reaches:
 /// `sqlparser`'s recursion limit and `SUBQUERY_DEPTH_LIMIT` both bound
-/// *nesting*, and a flat `1 AND 1 AND ...` chain and a `UNION ALL` chain each
-/// nest once however long they are. Measured against the server before the
-/// check went in: 1150 terms answered and 1180 aborted the whole process with
-/// `fatal runtime error: stack overflow` on the tokio worker — not the
-/// statement, the process, and every other connection with it. A thousand
-/// `UNION ALL` arms answered and three thousand did the same. 8.3 answers 1436
-/// when its own thread stack runs out, which is the code asserted here.
+/// *nesting*, and a flat chain nests once as far as those are concerned however
+/// long it is. Measured against the server before the check went in: 1150 terms
+/// answered and 1180 aborted the whole process with `fatal runtime error: stack
+/// overflow` on the tokio worker — not the statement, the process, and every
+/// other connection with it. A thousand `UNION ALL` arms answered and three
+/// thousand did the same. 8.3 answers 1436 when its own thread stack runs out,
+/// which is the code asserted here.
 ///
 /// Fixed counts and not a search: the limit is a *depth* checked before
 /// anything walks the tree, so it fires at the same term for every build, and a
 /// test that climbed towards the fatal depth would abort the whole binary
 /// rather than fail an assertion if it ever arrived there first.
 ///
-/// The case just *inside* the limit is the tripwire the depth is chosen
-/// against. Under `cargo test` the walkers take a 2 MB thread at about ninety
-/// terms, so sixty-four is a margin rather than a coincidence — and if a walker
-/// ever grows enough to close that gap, this line is where it shows.
+/// The composed shape is the one that matters most. A chain whose leftmost term
+/// is itself a parenthesised chain is how a bound on chain *length* gets
+/// walked around — each level pays one level of depth and a chain's worth of
+/// stack — and an earlier attempt at this was reverted for exactly that. One
+/// budget, counted along the longest root-to-leaf path, is what closes it.
+///
+/// **Run on the stack a connection gets, and that is a narrowing.** This used
+/// to run on the 2 MB a `cargo test` thread is given, and the limit was fitted
+/// to it. Raising the limit to 256 gives that up: driven as a library on a
+/// default thread the engine can now abort where it used to refuse. Given up on
+/// purpose, because the engine ships as a binary that hands every connection
+/// 32 MB (#0247), and a limit measured on a stack it never runs with refused
+/// ordinary Prisma queries. #0253 carries the library case, including the
+/// hazard that a future test here which forgets to spawn a fat thread takes the
+/// binary down rather than failing.
 #[test]
 fn a_statement_nesting_further_than_the_engine_walks_is_refused_not_fatal() {
-    let (engine, mut session) = engine();
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let (engine, mut session) = engine();
 
-    for sql in [
-        format!("SELECT {}", vec!["1"; 100].join(" AND ")),
-        format!("SELECT {}", vec!["1"; 100].join(" + ")),
-        vec!["SELECT 1"; 100].join(" UNION ALL "),
-    ] {
-        let refused = engine
-            .execute(&mut session, &sql, &[])
-            .expect_err("this nests further than the engine walks");
-        assert_eq!(refused.code, 1436, "{}", refused.message);
-        assert_eq!(refused.sql_state, "HY000", "{}", refused.message);
-    }
+            // A chain of parenthesised chains: six levels of 256 terms is
+            // about 1500 frames, which is past where this aborts.
+            let mut composed = format!("SELECT {}", vec!["1"; 256].join(" AND "));
+            for _ in 0..6 {
+                composed = format!("SELECT ({}) AND {}", composed, vec!["1"; 255].join(" AND "));
+            }
 
-    // Just inside it still answers, so the limit is a limit and not a refusal
-    // of the shape.
-    let inside = format!("SELECT {}", vec!["1"; 64].join(" AND "));
-    assert_eq!(rows(&engine, &mut session, &inside), vec![vec!["1"]]);
+            // The composed shape goes first on purpose. Every case here is
+            // refused by the same guard, so a weakened guard panics on
+            // whichever runs first — and if that is a plain chain, the case
+            // this test exists for never runs at all. It also has the worst
+            // failure mode: weakened, it does not fail an assertion, it
+            // overflows and takes the test binary down with it.
+            for sql in [
+                composed,
+                format!("SELECT {}", vec!["1"; 300].join(" AND ")),
+                format!("SELECT {}", vec!["1"; 300].join(" + ")),
+                vec!["SELECT 1"; 300].join(" UNION ALL "),
+                // A set-operation spine carrying a long chain in its leftmost
+                // arm: the two used to be separate budgets, and this is the
+                // shape that passed both.
+                format!(
+                    "SELECT {} AS c{}",
+                    vec!["1"; 250].join(" AND "),
+                    " UNION ALL SELECT 1".repeat(250)
+                ),
+            ] {
+                let refused = engine
+                    .execute(&mut session, &sql, &[])
+                    .expect_err("this nests further than the engine walks");
+                assert_eq!(refused.code, 1436, "{}", refused.message);
+                assert_eq!(refused.sql_state, "HY000", "{}", refused.message);
+            }
 
-    // And the session is still usable, which is the whole difference between
-    // this and the abort it replaces.
-    assert_eq!(
-        rows(&engine, &mut session, "SELECT 1 AND 1 AND 1"),
-        vec![vec!["1"]]
-    );
+            // Just inside the limit still answers, so it is a limit and not a
+            // refusal of the shape. This is the tripwire the number is chosen
+            // against: if a walker ever grows enough to close the gap to the
+            // stack, this line is where it shows.
+            //
+            // 256 is the limit itself, not a number near it —
+            // `a_statement_at_the_limit_is_the_last_one_accepted` pins that
+            // this is the last accepted count, so raising the constant cannot
+            // leave this passing over nothing.
+            let inside = format!("SELECT {}", vec!["1"; 256].join(" AND "));
+            assert_eq!(rows(&engine, &mut session, &inside), vec![vec!["1"]]);
+
+            // And the session is still usable, which is the whole difference
+            // between this and the abort it replaces.
+            assert_eq!(
+                rows(&engine, &mut session, "SELECT 1 AND 1 AND 1"),
+                vec![vec!["1"]]
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("the statement must be refused, not overflow");
 }
 
 /// Describing a scalar subquery leaves the probe around it in place.

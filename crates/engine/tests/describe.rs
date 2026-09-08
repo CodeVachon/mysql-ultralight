@@ -2068,29 +2068,72 @@ fn a_statement_too_deep_to_walk_is_refused_at_prepare() {
         .stack_size(32 * 1024 * 1024)
         .spawn(|| {
             let (engine, session) = setup();
-            for terms in [200usize, 5_000, 50_000] {
-                let chain = std::iter::repeat_n("1", terms)
+            let chain = |terms: usize| {
+                std::iter::repeat_n("1", terms)
                     .collect::<Vec<_>>()
-                    .join(" AND ");
+                    .join(" AND ")
+            };
+            for terms in [300usize, 5_000, 50_000] {
                 let refused = engine
-                    .describe(&session, &format!("SELECT {chain}"), 0)
+                    .describe(&session, &format!("SELECT {}", chain(terms)), 0)
                     .unwrap_err();
                 assert_eq!(refused.code, 1436, "{terms} terms -> {refused}");
             }
-            // And a statement inside the bound still describes its column,
-            // which is what says the guard refuses depth rather than length.
-            let shallow = std::iter::repeat_n("1", 8)
-                .collect::<Vec<_>>()
-                .join(" AND ");
-            assert!(
-                engine
-                    .describe(&session, &format!("SELECT {shallow}"), 0)
-                    .unwrap()
-                    .is_some(),
-                "a statement within the bound must still describe"
-            );
+            // A chain within the limit still describes its column, which is
+            // what says the bound refuses size rather than the shape itself.
+            for terms in [8usize, 256] {
+                assert!(
+                    engine
+                        .describe(&session, &format!("SELECT {}", chain(terms)), 0)
+                        .unwrap()
+                        .is_some(),
+                    "a chain of {terms} terms is within the limit and must describe"
+                );
+            }
         })
         .expect("spawn")
         .join()
         .expect("the prepare must refuse, not abort");
+}
+
+/// The limit is where the constant says it is, pinned from both sides.
+///
+/// Neither this file nor `sql.rs` can read `MAX_EXPRESSION_DEPTH` — it is
+/// private to the engine — so a count written near the limit pins nothing: raise
+/// the constant and every "just inside" case keeps passing over a boundary that
+/// moved. A pair of fixed counts either side of it does pin it, and does so
+/// without climbing towards the fatal depth, which is a search this must not do.
+///
+/// Asserted through `describe` rather than `execute`, because `describe`
+/// refuses before anything walks: a broken bound fails an assertion here, where
+/// through `execute` it would overflow and abort the test binary. #0218.
+#[test]
+fn a_statement_at_the_limit_is_the_last_one_accepted() {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let (engine, session) = setup();
+            let chain = |terms: usize| {
+                format!(
+                    "SELECT {}",
+                    std::iter::repeat_n("1", terms)
+                        .collect::<Vec<_>>()
+                        .join(" AND ")
+                )
+            };
+            // A chain of N terms is N frames deep: N - 1 operators and the
+            // leaf under the last of them.
+            assert!(
+                engine.describe(&session, &chain(256), 0).unwrap().is_some(),
+                "256 is the limit and must be accepted"
+            );
+            assert_eq!(
+                engine.describe(&session, &chain(257), 0).unwrap_err().code,
+                1436,
+                "257 is one past the limit and must be refused"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("the boundary must be assertable, not fatal");
 }
