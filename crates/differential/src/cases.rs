@@ -96,6 +96,96 @@ const fn same(sql: &'static str) -> Case {
 
 pub const GROUPS: &[Group] = &[
     Group {
+        name: "a constraint name is unique in its database",
+        // The keys are set up rather than asked, because every case runs in
+        // both protocols against one database and so runs twice -- and the
+        // second run of an `ADD CONSTRAINT` is the very thing this group is
+        // about. What is asked below is the collision, which answers the same
+        // way however many times it runs.
+        setup: &[
+            "CREATE TABLE Cp (id INT NOT NULL PRIMARY KEY)",
+            "CREATE TABLE C1 (id INT NOT NULL PRIMARY KEY, r INT NULL, s INT NULL)",
+            "CREATE TABLE C2 (id INT NOT NULL PRIMARY KEY, r INT NULL, s INT NULL)",
+            "ALTER TABLE C1 ADD CONSTRAINT ck FOREIGN KEY (r) REFERENCES Cp (id)",
+            "ALTER TABLE C1 ADD CONSTRAINT cc CHECK (r > 0)",
+            "CREATE INDEX cov ON C2 (r)",
+            // C4 carries an auto-named key. `C5x` is a name no table has, and
+            // C5 holds a constraint called what renaming C4 to `C5x` would
+            // produce -- so the only thing in the way of that rename is the
+            // constraint name, which is what makes the refusal below 1826 and
+            // not the 1050 an occupied target would give.
+            "CREATE TABLE C4 (id INT NOT NULL PRIMARY KEY, r INT NULL)",
+            "ALTER TABLE C4 ADD FOREIGN KEY (r) REFERENCES Cp (id)",
+            "CREATE TABLE C5 (id INT NOT NULL PRIMARY KEY, r INT NULL)",
+            "ALTER TABLE C5 ADD CONSTRAINT C5x_ibfk_1 FOREIGN KEY (r) REFERENCES Cp (id)",
+        ],
+        cases: &[
+            // A key's name is scoped to the database, not the table. This was
+            // accepted here, leaving one database two constraints of one name
+            // and information_schema reporting both. #0257.
+            same("ALTER TABLE C2 ADD CONSTRAINT ck FOREIGN KEY (s) REFERENCES Cp (id)"),
+            // The comparison ignores case, and the answer names the spelling
+            // the statement used rather than the one already held.
+            same("ALTER TABLE C2 ADD CONSTRAINT CK FOREIGN KEY (s) REFERENCES Cp (id)"),
+            // 1061 beats it: adding a key makes an index of its name, so where
+            // that name is taken on *this* table the index answers first.
+            same("ALTER TABLE C1 ADD CONSTRAINT ck FOREIGN KEY (s) REFERENCES Cp (id)"),
+            // And where the key needs no index of its own -- `cov` already
+            // covers `r` -- there is no 1061 to beat it.
+            same("ALTER TABLE C2 ADD CONSTRAINT ck FOREIGN KEY (r) REFERENCES Cp (id)"),
+            // The same name declared inline by a CREATE TABLE.
+            same("CREATE TABLE C3 (id INT NOT NULL PRIMARY KEY, r INT NULL, CONSTRAINT ck FOREIGN KEY (r) REFERENCES Cp (id))"),
+            // A CHECK's name is scoped the same way, with its own code.
+            same("ALTER TABLE C2 ADD CONSTRAINT cc CHECK (r > 0)"),
+            // Including on the table that already holds it, where a key would
+            // have answered 1061 for its index instead.
+            same("ALTER TABLE C1 ADD CONSTRAINT cc CHECK (s > 0)"),
+            same("ALTER TABLE C2 ADD CONSTRAINT CC CHECK (r > 0)"),
+            // The two namespaces are separate, both ways round.
+            same("ALTER TABLE C2 ADD CONSTRAINT ck CHECK (r > 0)"),
+            same("ALTER TABLE C2 ADD CONSTRAINT cc2 FOREIGN KEY (s) REFERENCES Cp (id)"),
+            // An auto-generated `_ibfk_` name would collide like any other,
+            // and is left out of this group because the engine numbers them
+            // differently from 8.3 -- #0260, which has to be settled before a
+            // case here could tell the two rules apart.
+            // A rename rewrites the keys named after the table, so it can put
+            // two of one name in a database. Both spellings refuse, and the
+            // table stays where it was -- which is what the row listing below
+            // says. These answer the same way however many times they run.
+            same("RENAME TABLE C4 TO C5x"),
+            same("ALTER TABLE C4 RENAME TO C5x"),
+            // The same for a check name, which the rename rewrites too. Left
+            // unsimulated, the rename was accepted and the duplicate it made
+            // then refused every later ALTER TABLE on *both* tables.
+            same("CREATE TABLE Cr (a INT, CHECK (a > 0))"),
+            same("CREATE TABLE Cx (a INT, CONSTRAINT Cs_chk_1 CHECK (a < 9))"),
+            same("RENAME TABLE Cr TO Cs"),
+            same("ALTER TABLE Cr RENAME TO Cs"),
+            // And the table is still usable afterwards, which is what says
+            // nothing was written on the way to the refusal.
+            same("ALTER TABLE Cx ADD COLUMN z INT"),
+            // What a CHECK is called when the statement does not say. Asserted
+            // by colliding with the name, because this engine reports no check
+            // in information_schema at all (#0259). Each was measured on 8.3.
+            same("CREATE TABLE Ca (a INT CHECK (a > 0))"),
+            // The same inline check on the same column of a second table. This
+            // was `a_chk` on both here, so the second table stopped being
+            // creatable the moment a constraint name had to be unique.
+            same("CREATE TABLE Cb (a INT CHECK (a > 0))"),
+            same("CREATE TABLE Cd (a INT CHECK (a > 0) CHECK (a < 9))"),
+            same("ALTER TABLE Cb ADD CONSTRAINT Ca_chk_1 CHECK (a > 0)"),
+            same("ALTER TABLE Cb ADD CONSTRAINT Cd_chk_2 CHECK (a > 0)"),
+            // `LIKE` renames every check after the copy, written ones too.
+            same("CREATE TABLE Cg (a INT, CONSTRAINT wrote CHECK (a > 0))"),
+            same("CREATE TABLE Ch LIKE Cg"),
+            same("ALTER TABLE Cb ADD CONSTRAINT Ch_chk_1 CHECK (a > 0)"),
+            same("ALTER TABLE Cb ADD CONSTRAINT wrote CHECK (a > 0)"),
+            // What the database is left holding, read through the view that
+            // does report keys -- #0259 is why this is not TABLE_CONSTRAINTS.
+            same("SELECT CONSTRAINT_NAME, TABLE_NAME, COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME"),
+        ],
+    },
+    Group {
         name: "a column list written after an alias",
         setup: &["CREATE TABLE Al (a INT, b INT)", "INSERT INTO Al VALUES (1, 2)"],
         cases: &[

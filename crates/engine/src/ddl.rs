@@ -79,7 +79,14 @@ pub fn create_table(
             &mut inline_checks,
         )?);
     }
-    table.checks.append(&mut inline_checks);
+    // One at a time, because each name is worked out from the ones already
+    // there: 8.3 numbers a table's generated check names in declaration order.
+    for mut check in inline_checks {
+        if check.name.is_empty() {
+            check.name = auto_check_name(&table);
+        }
+        table.checks.push(check);
+    }
 
     // The names the query hands over are checked too, and answered 1166 where
     // the definition's own columns are answered 1059 — measured on 8.3, both
@@ -274,6 +281,10 @@ pub fn create_table(
         },
         None => Outcome::ok(),
     };
+
+    // The same scope check `ALTER TABLE` makes, for the constraints a
+    // `CREATE TABLE` declares inline. #0257.
+    refuse_duplicate_constraint_names(database, &name, &table)?;
 
     database.tables.insert(name.clone(), table);
     drop(catalog);
@@ -515,13 +526,14 @@ fn create_table_like(
     // unique per schema, so carrying one over would give two tables the same
     // constraint name.
     table.foreign_keys.clear();
-    // And so no index in the copy was made *for* a key: `LIKE` copies indexes
-    // and not constraints, so an index that was provisional in the source is an
-    // ordinary one here. Left set, it would let a later `CREATE INDEX` take
-    // over an index 8.3 keeps.
-    for index in &mut table.indexes {
-        index.implicit_for_foreign_key = false;
-    }
+    // The indexes keep their marks, constraints or no constraints. It reads
+    // backwards — `LIKE` copies no foreign keys, so nothing in the copy is
+    // standing in for one — and clearing them was tried and measured wrong:
+    // `CREATE TABLE L2 LIKE L` where `L`'s index was made for a key, and then
+    // `CREATE INDEX z ON L2 (r)` with no key on `L2` at all, leaves 8.3 holding
+    // `z` alone. The same copy of an index that was written by `CREATE INDEX`
+    // keeps both. So the mark is a property of how the index came to exist,
+    // and it survives being copied.
     // The counter starts over rather than resuming the source's: the copy has
     // no rows, so a first insert taking the source's next id would leave a gap
     // that MySQL does not have.
@@ -537,6 +549,18 @@ fn create_table_like(
         return Err(EngineError::table_exists(name));
     }
     resolve_collations(&mut table, &database.collation);
+    // Every check in the copy is renamed after the copy, whatever it was
+    // called in the source. Measured on 8.3, and it regenerates the
+    // *explicitly* named ones too: `CREATE TABLE L (a INT, CONSTRAINT named
+    // CHECK (a > 0))` copied to `L2` leaves `L2` holding `L2_chk_1`, not
+    // `named`. Without this the copy carried names the database already held
+    // and `LIKE` refused any source table that had a check at all.
+    let copied = std::mem::take(&mut table.checks);
+    for mut check in copied {
+        check.name = auto_check_name(&table);
+        table.checks.push(check);
+    }
+    refuse_duplicate_constraint_names(database, name, &table)?;
     database.tables.insert(name.to_owned(), table);
     drop(catalog);
     engine.mark_modified_public(session, db, name);
@@ -695,11 +719,20 @@ fn build_column_with_checks(
             // just written next to the column.
             ColumnOption::Check(check) => {
                 inline_checks.push(crate::catalog::Check {
+                    // Left empty where the statement wrote no name, and
+                    // filled in by the caller: 8.3 names these after the
+                    // *table* and numbers them across it — `t3_chk_1`,
+                    // `t3_chk_2` — which a function looking at one column
+                    // cannot do. Naming it `<column>_chk` here was merely a
+                    // wrong name until a constraint name had to be unique in
+                    // its database, and then it was a wrong refusal: two
+                    // tables with the same inline check on the same column
+                    // name collided.
                     name: check
                         .name
                         .as_ref()
                         .map(|n| n.value.clone())
-                        .unwrap_or_else(|| format!("{}_chk", def.name.value)),
+                        .unwrap_or_default(),
                     expr: check.expr.to_string(),
                 });
             }
@@ -1023,15 +1056,46 @@ fn walk_referencing_keys(
 /// The *index* behind the key is not renamed with it, also measured: the
 /// `named_ibfk_9` index is still called that on `named2` afterwards.
 fn rename_own_auto_keys(table: &mut Table, old_name: &str, new_name: &str) {
-    let prefix = format!("{old_name}{IBFK}");
     for fk in &mut table.foreign_keys {
-        // Something has to follow the prefix. Every name measured on 8.3
-        // carried a number after it, and a name that is the prefix and nothing
-        // else was not, so it is left alone rather than guessed at.
-        match fk.name.strip_prefix(&prefix) {
-            Some(tail) if !tail.is_empty() => fk.name = format!("{new_name}{IBFK}{tail}"),
-            _ => {}
-        }
+        fk.name = renamed_auto_key(&fk.name, old_name, new_name);
+    }
+    // Checks too, and by the same rule. Measured on 8.3: `T` holding
+    // `T_chk_1` renamed to `T2` holds `T2_chk_1`, while a check written as
+    // `named` keeps its name. Left behind, the generated one went on claiming
+    // the old table's name — so recreating a table under that name was a
+    // spurious 3822, which is drop-and-recreate under migrations and exactly
+    // what this engine is for.
+    for check in &mut table.checks {
+        check.name = renamed_auto_check(&check.name, old_name, new_name);
+    }
+}
+
+/// What a rename does to one check's name.
+///
+/// The `_chk_` counterpart of [`renamed_auto_key`], and the same shape: a name
+/// that does not start with the old table's prefix is one the statement chose,
+/// and is left alone.
+fn renamed_auto_check(name: &str, old_name: &str, new_name: &str) -> String {
+    match name.strip_prefix(&format!("{old_name}_chk_")) {
+        Some(tail) if !tail.is_empty() => format!("{new_name}_chk_{tail}"),
+        _ => name.to_owned(),
+    }
+}
+
+/// What a rename does to one key's name, on its own.
+///
+/// Split out so that `RENAME TABLE`'s dry run and the write that follows it
+/// cannot come to different conclusions — the dry run has to know the names
+/// the statement will produce in order to refuse a collision before anything
+/// is written.
+///
+/// Something has to follow the prefix. Every name measured on 8.3 carried a
+/// number after it, and a name that is the prefix and nothing else was not, so
+/// it is left alone rather than guessed at.
+fn renamed_auto_key(name: &str, old_name: &str, new_name: &str) -> String {
+    match name.strip_prefix(&format!("{old_name}{IBFK}")) {
+        Some(tail) if !tail.is_empty() => format!("{new_name}{IBFK}{tail}"),
+        _ => name.to_owned(),
     }
 }
 
@@ -1158,6 +1222,67 @@ fn auto_check_name(table: &Table) -> String {
     format!("{prefix}{}", highest + 1)
 }
 
+/// Refuses a constraint name the database already holds.
+///
+/// A foreign key's name and a `CHECK`'s are scoped to the *database*, where an
+/// index name is scoped to its table. This engine enforced neither, so
+/// `ALTER TABLE A ADD CONSTRAINT k FOREIGN KEY ...` followed by the same
+/// against `B` gave one database two constraints called `k` — and then
+/// reported both from `information_schema`, where Prisma's migration engine
+/// reads them back and compares them against the schema. #0257.
+///
+/// Checked against the table as it will be, not as it was, and called once the
+/// table is otherwise built. Two reasons, both measured:
+///
+/// * 1061 wins where it applies. A foreign key makes an index of its own name,
+///   so `ADD CONSTRAINT k` on a table already holding an index `k` is the
+///   index's answer, not this one — and running this first would report 1826
+///   where 8.3 reports 1061. Adding the key to a table whose index name is
+///   *free* (renamed away, or covered by another index so no index is made) is
+///   1826, which is what says this rule is real rather than the index rule
+///   wearing a different number.
+/// * `ALTER TABLE t DROP CHECK c, ADD CONSTRAINT c CHECK (...)` is accepted,
+///   so the name has to be judged on what the statement leaves behind.
+///
+/// The two namespaces are separate: a `CHECK` may take a name a foreign key
+/// holds, and the other way round, both measured.
+fn refuse_duplicate_constraint_names(
+    database: &Database,
+    replacing: &str,
+    table: &Table,
+) -> EngineResult<()> {
+    // Every other table's names. The table being written is excluded and its
+    // own names come from `table`, because that is the version this statement
+    // produces and the stored one is about to be replaced by it.
+    let mut keys: Vec<&str> = Vec::new();
+    let mut checks: Vec<&str> = Vec::new();
+    for (name, other) in &database.tables {
+        if name.eq_ignore_ascii_case(replacing) {
+            continue;
+        }
+        keys.extend(other.foreign_keys.iter().map(|f| f.name.as_str()));
+        checks.extend(other.checks.iter().map(|c| c.name.as_str()));
+    }
+    // Spelled as this statement wrote it, not as the holder did: 8.3 reports
+    // `K` for a `K` added after a `k`.
+    for key in &table.foreign_keys {
+        if keys.iter().any(|held| held.eq_ignore_ascii_case(&key.name)) {
+            return Err(EngineError::duplicate_foreign_key_name(&key.name));
+        }
+        keys.push(&key.name);
+    }
+    for check in &table.checks {
+        if checks
+            .iter()
+            .any(|held| held.eq_ignore_ascii_case(&check.name))
+        {
+            return Err(EngineError::duplicate_check_name(&check.name));
+        }
+        checks.push(&check.name);
+    }
+    Ok(())
+}
+
 /// Adds an index, refusing a name the table already carries.
 ///
 /// An index name is scoped to its table, so the same name on two tables is
@@ -1214,32 +1339,24 @@ fn add_index(table: &mut Table, index: Index) -> EngineResult<()> {
 /// is really taken before committing to anything — a name held by an index
 /// about to be taken over is exactly the case that must *not* be 1061.
 ///
-/// Only a foreign key that still *has* its provisional index counts, so a key
-/// whose index was already taken over cannot nominate a second victim.
+/// **Column coverage alone, and no foreign key is consulted.** That is measured
+/// and was got wrong first: an index MySQL made for a key is replaceable
+/// wherever another index covers it, whether or not the key is still there.
+/// `ADD CONSTRAINT k FOREIGN KEY (r)`, `DROP FOREIGN KEY k`, `CREATE INDEX z ON
+/// T (r)` leaves 8.3 holding `z` alone; the same with `z` over a different
+/// column leaves it holding both, which is what says the rule is coverage.
 ///
-/// Nothing about the incoming index is excluded, and both exclusions that
-/// suggested themselves were measured on 8.3 and are wrong:
-///
-/// * a **primary key** takes over. `ADD PRIMARY KEY (r)` over a foreign key on
-///   `(r)` leaves 8.3 holding `PRIMARY` alone, not `PRIMARY` beside the key's
-///   own index.
-/// * so does **another foreign key's** provisional index. `c1 (r)` followed by
-///   `c2 (r, b)` leaves 8.3 holding `c2` alone, because `(r, b)` covers `(r)`.
-///
-/// Both are the same rule the explicit case follows — whatever can serve the
-/// key replaces what was standing in for it — which is the argument for not
-/// special-casing by where the index came from.
+/// Nothing about the incoming index is excluded either, and both exclusions
+/// that suggested themselves were measured and are wrong: a **primary key**
+/// takes over (`ADD PRIMARY KEY (r)` over a key on `(r)` leaves `PRIMARY`
+/// alone), and so does **another key's** provisional index (`c1 (r)` then
+/// `c2 (r, b)` leaves `c2` alone, because `(r, b)` covers `(r)`).
 fn provisional_indexes_superseded_by(table: &Table, index: &Index) -> Vec<String> {
     table
-        .foreign_keys
+        .indexes
         .iter()
-        .filter(|fk| index_serves(index, &fk.columns))
-        .filter(|fk| {
-            table.indexes.iter().any(|held| {
-                held.implicit_for_foreign_key && held.name.eq_ignore_ascii_case(&fk.name)
-            })
-        })
-        .map(|fk| fk.name.clone())
+        .filter(|held| held.implicit_for_foreign_key && index_serves(index, &held.columns))
+        .map(|held| held.name.clone())
         .collect()
 }
 
@@ -1260,19 +1377,6 @@ fn index_name_taken_apart_from(table: &Table, name: &str, superseded: &[String])
 
 fn is_superseded(held: &Index, superseded: &[String]) -> bool {
     held.implicit_for_foreign_key && superseded.iter().any(|n| held.name.eq_ignore_ascii_case(n))
-}
-
-/// An index that outlived the foreign key it was made for is an ordinary index.
-///
-/// The index survives the drop — 8.3 keeps it — but nothing is provisional on
-/// behalf of a key that is gone, so a later `CREATE INDEX` must collide with it
-/// rather than take it over.
-fn unmark_provisional(table: &mut Table, key: &str) {
-    for index in &mut table.indexes {
-        if index.implicit_for_foreign_key && index.name.eq_ignore_ascii_case(key) {
-            index.implicit_for_foreign_key = false;
-        }
-    }
 }
 
 fn drop_superseded(table: &mut Table, superseded: &[String]) {
@@ -1649,12 +1753,40 @@ pub fn rename_tables(
         // `A TO X, B TO X` is not. Only a simulation gets both.
         let mut names: Vec<(String, String)> = Vec::new();
         let mut seeded: Vec<String> = Vec::new();
+        // Alongside the table names, the constraint names each table carries,
+        // because a rename rewrites the keys named after the table and can
+        // therefore put two of one name in a database. Simulated rather than
+        // checked afterwards for the reason the table names are: this
+        // statement is all-or-nothing, and by the time the write loop below
+        // runs the earlier pairs have been applied. Measured on 8.3, which
+        // answers 1826 and leaves every table where it was.
+        let mut held: Vec<(String, String, String)> = Vec::new();
+        // Checks in a pool of their own, because the two namespaces are
+        // independent: measured, a rename onto a check name that only a
+        // *foreign key* holds is accepted, and the refusal when it does
+        // collide is 3822 rather than 1826. Folding them together would refuse
+        // statements 8.3 answers.
+        let mut held_checks: Vec<(String, String, String)> = Vec::new();
         for (db, from, to) in &planned {
             let database = catalog
                 .database(db)
                 .ok_or_else(|| EngineError::unknown_database(db))?;
             if !seeded.iter().any(|d| d == db) {
                 names.extend(database.tables.keys().map(|k| (db.clone(), k.clone())));
+                for (owner, table) in &database.tables {
+                    held.extend(
+                        table
+                            .foreign_keys
+                            .iter()
+                            .map(|f| (db.clone(), owner.clone(), f.name.clone())),
+                    );
+                    held_checks.extend(
+                        table
+                            .checks
+                            .iter()
+                            .map(|c| (db.clone(), owner.clone(), c.name.clone())),
+                    );
+                }
                 seeded.push(db.clone());
             }
             // The target before the source, which is measurable only when
@@ -1678,8 +1810,57 @@ pub fn rename_tables(
             let Some(at) = at else {
                 return Err(EngineError::no_such_table(&format!("{db}.{from}")));
             };
+            // The name as the catalog *stores* it, not as this statement
+            // typed it. `renamed_auto_key` strips a byte-exact prefix, so a
+            // dry run driven off the typed spelling reaches a different
+            // conclusion from the write, which is driven off `table.name`:
+            // `RENAME TABLE a TO b` over a stored `A` left the dry run seeing
+            // no collision and the write producing `b_ibfk_1` beside another
+            // table's. Measured.
+            let stored = names[at].1.clone();
             names.remove(at);
             names.push((db.clone(), to.clone()));
+
+            // The renamed table's own keys follow it, and the result must not
+            // be a name the database already holds. Applied pair by pair,
+            // because that is the order 8.3 applies them in and the pair that
+            // collides is the one it names.
+            for entry in &mut held {
+                if entry.0 == *db && entry.1.eq_ignore_ascii_case(&stored) {
+                    entry.1 = to.clone();
+                    entry.2 = renamed_auto_key(&entry.2, &stored, to);
+                }
+            }
+            // The checks named after the table follow it too, by the rule
+            // `rename_own_auto_keys` applies when the write happens. Simulated
+            // here for the same reason the keys are: without it a rename that
+            // collides two check names was accepted, and the duplicate it
+            // created then refused every later `ALTER TABLE` on *both* tables,
+            // which only dropping one could clear.
+            for entry in &mut held_checks {
+                if entry.0 == *db && entry.1.eq_ignore_ascii_case(&stored) {
+                    entry.1 = to.clone();
+                    entry.2 = renamed_auto_check(&entry.2, &stored, to);
+                }
+            }
+            for at in 0..held.len() {
+                let (edb, _, name) = &held[at];
+                if held[..at]
+                    .iter()
+                    .any(|(d, _, earlier)| d == edb && earlier.eq_ignore_ascii_case(name))
+                {
+                    return Err(EngineError::duplicate_foreign_key_name(name));
+                }
+            }
+            for at in 0..held_checks.len() {
+                let (edb, _, name) = &held_checks[at];
+                if held_checks[..at]
+                    .iter()
+                    .any(|(d, _, earlier)| d == edb && earlier.eq_ignore_ascii_case(name))
+                {
+                    return Err(EngineError::duplicate_check_name(name));
+                }
+            }
         }
     }
 
@@ -2020,7 +2201,6 @@ pub fn alter_table(
                 // where the doubled drops below are not — the pre-pass asks
                 // the table as it stands, so both see `ck1`.
                 drop_constraint_named(table, &name.value);
-                unmark_provisional(table, &name.value);
             }
             AlterTableOperation::DropForeignKey { name, .. } => {
                 if !drop_named(&mut table.foreign_keys, |f| {
@@ -2028,7 +2208,6 @@ pub fn alter_table(
                 }) {
                     return Err(EngineError::cant_drop(&name.value));
                 }
-                unmark_provisional(table, &name.value);
             }
             AlterTableOperation::DropPrimaryKey { .. } => {
                 // Asked of `has_primary_key` rather than of what the drop
@@ -2254,6 +2433,22 @@ pub fn alter_table(
         }
     }
 
+    // Against the table as this statement leaves it, and against the rest of
+    // the database, which is the scope a constraint name is unique in. Last,
+    // so that every refusal an operation raises for itself — 1061 among them,
+    // which beats this one — has already been raised. #0257.
+    // The keys named after the table follow it, and they have to follow it
+    // *before* the names are judged: `RENAME TO B2` turns `A_ibfk_1` into
+    // `B2_ibfk_1`, which another table may already hold. Measured on 8.3,
+    // which answers 1826 and leaves the table where it was. Applied to the
+    // copy, so a refusal below still leaves the stored table untouched.
+    if let Some(new_name) = &renamed_to {
+        let was = table.name.clone();
+        rename_own_auto_keys(table, &was, new_name);
+    }
+
+    refuse_duplicate_constraint_names(database, &table_name, table)?;
+
     // Every operation succeeded, so the copy becomes the table. Written back
     // under the stored key rather than what the user typed, which can differ
     // in case — inserting under the typed spelling would leave the rows under
@@ -2271,13 +2466,8 @@ pub fn alter_table(
             // both.
             Some(new_name) => {
                 database.tables.remove(&key);
-                // Before the table is written back, because the keys being
-                // renamed are its own. Off the stored name rather than the one
-                // the statement typed, which can differ in case — the keys
-                // were named after the stored one, and this comparison is the
-                // one that is case-sensitive.
-                let was = table.name.clone();
-                rename_own_auto_keys(table, &was, &new_name);
+                // The keys themselves were renamed above, before the names
+                // were judged; only the table's own name is left to set.
                 table.name = new_name.clone();
                 database.tables.insert(new_name.clone(), table.clone());
                 // The name the table arrives under is marked too, and not only

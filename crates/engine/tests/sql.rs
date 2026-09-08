@@ -35679,10 +35679,15 @@ fn an_explicit_index_takes_over_the_one_a_foreign_key_made() {
     );
 }
 
-/// The three ways the takeover must *not* happen, each of which was a fix with
-/// no test behind it until the review said so. #0255.
+/// What ends an index's provisional life, and what does not.
+///
+/// Every line here is measured on 8.3, and three of them were implemented the
+/// other way round first — from review findings that reasoned about it rather
+/// than asking. An index a foreign key made for itself is replaceable wherever
+/// another index covers its columns, and that mark outlives more than it looks
+/// like it should. #0255, #0257.
 #[test]
-fn the_index_a_foreign_key_made_is_only_taken_over_while_it_is_still_standing_in() {
+fn what_ends_the_provisional_life_of_a_foreign_keys_index() {
     let (engine, mut session) = engine();
     let run = |engine: &Engine, session: &mut Session, sql: &str| {
         engine.execute(session, sql, &[]).map(|_| ())
@@ -35697,11 +35702,16 @@ fn the_index_a_foreign_key_made_is_only_taken_over_while_it_is_still_standing_in
         "CREATE TABLE P (id INT NOT NULL PRIMARY KEY)",
     )
     .unwrap();
+    run(&engine, &mut session, "INSERT INTO P (id) VALUES (1)").unwrap();
+    // Every constraint below is named differently, because a foreign key's
+    // name is unique across the *database* and reusing one is 1826 (#0257).
+    // The first version of this test reused `c` on four tables, which 8.3
+    // would have refused outright.
 
     // A refused statement must not have taken anything over on its way to the
     // refusal. `create_index` holds the live catalog, so a takeover applied
     // before the checks is not rolled back, and the key was left with no index
-    // at all -- a state 1553 exists to prevent.
+    // at all -- the state 1553 exists to prevent.
     run(
         &engine,
         &mut session,
@@ -35711,10 +35721,9 @@ fn the_index_a_foreign_key_made_is_only_taken_over_while_it_is_still_standing_in
     run(
         &engine,
         &mut session,
-        "ALTER TABLE R ADD CONSTRAINT c FOREIGN KEY (r) REFERENCES P (id)",
+        "ALTER TABLE R ADD CONSTRAINT kr FOREIGN KEY (r) REFERENCES P (id)",
     )
     .unwrap();
-    run(&engine, &mut session, "INSERT INTO P (id) VALUES (1)").unwrap();
     run(
         &engine,
         &mut session,
@@ -35722,47 +35731,89 @@ fn the_index_a_foreign_key_made_is_only_taken_over_while_it_is_still_standing_in
     )
     .unwrap();
     assert_eq!(
-        run(&engine, &mut session, "CREATE UNIQUE INDEX c ON R (r)")
+        run(&engine, &mut session, "CREATE UNIQUE INDEX kr ON R (r)")
             .expect_err("the rows already collide")
             .code,
         1062
     );
     assert_eq!(
         index_names(&engine, &mut session, "R"),
-        vec![vec!["c"]],
+        vec![vec!["kr"]],
         "a refused statement must leave the key's index where it was"
     );
 
-    // An index that outlived the key it was made for is an ordinary index.
+    // Dropping the key does NOT end it. The index survives the drop and is
+    // still replaceable: 8.3 leaves `z` alone here.
     run(
         &engine,
         &mut session,
-        "CREATE TABLE D (id INT NOT NULL PRIMARY KEY, r INT NULL)",
+        "CREATE TABLE D (id INT NOT NULL PRIMARY KEY, r INT NULL, q INT NULL)",
     )
     .unwrap();
     run(
         &engine,
         &mut session,
-        "ALTER TABLE D ADD CONSTRAINT c FOREIGN KEY (r) REFERENCES P (id)",
+        "ALTER TABLE D ADD CONSTRAINT kd FOREIGN KEY (r) REFERENCES P (id)",
     )
     .unwrap();
-    run(&engine, &mut session, "ALTER TABLE D DROP FOREIGN KEY c").unwrap();
-    // Re-added, and covered by the index left behind, so no new one is made.
-    run(
-        &engine,
-        &mut session,
-        "ALTER TABLE D ADD CONSTRAINT c FOREIGN KEY (r) REFERENCES P (id)",
-    )
-    .unwrap();
-    run(&engine, &mut session, "CREATE INDEX z ON D (r)").unwrap();
+    run(&engine, &mut session, "ALTER TABLE D DROP FOREIGN KEY kd").unwrap();
+    run(&engine, &mut session, "CREATE INDEX zd ON D (r)").unwrap();
     assert_eq!(
         index_names(&engine, &mut session, "D"),
-        vec![vec!["c"], vec!["z"]],
-        "an index that outlived its key is ordinary and is not taken over"
+        vec![vec!["zd"]],
+        "the mark outlives the key that made the index"
     );
 
-    // `LIKE` copies indexes and not constraints, so nothing in the copy is
-    // standing in for a key.
+    // And it is coverage that decides, not the key: an index over a different
+    // column takes nothing over.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE C (id INT NOT NULL PRIMARY KEY, r INT NULL, q INT NULL)",
+    )
+    .unwrap();
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE C ADD CONSTRAINT kc FOREIGN KEY (r) REFERENCES P (id)",
+    )
+    .unwrap();
+    run(&engine, &mut session, "CREATE INDEX zc ON C (q)").unwrap();
+    assert_eq!(
+        index_names(&engine, &mut session, "C"),
+        vec![vec!["kc"], vec!["zc"]],
+        "an index over another column covers nothing and takes nothing"
+    );
+
+    // A rename DOES end it. The same statement that would have removed the
+    // index leaves it alone once it has been renamed.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE N (id INT NOT NULL PRIMARY KEY, r INT NULL)",
+    )
+    .unwrap();
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE N ADD CONSTRAINT kn FOREIGN KEY (r) REFERENCES P (id)",
+    )
+    .unwrap();
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE N RENAME INDEX kn TO ren",
+    )
+    .unwrap();
+    run(&engine, &mut session, "CREATE INDEX zn ON N (r)").unwrap();
+    assert_eq!(
+        index_names(&engine, &mut session, "N"),
+        vec![vec!["ren"], vec!["zn"]],
+        "a renamed index is an ordinary one"
+    );
+
+    // `LIKE` carries the mark, which reads backwards -- the copy has no
+    // constraints at all -- and clearing it was measured wrong.
     run(
         &engine,
         &mut session,
@@ -35772,21 +35823,31 @@ fn the_index_a_foreign_key_made_is_only_taken_over_while_it_is_still_standing_in
     run(
         &engine,
         &mut session,
-        "ALTER TABLE L ADD CONSTRAINT c FOREIGN KEY (r) REFERENCES P (id)",
+        "ALTER TABLE L ADD CONSTRAINT kl FOREIGN KEY (r) REFERENCES P (id)",
     )
     .unwrap();
     run(&engine, &mut session, "CREATE TABLE L2 LIKE L").unwrap();
+    run(&engine, &mut session, "CREATE INDEX zl ON L2 (r)").unwrap();
+    assert_eq!(
+        index_names(&engine, &mut session, "L2"),
+        vec![vec!["zl"]],
+        "the copy of an index made for a key is still replaceable"
+    );
+
+    // The same copy of an index that a statement asked for is not.
     run(
         &engine,
         &mut session,
-        "ALTER TABLE L2 ADD CONSTRAINT c FOREIGN KEY (r) REFERENCES P (id)",
+        "CREATE TABLE E (id INT NOT NULL PRIMARY KEY, r INT NULL)",
     )
     .unwrap();
-    run(&engine, &mut session, "CREATE INDEX z ON L2 (r)").unwrap();
+    run(&engine, &mut session, "CREATE INDEX plain ON E (r)").unwrap();
+    run(&engine, &mut session, "CREATE TABLE E2 LIKE E").unwrap();
+    run(&engine, &mut session, "CREATE INDEX ze ON E2 (r)").unwrap();
     assert_eq!(
-        index_names(&engine, &mut session, "L2"),
-        vec![vec!["c"], vec!["z"]],
-        "a copied index is an ordinary index"
+        index_names(&engine, &mut session, "E2"),
+        vec![vec!["plain"], vec!["ze"]],
+        "an ordinary index stays ordinary through the copy"
     );
 }
 
@@ -35930,5 +35991,284 @@ fn a_column_list_after_an_alias_renames_what_it_names() {
             engine.describe(&session, sql, 0).is_err(),
             "prepare must refuse: {sql}"
         );
+    }
+}
+
+/// A constraint name is unique across its database, not its table.
+///
+/// An index name is scoped to its table; a foreign key's and a `CHECK`'s are
+/// scoped to the schema. The engine enforced neither, so one database could
+/// hold two constraints of one name and then report both from
+/// `information_schema`, which Prisma reads back and compares against the
+/// schema. #0257.
+///
+/// Every code here was measured on 8.3, and the same sequences are in the
+/// differential corpus.
+#[test]
+fn a_constraint_name_is_unique_across_its_database() {
+    let (engine, mut session) = engine();
+    let run = |engine: &Engine, session: &mut Session, sql: &str| {
+        engine.execute(session, sql, &[]).map(|_| ())
+    };
+    for sql in [
+        "CREATE TABLE Cp (id INT NOT NULL PRIMARY KEY)",
+        "CREATE TABLE C1 (id INT NOT NULL PRIMARY KEY, r INT NULL, s INT NULL)",
+        "CREATE TABLE C2 (id INT NOT NULL PRIMARY KEY, r INT NULL, s INT NULL)",
+        "ALTER TABLE C1 ADD CONSTRAINT ck FOREIGN KEY (r) REFERENCES Cp (id)",
+        "ALTER TABLE C1 ADD CONSTRAINT cc CHECK (r > 0)",
+        "CREATE INDEX cov ON C2 (r)",
+    ] {
+        run(&engine, &mut session, sql).unwrap();
+    }
+
+    // A key's name, taken by another table in the same database.
+    assert_eq!(
+        run(
+            &engine,
+            &mut session,
+            "ALTER TABLE C2 ADD CONSTRAINT ck FOREIGN KEY (s) REFERENCES Cp (id)"
+        )
+        .expect_err("the database already holds a key called ck")
+        .code,
+        1826
+    );
+
+    // Case-insensitively, and reported as this statement spelled it.
+    let refused = run(
+        &engine,
+        &mut session,
+        "ALTER TABLE C2 ADD CONSTRAINT CK FOREIGN KEY (s) REFERENCES Cp (id)",
+    )
+    .expect_err("names differing only in case still collide");
+    assert_eq!(refused.code, 1826);
+    assert!(
+        refused.message.contains("'CK'"),
+        "reported as written: {}",
+        refused.message
+    );
+
+    // 1061 beats it, because a key makes an index of its own name and that
+    // name is taken on C1 itself.
+    assert_eq!(
+        run(
+            &engine,
+            &mut session,
+            "ALTER TABLE C1 ADD CONSTRAINT ck FOREIGN KEY (s) REFERENCES Cp (id)"
+        )
+        .expect_err("the index name is taken here")
+        .code,
+        1061
+    );
+
+    // And where the key needs no index of its own -- `cov` covers `r` -- there
+    // is no 1061 to beat it.
+    assert_eq!(
+        run(
+            &engine,
+            &mut session,
+            "ALTER TABLE C2 ADD CONSTRAINT ck FOREIGN KEY (r) REFERENCES Cp (id)"
+        )
+        .expect_err("covered, so no index is made and the name still collides")
+        .code,
+        1826
+    );
+
+    // Declared inline by a CREATE TABLE, which must not slip past.
+    assert_eq!(
+        run(
+            &engine,
+            &mut session,
+            "CREATE TABLE C3 (id INT NOT NULL PRIMARY KEY, r INT NULL, CONSTRAINT ck FOREIGN KEY (r) REFERENCES Cp (id))"
+        )
+        .expect_err("a CREATE TABLE is in the database too")
+        .code,
+        1826
+    );
+
+    // A CHECK is scoped the same way, with its own code -- including on the
+    // table that already holds it, where a key would have answered 1061.
+    for sql in [
+        "ALTER TABLE C2 ADD CONSTRAINT cc CHECK (r > 0)",
+        "ALTER TABLE C1 ADD CONSTRAINT cc CHECK (s > 0)",
+        "ALTER TABLE C2 ADD CONSTRAINT CC CHECK (r > 0)",
+    ] {
+        assert_eq!(
+            run(&engine, &mut session, sql)
+                .expect_err("the database already holds a check called cc")
+                .code,
+            3822,
+            "{sql}"
+        );
+    }
+
+    // The two namespaces are separate, both ways round.
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE C2 ADD CONSTRAINT ck CHECK (r > 0)",
+    )
+    .expect("a check may take a name a key holds");
+    run(
+        &engine,
+        &mut session,
+        "ALTER TABLE C2 ADD CONSTRAINT cc2 FOREIGN KEY (s) REFERENCES Cp (id)",
+    )
+    .expect("and a name no key holds is free");
+
+    // A rename rewrites the keys named after the table, so it can produce the
+    // collision too -- and both spellings must refuse it *before* writing,
+    // because `RENAME TABLE` is one statement however many pairs it lists.
+    for sql in [
+        "CREATE TABLE C4 (id INT NOT NULL PRIMARY KEY, r INT NULL)",
+        "ALTER TABLE C4 ADD FOREIGN KEY (r) REFERENCES Cp (id)",
+        // `C5x` is a name no table has, and this key is called what renaming
+        // C4 to it would produce -- so the only thing in the way of the rename
+        // is the constraint name.
+        "CREATE TABLE C5 (id INT NOT NULL PRIMARY KEY, r INT NULL)",
+        "ALTER TABLE C5 ADD CONSTRAINT C5x_ibfk_1 FOREIGN KEY (r) REFERENCES Cp (id)",
+    ] {
+        run(&engine, &mut session, sql).unwrap();
+    }
+    for sql in [
+        "RENAME TABLE C4 TO C5x",
+        "ALTER TABLE C4 RENAME TO C5x",
+        // Spelled in another case than the catalog stores it. This is the one
+        // that caught a real bug: the dry run stripped the prefix off the
+        // *typed* name and saw no collision, while the write stripped it off
+        // the stored one and produced the duplicate anyway.
+        "RENAME TABLE c4 TO c5x",
+    ] {
+        // The target name is free, so the refusal can only be about the key
+        // name the rename would produce.
+        let refused = run(&engine, &mut session, sql).expect_err("the key name would collide");
+        assert_eq!(refused.code, 1826, "{sql}");
+    }
+    // And nothing was written: the table is still there under its own name,
+    // with its own key.
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT CONSTRAINT_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'C4' AND REFERENCED_TABLE_NAME IS NOT NULL"),
+        vec![vec!["C4_ibfk_1"]],
+        "a refused rename leaves the table where it was"
+    );
+}
+
+/// What a CHECK gets called when the statement does not say.
+///
+/// Every name below is asserted by *colliding* with it, because this engine's
+/// `information_schema` does not report a check at all (#0259) and the names
+/// are otherwise unobservable. Each was measured on 8.3 first.
+///
+/// It was `<column>_chk` here, which was merely a wrong name until #0257 made
+/// a constraint name unique across its database — and then two tables with the
+/// same inline check on the same column stopped being creatable.
+#[test]
+fn a_check_the_statement_did_not_name_is_named_after_its_table() {
+    let (engine, mut session) = engine();
+    let run = |engine: &Engine, session: &mut Session, sql: &str| {
+        engine.execute(session, sql, &[]).map(|_| ())
+    };
+    // The name is proved by adding a check under it and being refused.
+    let taken = |engine: &Engine, session: &mut Session, name: &str| {
+        engine
+            .execute(
+                session,
+                &format!("ALTER TABLE probe ADD CONSTRAINT {name} CHECK (a > 0)"),
+                &[],
+            )
+            .err()
+            .map(|e| e.code)
+    };
+
+    for sql in [
+        "CREATE TABLE probe (a INT)",
+        // Two tables, the same inline check, the same column name. 8.3 calls
+        // them `alpha_chk_1` and `bravo_chk_1`; this called both `a_chk`.
+        "CREATE TABLE alpha (a INT CHECK (a > 0))",
+        "CREATE TABLE bravo (a INT CHECK (a > 0))",
+        // Numbered across the table, not per column.
+        "CREATE TABLE delta (a INT CHECK (a > 0) CHECK (a < 9))",
+        // `LIKE` renames every check after the copy, the written ones too.
+        "CREATE TABLE echo (a INT, CHECK (a > 0))",
+        "CREATE TABLE foxtrot LIKE echo",
+        "CREATE TABLE golf (a INT, CONSTRAINT named CHECK (a > 0))",
+        "CREATE TABLE hotel LIKE golf",
+        // A generated name follows the table it was named after.
+        "CREATE TABLE india (a INT, CHECK (a > 0))",
+        "RENAME TABLE india TO juliet",
+    ] {
+        run(&engine, &mut session, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    for name in [
+        "alpha_chk_1",
+        "bravo_chk_1",
+        "delta_chk_1",
+        "delta_chk_2",
+        "echo_chk_1",
+        "foxtrot_chk_1",
+        // The copy's, not the source's written name.
+        "hotel_chk_1",
+        // The source keeps what it was written as.
+        "named",
+        // Carried by the rename.
+        "juliet_chk_1",
+    ] {
+        assert_eq!(
+            taken(&engine, &mut session, name),
+            Some(3822),
+            "{name} should be taken"
+        );
+    }
+
+    // And the names a rename left behind are free again, which is what makes
+    // dropping and recreating a table work.
+    assert_eq!(
+        taken(&engine, &mut session, "india_chk_1"),
+        None,
+        "the renamed table stopped holding its old name"
+    );
+
+    // A rename that would collide two *check* names is refused before it is
+    // written, the way one colliding two key names is. Left unsimulated, the
+    // rename went through and the duplicate then refused every later
+    // `ALTER TABLE` on both tables -- state only a `DROP TABLE` could clear.
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE kilo (a INT, CHECK (a > 0))",
+    )
+    .unwrap();
+    run(
+        &engine,
+        &mut session,
+        "CREATE TABLE lima (a INT, CONSTRAINT mike_chk_1 CHECK (a < 9))",
+    )
+    .unwrap();
+    for sql in [
+        "RENAME TABLE kilo TO mike",
+        "ALTER TABLE kilo RENAME TO mike",
+    ] {
+        assert_eq!(
+            run(&engine, &mut session, sql)
+                .expect_err("the check name would collide")
+                .code,
+            3822,
+            "{sql}"
+        );
+    }
+    // Both tables still work, which is what says nothing was written.
+    run(&engine, &mut session, "ALTER TABLE lima ADD COLUMN z INT").expect("lima is not wedged");
+    run(&engine, &mut session, "ALTER TABLE kilo ADD COLUMN z INT").expect("kilo is not wedged");
+
+    // A name only a foreign key holds does not block a check, because the two
+    // namespaces are separate.
+    for sql in [
+        "CREATE TABLE papa (id INT NOT NULL PRIMARY KEY)",
+        "CREATE TABLE november (a INT, CHECK (a > 0))",
+        "CREATE TABLE oscar (id INT NOT NULL PRIMARY KEY, r INT NULL)",
+        "ALTER TABLE oscar ADD CONSTRAINT quebec_chk_1 FOREIGN KEY (r) REFERENCES papa (id)",
+        "RENAME TABLE november TO quebec",
+    ] {
+        run(&engine, &mut session, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 }

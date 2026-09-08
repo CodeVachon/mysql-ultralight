@@ -405,6 +405,43 @@ impl EngineError {
         )
     }
 
+    /// ER_FK_DUP_NAME.
+    ///
+    /// A foreign key's name is scoped to its *database*, not to its table —
+    /// unlike an index name, which `duplicate_key_name` records is scoped to
+    /// the table. Measured on 8.3: the same name on two tables of one database
+    /// is this, the same name in two databases is fine, and the comparison
+    /// ignores case, so `K` after `k` is refused and reported as `K`.
+    ///
+    /// 1061 beats it. Adding a foreign key makes an index of the same name, so
+    /// where that name is also taken by an index the answer is the index's —
+    /// measured, and the reason this check runs after the index has been made
+    /// rather than before.
+    pub fn duplicate_foreign_key_name(name: &str) -> Self {
+        Self::new(
+            1826,
+            "HY000",
+            format!("Duplicate foreign key constraint name '{name}'"),
+        )
+    }
+
+    /// ER_CHECK_CONSTRAINT_DUP_NAME.
+    ///
+    /// The same scoping as a foreign key's name and a separate namespace from
+    /// it: measured on 8.3, a `CHECK` may take a name a foreign key already
+    /// holds and the other way round, and neither may take one another `CHECK`
+    /// holds — including on the same table, where a foreign key would have
+    /// answered 1061 for its index instead.
+    ///
+    /// The trailing full stop is MySQL's, and 1826 next door has none.
+    pub fn duplicate_check_name(name: &str) -> Self {
+        Self::new(
+            3822,
+            "HY000",
+            format!("Duplicate check constraint name '{name}'."),
+        )
+    }
+
     /// ER_PARSE_ERROR.
     pub fn parse(message: impl Into<String>) -> Self {
         Self::new(1064, "42000", message)

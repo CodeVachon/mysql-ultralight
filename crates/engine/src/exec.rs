@@ -875,6 +875,15 @@ impl Engine {
                     return Err(EngineError::duplicate_key_name(&new));
                 }
                 table.indexes[at].name = new;
+                // A renamed index is an ordinary one, whoever made it.
+                // Measured on 8.3: an index a foreign key created is dropped
+                // when another index covers it, and the same index *renamed*
+                // survives — `RENAME INDEX k TO ren` then `CREATE INDEX z ON
+                // T (r)` leaves both `ren` and `z`, where without the rename it
+                // leaves `z` alone. So renaming is one of the two things that
+                // ends an index's provisional life; being taken over is the
+                // other. #0255.
+                table.indexes[at].implicit_for_foreign_key = false;
                 Ok(Outcome::ok())
             }
 

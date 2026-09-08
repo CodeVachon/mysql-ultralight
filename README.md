@@ -17,7 +17,7 @@ answers "No pending migrations to apply" — `prisma db push` creates a schema, 
 Client does CRUD against it. (604 is what `prisma migrate deploy` reports for that
 directory; a plain `ls` says 605, because one entry is `migration_lock.toml`.)
 
-It is also checked against MySQL itself, not only against its own tests: **5,608
+It is also checked against MySQL itself, not only against its own tests: **5,662
 statements** of a differential corpus are put to a real `mysql:8.3` and to this engine over
 both the text and binary protocols, and the answers are compared. **0 diverge.** Every
 divergence found and not yet fixed is a filed issue rather than an accepted baseline —
