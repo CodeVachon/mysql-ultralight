@@ -1,0 +1,57 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+  # So the site can be rebuilt without an empty commit — after a Pages setting
+  # changes, say.
+  workflow_dispatch:
+
+# Pages accepts one deployment at a time. Cancelling a half-finished one would
+# leave the site mid-upload, so a second push waits rather than replacing it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# Pull requests do not appear here on purpose: `scripts/check.sh` builds the
+# book, so CI already fails a pull request whose SUMMARY.md names a file that
+# does not exist. This workflow only publishes what has landed.
+jobs:
+  build:
+    name: Build the book
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # binstall rather than `cargo install`, for the same reason the gate's
+      # tools are: CI should not compile a documentation tool every run.
+      - name: Install mdBook
+        uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook@0.5.4
+
+      - name: Build
+        run: mdbook build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: book
+
+  deploy:
+    name: Publish to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      # The deployment is authenticated by an OIDC token rather than a
+      # long-lived secret, so the job has to be allowed to mint one.
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

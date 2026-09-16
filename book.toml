@@ -1,0 +1,21 @@
+# The docs are the markdown already in `docs/`, rendered rather than rewritten:
+# `src` points mdBook at that directory so a page has one copy and the site and a
+# `docs/` link from the README are the same file.
+[book]
+title = "mysql-ultralight"
+description = "A fast-starting, MySQL 8 compatible storage engine for tests."
+authors = ["Christopher Vachon"]
+src = "docs"
+language = "en"
+
+[build]
+# A page named in SUMMARY.md that does not exist is a typo, not a request for an
+# empty page. Failing the build says so; the default silently creates the file.
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/CodeVachon/mysql-ultralight"
+edit-url-template = "https://github.com/CodeVachon/mysql-ultralight/edit/main/{path}"
+# Pages serves a project site from a subdirectory, and without this the 404 page
+# loads its assets from the domain root and renders unstyled.
+site-url = "/mysql-ultralight/"

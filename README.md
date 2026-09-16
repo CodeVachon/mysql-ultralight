@@ -44,7 +44,8 @@ mysql-ultralight --state schema.mus                  # every test process
 See [`docs/prototype.md`](docs/prototype.md) for what works and what does not,
 [`docs/baseline-mysql.md`](docs/baseline-mysql.md) for the numbers it has to beat, and
 [`docs/conformance-surface.md`](docs/conformance-surface.md) for the SQL surface a real
-codebase demands.
+codebase demands. All of it is published at
+<https://codevachon.github.io/mysql-ultralight>.
 
 Work is tracked in [motte](https://codevachon.github.io/motte) — run `motte ready` to see
 what is actionable.

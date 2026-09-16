@@ -2,3 +2,6 @@
 
 # Agent worktrees, not part of the project
 .claude/worktrees/
+
+# The rendered docs site; built by CI, published to Pages.
+/book

@@ -33,6 +33,7 @@ call it, so it must never diverge from what they need:
 | npm dead code | `fallow dead-code` in `packages/npm` |
 | Prisma end to end | `npm test` in `examples/node-test` |
 | Runner wiring | `npm test` in `examples/jest` and `examples/vitest` |
+| Docs site | `mdbook build` |
 
 `scripts/differential.sh` is deliberately *not* in the gate: it runs the SQL
 corpus against a real `mysql:8.3` in Docker and compares the answers, which a
@@ -121,6 +122,23 @@ clone needs:
 
 ```sh
 git config core.hooksPath .githooks
+```
+
+## The docs site
+
+`docs/` is published to <https://codevachon.github.io/mysql-ultralight> by
+`.github/workflows/docs.yml`, which renders it with mdBook. The markdown in `docs/` is
+the site — there is no second copy to update.
+
+A new page needs an entry in [`docs/SUMMARY.md`](docs/SUMMARY.md) or it is not part of
+the book. `create-missing = false` means a `SUMMARY.md` entry naming a file that does not
+exist fails the build rather than quietly writing an empty page, and `scripts/check.sh`
+builds the book so that failure lands on the commit rather than on the push. mdBook has
+no check in the other direction: a page left out of `SUMMARY.md` builds green everywhere
+and is simply absent from the site.
+
+```sh
+mdbook serve    # local preview at 127.0.0.1:3000, rebuilding on save
 ```
 
 ## Layout

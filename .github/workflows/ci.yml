@@ -40,10 +40,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # Installed via binstall so CI does not pay to compile them every run.
+      # mdBook is here because the gate builds the docs site; `--require-tools`
+      # would otherwise turn its absence into a failure rather than a skip.
       - name: Install analysis tools
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-machete,cargo-audit
+          tool: cargo-machete,cargo-audit,mdbook@0.5.4
 
       # The gate reports a missing install as a skip locally and a failure under
       # CI, so the example's dependencies have to be there before it runs.

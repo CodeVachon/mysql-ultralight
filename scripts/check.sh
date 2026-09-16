@@ -147,6 +147,15 @@ run_example "node:test   " examples/node-test 'npm test --silent'
 run_example "jest        " examples/jest 'npm run typecheck --silent && npm test --silent'
 run_example "vitest      " examples/vitest 'npm run typecheck --silent && npm test --silent' 
 
+# The docs site is built from `docs/` by CI, so the gate builds it too: a
+# SUMMARY.md entry naming a file that does not exist should fail here rather
+# than after the push. Built into a temporary directory because the gate is a
+# check, not a way to produce the site.
+if [ -f book.toml ]; then
+    run_if_available "docs        " mdbook \
+        bash -c 'out=$(mktemp -d); trap "rm -rf \"$out\"" EXIT; mdbook build --dest-dir "$out"'
+fi
+
 if [ "$FAST" = 0 ]; then
     # Unused dependencies. The closest analogue to what Fallow gives the JS
     # side; the Rust compiler will not tell you about these.
@@ -176,7 +185,7 @@ echo
 # crashed exactly where a fresh clone missing a tool would land. See #0164.
 if [ ${#SKIPPED[@]} -gt 0 ]; then
     printf '%s\n' "${YELLOW}Skipped: ${SKIPPED[*]}${OFF}"
-    echo "  Install with: cargo install cargo-machete cargo-audit --locked"
+    echo "  Install with: cargo install cargo-machete cargo-audit mdbook --locked"
     echo '  And, for the examples: for d in examples/*/; do npm install --prefix "$d"; done'
 fi
 
