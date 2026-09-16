@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { spawn } = require('node:child_process');
+const { execFileSync, spawn } = require('node:child_process');
 const fs = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
@@ -199,6 +199,60 @@ describe('platform resolution', () => {
             assert.ok(pkg.endsWith(key), `${pkg} should end with ${key}`);
         }
     });
+
+    // The gate's examples run against the binary the same run built, and the
+    // only thing holding that is this ordering: MYSQL_ULTRALIGHT_BINARY is read
+    // before the platform package. CI used to install the examples with
+    // --omit=optional as a second guard, which withheld rollup's platform
+    // binary too and broke every vitest run; the flag is gone, so the ordering
+    // is now the whole guard and is asserted rather than assumed.
+    //
+    // Asked of child processes with the fixture on NODE_PATH, rather than by
+    // writing one into this package's own `node_modules`: a fixture there
+    // outlives a Ctrl-C, is not gitignored, and `resolveBinary` prefers a
+    // platform package over the local cargo build -- so an empty file left
+    // behind would break every later run until somebody deleted it by hand.
+    it('prefers MYSQL_ULTRALIGHT_BINARY over an installed platform package', (t) => {
+        const pkg = PLATFORMS[platformKey()];
+        if (!pkg) {
+            t.skip(`no platform package for ${platformKey()}, so nothing to take precedence over`);
+            return;
+        }
+
+        // Through realpath because `require.resolve` returns one, and on macOS
+        // the temp directory is reached through a symlink.
+        const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'mysql-ultralight-platform-')));
+        t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+        const modules = path.join(root, 'node_modules');
+        const installed = path.join(modules, pkg);
+        fs.mkdirSync(installed, { recursive: true });
+        fs.writeFileSync(path.join(installed, 'package.json'), JSON.stringify({ name: pkg, version: '0.0.0' }));
+        fs.writeFileSync(path.join(installed, 'mysql-ultralight'), '');
+
+        const entry = path.join(__dirname, '..', 'src', 'index.js');
+        const ask = (override) => {
+            const env = { ...process.env, NODE_PATH: modules };
+            if (override === undefined) delete env.MYSQL_ULTRALIGHT_BINARY;
+            else env.MYSQL_ULTRALIGHT_BINARY = override;
+            const source = `process.stdout.write(require(${JSON.stringify(entry)}).resolveBinary())`;
+            return execFileSync(process.execPath, ['-e', source], { env, encoding: 'utf8' });
+        };
+
+        // Without the environment set, a platform package wins -- which is what
+        // makes the assertion below evidence. Skip this and a fixture NODE_PATH
+        // never found would fall through to the local cargo build and pass
+        // anyway. Asserted as a suffix rather than against the fixture's own
+        // path because Node searches this package's `node_modules` before
+        // NODE_PATH: once the platform packages are published, an install here
+        // puts the real one ahead of the fixture. Either is a platform package
+        // winning, and neither is the local build.
+        const withoutEnv = ask(undefined);
+        const suffix = path.join(pkg, 'mysql-ultralight');
+        assert.ok(withoutEnv.endsWith(suffix), `${withoutEnv} should end with ${suffix}`);
+
+        assert.equal(ask(__filename), __filename);
+    });
 });
 
 /**
@@ -364,7 +418,6 @@ describe('lifecycle in a bare script', () => {
                 console.log('stopped');
             })();
         `;
-        const { execFileSync } = require('node:child_process');
         const out = execFileSync(process.execPath, ['-e', script], { encoding: 'utf8' });
         assert.match(out, /stopped/);
     });

@@ -49,13 +49,19 @@ jobs:
 
       # The gate reports a missing install as a skip locally and a failure under
       # CI, so the example's dependencies have to be there before it runs.
-      # --omit=optional so the published platform packages, once they exist,
-      # cannot supply a binary in place of the one this run builds. The gate
-      # also pins MYSQL_ULTRALIGHT_BINARY for the same reason.
+      #
+      # This used to pass --omit=optional, to stop a published platform package
+      # from supplying a binary in place of the one this run builds. That is
+      # already what MYSQL_ULTRALIGHT_BINARY does -- `resolveBinary` reads the
+      # environment before it looks for a platform package -- so the flag was a
+      # second guard on the same thing, and the composition is what broke:
+      # --omit=optional is not selective, so it also withheld rollup's platform
+      # binary and every vitest run died in `require`. One guard, asserted by a
+      # test, rather than two that only agree by accident.
       - name: Install the examples' dependencies
         run: |
           for example in examples/*/; do
-            npm ci --omit=optional --prefix "$example"
+            npm ci --prefix "$example"
           done
 
       # The same script the pre-commit hook runs, so local and CI cannot drift.

@@ -24,6 +24,30 @@ cd "$(dirname "$0")/.." || exit 1
 # include it.
 export PATH="$HOME/.cargo/bin:$PATH"
 
+# The binary a gate run is testing. Everything that spawns the engine -- the npm
+# tests and every example -- is pinned to it, because that pin is the only thing
+# stopping a published platform package from answering instead. One definition,
+# so this script's callers cannot drift apart -- `scripts/differential.sh`,
+# `scripts/ask.sh` and the npm package's own local-build fallback still look in
+# `./target/release` and do not read CARGO_TARGET_DIR.
+#
+# CARGO_TARGET_DIR because a shared target directory is a common setup, and
+# looking in the wrong place here does not fail: it reports every one of those
+# checks as skipped, and the hint tells the reader to run the build they just
+# ran. A `build.target-dir` in a cargo config is not read -- that would want
+# `cargo metadata` and a JSON parser this script does not otherwise need.
+#
+# Made absolute: CARGO_TARGET_DIR is documented relative to the working
+# directory, and the examples are run through a `cd`, so a relative pin passes
+# the `-x` test at the repo root and then resolves to nothing inside the
+# example -- a failure where the guard has just promised a skip.
+CARGO_TARGET="${CARGO_TARGET_DIR:-target}"
+case "$CARGO_TARGET" in
+    /*) ;;
+    *) CARGO_TARGET="$PWD/$CARGO_TARGET" ;;
+esac
+ENGINE="$CARGO_TARGET/release/mysql-ultralight"
+
 FAST=0
 FIX=0
 # CI must not pass because a tool failed to install. Honour the conventional
@@ -105,7 +129,33 @@ if [ -d packages/npm ]; then
     run_if_available "npm build   " cargo cargo build --release --quiet
     # Through a shell so the glob expands: this node treats a bare directory as
     # a module path rather than a directory of tests.
-    run_if_available "npm tests   " node bash -c 'node --test packages/npm/test/*.test.js'
+    #
+    # The pin is the same one the examples get, and for the same reason: these
+    # tests spawn a server through `resolveBinary`, so once the platform
+    # packages are published an install under packages/npm would win and they
+    # would be covering the released engine rather than this commit.
+    #
+    # With no binary at that path there is no unpinned fallback, because an
+    # unpinned run is the state the pin exists to prevent: an `ok` from whatever
+    # engine happened to be installed. Skipped instead, the way `run_example`
+    # treats the same state, and a failure under --require-tools.
+    #
+    # The test is existence, not freshness. A binary left by an older build
+    # satisfies it, so a run whose `npm build` was skipped for want of cargo
+    # reports against that older build -- true of the examples since they were
+    # written, and not something this pin set out to change.
+    npm_tests_label="npm tests   "
+    if [ -x "$ENGINE" ]; then
+        run_if_available "$npm_tests_label" node \
+            env "MYSQL_ULTRALIGHT_BINARY=$ENGINE" \
+            bash -c 'node --test packages/npm/test/*.test.js'
+    elif [ "$REQUIRE_TOOLS" = 1 ]; then
+        printf '  %s ... %s\n' "$npm_tests_label" "${RED}FAILED (no release binary to pin the tests to)${OFF}"
+        FAILED+=("$npm_tests_label")
+    else
+        printf '  %s ... %s\n' "$npm_tests_label" "${YELLOW}skipped (needs a release build)${OFF}"
+        SKIPPED+=("$npm_tests_label")
+    fi
 fi
 
 # The examples are the only checks that exercise the npm package, the wire
@@ -121,12 +171,12 @@ run_example() {
     if [ ! -d "$directory" ]; then
         return 0
     fi
-    if [ -d "$directory/node_modules" ] && [ -x target/release/mysql-ultralight ]; then
+    if [ -d "$directory/node_modules" ] && [ -x "$ENGINE" ]; then
         # MYSQL_ULTRALIGHT_BINARY pins the example to the binary this run built.
         # Without it an installed platform package would win once the packages
         # are published, and the checks that cover every layer would be testing
         # the *released* engine rather than this commit.
-        run "$label" env "MYSQL_ULTRALIGHT_BINARY=$PWD/target/release/mysql-ultralight" \
+        run "$label" env "MYSQL_ULTRALIGHT_BINARY=$ENGINE" \
             bash -c "cd $directory && $command"
         return $?
     fi
@@ -187,6 +237,7 @@ if [ ${#SKIPPED[@]} -gt 0 ]; then
     printf '%s\n' "${YELLOW}Skipped: ${SKIPPED[*]}${OFF}"
     echo "  Install with: cargo install cargo-machete cargo-audit mdbook --locked"
     echo '  And, for the examples: for d in examples/*/; do npm install --prefix "$d"; done'
+    echo '  A skip that names a release build wants: cargo build --release'
 fi
 
 if [ ${#FAILED[@]} -gt 0 ]; then

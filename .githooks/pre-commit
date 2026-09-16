@@ -13,9 +13,13 @@ set -uo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT" || exit 1
 
-# Nothing Rust in this commit means nothing for this gate to say.
+# Nothing this gate covers means nothing for it to say. The list has to be what
+# `scripts/check.sh` actually checks, or a commit skips the gate that would have
+# caught it: the Rust, the JavaScript it runs tests over -- `packages/npm/src`
+# carries the binary-resolution ordering the examples depend on -- the examples
+# themselves, and the docs it builds into a book.
 if ! git diff --cached --name-only --diff-filter=ACMR \
-    | grep -qE '\.rs$|Cargo\.(toml|lock)$|scripts/check\.sh$'; then
+    | grep -qE '\.rs$|Cargo\.(toml|lock)$|scripts/check\.sh$|^packages/npm/|^examples/|^docs/|^book\.toml$'; then
     exit 0
 fi
 
