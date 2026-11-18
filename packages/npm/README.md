@@ -37,32 +37,50 @@ migrations produce:
 
 ```js
 import { start } from '@codevachon/mysql-ultralight';
+import { PrismaClient } from '@prisma/client';
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 
-const db = await start({ port: 3306, database: 'app' });
-execFileSync('npx', ['prisma', 'migrate', 'deploy'], {
-    env: { ...process.env, DATABASE_URL: db.url },
-    stdio: 'inherit'
-});
-// Any MySQL client can take the snapshot; it is an ordinary SELECT.
-await query(db, "SELECT ultralight_snapshot('.cache/schema.mus')");
-await db.stop();
+// Absolute: the server writes the file, relative to its own working directory.
+const image = path.resolve('.cache/schema.mus');
+// The server does not create the directory.
+fs.mkdirSync(path.dirname(image), { recursive: true });
+
+const db = await start({ database: 'app' });
+try {
+    execFileSync('npx', ['--no-install', 'prisma', 'migrate', 'deploy'], {
+        env: { ...process.env, DATABASE_URL: db.url },
+        stdio: 'inherit'
+    });
+    // Any MySQL client can take the snapshot; it is an ordinary SELECT.
+    const prisma = new PrismaClient({ datasources: { db: { url: db.url } } });
+    try {
+        await prisma.$queryRawUnsafe(`SELECT ultralight_snapshot('${image}')`);
+    } finally {
+        await prisma.$disconnect();
+    }
+} finally {
+    await db.stop();
+}
 ```
 
 Then boot from it in every test process:
 
 ```js
-const db = await start({ image: '.cache/schema.mus', database: 'app' });
+const db = await start({ image, database: 'app' });
 ```
 
 Against a real 604-migration Prisma history that is **26.1s of `migrate deploy`
 down to about 1ms**, with 278 tables, 2,771 columns, seed rows and every
 constraint intact.
 
-Key the image file by a hash of your migrations directory, and rebake when it
-changes — a stale image is a schema your tests are not actually running against.
+Key the image file by a hash of your migrations directory *and* the engine
+binary, and rebake when either changes — a stale image is a schema your tests are
+not actually running against, and only a change of image format is refused at
+load.
 
-`SELECT ultralight_restore('.cache/schema.mus')` does the same to a *running*
+`SELECT ultralight_restore('/abs/path/.cache/schema.mus')` does the same to a *running*
 server, which resets it between test files without starting a new process.
 
 ## With jest
