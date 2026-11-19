@@ -2,6 +2,11 @@
 
 [mysql-ultralight](README.md)
 
+# Using it
+
+- [Using it in a test suite](guide.md)
+- [For AI agents](for-agents.md)
+
 # Design
 
 - [ADR 001 — Engine architecture](adr-001-architecture.md)

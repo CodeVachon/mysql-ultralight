@@ -1,0 +1,14 @@
+# mysql-ultralight
+
+> A fast-starting, in-memory, MySQL 8 wire- and SQL-compatible server for tests. npm package `@codevachon/mysql-ultralight`. Not for production.
+
+## Docs
+
+- [For AI agents](https://raw.githubusercontent.com/CodeVachon/mysql-ultralight/main/docs/for-agents.md): rules, recipes and error table for wiring it into a test suite
+- [Using it in a test suite](https://raw.githubusercontent.com/CodeVachon/mysql-ultralight/main/docs/guide.md): the same material for a person, with the API reference
+- [Examples](https://github.com/CodeVachon/mysql-ultralight/tree/main/examples): tested Jest, Vitest and node:test setups against one Prisma app
+
+## Optional
+
+- [What works and what does not](https://raw.githubusercontent.com/CodeVachon/mysql-ultralight/main/docs/prototype.md)
+- [Architecture](https://raw.githubusercontent.com/CodeVachon/mysql-ultralight/main/docs/adr-001-architecture.md)
